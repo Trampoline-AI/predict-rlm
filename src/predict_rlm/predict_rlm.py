@@ -909,12 +909,64 @@ class PredictRLM(dspy.RLM):
             return super().forward(**kwargs)
 
     async def aforward(self, **kwargs: Any) -> dspy.Prediction:
-        """Async version of forward(). Sets the LM context for async execution."""
-        with self._lm_context():
+        """Async version of forward(). Sets the LM context for async execution.
+
+        Uses aexecute() on the interpreter so asyncio.gather can run
+        multiple rollouts concurrently.
+        """
+        self._context_lm = dspy.settings.lm
+
+        try:
             file_plan, kwargs = self._prepare_file_io(kwargs)
-            if file_plan:
-                return await self._aforward_with_files(file_plan, **kwargs)
-            return await super().aforward(**kwargs)
+            with self._lm_context():
+                if file_plan:
+                    return await self._aforward_with_files(file_plan, **kwargs)
+                return await super().aforward(**kwargs)
+        finally:
+            self._context_lm = None
+
+    async def _aexecute_iteration(
+        self,
+        repl,
+        variables,
+        history,
+        iteration,
+        input_args,
+        output_field_names,
+    ):
+        """Override parent to use non-blocking aexecute() on the interpreter.
+
+        The parent calls repl.execute() synchronously which blocks the event
+        loop, serializing all concurrent rollouts. This override uses
+        repl.aexecute() (available on JspiInterpreter) so the event loop
+        stays free for other coroutines.
+        """
+        from dspy.predict.rlm import _strip_code_fences
+
+        variables_info = [variable.format() for variable in variables]
+        pred = await self.generate_action.acall(
+            variables_info=variables_info,
+            repl_history=history,
+            iteration=f"{iteration + 1}/{self.max_iterations}",
+        )
+        if self.verbose:
+            import logging as _logging
+
+            _logging.getLogger("dspy.predict.rlm").info(
+                f"RLM iteration {iteration + 1}/{self.max_iterations}\n"
+                f"Reasoning: {pred.reasoning}\nCode:\n{pred.code}"
+            )
+
+        try:
+            code = _strip_code_fences(pred.code)
+            if hasattr(repl, "aexecute"):
+                result = await repl.aexecute(code, variables=dict(input_args))
+            else:
+                result = repl.execute(code, variables=dict(input_args))
+        except Exception as e:
+            result = f"[Error] {e}"
+
+        return self._process_execution_result(pred, result, history, output_field_names)
 
     def _prepare_file_io(
         self, input_args: dict[str, Any]
