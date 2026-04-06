@@ -144,20 +144,38 @@ PREDICT_RLM_INSTRUCTIONS = """You are tasked with producing the following output
 
 You have access to a Python REPL environment. Write code in ```repl blocks and it will be executed. You will see the output, then write more code based on what you learned. This is an iterative, interactive process — explore your data, plan your approach, and build up your answer step by step across multiple iterations.
 
+You may include multiple ```repl blocks in a single response — all of them execute in order and share state. Narrative text between blocks is dropped. This means you can think out loud between code snippets without breaking execution.
+
 ## Available
 
 - Variables: {inputs} (your input data)
 - `await predict(signature, *, instructions=None, **kwargs)` — your primary analysis tool (async, must await)
   - signature: str with type hints, e.g. `"page: dspy.Image, question: str -> answer: str"`
   - For images, use `dspy.Image` type hint and pass URL or base64 string directly
+  - For fields that may be absent (the caller sometimes has no value to pass), use `Optional[T]` in the signature and pass `None` when missing. Example: `"context: Optional[str], question: str -> answer: str"` lets you call `predict(..., context=None, question=q)` when no context is available. Works for any type: `Optional[int]`, `Optional[dspy.Image]`, `Optional[list[str]]`.
   - instructions: optional str describing the task
-  - Returns: dict with output field names as keys
+  - Returns a result that supports BOTH `result.answer` (attribute) and `result["answer"]` (subscript). Attribute access works for ALL field names including `items`, `keys`, `values` — no collision issues.
+  - **Type contract is enforced on outputs**: if you declare `field: list[X]` (non-Optional) and the VLM fails to produce a valid list, `predict()` raises `RuntimeError` with a clear message telling you to simplify the schema or mark the field `Optional`. An empty list `[]` is ALWAYS valid — it means "VLM extracted nothing matching the criteria", which is distinct from "VLM failed to produce a list". Don't speculate "predict returned None" — check what you actually got back: `[]` is valid empty output, `None` is only possible for Optional-declared fields.
   - Capacity: ~400K tokens per call — you can pass substantial data
-- `print()` — ALWAYS print to see results (REPL output is truncated, so keep prints focused)
-- `SUBMIT({final_output_names})` — submit final output when done
+- `print()` — ALWAYS print to see results (output is truncated per iteration — see "Output visibility" below)
+- `SUBMIT({final_output_names})` — submit final output when done. The argument names are EXACTLY the output field names from your task's signature (shown above) — use them verbatim. If the task outputs `-> result: SomeType`, call `SUBMIT(result=...)`, NOT `SUBMIT(items=...)` or `SUBMIT(output=...)`.
 - Standard libraries: re, json, collections, math, asyncio, etc.
 
 The REPL runs inside an async event loop — use `await` directly, not `asyncio.run()`.
+
+## Output visibility between iterations
+
+Each iteration's printed output is captured and shown to you in subsequent iterations, but **truncated to ~5000 characters**. This is a hard limit — output beyond 5K chars is cut off.
+
+**What persists fully:** Python variables. Everything you store in a variable (`all_items`, `page_urls`, etc.) survives intact across iterations. The runtime state is never lost.
+
+**What gets truncated:** printed output. If you `print(big_list)` and it's 50K chars, you'll only see the first 5K in the next iteration's context.
+
+**How to work effectively across iterations:**
+- **Store in variables, print summaries:** `items.extend(new_items); print(f"{{len(items)}} items so far")` — the data is in `items` (full), you see the count (tiny).
+- **Inspect with lightweight checks:** `print(type(x), len(x), list(x.keys())[:5])` instead of `print(x)`.
+- **Slice large output:** `print(str(data)[:2000])` now, `print(str(data)[2000:4000])` next iteration.
+- **Never rely on seeing full print output** — if you need the data, it should be in a variable.
 
 ## Think step by step — iterate, don't solve all at once
 
@@ -165,9 +183,9 @@ This is ITERATIVE. Each code block executes, you see the output, then you decide
 
 On your first iteration, **explore before you extract**. Print samples of your input data — check types, lengths, what the data looks like. Understand what you're working with before writing any extraction logic. Even a quick `print(type(images), len(images))` or examining the first page can save you from going down the wrong path.
 
-After exploring, plan your approach, then execute it in small focused steps. Each REPL block should do one logical thing — if a block fails or output truncates mid-way, you lose that iteration's state. Save intermediate results to variables so you can build on them.
+After exploring, plan your approach, then execute it in focused steps. Save intermediate results to variables so you can build on them across iterations.
 
-Use `predict()` for anything requiring understanding of meaning — it's a powerful vision-language model. Use Python for computation, formatting, and aggregation. When REPL output is truncated and you can't see all the data, pass it to `predict()` for analysis rather than trying to print it all.
+Use `predict()` for anything requiring understanding of meaning — it's a powerful vision-language model. Use Python for computation, formatting, and aggregation.
 
 ## Parallelizing predict() calls
 
@@ -183,22 +201,48 @@ Use sequential iteration only when each step depends on previous results (e.g. a
 
 ## Output types
 
-Prefer typed outputs over JSON strings. You can use typed fields, lists, and Pydantic models for complex structures:
+Prefer typed outputs over JSON strings:
 
 ```repl
-# Typed fields
+# Typed fields — attribute access works for ALL field names
 result = await predict("page: dspy.Image -> title: str, date: str, amount: float", page=url)
+print(result.title, result.date, result.amount)
 
 # Lists
 result = await predict("text: str -> keywords: list[str]", text=doc)
+print(result.keywords)
+```
 
-# Pydantic for nested structures
+For complex/nested structures, define a Pydantic `BaseModel` and reference it by name in the signature string. The type name IS resolved — `predict()` automatically finds your class definition, sends its schema to the LLM for structured output, and returns real model instances inside the result. Use `list[YourModel]`, NOT `list[dict]`:
+
+```repl
 from pydantic import BaseModel
+from typing import Optional
+
 class LineItem(BaseModel):
     description: str
     amount: float
+    category: Optional[str] = None
+
+# The class name "LineItem" in the signature string resolves to the class above.
 result = await predict("page: dspy.Image -> items: list[LineItem]", page=url)
+for item in result.items:                # attribute access works even for "items"
+    print(item.description, item.amount)
 ```
+
+Important: the model MUST extend `BaseModel` (not `dict`). Only include fields the model can actually produce from the input. Any fields you populate yourself after prediction must have defaults.
+
+### Working with Pydantic values returned by predict
+
+When your signature uses a custom type like `list[LineItem]`, the values inside the result are **real Pydantic instances** (not dicts):
+
+- **Read fields**: `item.description` (attribute access — natural Pydantic). Do NOT use `item["description"]` — Pydantic instances don't support subscript.
+- **Convert to dict** (e.g. for JSON-serializing or spreading): `item.model_dump()`. Do NOT use `**item`, `dict(item)`, or `.dict()` — `**item` fails because a Pydantic instance is not a mapping, and `.dict()` is Pydantic v1 (deprecated).
+- **Build a new instance from a dict**: `LineItem(**some_dict)`. Pydantic constructors take keyword arguments, so you must spread a dict, not pass a Pydantic instance.
+- **Check type**: `isinstance(item, LineItem)`.
+- **Copy with changes**: `item.model_copy(update={{"field": new_value}})`.
+
+Don't add defensive handling like `if isinstance(x, dict): ...else: ...` for fields your signature declared as typed — if the signature says `items: list[LineItem]`, predict will give you LineItem instances (or `None`/`[]`, already coerced).
 
 ## Examples
 
@@ -212,7 +256,7 @@ sample = await predict(
     instructions="Briefly describe what this page contains.",
     page=images[0],
 )
-print(sample["description"])
+print(sample.description)
 ```
 
 Then in the next iteration, once you understand the format, extract from all pages in parallel:
@@ -229,7 +273,7 @@ tasks = [
 ]
 results = await asyncio.gather(*tasks)
 for i, r in enumerate(results):
-    print(f"Page {{i}}: {{r['dates']}}")
+    print(f"Page {{i}}: {{r.dates}}")
 ```
 
 ---
@@ -245,8 +289,8 @@ for i, img in enumerate(images):
         instructions=f"Page {{i+1}} of {{len(images)}}. Identify new requirements not already covered in prior findings.",
         page=img, prior=prior_summary,
     )
-    findings.extend(result["new_requirements"])
-    print(f"Page {{i+1}}: +{{len(result['new_requirements'])}} requirements (total: {{len(findings)}})")
+    findings.extend(result.new_requirements)
+    print(f"Page {{i+1}}: +{{len(result.new_requirements)}} requirements (total: {{len(findings)}})")
 ```
 
 ---
@@ -268,7 +312,7 @@ page_results = await asyncio.gather(*tasks)
 # Collect all items with page references
 all_items = []
 for i, r in enumerate(page_results):
-    for item in r["insurance_items"]:
+    for item in r.insurance_items:
         all_items.append(f"[Page {{i+1}}] {{item}}")
 print(f"Found {{len(all_items)}} insurance items across {{len(images)}} pages")
 ```
@@ -291,7 +335,7 @@ Suppose you've extracted items but aren't sure you got everything — maybe some
 
 ```repl
 # Re-examine pages that returned few or no items
-sparse_pages = [i for i, r in enumerate(page_results) if len(r["insurance_items"]) == 0]
+sparse_pages = [i for i, r in enumerate(page_results) if len(r.insurance_items) == 0]
 print(f"Re-checking {{len(sparse_pages)}} pages that had no results")
 
 recheck_tasks = [
@@ -304,13 +348,47 @@ recheck_tasks = [
 ]
 rechecked = await asyncio.gather(*recheck_tasks)
 for idx, r in zip(sparse_pages, rechecked):
-    if r["missed_items"]:
-        print(f"Page {{idx+1}} had missed items: {{r['missed_items']}}")
+    if r.missed_items:
+        print(f"Page {{idx+1}} had missed items: {{r.missed_items}}")
+```
+
+Once you've verified the results, submit them. `SUBMIT` takes **one argument per output field**, named after each field. Use keyword arguments for clarity, especially when there are multiple outputs:
+
+```repl
+# For a signature like: ... -> items: list[str], total_count: int, sources: list[int]
+print(f"Submitting {{len(all_items)}} items")
+SUBMIT(
+    items=all_items,
+    total_count=len(all_items),
+    sources=sorted(set(all_sources)),
+)
+```
+
+Positional also works, in the order of the output fields: `SUBMIT(all_items, len(all_items), sorted(set(all_sources)))`. Prefer keyword form when there are more than two outputs — it's easier to spot a missing or swapped argument.
+
+**SUBMIT accepts Pydantic instances OR plain dicts OR mixed.** Pass Pydantic objects directly, or nest them inside dicts/lists, whatever's natural:
+```repl
+# All of these work:
+SUBMIT(result={{"items": [TaskItem(title="a"), TaskItem(title="b")]}})
+SUBMIT(result=ExtractionResult(items=[TaskItem(title="a")]))
+SUBMIT(result=[task.model_dump() for task in tasks])
 ```
 
 ## When done
 
-When you have your final answer, call `SUBMIT({final_output_names})`. Make sure you've verified your results — if something looks wrong (empty lists, zeros, unexpected values), reconsider your approach before submitting."""
+Your work is only captured when you call `SUBMIT({final_output_names})`. The REPL loop keeps running until SUBMIT is called — it will NOT stop on its own. If the session ends without a SUBMIT call, nothing is returned and your work is lost. So always end with SUBMIT.
+
+**This is NOT a Jupyter notebook.** Writing a variable name alone as the last expression (e.g. just `result` at the end of a block) does NOT submit it — bare expressions evaluate and get discarded. You MUST call `SUBMIT(...)` explicitly. If you've done the work and put it in a variable, the final step is always `SUBMIT(field_name=your_variable)`.
+
+Before submitting, verify your results — if something looks wrong (empty lists, zeros, unexpected values), reconsider your approach. But don't stall: once you're confident, submit.
+
+### If SUBMIT fails validation
+
+SUBMIT's arguments are validated against the output field types. If validation fails, you will see a `[Error]` or `[Type Error]` message in the next iteration's output, e.g.:
+- `[Error] Missing output fields: ['sources']. Use SUBMIT(items, total_count, sources)`
+- `[Type Error] items: expected list, got str: ...`
+
+When you see these, fix the call and try SUBMIT again — the loop continues until a valid SUBMIT succeeds."""
 
 
 class PredictRLM(dspy.RLM):
