@@ -3,14 +3,24 @@
 These tests should fail without the fixes and pass with them.
 """
 
+import asyncio
 import json
 import re
 import unittest
 from typing import Literal, Optional
-from unittest.mock import patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from pydantic import BaseModel, Field
+
+
+def _run(coro):
+    """Run async predict call from sync test."""
+    import nest_asyncio
+
+    nest_asyncio.apply()
+    loop = asyncio.get_event_loop()
+    return loop.run_until_complete(coro)
 
 
 class ExtractedItem(BaseModel):
@@ -721,7 +731,6 @@ class TestPredictToolListDict(unittest.TestCase):
     def test_predict_tool_with_list_dict_output(self):
         """Test that the predict tool handles list[dict] correctly."""
         import warnings
-        from unittest.mock import MagicMock
 
         from predict_rlm import PredictRLM
 
@@ -743,17 +752,17 @@ class TestPredictToolListDict(unittest.TestCase):
             ]
             mock_prediction.items = items_list
             mock_prediction.__getitem__ = lambda self, key: getattr(self, key)
-            mock_predictor.return_value = mock_prediction
+            mock_predictor.acall = AsyncMock(return_value=mock_prediction)
             mock_predict_class.return_value = mock_predictor
 
             # Capture warnings during execution
             with warnings.catch_warnings(record=True) as w:
                 warnings.simplefilter("always")
 
-                result = predict_tool(
+                result = _run(predict_tool(
                     "context: str -> items: list[dict]",
                     context="test context",
-                )
+                ))
 
                 # Should return a dict with items
                 self.assertIsInstance(result, dict)
@@ -786,7 +795,6 @@ class TestPredictToolListDict(unittest.TestCase):
     def test_predict_tool_with_list_of_pydantic_models(self):
         """Test that the predict tool handles list of Pydantic models correctly."""
         import warnings
-        from unittest.mock import MagicMock
 
         from predict_rlm import PredictRLM
 
@@ -809,7 +817,7 @@ class TestPredictToolListDict(unittest.TestCase):
                 TaskItem(category="FORM", title="Form 1", priority="high"),
             ]
             mock_prediction.__getitem__ = lambda self, key: getattr(self, key)
-            mock_predictor.return_value = mock_prediction
+            mock_predictor.acall = AsyncMock(return_value=mock_prediction)
             mock_predict_class.return_value = mock_predictor
 
             with warnings.catch_warnings(record=True) as w:
@@ -817,11 +825,11 @@ class TestPredictToolListDict(unittest.TestCase):
 
                 # Must provide pydantic_schemas for models defined in local scope
                 # (in real sandbox usage, this is extracted and passed automatically)
-                result = predict_tool(
+                result = _run(predict_tool(
                     "context: str -> items: list[TaskItem]",
                     context="test context",
                     pydantic_schemas={"TaskItem": TaskItem.model_json_schema()},
-                )
+                ))
 
                 # Should return dicts, not Pydantic models
                 self.assertIsInstance(result, dict)
