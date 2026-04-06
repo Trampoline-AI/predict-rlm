@@ -17,6 +17,10 @@ from .files import File, build_file_plan, scan_file_fields
 from .interpreter import JspiInterpreter
 from .rlm_skills import Skill, merge_skills
 
+# Capture the real dspy.Image class at import time so type comparisons
+# work even when tests patch predict_rlm.dspy.Image to a mock.
+_ImageType = dspy.Image
+
 if TYPE_CHECKING:
     from dspy.signatures.signature import Signature
 
@@ -472,48 +476,65 @@ class PredictRLM(dspy.RLM):
         # Capture self to access _sub_lm at call time
         rlm_instance = self
 
-        def _parse_image_fields(signature: str) -> dict[str, bool]:
-            """Parse signature to find fields with dspy.Image type hint."""
-            # Extract input part (before ->)
-            inputs_part = signature.split("->")[0].strip()
+        def _unwrap_optional(anno: Any) -> Any:
+            """Strip Optional[X] / Union[X, None] / X | None → X."""
+            import typing as _typing
 
-            image_fields: dict[str, bool] = {}
+            if _typing.get_origin(anno) is _typing.Union:
+                non_none = [a for a in _typing.get_args(anno) if a is not type(None)]
+                if len(non_none) == 1:
+                    return non_none[0]
+            return anno
 
-            # Find fields with list[dspy.Image] type annotation
-            list_pattern = r"(\w+)\s*:\s*(?:list|List)\s*\[\s*dspy\.Image\s*\]"
-            for match in re.findall(list_pattern, inputs_part):
-                image_fields[match] = True  # is_list = True
+        def _image_field_info(anno: Any) -> tuple[bool, bool]:
+            """Returns (is_image, is_list) for an annotation.
 
-            # Find fields with dspy.Image type annotation (non-list)
-            single_pattern = r"(\w+)\s*:\s*dspy\.Image(?!\s*\])"
-            for match in re.findall(single_pattern, inputs_part):
-                if match not in image_fields:  # Don't override list matches
-                    image_fields[match] = False  # is_list = False
+            Recognizes dspy.Image inside any Optional/Union/list wrapper by
+            unwrapping and inspecting origins via typing.get_origin.
+            """
+            import typing as _typing
 
-            return image_fields
+            anno = _unwrap_optional(anno)
+            if _typing.get_origin(anno) is list:
+                args = _typing.get_args(anno)
+                if args:
+                    inner = _unwrap_optional(args[0])
+                    return (inner is _ImageType, True)
+                return (False, False)
+            return (anno is _ImageType, False)
 
-        def _wrap_images(signature: str, kwargs: dict[str, Any]) -> dict[str, Any]:
-            """Wrap values for dspy.Image typed fields."""
-            image_fields = _parse_image_fields(signature)
+        def _is_list_output(anno: Any) -> bool:
+            """True if anno is list[...] or Optional[list[...]]."""
+            import typing as _typing
 
-            wrapped = {}
+            return _typing.get_origin(_unwrap_optional(anno)) is list
+
+        def _allows_none(anno: Any) -> bool:
+            """True if the annotation allows None (Optional[T], T | None, etc.)."""
+            return _unwrap_optional(anno) is not anno
+
+        def _wrap_images_from_sig(
+            sig_obj: Any, kwargs: dict[str, Any]
+        ) -> dict[str, Any]:
+            """Wrap URL/base64 strings as dspy.Image for Image-typed input fields."""
+            wrapped: dict[str, Any] = {}
             for key, value in kwargs.items():
-                if key in image_fields:
-                    is_list = image_fields[key]
-                    if is_list and isinstance(value, list):
-                        wrapped[key] = [
-                            dspy.Image(url=item) if isinstance(item, str) else item
-                            for item in value
-                        ]
-                    elif not is_list and isinstance(value, str):
-                        wrapped[key] = dspy.Image(url=value)
-                    else:
-                        wrapped[key] = value
+                if key not in sig_obj.input_fields or value is None:
+                    wrapped[key] = value
+                    continue
+                is_image, is_list = _image_field_info(sig_obj.input_fields[key].annotation)
+                if is_image and is_list and isinstance(value, list):
+                    wrapped[key] = [
+                        dspy.Image(url=item) if isinstance(item, str) else item
+                        for item in value
+                    ]
+                elif is_image and not is_list and isinstance(value, str):
+                    wrapped[key] = dspy.Image(url=value)
                 else:
                     wrapped[key] = value
             return wrapped
 
-        def predict(
+        async def predict(
             signature: str,
             *,
             instructions: str | None = None,
@@ -566,14 +587,20 @@ class PredictRLM(dspy.RLM):
                     "or set a default LM with dspy.configure(lm=...)"
                 )
 
-            # Auto-wrap image URLs/base64 for dspy.Image typed fields
-            wrapped_kwargs = _wrap_images(signature, kwargs)
+            # Normalize signature for dspy.Signature parser: collapse
+            # multi-line signatures to a single line.
+            signature = " ".join(signature.split())
 
             # Reconstruct custom Pydantic types from schemas if provided
             custom_types: dict[str, type] = {}
             if pydantic_schemas:
                 for name, schema in pydantic_schemas.items():
                     try:
+                        # Ensure schema has a title matching the key so the
+                        # reconstructed model gets the right name (hand-crafted
+                        # schemas from the LM often omit "title")
+                        if "title" not in schema:
+                            schema = {**schema, "title": name}
                         built = _models_from_schema(schema)
                         custom_types.update(built)
                     except Exception as e:
@@ -585,8 +612,8 @@ class PredictRLM(dspy.RLM):
             else:
                 import logging
 
-                # Check if signature has custom types (capitalized names after colons)
-                pattern = r":\s*(?:list\[|List\[|Optional\[)?([A-Z][A-Za-z0-9_]*)"
+                # Check if signature has custom types (capitalized identifiers)
+                pattern = r"(?<![.\w])([A-Z][A-Za-z0-9_]*)"
                 matches = re.findall(pattern, signature)
                 builtins = {
                     "Image",
@@ -625,7 +652,7 @@ class PredictRLM(dspy.RLM):
                 logger = logging.getLogger(__name__)
 
                 if "Unknown name" in str(e):
-                    pattern = r":\s*(?:list\[|List\[|Optional\[)?([A-Z][A-Za-z0-9_]*)"
+                    pattern = r"(?<![.\w])([A-Z][A-Za-z0-9_]*)"
                     custom_types_in_sig = re.findall(pattern, signature)
                     builtins = {
                         "Image",
@@ -642,28 +669,37 @@ class PredictRLM(dspy.RLM):
                     custom_names = [m for m in custom_types_in_sig if m not in builtins]
 
                     if custom_names:
+                        # Unresolved types — fall back to string signature instead of crashing.
+                        # This commonly happens when models are defined inside functions or
+                        # the schema extractor couldn't find them via frame introspection.
                         logger.warning(
                             f"Failed to resolve custom types {custom_names} in signature. "
-                            f"This often happens when using asyncio.gather() with Pydantic models. "
-                            f"Ensure models are defined at module/global scope, not inside functions. "
+                            f"Falling back to string signature. "
                             f"Error: {e}"
                         )
-                        raise RuntimeError(
-                            f"Failed to create signature '{signature}' with custom_types={list(custom_types.keys()) if custom_types else []}. "
-                            f"If using Pydantic models in output types, ensure they are defined at global scope "
-                            f"(not inside a function) so they can be found by the schema extractor. "
-                            f"Original error: {e}"
-                        ) from e
 
                 logger.warning(
                     f"Failed to create Signature with parsed types: {e}. Falling back to string signature."
                 )
                 sig = signature  # Use string signature directly
 
-            # Create predictor and run with the specified LM
+            # Derive image-wrapping and list-output metadata from the parsed
+            # signature's annotations (DSPy's own parser is authoritative).
+            # If sig is a string (fallback path), skip these features.
+            if isinstance(sig, str):
+                wrapped_kwargs = kwargs
+                output_field_annotations: dict[str, Any] = {}
+            else:
+                wrapped_kwargs = _wrap_images_from_sig(sig, kwargs)
+                output_field_annotations = {
+                    name: field.annotation
+                    for name, field in sig.output_fields.items()
+                }
+
+            # Create predictor and run with the specified LM (async, no threads)
             predictor = dspy.Predict(sig)
             with dspy.context(lm=lm):
-                prediction = predictor(**wrapped_kwargs)
+                prediction = await predictor.acall(**wrapped_kwargs)
 
             # Convert Prediction to dict, serializing any Pydantic models to dicts
             def _to_serializable(value: Any) -> Any:
@@ -717,11 +753,30 @@ class PredictRLM(dspy.RLM):
 
                 return str(value)
 
-            return {
-                field: _to_serializable(prediction[field])
-                for field in prediction.keys()
-                if not field.startswith("_")
-            }
+            # Use prediction[field] for extracting values from DSPy Prediction.
+            # Enforce type contract: if the VLM returned None for a field
+            # whose declared type does NOT allow None (e.g. list[X] not
+            # Optional[list[X]]), raise loudly. Silently coercing None→[] or
+            # passing None through hides VLM failures behind ambiguous empty
+            # values and causes models to speculate "predict returned None".
+            result = {}
+            for field in prediction.keys():
+                if field.startswith("_"):
+                    continue
+                value = prediction[field]
+                if value is None and field in output_field_annotations:
+                    anno = output_field_annotations[field]
+                    if not _allows_none(anno):
+                        raise RuntimeError(
+                            f"predict: VLM returned None for non-Optional output "
+                            f"field {field!r} (declared type: {anno}). The VLM "
+                            f"couldn't produce a valid value. Schema may be too "
+                            f"complex — try simplifying the signature, or mark "
+                            f"the field Optional (e.g. Optional[list[X]]) if None "
+                            f"is acceptable."
+                        )
+                result[field] = _to_serializable(value)
+            return result
 
         return predict
 

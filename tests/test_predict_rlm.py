@@ -1,6 +1,7 @@
 """Tests for PredictRLM with predict tool for DSPy signatures."""
 
-from unittest.mock import MagicMock, patch
+import asyncio
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import dspy
 import pytest
@@ -8,6 +9,15 @@ from pydantic import BaseModel
 
 from predict_rlm import PredictRLM
 from predict_rlm.predict_rlm import _models_from_schema
+
+
+def _run(coro):
+    """Run async predict call from sync test."""
+    import nest_asyncio
+
+    nest_asyncio.apply()
+    loop = asyncio.get_event_loop()
+    return loop.run_until_complete(coro)
 
 
 class ImageAnalysisSignature(dspy.Signature):
@@ -49,13 +59,13 @@ class TestPredictTool:
             values = {"answer": "Paris"}
             mock_prediction.keys.return_value = list(values.keys())
             mock_prediction.__getitem__ = MagicMock(side_effect=lambda k: values[k])
-            mock_predictor.return_value = mock_prediction
+            mock_predictor.acall = AsyncMock(return_value=mock_prediction)
             mock_predict_class.return_value = mock_predictor
 
-            result = rlm.tools["predict"].func(
+            result = _run(rlm.tools["predict"].func(
                 "question -> answer",
                 question="What is the capital of France?",
-            )
+            ))
 
             assert isinstance(result, dict)
             assert result == {"answer": "Paris"}
@@ -63,7 +73,7 @@ class TestPredictTool:
             mock_predict_class.assert_called_once()
             sig = mock_predict_class.call_args[0][0]
             assert hasattr(sig, "input_fields") and "question" in sig.input_fields
-            mock_predictor.assert_called_once_with(question="What is the capital of France?")
+            mock_predictor.acall.assert_called_once_with(question="What is the capital of France?")
 
     def test_predict_with_multiple_outputs(self):
         """predict correctly handles signatures with multiple outputs."""
@@ -76,13 +86,13 @@ class TestPredictTool:
             values = {"title": "Test Document", "summary": "A brief summary"}
             mock_prediction.keys.return_value = list(values.keys())
             mock_prediction.__getitem__ = MagicMock(side_effect=lambda k: values[k])
-            mock_predictor.return_value = mock_prediction
+            mock_predictor.acall = AsyncMock(return_value=mock_prediction)
             mock_predict_class.return_value = mock_predictor
 
-            result = rlm.tools["predict"].func(
+            result = _run(rlm.tools["predict"].func(
                 "text -> title, summary",
                 text="Some document content",
-            )
+            ))
 
             assert isinstance(result, dict)
             assert result == {"title": "Test Document", "summary": "A brief summary"}
@@ -99,15 +109,15 @@ class TestPredictTool:
                 values = {"toxic": True}
                 mock_prediction.keys.return_value = list(values.keys())
                 mock_prediction.__getitem__ = MagicMock(side_effect=lambda k: values[k])
-                mock_predictor.return_value = mock_prediction
+                mock_predictor.acall = AsyncMock(return_value=mock_prediction)
                 mock_predict_class.return_value = mock_predictor
                 mock_sig_class.return_value = "mocked_signature"
 
-                result = rlm.tools["predict"].func(
+                result = _run(rlm.tools["predict"].func(
                     "comment -> toxic: bool",
                     instructions="Mark as toxic if the comment includes insults.",
                     comment="You're an idiot!",
-                )
+                ))
 
                 assert result == {"toxic": True}
                 mock_sig_class.assert_called_once_with(
@@ -126,13 +136,13 @@ class TestPredictTool:
             values = {"answer": "Test answer"}
             mock_prediction.keys.return_value = list(values.keys())
             mock_prediction.__getitem__ = MagicMock(side_effect=lambda k: values[k])
-            mock_predictor.return_value = mock_prediction
+            mock_predictor.acall = AsyncMock(return_value=mock_prediction)
             mock_predict_class.return_value = mock_predictor
 
-            result = rlm.tools["predict"].func(
+            result = _run(rlm.tools["predict"].func(
                 "question -> answer",
                 question="Test question",
-            )
+            ))
 
             assert result == {"answer": "Test answer"}
 
@@ -142,7 +152,7 @@ class TestPredictTool:
 
         with dspy.context(lm=None):
             with pytest.raises(RuntimeError, match="No LM available for predict"):
-                rlm.tools["predict"].func("question -> answer", question="test")
+                _run(rlm.tools["predict"].func("question -> answer", question="test"))
 
     def test_predict_auto_wraps_images_with_type_hint(self):
         """predict automatically wraps image URLs when field has dspy.Image type hint."""
@@ -150,28 +160,25 @@ class TestPredictTool:
         rlm = PredictRLM(ImageAnalysisSignature, sub_lm=mock_lm, max_iterations=5)
 
         with patch("predict_rlm.predict_rlm.dspy.Predict") as mock_predict_class:
-            with patch("predict_rlm.predict_rlm.dspy.Image") as mock_image_class:
-                mock_predictor = MagicMock()
-                mock_prediction = MagicMock()
-                values = {"answer": "Extracted text"}
-                mock_prediction.keys.return_value = list(values.keys())
-                mock_prediction.__getitem__ = MagicMock(side_effect=lambda k: values[k])
-                mock_predictor.return_value = mock_prediction
-                mock_predict_class.return_value = mock_predictor
-                mock_image_class.return_value = "wrapped_image"
+            mock_predictor = MagicMock()
+            mock_prediction = MagicMock()
+            values = {"answer": "Extracted text"}
+            mock_prediction.keys.return_value = list(values.keys())
+            mock_prediction.__getitem__ = MagicMock(side_effect=lambda k: values[k])
+            mock_predictor.acall = AsyncMock(return_value=mock_prediction)
+            mock_predict_class.return_value = mock_predictor
 
-                result = rlm.tools["predict"].func(
-                    "image: dspy.Image, question -> answer",
-                    image="https://example.com/image.png",
-                    question="What text is visible?",
-                )
+            result = _run(rlm.tools["predict"].func(
+                "image: dspy.Image, question -> answer",
+                image="https://example.com/image.png",
+                question="What text is visible?",
+            ))
 
-                assert result == {"answer": "Extracted text"}
-                mock_image_class.assert_called_once_with(url="https://example.com/image.png")
-                mock_predictor.assert_called_once_with(
-                    image="wrapped_image",
-                    question="What text is visible?",
-                )
+            assert result == {"answer": "Extracted text"}
+            # Verify the image was wrapped in dspy.Image
+            call_kwargs = mock_predictor.acall.call_args.kwargs
+            assert isinstance(call_kwargs["image"], dspy.Image)
+            assert call_kwargs["question"] == "What text is visible?"
 
     def test_predict_auto_wraps_base64_images_with_type_hint(self):
         """predict automatically wraps base64 image data when field has dspy.Image type hint."""
@@ -179,23 +186,22 @@ class TestPredictTool:
         rlm = PredictRLM(ImageAnalysisSignature, sub_lm=mock_lm, max_iterations=5)
 
         with patch("predict_rlm.predict_rlm.dspy.Predict") as mock_predict_class:
-            with patch("predict_rlm.predict_rlm.dspy.Image") as mock_image_class:
-                mock_predictor = MagicMock()
-                mock_prediction = MagicMock()
-                values = {"text": "OCR result"}
-                mock_prediction.keys.return_value = list(values.keys())
-                mock_prediction.__getitem__ = MagicMock(side_effect=lambda k: values[k])
-                mock_predictor.return_value = mock_prediction
-                mock_predict_class.return_value = mock_predictor
-                mock_image_class.return_value = "wrapped_base64"
+            mock_predictor = MagicMock()
+            mock_prediction = MagicMock()
+            values = {"text": "OCR result"}
+            mock_prediction.keys.return_value = list(values.keys())
+            mock_prediction.__getitem__ = MagicMock(side_effect=lambda k: values[k])
+            mock_predictor.acall = AsyncMock(return_value=mock_prediction)
+            mock_predict_class.return_value = mock_predictor
 
-                result = rlm.tools["predict"].func(
-                    "document: dspy.Image -> text",
-                    document="data:image/png;base64,abc123...",
-                )
+            result = _run(rlm.tools["predict"].func(
+                "document: dspy.Image -> text",
+                document="data:image/png;base64,abc123...",
+            ))
 
-                assert result == {"text": "OCR result"}
-                mock_image_class.assert_called_once_with(url="data:image/png;base64,abc123...")
+            assert result == {"text": "OCR result"}
+            call_kwargs = mock_predictor.acall.call_args.kwargs
+            assert isinstance(call_kwargs["document"], dspy.Image)
 
     def test_predict_does_not_wrap_without_type_hint(self):
         """predict does not wrap values for fields without dspy.Image type hint."""
@@ -209,17 +215,17 @@ class TestPredictTool:
                 values = {"answer": "42"}
                 mock_prediction.keys.return_value = list(values.keys())
                 mock_prediction.__getitem__ = MagicMock(side_effect=lambda k: values[k])
-                mock_predictor.return_value = mock_prediction
+                mock_predictor.acall = AsyncMock(return_value=mock_prediction)
                 mock_predict_class.return_value = mock_predictor
 
-                result = rlm.tools["predict"].func(
+                result = _run(rlm.tools["predict"].func(
                     "question -> answer",
                     question="https://example.com/some-url",
-                )
+                ))
 
                 assert result == {"answer": "42"}
                 mock_image_class.assert_not_called()
-                mock_predictor.assert_called_once_with(
+                mock_predictor.acall.assert_called_once_with(
                     question="https://example.com/some-url",
                 )
 
@@ -241,13 +247,13 @@ class TestPredictTool:
                 mock_prediction = MagicMock()
                 mock_prediction.keys.return_value = ["answer"]
                 mock_prediction.answer = "Test"
-                mock_predictor.return_value = mock_prediction
+                mock_predictor.acall = AsyncMock(return_value=mock_prediction)
                 mock_predict_class.return_value = mock_predictor
 
-                _ = rlm.tools["predict"].func(
+                _ = _run(rlm.tools["predict"].func(
                     "question -> answer",
                     question="Test?",
-                )
+                ))
 
                 mock_context.assert_called_once_with(lm=context_lm)
 
@@ -279,42 +285,115 @@ class TestPredictTool:
         rlm = PredictRLM(ImageAnalysisSignature, sub_lm=mock_lm, max_iterations=5)
 
         with patch("predict_rlm.predict_rlm.dspy.Predict") as mock_predict_class:
-            with patch("predict_rlm.predict_rlm.dspy.Image") as mock_image_class:
-                mock_predictor = MagicMock()
-                mock_prediction = MagicMock()
-                values = {"answer": "Analyzed 3 images"}
-                mock_prediction.keys.return_value = list(values.keys())
-                mock_prediction.__getitem__ = MagicMock(side_effect=lambda k: values[k])
-                mock_predictor.return_value = mock_prediction
-                mock_predict_class.return_value = mock_predictor
-                # Each call to dspy.Image returns a unique mock
-                mock_image_class.side_effect = lambda url: f"wrapped_{url}"
+            mock_predictor = MagicMock()
+            mock_prediction = MagicMock()
+            values = {"answer": "Analyzed 3 images"}
+            mock_prediction.keys.return_value = list(values.keys())
+            mock_prediction.__getitem__ = MagicMock(side_effect=lambda k: values[k])
+            mock_predictor.acall = AsyncMock(return_value=mock_prediction)
+            mock_predict_class.return_value = mock_predictor
 
-                result = rlm.tools["predict"].func(
-                    "images: list[dspy.Image], question -> answer",
-                    images=[
-                        "https://example.com/img1.png",
-                        "https://example.com/img2.png",
-                        "https://example.com/img3.png",
-                    ],
-                    question="What do these images show?",
-                )
+            result = _run(rlm.tools["predict"].func(
+                "images: list[dspy.Image], question -> answer",
+                images=[
+                    "https://example.com/img1.png",
+                    "https://example.com/img2.png",
+                    "https://example.com/img3.png",
+                ],
+                question="What do these images show?",
+            ))
 
-                assert result == {"answer": "Analyzed 3 images"}
-                # Each image URL should be wrapped
-                assert mock_image_class.call_count == 3
-                mock_image_class.assert_any_call(url="https://example.com/img1.png")
-                mock_image_class.assert_any_call(url="https://example.com/img2.png")
-                mock_image_class.assert_any_call(url="https://example.com/img3.png")
-                # Predictor should receive list of wrapped images
-                mock_predictor.assert_called_once()
-                call_kwargs = mock_predictor.call_args.kwargs
-                assert call_kwargs["images"] == [
-                    "wrapped_https://example.com/img1.png",
-                    "wrapped_https://example.com/img2.png",
-                    "wrapped_https://example.com/img3.png",
-                ]
-                assert call_kwargs["question"] == "What do these images show?"
+            assert result == {"answer": "Analyzed 3 images"}
+            # Predictor should receive list of wrapped dspy.Image instances
+            mock_predictor.acall.assert_called_once()
+            call_kwargs = mock_predictor.acall.call_args.kwargs
+            assert len(call_kwargs["images"]) == 3
+            assert all(isinstance(img, dspy.Image) for img in call_kwargs["images"])
+            assert call_kwargs["question"] == "What do these images show?"
+
+
+class TestTypeContractEnforcement:
+    """Tests for type contract enforcement on predict outputs."""
+
+    def test_none_for_non_optional_list_raises(self):
+        """VLM returning None for non-Optional list[X] field raises RuntimeError."""
+        mock_lm = MagicMock()
+        rlm = PredictRLM(ImageAnalysisSignature, sub_lm=mock_lm, max_iterations=5)
+
+        with patch("predict_rlm.predict_rlm.dspy.Predict") as mock_predict_class:
+            mock_predictor = MagicMock()
+            mock_prediction = MagicMock()
+            values = {"items": None}
+            mock_prediction.keys.return_value = list(values.keys())
+            mock_prediction.__getitem__ = MagicMock(side_effect=lambda k: values[k])
+            mock_predictor.acall = AsyncMock(return_value=mock_prediction)
+            mock_predict_class.return_value = mock_predictor
+
+            with pytest.raises(RuntimeError, match="VLM returned None for non-Optional"):
+                _run(rlm.tools["predict"].func(
+                    "text: str -> items: list[str]",
+                    text="some input",
+                ))
+
+    def test_empty_list_passes_through_unchanged(self):
+        """Empty list [] is always valid — it means 'nothing found', distinct from None."""
+        mock_lm = MagicMock()
+        rlm = PredictRLM(ImageAnalysisSignature, sub_lm=mock_lm, max_iterations=5)
+
+        with patch("predict_rlm.predict_rlm.dspy.Predict") as mock_predict_class:
+            mock_predictor = MagicMock()
+            mock_prediction = MagicMock()
+            values = {"items": []}
+            mock_prediction.keys.return_value = list(values.keys())
+            mock_prediction.__getitem__ = MagicMock(side_effect=lambda k: values[k])
+            mock_predictor.acall = AsyncMock(return_value=mock_prediction)
+            mock_predict_class.return_value = mock_predictor
+
+            result = _run(rlm.tools["predict"].func(
+                "text: str -> items: list[str]",
+                text="some input",
+            ))
+            assert result["items"] == []
+
+    def test_none_for_optional_str_passes_through(self):
+        """None for Optional[str] field passes through without error."""
+        mock_lm = MagicMock()
+        rlm = PredictRLM(ImageAnalysisSignature, sub_lm=mock_lm, max_iterations=5)
+
+        with patch("predict_rlm.predict_rlm.dspy.Predict") as mock_predict_class:
+            mock_predictor = MagicMock()
+            mock_prediction = MagicMock()
+            values = {"answer": None}
+            mock_prediction.keys.return_value = list(values.keys())
+            mock_prediction.__getitem__ = MagicMock(side_effect=lambda k: values[k])
+            mock_predictor.acall = AsyncMock(return_value=mock_prediction)
+            mock_predict_class.return_value = mock_predictor
+
+            result = _run(rlm.tools["predict"].func(
+                "text: str -> answer: Optional[str]",
+                text="some input",
+            ))
+            assert result["answer"] is None
+
+    def test_none_for_non_optional_str_raises(self):
+        """VLM returning None for non-Optional str field raises RuntimeError."""
+        mock_lm = MagicMock()
+        rlm = PredictRLM(ImageAnalysisSignature, sub_lm=mock_lm, max_iterations=5)
+
+        with patch("predict_rlm.predict_rlm.dspy.Predict") as mock_predict_class:
+            mock_predictor = MagicMock()
+            mock_prediction = MagicMock()
+            values = {"answer": None}
+            mock_prediction.keys.return_value = list(values.keys())
+            mock_prediction.__getitem__ = MagicMock(side_effect=lambda k: values[k])
+            mock_predictor.acall = AsyncMock(return_value=mock_prediction)
+            mock_predict_class.return_value = mock_predictor
+
+            with pytest.raises(RuntimeError, match="VLM returned None for non-Optional"):
+                _run(rlm.tools["predict"].func(
+                    "text: str -> answer: str",
+                    text="some input",
+                ))
 
 
 class TestPredictRLMConfiguration:
@@ -731,15 +810,15 @@ class TestModelsFromSchema:
                 mock_prediction = MagicMock()
                 mock_prediction.keys.return_value = ["tasks"]
                 mock_prediction.tasks = [{"category": "Test", "title": "Task 1"}]
-                mock_predictor.return_value = mock_prediction
+                mock_predictor.acall = AsyncMock(return_value=mock_prediction)
                 mock_predict_class.return_value = mock_predictor
                 mock_sig_class.return_value = "mocked_signature"
 
-                _ = rlm.tools["predict"].func(
+                _ = _run(rlm.tools["predict"].func(
                     "text: str -> tasks: list[TaskItem]",
                     pydantic_schemas=pydantic_schemas,
                     text="test input",
-                )
+                ))
 
                 # Verify Signature was called with custom_types
                 assert mock_sig_class.call_count == 1
@@ -758,13 +837,13 @@ class TestModelsFromSchema:
             mock_prediction = MagicMock()
             mock_prediction.keys.return_value = ["answer"]
             mock_prediction.answer = "Test"
-            mock_predictor.return_value = mock_prediction
+            mock_predictor.acall = AsyncMock(return_value=mock_prediction)
             mock_predict_class.return_value = mock_predictor
 
-            _ = rlm.tools["predict"].func(
+            _ = _run(rlm.tools["predict"].func(
                 "question -> answer",
                 question="What is 2+2?",
-            )
+            ))
 
             # Predict should be called once with a parsed Signature
             mock_predict_class.assert_called_once()
@@ -793,13 +872,13 @@ class TestModelsFromSchema:
             # Set up __getitem__ to return the actual value
             expected_items = [{"title": "Task 1"}, {"title": "Task 2"}]
             mock_prediction.__getitem__ = MagicMock(return_value=expected_items)
-            mock_predictor.return_value = mock_prediction
+            mock_predictor.acall = AsyncMock(return_value=mock_prediction)
             mock_predict_class.return_value = mock_predictor
 
-            result = rlm.tools["predict"].func(
+            result = _run(rlm.tools["predict"].func(
                 "page: dspy.Image -> items: list[dict]",
                 page="https://example.com/page.png",
-            )
+            ))
 
             assert isinstance(result, dict)
             assert "items" in result
