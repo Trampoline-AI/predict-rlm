@@ -48,7 +48,8 @@ class MockLM:
 class TestPredictTool:
     """Tests that PredictRLM predict tool correctly runs DSPy signatures."""
 
-    def test_predict_returns_dict_response(self):
+    @pytest.mark.asyncio
+    async def test_predict_returns_dict_response(self):
         """predict tool runs DSPy Predict and returns dict output."""
         mock_lm = MagicMock()
         rlm = PredictRLM(ImageAnalysisSignature, sub_lm=mock_lm, max_iterations=5)
@@ -62,10 +63,10 @@ class TestPredictTool:
             mock_predictor.acall = AsyncMock(return_value=mock_prediction)
             mock_predict_class.return_value = mock_predictor
 
-            result = _run(rlm.tools["predict"].func(
+            result = await rlm.tools["predict"].func(
                 "question -> answer",
                 question="What is the capital of France?",
-            ))
+            )
 
             assert isinstance(result, dict)
             assert result == {"answer": "Paris"}
@@ -75,7 +76,8 @@ class TestPredictTool:
             assert hasattr(sig, "input_fields") and "question" in sig.input_fields
             mock_predictor.acall.assert_called_once_with(question="What is the capital of France?")
 
-    def test_predict_with_multiple_outputs(self):
+    @pytest.mark.asyncio
+    async def test_predict_with_multiple_outputs(self):
         """predict correctly handles signatures with multiple outputs."""
         mock_lm = MagicMock()
         rlm = PredictRLM(ImageAnalysisSignature, sub_lm=mock_lm, max_iterations=5)
@@ -89,15 +91,16 @@ class TestPredictTool:
             mock_predictor.acall = AsyncMock(return_value=mock_prediction)
             mock_predict_class.return_value = mock_predictor
 
-            result = _run(rlm.tools["predict"].func(
+            result = await rlm.tools["predict"].func(
                 "text -> title, summary",
                 text="Some document content",
-            ))
+            )
 
             assert isinstance(result, dict)
             assert result == {"title": "Test Document", "summary": "A brief summary"}
 
-    def test_predict_with_instructions(self):
+    @pytest.mark.asyncio
+    async def test_predict_with_instructions(self):
         """predict passes instructions to create a Signature with instructions."""
         mock_lm = MagicMock()
         rlm = PredictRLM(ImageAnalysisSignature, sub_lm=mock_lm, max_iterations=5)
@@ -113,11 +116,11 @@ class TestPredictTool:
                 mock_predict_class.return_value = mock_predictor
                 mock_sig_class.return_value = "mocked_signature"
 
-                result = _run(rlm.tools["predict"].func(
+                result = await rlm.tools["predict"].func(
                     "comment -> toxic: bool",
                     instructions="Mark as toxic if the comment includes insults.",
                     comment="You're an idiot!",
-                ))
+                )
 
                 assert result == {"toxic": True}
                 mock_sig_class.assert_called_once_with(
@@ -125,7 +128,8 @@ class TestPredictTool:
                 )
                 mock_predict_class.assert_called_once_with("mocked_signature")
 
-    def test_predict_uses_sub_lm(self):
+    @pytest.mark.asyncio
+    async def test_predict_uses_sub_lm(self):
         """predict uses the sub_lm when provided."""
         mock_lm = MagicMock()
         rlm = PredictRLM(ImageAnalysisSignature, sub_lm=mock_lm, max_iterations=5)
@@ -139,22 +143,24 @@ class TestPredictTool:
             mock_predictor.acall = AsyncMock(return_value=mock_prediction)
             mock_predict_class.return_value = mock_predictor
 
-            result = _run(rlm.tools["predict"].func(
+            result = await rlm.tools["predict"].func(
                 "question -> answer",
                 question="Test question",
-            ))
+            )
 
             assert result == {"answer": "Test answer"}
 
-    def test_predict_error_when_no_lm(self):
+    @pytest.mark.asyncio
+    async def test_predict_error_when_no_lm(self):
         """predict raises error when no LM is available."""
         rlm = PredictRLM(ImageAnalysisSignature, sub_lm=None, max_iterations=3)
 
         with dspy.context(lm=None):
             with pytest.raises(RuntimeError, match="No LM available for predict"):
-                _run(rlm.tools["predict"].func("question -> answer", question="test"))
+                await rlm.tools["predict"].func("question -> answer", question="test")
 
-    def test_predict_auto_wraps_images_with_type_hint(self):
+    @pytest.mark.asyncio
+    async def test_predict_auto_wraps_images_with_type_hint(self):
         """predict automatically wraps image URLs when field has dspy.Image type hint."""
         mock_lm = MagicMock()
         rlm = PredictRLM(ImageAnalysisSignature, sub_lm=mock_lm, max_iterations=5)
@@ -168,11 +174,11 @@ class TestPredictTool:
             mock_predictor.acall = AsyncMock(return_value=mock_prediction)
             mock_predict_class.return_value = mock_predictor
 
-            result = _run(rlm.tools["predict"].func(
+            result = await rlm.tools["predict"].func(
                 "image: dspy.Image, question -> answer",
                 image="https://example.com/image.png",
                 question="What text is visible?",
-            ))
+            )
 
             assert result == {"answer": "Extracted text"}
             # Verify the image was wrapped in dspy.Image
@@ -180,7 +186,8 @@ class TestPredictTool:
             assert isinstance(call_kwargs["image"], dspy.Image)
             assert call_kwargs["question"] == "What text is visible?"
 
-    def test_predict_auto_wraps_base64_images_with_type_hint(self):
+    @pytest.mark.asyncio
+    async def test_predict_auto_wraps_base64_images_with_type_hint(self):
         """predict automatically wraps base64 image data when field has dspy.Image type hint."""
         mock_lm = MagicMock()
         rlm = PredictRLM(ImageAnalysisSignature, sub_lm=mock_lm, max_iterations=5)
@@ -194,16 +201,17 @@ class TestPredictTool:
             mock_predictor.acall = AsyncMock(return_value=mock_prediction)
             mock_predict_class.return_value = mock_predictor
 
-            result = _run(rlm.tools["predict"].func(
+            result = await rlm.tools["predict"].func(
                 "document: dspy.Image -> text",
                 document="data:image/png;base64,abc123...",
-            ))
+            )
 
             assert result == {"text": "OCR result"}
             call_kwargs = mock_predictor.acall.call_args.kwargs
             assert isinstance(call_kwargs["document"], dspy.Image)
 
-    def test_predict_does_not_wrap_without_type_hint(self):
+    @pytest.mark.asyncio
+    async def test_predict_does_not_wrap_without_type_hint(self):
         """predict does not wrap values for fields without dspy.Image type hint."""
         mock_lm = MagicMock()
         rlm = PredictRLM(ImageAnalysisSignature, sub_lm=mock_lm, max_iterations=5)
@@ -218,10 +226,10 @@ class TestPredictTool:
                 mock_predictor.acall = AsyncMock(return_value=mock_prediction)
                 mock_predict_class.return_value = mock_predictor
 
-                result = _run(rlm.tools["predict"].func(
+                result = await rlm.tools["predict"].func(
                     "question -> answer",
                     question="https://example.com/some-url",
-                ))
+                )
 
                 assert result == {"answer": "42"}
                 mock_image_class.assert_not_called()
@@ -229,7 +237,8 @@ class TestPredictTool:
                     question="https://example.com/some-url",
                 )
 
-    def test_predict_uses_context_lm_captured_by_forward(self):
+    @pytest.mark.asyncio
+    async def test_predict_uses_context_lm_captured_by_forward(self):
         """predict uses context LM captured during forward() for thread-safe execution."""
         context_lm = MagicMock()
         context_lm.name = "context_lm"
@@ -250,10 +259,10 @@ class TestPredictTool:
                 mock_predictor.acall = AsyncMock(return_value=mock_prediction)
                 mock_predict_class.return_value = mock_predictor
 
-                _ = _run(rlm.tools["predict"].func(
+                _ = await rlm.tools["predict"].func(
                     "question -> answer",
                     question="Test?",
-                ))
+                )
 
                 mock_context.assert_called_once_with(lm=context_lm)
 
@@ -279,7 +288,8 @@ class TestPredictTool:
 
         assert rlm._context_lm is None
 
-    def test_predict_auto_wraps_list_of_images_with_type_hint(self):
+    @pytest.mark.asyncio
+    async def test_predict_auto_wraps_list_of_images_with_type_hint(self):
         """predict automatically wraps list of image URLs when field has list[dspy.Image] type hint."""
         mock_lm = MagicMock()
         rlm = PredictRLM(ImageAnalysisSignature, sub_lm=mock_lm, max_iterations=5)
@@ -293,7 +303,7 @@ class TestPredictTool:
             mock_predictor.acall = AsyncMock(return_value=mock_prediction)
             mock_predict_class.return_value = mock_predictor
 
-            result = _run(rlm.tools["predict"].func(
+            result = await rlm.tools["predict"].func(
                 "images: list[dspy.Image], question -> answer",
                 images=[
                     "https://example.com/img1.png",
@@ -301,7 +311,7 @@ class TestPredictTool:
                     "https://example.com/img3.png",
                 ],
                 question="What do these images show?",
-            ))
+            )
 
             assert result == {"answer": "Analyzed 3 images"}
             # Predictor should receive list of wrapped dspy.Image instances
@@ -315,7 +325,8 @@ class TestPredictTool:
 class TestTypeContractEnforcement:
     """Tests for type contract enforcement on predict outputs."""
 
-    def test_none_for_non_optional_list_raises(self):
+    @pytest.mark.asyncio
+    async def test_none_for_non_optional_list_raises(self):
         """VLM returning None for non-Optional list[X] field raises RuntimeError."""
         mock_lm = MagicMock()
         rlm = PredictRLM(ImageAnalysisSignature, sub_lm=mock_lm, max_iterations=5)
@@ -330,12 +341,13 @@ class TestTypeContractEnforcement:
             mock_predict_class.return_value = mock_predictor
 
             with pytest.raises(RuntimeError, match="VLM returned None for non-Optional"):
-                _run(rlm.tools["predict"].func(
+                await rlm.tools["predict"].func(
                     "text: str -> items: list[str]",
                     text="some input",
-                ))
+                )
 
-    def test_empty_list_passes_through_unchanged(self):
+    @pytest.mark.asyncio
+    async def test_empty_list_passes_through_unchanged(self):
         """Empty list [] is always valid — it means 'nothing found', distinct from None."""
         mock_lm = MagicMock()
         rlm = PredictRLM(ImageAnalysisSignature, sub_lm=mock_lm, max_iterations=5)
@@ -349,13 +361,14 @@ class TestTypeContractEnforcement:
             mock_predictor.acall = AsyncMock(return_value=mock_prediction)
             mock_predict_class.return_value = mock_predictor
 
-            result = _run(rlm.tools["predict"].func(
+            result = await rlm.tools["predict"].func(
                 "text: str -> items: list[str]",
                 text="some input",
-            ))
+            )
             assert result["items"] == []
 
-    def test_none_for_optional_str_passes_through(self):
+    @pytest.mark.asyncio
+    async def test_none_for_optional_str_passes_through(self):
         """None for Optional[str] field passes through without error."""
         mock_lm = MagicMock()
         rlm = PredictRLM(ImageAnalysisSignature, sub_lm=mock_lm, max_iterations=5)
@@ -369,13 +382,14 @@ class TestTypeContractEnforcement:
             mock_predictor.acall = AsyncMock(return_value=mock_prediction)
             mock_predict_class.return_value = mock_predictor
 
-            result = _run(rlm.tools["predict"].func(
+            result = await rlm.tools["predict"].func(
                 "text: str -> answer: Optional[str]",
                 text="some input",
-            ))
+            )
             assert result["answer"] is None
 
-    def test_none_for_non_optional_str_raises(self):
+    @pytest.mark.asyncio
+    async def test_none_for_non_optional_str_raises(self):
         """VLM returning None for non-Optional str field raises RuntimeError."""
         mock_lm = MagicMock()
         rlm = PredictRLM(ImageAnalysisSignature, sub_lm=mock_lm, max_iterations=5)
@@ -390,10 +404,10 @@ class TestTypeContractEnforcement:
             mock_predict_class.return_value = mock_predictor
 
             with pytest.raises(RuntimeError, match="VLM returned None for non-Optional"):
-                _run(rlm.tools["predict"].func(
+                await rlm.tools["predict"].func(
                     "text: str -> answer: str",
                     text="some input",
-                ))
+                )
 
 
 class TestPredictRLMConfiguration:
@@ -792,7 +806,8 @@ class TestModelsFromSchema:
         models = _models_from_schema(schema)
         assert "RootModel" in models
 
-    def test_predict_with_pydantic_schemas(self):
+    @pytest.mark.asyncio
+    async def test_predict_with_pydantic_schemas(self):
         """predict tool uses pydantic_schemas to create custom_types."""
         mock_lm = MagicMock()
         rlm = PredictRLM(ImageAnalysisSignature, sub_lm=mock_lm, max_iterations=5)
@@ -814,11 +829,11 @@ class TestModelsFromSchema:
                 mock_predict_class.return_value = mock_predictor
                 mock_sig_class.return_value = "mocked_signature"
 
-                _ = _run(rlm.tools["predict"].func(
+                _ = await rlm.tools["predict"].func(
                     "text: str -> tasks: list[TaskItem]",
                     pydantic_schemas=pydantic_schemas,
                     text="test input",
-                ))
+                )
 
                 # Verify Signature was called with custom_types
                 assert mock_sig_class.call_count == 1
@@ -827,7 +842,8 @@ class TestModelsFromSchema:
                 custom_types = call_args.kwargs["custom_types"]
                 assert "TaskItem" in custom_types
 
-    def test_predict_without_pydantic_schemas_no_custom_types(self):
+    @pytest.mark.asyncio
+    async def test_predict_without_pydantic_schemas_no_custom_types(self):
         """predict without pydantic_schemas parses signature without custom_types."""
         mock_lm = MagicMock()
         rlm = PredictRLM(ImageAnalysisSignature, sub_lm=mock_lm, max_iterations=5)
@@ -840,10 +856,10 @@ class TestModelsFromSchema:
             mock_predictor.acall = AsyncMock(return_value=mock_prediction)
             mock_predict_class.return_value = mock_predictor
 
-            _ = _run(rlm.tools["predict"].func(
+            _ = await rlm.tools["predict"].func(
                 "question -> answer",
                 question="What is 2+2?",
-            ))
+            )
 
             # Predict should be called once with a parsed Signature
             mock_predict_class.assert_called_once()
@@ -855,7 +871,8 @@ class TestModelsFromSchema:
             assert "question" in sig.input_fields
             assert "answer" in sig.output_fields
 
-    def test_predict_handles_items_field_without_collision(self):
+    @pytest.mark.asyncio
+    async def test_predict_handles_items_field_without_collision(self):
         """predict returns correct value when output field is named 'items'.
 
         Regression test: using getattr(prediction, 'items') returns the .items()
@@ -875,10 +892,10 @@ class TestModelsFromSchema:
             mock_predictor.acall = AsyncMock(return_value=mock_prediction)
             mock_predict_class.return_value = mock_predictor
 
-            result = _run(rlm.tools["predict"].func(
+            result = await rlm.tools["predict"].func(
                 "page: dspy.Image -> items: list[dict]",
                 page="https://example.com/page.png",
-            ))
+            )
 
             assert isinstance(result, dict)
             assert "items" in result

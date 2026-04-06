@@ -1409,7 +1409,7 @@ class Item(BaseModel):
     price: float
 
 result = await predict("text: str -> item: Optional[Item]", text="test")
-print(f"Got item: {result['item']['name']}")
+print(f"Got item: {result['item'].name}")
 """)
             assert "Got item: Widget" in str(result)
             # Verify schema was extracted
