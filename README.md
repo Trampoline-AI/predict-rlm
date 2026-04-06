@@ -1,7 +1,7 @@
 # predict-rlm
 
 [![Tests](https://github.com/Trampoline-AI/predict-rlm/actions/workflows/tests.yml/badge.svg)](https://github.com/Trampoline-AI/predict-rlm/actions/workflows/tests.yml)
-[![codecov](https://codecov.io/gh/Trampoline-AI/predict-rlm/branch/main/graph/badge.svg)](https://codecov.io/gh/Trampoline-AI/predict-rlm)
+[![codecov](https://codecov.io/gh/Trampoline-AI/predict-rlm/graph/badge.svg?token=NNS3R7OIT2)](https://codecov.io/gh/Trampoline-AI/predict-rlm)
 [![Book a Call](https://img.shields.io/badge/Book_a_Call-Cal.com-292929?style=flat&logo=cal.com)](https://cal.com/team/trampoline)
 [![Discord](https://img.shields.io/badge/Discord-Join-5865F2?style=flat&logo=discord&logoColor=white)](https://discord.gg/BAkd288sGN)
 
