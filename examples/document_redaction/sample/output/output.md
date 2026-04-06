@@ -1,5 +1,7 @@
 # Sample Output — Document Redaction
 
+![Screenshot](screenshot.png)
+
 **Input:** [PNFS-Employment-Agreement-2025.pdf](../input/PNFS-Employment-Agreement-2025.pdf) (6 pages)
 **Redacted output:** [PNFS-Employment-Agreement-2025_redacted.pdf](PNFS-Employment-Agreement-2025_redacted.pdf)
 
