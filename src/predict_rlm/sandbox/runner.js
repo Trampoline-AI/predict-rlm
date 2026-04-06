@@ -327,9 +327,14 @@ def _reconstruct_output_types(sig, result):
     outputs_part = sig.split("->")[1] if "->" in sig else ""
     _builtins = {'Image', 'List', 'Dict', 'Any', 'Optional', 'Union',
                  'Literal', 'Tuple', 'Set', 'BaseModel'}
-    for match in _re.finditer(r'(\\w+)\\s*:\\s*(list\\[)?([A-Z][A-Za-z0-9_]*)', outputs_part):
-        field_name, is_list_marker, type_name = match.group(1), match.group(2), match.group(3)
-        is_list = is_list_marker is not None
+    # Match field: Type, field: list[Type], field: Optional[Type],
+    # field: Optional[list[Type]], etc. The wrapper group explicitly matches
+    # any sequence of Optional[, list[, List[ prefixes before the type name.
+    for match in _re.finditer(r'(\\w+)\\s*:\\s*((?:Optional\\[|list\\[|List\\[)*)\\s*([A-Z][A-Za-z0-9_]*)', outputs_part):
+        field_name = match.group(1)
+        wrapper = match.group(2) or ''
+        type_name = match.group(3)
+        is_list = 'list[' in wrapper.lower()
         if type_name in _builtins:
             continue
         # Look up model class in sandbox scope

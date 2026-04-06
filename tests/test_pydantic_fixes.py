@@ -728,7 +728,8 @@ class TestToSerializableEdgeCases(unittest.TestCase):
 class TestPredictToolListDict(unittest.TestCase):
     """Test the actual predict tool from PredictRLM with list[dict] output."""
 
-    def test_predict_tool_with_list_dict_output(self):
+    @pytest.mark.asyncio
+    async def test_predict_tool_with_list_dict_output(self):
         """Test that the predict tool handles list[dict] correctly."""
         import warnings
 
@@ -759,10 +760,10 @@ class TestPredictToolListDict(unittest.TestCase):
             with warnings.catch_warnings(record=True) as w:
                 warnings.simplefilter("always")
 
-                result = _run(predict_tool(
+                result = await predict_tool(
                     "context: str -> items: list[dict]",
                     context="test context",
-                ))
+                )
 
                 # Should return a dict with items
                 self.assertIsInstance(result, dict)
@@ -792,7 +793,8 @@ class TestPredictToolListDict(unittest.TestCase):
                     f"Got unexpected Pydantic warnings: {pydantic_warnings}",
                 )
 
-    def test_predict_tool_with_list_of_pydantic_models(self):
+    @pytest.mark.asyncio
+    async def test_predict_tool_with_list_of_pydantic_models(self):
         """Test that the predict tool handles list of Pydantic models correctly."""
         import warnings
 
@@ -825,11 +827,11 @@ class TestPredictToolListDict(unittest.TestCase):
 
                 # Must provide pydantic_schemas for models defined in local scope
                 # (in real sandbox usage, this is extracted and passed automatically)
-                result = _run(predict_tool(
+                result = await predict_tool(
                     "context: str -> items: list[TaskItem]",
                     context="test context",
                     pydantic_schemas={"TaskItem": TaskItem.model_json_schema()},
-                ))
+                )
 
                 # Should return dicts, not Pydantic models
                 self.assertIsInstance(result, dict)
