@@ -2992,3 +2992,137 @@ print(results)
 
         finally:
             interpreter.shutdown()
+
+
+class TestPydanticReconstruction:
+    """Predict results should be reconstructed as Pydantic model instances."""
+
+    def test_predict_returns_pydantic_instances_for_list_output(self):
+        """When predict returns list[TaskItem], items should have attribute access."""
+
+        def mock_predict(signature: str, pydantic_schemas=None, **kwargs):
+            return {"tasks": [
+                {"category": "Cert", "title": "Get ISO cert"},
+                {"category": "Form", "title": "Fill W-9"},
+            ]}
+
+        interpreter = JspiInterpreter(tools={"predict": mock_predict})
+        try:
+            result = interpreter.execute("""
+from pydantic import BaseModel
+
+class TaskItem(BaseModel):
+    category: str
+    title: str
+
+result = await predict("doc: str -> tasks: list[TaskItem]", doc="test")
+# Attribute access should work — not just dict access
+for task in result["tasks"]:
+    print(f"{task.title} ({task.category})")
+""")
+            assert "Get ISO cert (Cert)" in str(result)
+            assert "Fill W-9 (Form)" in str(result)
+        finally:
+            interpreter.shutdown()
+
+    def test_predict_returns_pydantic_instance_for_single_output(self):
+        """When predict returns a single Pydantic type, it should have attribute access."""
+
+        def mock_predict(signature: str, pydantic_schemas=None, **kwargs):
+            return {"summary": {"title": "Project X", "score": 95}}
+
+        interpreter = JspiInterpreter(tools={"predict": mock_predict})
+        try:
+            result = interpreter.execute("""
+from pydantic import BaseModel
+
+class Summary(BaseModel):
+    title: str
+    score: int
+
+result = await predict("doc: str -> summary: Summary", doc="test")
+print(f"{result['summary'].title}: {result['summary'].score}")
+""")
+            assert "Project X: 95" in str(result)
+        finally:
+            interpreter.shutdown()
+
+    def test_predict_dict_output_stays_as_dict(self):
+        """When output type is plain dict (no Pydantic model), result stays as dict."""
+
+        def mock_predict(signature: str, pydantic_schemas=None, **kwargs):
+            return {"items": [{"a": 1}, {"b": 2}]}
+
+        interpreter = JspiInterpreter(tools={"predict": mock_predict})
+        try:
+            result = interpreter.execute("""
+result = await predict("doc: str -> items: list[dict]", doc="test")
+# dict access should work
+print(f"Got {len(result['items'])} items, first has key: {list(result['items'][0].keys())[0]}")
+""")
+            assert "Got 2 items" in str(result)
+        finally:
+            interpreter.shutdown()
+
+    def test_can_add_fields_after_reconstruction(self):
+        """LM can add metadata fields to reconstructed models (extra='allow')."""
+
+        def mock_predict(signature: str, pydantic_schemas=None, **kwargs):
+            return {"tasks": [
+                {"category": "Cert", "title": "Get ISO cert", "extra_field": "bonus"},
+            ]}
+
+        interpreter = JspiInterpreter(tools={"predict": mock_predict})
+        try:
+            result = interpreter.execute("""
+from pydantic import BaseModel
+
+class TaskItem(BaseModel):
+    category: str
+    title: str
+
+result = await predict("doc: str -> tasks: list[TaskItem]", doc="test")
+task = result["tasks"][0]
+print(f"title: {task.title}, extra: {task.extra_field}")
+""")
+            assert "title: Get ISO cert, extra: bonus" in str(result)
+        finally:
+            interpreter.shutdown()
+
+    def test_predict_result_attribute_access(self):
+        """Top-level result supports both attribute and subscript access."""
+
+        def mock_predict(signature: str, pydantic_schemas=None, **kwargs):
+            return {"answer": "Paris", "confidence": 0.95}
+
+        interpreter = JspiInterpreter(tools={"predict": mock_predict})
+        try:
+            result = interpreter.execute("""
+result = await predict("question: str -> answer: str, confidence: float", question="capital?")
+# Both access patterns should work
+print(f"attr: {result.answer}, sub: {result['confidence']}")
+""")
+            assert "attr: Paris, sub: 0.95" in str(result)
+        finally:
+            interpreter.shutdown()
+
+    def test_predict_result_items_no_collision(self):
+        """result.items returns stored list, not dict.items() method."""
+
+        def mock_predict(signature: str, pydantic_schemas=None, **kwargs):
+            return {"items": ["apple", "banana", "cherry"]}
+
+        interpreter = JspiInterpreter(tools={"predict": mock_predict})
+        try:
+            result = interpreter.execute("""
+result = await predict("text: str -> items: list[str]", text="fruits")
+# This previously collided with dict.items() method
+for item in result.items:
+    print(f"fruit: {item}")
+""")
+            output = str(result)
+            assert "fruit: apple" in output
+            assert "fruit: banana" in output
+            assert "fruit: cherry" in output
+        finally:
+            interpreter.shutdown()

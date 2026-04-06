@@ -130,11 +130,6 @@ async def _tool_${toolName}(*args, **kwargs):
 
     try:
         result = await _js_tool_call("${toolName}", payload)
-        if isinstance(result, str):
-            try:
-                return json.loads(result)
-            except (json.JSONDecodeError, ValueError):
-                return result
         return result.to_py() if isinstance(result, JsProxy) else result
     except Exception as e:
         # Re-raise with context but don't corrupt state
@@ -212,9 +207,10 @@ def _get_pydantic_schemas(sig):
     the __main__ module's namespace directly, which persists across async contexts.
     """
     schemas = {}
-    # Find capitalized names after colons that look like type annotations
-    # Matches: ": TypeName" or ": list[TypeName]" or ": Optional[TypeName]"
-    pattern = r':\\s*(?:list\\[|List\\[|Optional\\[)?([A-Z][A-Za-z0-9_]*)'
+    # Find ALL capitalized identifiers in the signature. This handles any
+    # nesting depth (e.g. Optional[list[TaskItem]], list[Optional[TaskItem]]).
+    # Non-Pydantic names are filtered by the model_json_schema() check below.
+    pattern = r'(?<![.\\w])([A-Z][A-Za-z0-9_]*)'
     for match in re.finditer(pattern, sig):
         name = match.group(1)
         # Skip built-in DSPy types and Python typing
@@ -265,6 +261,106 @@ def _get_pydantic_schemas(sig):
                 print(f"Warning: Failed to extract schema for {name}: {e}")
     return schemas
 
+# DSPy Prediction-like wrapper: the top-level predict() return supports
+# both attribute access (result.answer) and subscript access (result["answer"]).
+# Uses composition (_store) + __getattribute__ so data fields ALWAYS win over
+# methods. result.items returns the stored list, not a method — eliminating the
+# dict-method collision that wastes iterations on "builtin_function_or_method
+# is not iterable" errors.
+class _PredictResult:
+    __slots__ = ('_store',)
+
+    def __init__(self, d):
+        object.__setattr__(self, '_store', dict(d) if d else {})
+
+    def __getattribute__(self, key):
+        # Data fields take priority over class methods. This is the key
+        # difference from __getattr__ (which only fires AFTER MRO lookup).
+        if not key.startswith('_'):
+            store = object.__getattribute__(self, '_store')
+            if key in store:
+                return store[key]
+        return object.__getattribute__(self, key)
+
+    def __getitem__(self, key):
+        return object.__getattribute__(self, '_store')[key]
+
+    def __setitem__(self, key, value):
+        object.__getattribute__(self, '_store')[key] = value
+
+    def __contains__(self, key):
+        return key in object.__getattribute__(self, '_store')
+
+    def __iter__(self):
+        return iter(object.__getattribute__(self, '_store'))
+
+    def __len__(self):
+        return len(object.__getattribute__(self, '_store'))
+
+    def __repr__(self):
+        return f"PredictResult({object.__getattribute__(self, '_store')!r})"
+
+    # Fallback methods — only reached when no data field has this name
+    # (because __getattribute__ checks _store first).
+    def keys(self):
+        return list(object.__getattribute__(self, '_store').keys())
+
+    def values(self):
+        return list(object.__getattribute__(self, '_store').values())
+
+    def items(self):
+        return list(object.__getattribute__(self, '_store').items())
+
+    def get(self, key, default=None):
+        return object.__getattribute__(self, '_store').get(key, default)
+
+# Reconstruct Pydantic model instances from predict result dicts.
+# When the LM defines e.g. TaskItem and uses "-> tasks: list[TaskItem]",
+# the host returns plain dicts (JSON-RPC).  This wraps them back into
+# model instances so that attribute access (task.title) works naturally.
+# The final result is wrapped in _PredictResult so the top level also
+# supports attribute access (result.tasks) and matches DSPy conventions.
+def _reconstruct_output_types(sig, result):
+    if not isinstance(result, dict):
+        return result
+    import re as _re, sys as _sys
+    outputs_part = sig.split("->")[1] if "->" in sig else ""
+    _builtins = {'Image', 'List', 'Dict', 'Any', 'Optional', 'Union',
+                 'Literal', 'Tuple', 'Set', 'BaseModel'}
+    for match in _re.finditer(r'(\\w+)\\s*:\\s*(list\\[)?([A-Z][A-Za-z0-9_]*)', outputs_part):
+        field_name, is_list_marker, type_name = match.group(1), match.group(2), match.group(3)
+        is_list = is_list_marker is not None
+        if type_name in _builtins:
+            continue
+        # Look up model class in sandbox scope
+        cls = None
+        _main = _sys.modules.get('__main__')
+        if _main and hasattr(_main, type_name):
+            cls = getattr(_main, type_name)
+        if cls is None and '_repl_tools' in _sys.modules:
+            cls = getattr(_sys.modules['_repl_tools'], type_name, None)
+        if cls is None or not hasattr(cls, 'model_validate') or not hasattr(cls, 'model_fields'):
+            continue
+        # Subclass with extra='allow' so the LM can add fields after prediction
+        from pydantic import ConfigDict as _ConfigDict
+        cls = type(cls.__name__, (cls,), {
+            'model_config': _ConfigDict(extra='allow'),
+        })
+        # Reconstruct dicts into model instances. With extra='allow' on the
+        # subclass, extra fields survive — no data is lost.
+        value = result.get(field_name)
+        if value is None:
+            continue
+        try:
+            if is_list and isinstance(value, list):
+                if all(isinstance(item, dict) for item in value):
+                    result[field_name] = [cls.model_validate(item) for item in value]
+            elif isinstance(value, dict):
+                result[field_name] = cls.model_validate(value)
+        except Exception:
+            pass  # Fall back to plain dicts if reconstruction fails
+    return _PredictResult(result)
+
 # Define predict tool with schema extraction
 async def _tool_predict(*args, **kwargs):
     try:
@@ -292,12 +388,12 @@ async def _tool_predict(*args, **kwargs):
 
     try:
         result = await _js_tool_call("predict", payload)
-        if isinstance(result, str):
-            try:
-                return json.loads(result)
-            except (json.JSONDecodeError, ValueError):
-                return result
-        return result.to_py() if isinstance(result, JsProxy) else result
+        result = result.to_py() if isinstance(result, JsProxy) else result
+        # Reconstruct Pydantic model instances for output fields so that
+        # both task.title (attribute) and task["title"] (subscript) work.
+        if isinstance(result, dict):
+            result = _reconstruct_output_types(sig, result)
+        return result
     except Exception as e:
         # Re-raise with context but don't corrupt state
         raise RuntimeError(f"Tool predict call failed: {e}") from e
@@ -315,10 +411,37 @@ predict = _repl_tools.predict
 };
 
 const makeSubmitWrapper = (outputs) => {
+  // Inlined Pydantic-aware serializer. SUBMIT accepts Pydantic instances
+  // (top-level, nested in dicts, inside lists) and normalizes them to plain
+  // JSON-safe types before raising FinalOutput. Without this, FinalOutput's
+  // dict contains Pydantic instances that fail JSON serialization at the
+  // transport boundary, silently producing a confusing 'FINAL returned
+  // NoneType' error. Falls back to str() for anything else unserializable
+  // so FinalOutput is never unparseable at the transport boundary.
+  const serializerDef = `
+import json as _submit_json
+def _submit_to_jsonsafe(_v):
+    if _v is None or isinstance(_v, (str, int, float, bool)):
+        return _v
+    if hasattr(_v, 'model_dump'):
+        return _submit_to_jsonsafe(_v.model_dump(mode='python'))
+    if hasattr(_v, 'dict') and hasattr(_v, '__fields__'):
+        return _submit_to_jsonsafe(_v.dict())
+    if isinstance(_v, dict):
+        return {_k: _submit_to_jsonsafe(_x) for _k, _x in _v.items()}
+    if isinstance(_v, (list, tuple, set)):
+        return [_submit_to_jsonsafe(_x) for _x in _v]
+    try:
+        _submit_json.dumps(_v)
+        return _v
+    except (TypeError, ValueError):
+        return str(_v)
+`;
+
   if (!outputs || outputs.length === 0) {
-    return `
+    return `${serializerDef}
 def SUBMIT(output):
-    raise FinalOutput({"output": output})
+    raise FinalOutput(_submit_to_jsonsafe({"output": output}))
 `;
   }
 
@@ -329,9 +452,9 @@ def SUBMIT(output):
   });
   const dictParts = outputs.map(o => `"${o.name}": ${o.name}`);
 
-  return `
+  return `${serializerDef}
 def SUBMIT(${sigParts.join(', ')}):
-    raise FinalOutput({${dictParts.join(', ')}})
+    raise FinalOutput(_submit_to_jsonsafe({${dictParts.join(', ')}}))
 `;
 };
 
@@ -446,7 +569,11 @@ function handleToolResponse(response) {
     pending.reject(new Error(response.error.message || "Tool call failed"));
   } else {
     const result = response.result;
-    pending.resolve(result.value);
+    if (result.type === "json") {
+      pending.resolve(JSON.parse(result.value));
+    } else {
+      pending.resolve(result.value);
+    }
   }
   return true;
 }
@@ -825,7 +952,15 @@ while (true) {
             const args = JSON.parse(last_exception_args());
             answer = args?.[0] ?? null;
           } catch (e) {
-            // Ignore errors getting exception args
+            // SUBMIT's built-in serializer should make this unreachable
+            // (Pydantic-aware + str() fallback for unknown types). If it
+            // still fires, surface the error instead of silently dropping
+            // the submitted value.
+            console.error(
+              `[submit] Failed to capture FinalOutput args (${e}); ` +
+              `answer will be null. This indicates the SUBMIT serializer ` +
+              `couldn't make a value JSON-safe — please report.`,
+            );
           }
           console.log(jsonrpcResult({ final: answer }, requestId));
           continue;
@@ -834,13 +969,11 @@ while (true) {
         // Map Python error type to JSON-RPC error code
         const errorCode = JSONRPC_APP_ERRORS[errorType] ?? JSONRPC_APP_ERRORS.Unknown;
         let errorArgs = [];
-        if (errorType !== "SyntaxError") {
-          try {
-            const last_exception_args = pyodide.globals.get("last_exception_args");
-            errorArgs = JSON.parse(last_exception_args()) || [];
-          } catch (e) {
-            // Ignore errors getting exception args
-          }
+        try {
+          const last_exception_args = pyodide.globals.get("last_exception_args");
+          errorArgs = JSON.parse(last_exception_args()) || [];
+        } catch (e) {
+          // Ignore errors getting exception args
         }
         console.log(jsonrpcError(
           errorCode,
