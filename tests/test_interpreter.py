@@ -1376,7 +1376,7 @@ class Person(BaseModel):
     address: Address  # Nested model
 
 result = await predict("text: str -> person: Person", text="test")
-print(f"Got person: {result['person']['name']} at {result['person']['address']['city']}")
+print(f"Got person: {result['person'].name} at {result['person'].address.city}")
 """)
             assert "Got person: Alice at NYC" in str(result)
             # Verify schema was extracted
@@ -1488,7 +1488,7 @@ class LineItem(BaseModel):
     qty: int
 
 result = await predict("text: str -> header: Header, items: list[LineItem]", text="test")
-print(f"Got header: {result['header']['title']}")
+print(f"Got header: {result['header'].title}")
 print(f"Got {len(result['items'])} items")
 """)
             assert "Got header: Doc" in str(result)
@@ -1536,7 +1536,7 @@ class MyType(BaseModel):
     value: int
 
 result = await predict("text: str -> item: MyType", text="test")
-print(f"Second call got: {result['item']['value']}")
+print(f"Second call got: {result['item'].value}")
 """)
             assert "Second call got: 42" in str(output2)
         finally:
@@ -1606,9 +1606,9 @@ result = await predict(
 print(f"Got {len(result['items'])} items")
 if result['items']:
     item = result['items'][0]
-    print(f"First item category: {item['category']}")
-    print(f"Schema received: {item.get('_schema_received', False)}")
-    print(f"Priority spec count: {item.get('_priority_spec_count', 0)}")
+    print(f"First item category: {item.category}")
+    print(f"Schema received: {getattr(item, '_schema_received', False)}")
+    print(f"Priority spec count: {getattr(item, '_priority_spec_count', 0)}")
 """)
             assert "Got 1 items" in str(result)
             assert "First item category: Test Category" in str(result)
@@ -1842,7 +1842,7 @@ result = await predict(
     page="dummy_image_url"
 )
 print(f"Got {len(result['items'])} items")
-print(f"First item category: {result['items'][0]['category']}")
+print(f"First item category: {result['items'][0].category}")
 """)
 
             # Verify it worked

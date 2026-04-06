@@ -14,6 +14,8 @@ Protocol: JSON-RPC 2.0 (matching dspy 3.1.3+)
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
+import functools
 import json
 import logging
 import os
@@ -135,6 +137,17 @@ class JspiInterpreter(PythonInterpreter):
         ```
     """
 
+    # Max concurrent Deno/Pyodide sandboxes system-wide.
+    # Each uses ~800MB RAM; 50 × 800MB ≈ 40GB.
+    MAX_CONCURRENT_SANDBOXES = 50
+    _sandbox_semaphore: asyncio.Semaphore | None = None
+
+    @classmethod
+    def _get_semaphore(cls) -> asyncio.Semaphore:
+        if cls._sandbox_semaphore is None:
+            cls._sandbox_semaphore = asyncio.Semaphore(cls.MAX_CONCURRENT_SANDBOXES)
+        return cls._sandbox_semaphore
+
     def __init__(
         self,
         *,
@@ -229,6 +242,67 @@ class JspiInterpreter(PythonInterpreter):
             tools=tools,
             output_fields=output_fields,
         )
+        # Raw-fd I/O state (initialised in _ensure_deno_process)
+        self._stdout_fd: int = -1
+        self._stdin_fd: int = -1
+        self._read_buf: str = ""
+        # Per-interpreter thread pool for sync tool calls (avoids starving
+        # the shared default executor when many interpreters run concurrently)
+        self._executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+
+    def _ensure_deno_process(self) -> None:
+        """Override to capture raw fds for non-blocking I/O."""
+        # Clean up old event loop watchers before replacing fds
+        try:
+            loop = asyncio.get_running_loop()
+            if self._stdout_fd >= 0:
+                loop.remove_reader(self._stdout_fd)
+            if self._stdin_fd >= 0:
+                loop.remove_writer(self._stdin_fd)
+        except (RuntimeError, ValueError):
+            pass  # No running loop or fd already closed
+
+        prev = self.deno_process
+        super()._ensure_deno_process()
+        if self.deno_process is not None and self.deno_process is not prev:
+            self._stdout_fd = self.deno_process.stdout.fileno()
+            self._stdin_fd = self.deno_process.stdin.fileno()
+            self._read_buf = ""
+            # Set stdin to non-blocking for async writes
+            import fcntl
+
+            flags = fcntl.fcntl(self._stdin_fd, fcntl.F_GETFL)
+            fcntl.fcntl(self._stdin_fd, fcntl.F_SETFL, flags | os.O_NONBLOCK)
+            # Reset executor — old threads may be stuck on a dead process
+            self._executor.shutdown(wait=False)
+            self._executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+
+    def shutdown(self) -> None:
+        """Shut down the Deno subprocess with timeout guards.
+
+        Overrides PythonInterpreter.shutdown() which has no timeout on
+        stdin.flush() or .wait(), causing hangs when Deno is unresponsive.
+        """
+        import subprocess
+
+        if self.deno_process and self.deno_process.poll() is None:
+            try:
+                self.deno_process.stdin.write(
+                    json.dumps({"jsonrpc": "2.0", "method": "shutdown"}) + "\n"
+                )
+                self.deno_process.stdin.flush()
+                self.deno_process.stdin.close()
+            except (BrokenPipeError, OSError):
+                pass
+            try:
+                self.deno_process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                self.deno_process.kill()
+                self.deno_process.wait()
+        self.deno_process = None
+        self._owner_thread = None
+        if hasattr(self, "_executor"):
+            self._executor.shutdown(wait=False)
 
     def _build_deno_command(
         self,
@@ -278,6 +352,11 @@ class JspiInterpreter(PythonInterpreter):
         # during startup, so we allow all env vars rather than restricting.
         args.append("--allow-env")
 
+        # Use Deno's global cache for npm: specifiers instead of a parent
+        # node_modules (e.g. one created by `prisma generate`). Without this,
+        # Deno 2.x fails to resolve npm:pyodide when a package.json exists
+        # in a parent directory that doesn't list pyodide.
+        args.append("--node-modules-dir=none")
         args.append("--no-prompt")
         args.append(str(RUNNER_PATH))
 
@@ -395,6 +474,65 @@ class JspiInterpreter(PythonInterpreter):
         # Fall back to parent implementation for other types
         return PythonInterpreter._serialize_value(self, value)
 
+    async def aexecute(
+        self,
+        code: str,
+        variables: dict[str, Any] | None = None,
+    ) -> Any:
+        """Async execute — runs on the current event loop without blocking.
+
+        Unlike execute(), this directly awaits _execute_async so other
+        coroutines in an asyncio.gather can make progress concurrently.
+        """
+        variables = variables or {}
+        code = self._strip_code_fences(code)
+        code = self._inject_variables(code, variables)
+
+        # Limit concurrent Deno sandboxes to prevent OOM.
+        # Acquired per-execute, released when done — allows other
+        # interpreters to run between iterations.
+        await self._get_semaphore().acquire()
+        try:
+            return await self._aexecute_inner(code, variables)
+        finally:
+            self._get_semaphore().release()
+
+    async def _aexecute_inner(self, code: str, variables: dict[str, Any] | None) -> Any:
+        """Inner async execute — runs within the sandbox semaphore."""
+        self._ensure_deno_process()
+        self._mount_files()
+        self._register_tools()
+
+        self._request_id += 1
+        execute_request_id = self._request_id
+        input_data = json.dumps({
+            "jsonrpc": "2.0",
+            "method": "execute",
+            "params": {"code": code},
+            "id": execute_request_id,
+        })
+        try:
+            self.deno_process.stdin.write(input_data + "\n")
+            self.deno_process.stdin.flush()
+        except BrokenPipeError:
+            self._tools_registered = False
+            self._mounted_files = False
+            self._ensure_deno_process()
+            self._mount_files()
+            self._register_tools()
+            self._request_id += 1
+            execute_request_id = self._request_id
+            input_data = json.dumps({
+                "jsonrpc": "2.0",
+                "method": "execute",
+                "params": {"code": code},
+                "id": execute_request_id,
+            })
+            self.deno_process.stdin.write(input_data + "\n")
+            self.deno_process.stdin.flush()
+
+        return await self._execute_async(execute_request_id)
+
     def execute(
         self,
         code: str,
@@ -449,51 +587,33 @@ class JspiInterpreter(PythonInterpreter):
             self.deno_process.stdin.write(input_data + "\n")
             self.deno_process.stdin.flush()
 
-        # Handle messages with concurrent async tool execution
-        # Check if we're already in an event loop (e.g., marimo, jupyter)
-        try:
-            loop = asyncio.get_running_loop()
-        except RuntimeError:
-            loop = None
+        # Run the async execute loop. Use nest_asyncio to allow
+        # run_until_complete even inside an already-running loop (e.g. marimo).
+        import nest_asyncio
 
-        if loop is not None:
-            # Already in event loop - run in a separate thread
-            import concurrent.futures
-
-            with concurrent.futures.ThreadPoolExecutor() as pool:
-                future = pool.submit(asyncio.run, self._execute_async(execute_request_id))
-                return future.result()
-        else:
-            # No event loop - use asyncio.run directly
-            return asyncio.run(self._execute_async(execute_request_id))
+        nest_asyncio.apply()
+        loop = asyncio.get_event_loop()
+        return loop.run_until_complete(self._execute_async(execute_request_id))
 
     async def _execute_async(self, execute_request_id: int) -> Any:
         """Read messages and handle tool calls concurrently using asyncio."""
-        # Expand the default thread pool so many concurrent sync tool calls
-        # (each blocking on an LLM HTTP round-trip) don't starve the read loop.
-        # The default pool is min(32, cpu+4) which is too small for 100+ calls.
-        import concurrent.futures
-
-        loop = asyncio.get_running_loop()
-        loop.set_default_executor(concurrent.futures.ThreadPoolExecutor(max_workers=256))
-
         pending_tasks: dict[str, asyncio.Task] = {}  # request_id -> Task
 
         while True:
             # Check for completed tool calls and send responses
             await self._send_completed_responses(pending_tasks)
 
-            # Read next message - use thread to avoid blocking event loop
+            # Read next message — non-blocking via event loop fd watching
             if pending_tasks:
-                # Non-blocking check with short timeout
-                output_line = await asyncio.to_thread(self._read_with_timeout, 0.01)
+                output_line = await self._read_with_timeout_async(0.01)
                 if output_line is None:
-                    # Timeout - give other tasks a chance to run
                     await asyncio.sleep(0)
                     continue
             else:
-                # No pending tasks, blocking read is ok
-                output_line = await asyncio.to_thread(self._read_with_timeout, None)
+                output_line = await self._read_with_timeout_async(1.0)
+                if output_line is None:
+                    await asyncio.sleep(0)
+                    continue
 
             if not output_line:
                 err_output = self.deno_process.stderr.read()
@@ -571,24 +691,76 @@ class JspiInterpreter(PythonInterpreter):
                     print("\033[31m─────────────────────────\033[0m", file=sys.stderr)
 
                 if error_type == "SyntaxError":
-                    raise SyntaxError(f"Invalid Python syntax. message: {error_msg}")
+                    # Format a helpful message from the args tuple:
+                    # SyntaxError.args = (msg, (filename, lineno, offset, text, ...))
+                    detail = error_msg
+                    if error_args and len(error_args) >= 2 and isinstance(error_args[1], list):
+                        info = error_args[1]
+                        lineno = info[1] if len(info) > 1 else None
+                        offset = info[2] if len(info) > 2 else None
+                        text = (info[3] or "").rstrip("\n") if len(info) > 3 else None
+                        parts = [error_args[0] or "invalid syntax"]
+                        if lineno:
+                            parts.append(f"line {lineno}")
+                        if offset:
+                            parts.append(f"col {offset}")
+                        if text:
+                            parts.append(repr(text))
+                        detail = ", ".join(parts)
+                    raise SyntaxError(detail or "Invalid Python syntax")
                 else:
                     raise CodeInterpreterError(f"{error_type}: {error_args or error_msg}")
 
             raise CodeInterpreterError(f"Unexpected message format from sandbox: {result}")
 
     def _read_with_timeout(self, timeout: float | None) -> str | None:
-        """Read a line from stdout with optional timeout.
-
-        Returns None on timeout, empty string on EOF, or the line content.
-        """
+        """Sync read — used by _send_request (registration, mount, etc.)."""
         if timeout is not None:
-            # Use select to check if data is available
-            ready, _, _ = select.select([self.deno_process.stdout], [], [], timeout)
+            if "\n" in self._read_buf:
+                line, self._read_buf = self._read_buf.split("\n", 1)
+                return line.strip()
+            ready, _, _ = select.select([self._stdout_fd], [], [], timeout)
             if not ready:
                 return None
+        return self._read_line_raw()
 
-        return self.deno_process.stdout.readline().strip()
+    async def _read_with_timeout_async(self, timeout: float | None) -> str | None:
+        """Async read using event loop fd watching — zero threads.
+
+        Uses ``loop.add_reader()`` to watch the raw stdout fd, then reads
+        with ``os.read()`` when data arrives.  Fully non-blocking: the
+        event loop stays free for other coroutines while waiting.
+        """
+        # Check residual buffer first (instant, no I/O)
+        if "\n" in self._read_buf:
+            line, self._read_buf = self._read_buf.split("\n", 1)
+            return line.strip()
+
+        if timeout is not None:
+            loop = asyncio.get_running_loop()
+            ready = asyncio.Event()
+            loop.add_reader(self._stdout_fd, ready.set)
+            try:
+                await asyncio.wait_for(ready.wait(), timeout=timeout)
+            except asyncio.TimeoutError:
+                return None
+            finally:
+                loop.remove_reader(self._stdout_fd)
+
+        return self._read_line_raw()
+
+    def _read_line_raw(self) -> str:
+        """Read one line from the raw stdout fd, accumulating in _read_buf."""
+        while "\n" not in self._read_buf:
+            chunk = os.read(self._stdout_fd, 65536)
+            if not chunk:
+                remainder = self._read_buf
+                self._read_buf = ""
+                return remainder.strip()
+            self._read_buf += chunk.decode("utf-8", errors="replace")
+
+        line, self._read_buf = self._read_buf.split("\n", 1)
+        return line.strip()
 
     async def _execute_tool_async(self, tool_name: str, call_args: dict) -> dict:
         """Execute a tool asynchronously and return the response dict."""
@@ -616,8 +788,15 @@ class JspiInterpreter(PythonInterpreter):
             if asyncio.iscoroutinefunction(tool_fn):
                 result = await tool_fn(*args, **kwargs)
             else:
-                # Run sync function in thread pool to not block event loop
-                result = await asyncio.to_thread(tool_fn, *args, **kwargs)
+                # Run sync function in per-interpreter thread pool (not the
+                # shared default pool) to prevent starvation when many
+                # interpreters run concurrently.
+                # loop.run_in_executor only accepts positional args, so wrap
+                # the call in functools.partial to bind **kwargs.
+                loop = asyncio.get_running_loop()
+                result = await loop.run_in_executor(
+                    self._executor, functools.partial(tool_fn, *args, **kwargs)
+                )
 
             is_json = isinstance(result, (list, dict))
             return {
@@ -627,12 +806,53 @@ class JspiInterpreter(PythonInterpreter):
         except Exception as e:
             return {"error": str(e)}
 
-    async def _send_completed_responses(self, pending_tasks: dict[str, asyncio.Task]) -> None:
-        """Send JSON-RPC responses for any completed tool calls."""
-        completed = [request_id for request_id, task in pending_tasks.items() if task.done()]
+    def _write_stdin(self, data: str) -> None:
+        """Sync write — used by _send_request, shutdown, etc."""
+        if self.deno_process is None or self.deno_process.poll() is not None:
+            raise CodeInterpreterError(
+                "Deno process is no longer running — cannot write to stdin"
+            )
+        self.deno_process.stdin.write(data)
+        self.deno_process.stdin.flush()
 
-        for request_id in completed:
-            task = pending_tasks.pop(request_id)
+    async def _write_stdin_async(self, data: str) -> None:
+        """Async write using event loop fd watching — zero threads.
+
+        Sets the stdin fd to non-blocking and writes in chunks, yielding
+        to the event loop when the pipe buffer is full.
+        """
+        if self.deno_process is None or self.deno_process.poll() is not None:
+            raise CodeInterpreterError(
+                "Deno process is no longer running — cannot write to stdin"
+            )
+        encoded = data.encode("utf-8")
+        fd = self._stdin_fd
+        loop = asyncio.get_running_loop()
+        while encoded:
+            try:
+                n = os.write(fd, encoded)
+                encoded = encoded[n:]
+            except BlockingIOError:
+                writable = asyncio.Event()
+                loop.add_writer(fd, writable.set)
+                try:
+                    await writable.wait()
+                finally:
+                    loop.remove_writer(fd)
+
+    async def _send_completed_responses(self, pending_tasks: dict[str, asyncio.Task]) -> None:
+        """Send a JSON-RPC response for one completed tool call.
+
+        Sends at most one response per invocation to prevent filling the OS
+        pipe buffer when multiple large responses complete simultaneously.
+        The caller (_execute_async) loops, interleaving reads between writes
+        so Deno's JS event loop gets time to process JSPI promise resolutions.
+        """
+        for request_id, task in list(pending_tasks.items()):
+            if not task.done():
+                continue
+
+            pending_tasks.pop(request_id)
             try:
                 result = task.result()
             except Exception as e:
@@ -649,13 +869,17 @@ class JspiInterpreter(PythonInterpreter):
                     {"value": result["value"], "type": result["type"]},
                     request_id,
                 )
-            self.deno_process.stdin.write(response + "\n")
-            self.deno_process.stdin.flush()
+            await self._write_stdin_async(response + "\n")
+            return  # Send at most one — interleave reads between writes
 
     async def _wait_and_send_all_responses(
         self, pending_tasks: dict[str, asyncio.Task]
     ) -> None:
-        """Wait for all pending tool calls and send their JSON-RPC responses."""
+        """Wait for all pending tool calls and send their JSON-RPC responses.
+
+        Yields to the event loop between writes so the pipe buffer can drain
+        and Deno's JSPI can process promise resolutions.
+        """
         for request_id, task in list(pending_tasks.items()):
             try:
                 result = await task  # Wait for completion
@@ -673,7 +897,6 @@ class JspiInterpreter(PythonInterpreter):
                     {"value": result["value"], "type": result["type"]},
                     request_id,
                 )
-            self.deno_process.stdin.write(response + "\n")
-            self.deno_process.stdin.flush()
+            await self._write_stdin_async(response + "\n")
 
         pending_tasks.clear()
