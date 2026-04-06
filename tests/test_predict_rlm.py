@@ -674,6 +674,45 @@ class TestModelsFromSchema:
         assert instance.decimal == 3.14
         assert instance.flag is True
 
+    def test_enum_to_literal(self):
+        """Enum types in JSON schema are converted to Literal."""
+        schema = {
+            "title": "Priority",
+            "properties": {
+                "level": {"enum": ["p1", "p2", "p3", "p4"], "type": "string"},
+            },
+            "required": ["level"],
+        }
+        models = _models_from_schema(schema)
+        Model = models["Priority"]
+        instance = Model(level="p1")
+        assert instance.level == "p1"
+
+    def test_type_array_shorthand_for_optional(self):
+        """Type-array shorthand {"type": ["string", "null"]} → Optional[str]."""
+        schema = {
+            "title": "Item",
+            "properties": {
+                "name": {"type": "string"},
+                "note": {"type": ["string", "null"]},
+            },
+            "required": ["name"],
+        }
+        models = _models_from_schema(schema)
+        Model = models["Item"]
+        instance = Model(name="test", note=None)
+        assert instance.name == "test"
+        assert instance.note is None
+
+    def test_schema_without_title_gets_fallback(self):
+        """Schema without a title key uses the fallback name."""
+        schema = {
+            "properties": {"x": {"type": "integer"}},
+            "required": ["x"],
+        }
+        models = _models_from_schema(schema)
+        assert "RootModel" in models
+
     def test_predict_with_pydantic_schemas(self):
         """predict tool uses pydantic_schemas to create custom_types."""
         mock_lm = MagicMock()

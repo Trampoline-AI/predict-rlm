@@ -6,7 +6,7 @@ import os
 import re
 from contextlib import contextmanager
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Callable, Iterator, List, Optional
+from typing import TYPE_CHECKING, Any, Callable, Iterator, List, Literal, Optional
 
 import dspy
 from dspy.primitives.code_interpreter import CodeInterpreter
@@ -81,6 +81,20 @@ def _models_from_schema(schema: dict) -> dict[str, type]:
                 return inner
             return Optional[str]  # type: ignore[return-value]
 
+        # Handle enum (Literal) types — e.g. {"enum": ["p1", "p2"], "type": "string"}
+        if "enum" in info:
+            return Literal[tuple(info["enum"])]  # type: ignore[valid-type]
+
+        # Handle type-array shorthand: {"type": ["string", "null"]} → Optional[str]
+        # This is valid JSON Schema (draft-07+) but not produced by Pydantic;
+        # LMs write it by hand instead of using anyOf.
+        raw_type = info.get("type", "string")
+        if isinstance(raw_type, list):
+            non_null = [t for t in raw_type if t != "null"]
+            has_null = "null" in raw_type
+            inner = get_python_type({"type": non_null[0]}) if non_null else str
+            return Optional[inner] if has_null else inner  # type: ignore[valid-type]
+
         # Handle primitive types
         type_map = {
             "string": str,
@@ -90,7 +104,7 @@ def _models_from_schema(schema: dict) -> dict[str, type]:
             "object": dict,
             "array": list,
         }
-        return type_map.get(info.get("type", "string"), str)
+        return type_map.get(raw_type, str)
 
     def _build_model(name: str, model_schema: dict) -> None:
         """Build a single model, recursively building dependencies first."""
