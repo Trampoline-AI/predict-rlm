@@ -1,5 +1,3 @@
-![Screenshot](screenshot.png)
-
 ## Run Stats
 
 | | Main LM (`gpt-5.4`) | Sub-LM (`gpt-5.1`) |
