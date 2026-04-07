@@ -40,8 +40,15 @@ class AnalyzeImages(dspy.Signature):
     query: str = dspy.InputField()
     answer: str = dspy.OutputField()
 
-rlm = PredictRLM(AnalyzeImages, lm="openai/gpt-5.4", sub_lm="openai/gpt-5.1")
-result = rlm(images=[File(path="page.png")], query="Extract all visible text, then count each letter A-Z (case-insensitive).")
+rlm = PredictRLM(
+    AnalyzeImages,
+    lm="openai/gpt-5.4",
+    sub_lm="openai/gpt-5.1",
+)
+result = rlm(
+    images=[File(path="page.png")],
+    query="Extract all visible text, then count each letter A-Z (case-insensitive).",
+)
 print(result.answer)
 ```
 
@@ -151,7 +158,10 @@ import pymupdf, base64, asyncio
 
 doc = pymupdf.open(documents[0])
 images = [
-    f"data:image/png;base64,{base64.b64encode(doc[i].get_pixmap(dpi=200).tobytes('png')).decode()}"
+    "data:image/png;base64,"
+    + base64.b64encode(
+        doc[i].get_pixmap(dpi=200).tobytes("png")
+    ).decode()
     for i in range(3)
 ]
 results = await asyncio.gather(*[
@@ -177,7 +187,8 @@ from predict_rlm import PredictRLM, Skill
 
 pdf_skill = Skill(
     name="pdf-extraction",
-    instructions="Use pdfplumber for table extraction. Prefer page.extract_tables() for tabular content.",
+    instructions="Use pdfplumber for table extraction."
+        " Prefer page.extract_tables() for tabular content.",
     packages=["pdfplumber"],
 )
 
@@ -222,7 +233,11 @@ spreadsheet_skill = Skill(
     name="spreadsheet",
     instructions="Use openpyxl to build workbooks. Use formula_eval to verify formulas.",
     packages=["openpyxl", "pandas", "formulas"],
-    modules={"formula_eval": str(Path(__file__).parent / "modules" / "formula_eval.py")},
+    modules={
+        "formula_eval": str(
+            Path(__file__).parent / "modules" / "formula_eval.py"
+        ),
+    },
 )
 ```
 
@@ -446,7 +461,9 @@ Skill(
     name="my-skill",                      # Short identifier
     instructions="How to approach...",     # Injected into the RLM prompt
     packages=["pandas", "pdfplumber"],     # Installed in the sandbox
-    modules={"helper": "/path/to/mod.py"},# Mounted as importable modules in the sandbox
+    modules={                              # Mounted as importable
+        "helper": "/path/to/mod.py",      # modules in the sandbox
+    },
     tools={"my_func": my_func},           # Exposed alongside predict()
 )
 ```
