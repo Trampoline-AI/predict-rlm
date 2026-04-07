@@ -287,10 +287,9 @@ class JspiInterpreter(PythonInterpreter):
 
         if self.deno_process and self.deno_process.poll() is None:
             try:
-                self.deno_process.stdin.write(
+                self._write_stdin(
                     json.dumps({"jsonrpc": "2.0", "method": "shutdown"}) + "\n"
                 )
-                self.deno_process.stdin.flush()
                 self.deno_process.stdin.close()
             except (BrokenPipeError, OSError):
                 pass
@@ -364,6 +363,60 @@ class JspiInterpreter(PythonInterpreter):
             args.append(",".join(env_vars))
 
         return args
+
+    def _sync_files(self) -> None:
+        """Sync modified files back to the host without blocking writes."""
+        if not self.enable_write_paths or not self.sync_files:
+            return
+
+        for path in self.enable_write_paths:
+            virtual_path = f"/sandbox/{os.path.basename(path)}"
+            msg = json.dumps(
+                {
+                    "jsonrpc": "2.0",
+                    "method": "sync_file",
+                    "params": {
+                        "virtual_path": virtual_path,
+                        "host_path": str(path),
+                    },
+                }
+            )
+            self._write_stdin(msg + "\n")
+
+    def _send_request(self, method: str, params: dict, context: str) -> dict:
+        """Send a JSON-RPC request without blocking the OS pipe."""
+        self._request_id += 1
+        request_id = self._request_id
+        msg = json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "method": method,
+                "params": params,
+                "id": request_id,
+            }
+        )
+        self._write_stdin(msg + "\n")
+
+        response_line = self._read_with_timeout(timeout=None)
+        if not response_line:
+            exit_code = self.deno_process.poll()
+            if exit_code is not None:
+                stderr = self.deno_process.stderr.read() if self.deno_process.stderr else ""
+                raise CodeInterpreterError(
+                    f"Deno exited (code {exit_code}) {context}: {stderr}"
+                )
+            raise CodeInterpreterError(f"No response {context}")
+
+        response = json.loads(response_line)
+        if response.get("id") != request_id:
+            raise CodeInterpreterError(
+                f"Response ID mismatch {context}: expected {request_id}, got {response.get('id')}"
+            )
+        if "error" in response:
+            raise CodeInterpreterError(
+                f"Error {context}: {response['error'].get('message', 'Unknown error')}"
+            )
+        return response
 
     def _get_deno_dir(self) -> list[str]:
         """Get Deno cache directory paths (may have multiple on different platforms)."""
@@ -512,8 +565,7 @@ class JspiInterpreter(PythonInterpreter):
             "id": execute_request_id,
         })
         try:
-            self.deno_process.stdin.write(input_data + "\n")
-            self.deno_process.stdin.flush()
+            await self._write_stdin_async(input_data + "\n")
         except BrokenPipeError:
             self._tools_registered = False
             self._mounted_files = False
@@ -528,8 +580,7 @@ class JspiInterpreter(PythonInterpreter):
                 "params": {"code": code},
                 "id": execute_request_id,
             })
-            self.deno_process.stdin.write(input_data + "\n")
-            self.deno_process.stdin.flush()
+            await self._write_stdin_async(input_data + "\n")
 
         return await self._execute_async(execute_request_id)
 
@@ -565,8 +616,7 @@ class JspiInterpreter(PythonInterpreter):
             }
         )
         try:
-            self.deno_process.stdin.write(input_data + "\n")
-            self.deno_process.stdin.flush()
+            self._write_stdin(input_data + "\n")
         except BrokenPipeError:
             # Process died - restart it
             self._tools_registered = False
@@ -584,8 +634,7 @@ class JspiInterpreter(PythonInterpreter):
                     "id": execute_request_id,
                 }
             )
-            self.deno_process.stdin.write(input_data + "\n")
-            self.deno_process.stdin.flush()
+            self._write_stdin(input_data + "\n")
 
         # Run the async execute loop. Use nest_asyncio to allow
         # run_until_complete even inside an already-running loop (e.g. marimo).
@@ -719,9 +768,17 @@ class JspiInterpreter(PythonInterpreter):
             if "\n" in self._read_buf:
                 line, self._read_buf = self._read_buf.split("\n", 1)
                 return line.strip()
-            ready, _, _ = select.select([self._stdout_fd], [], [], timeout)
-            if not ready:
-                return None
+            if self._stdout_fd >= 0:
+                ready, _, _ = select.select([self._stdout_fd], [], [], timeout)
+                if not ready:
+                    return None
+            else:
+                stdout = getattr(self.deno_process, "stdout", None)
+                if stdout is None:
+                    return None
+                ready, _, _ = select.select([stdout.fileno()], [], [], timeout)
+                if not ready:
+                    return None
         return self._read_line_raw()
 
     async def _read_with_timeout_async(self, timeout: float | None) -> str | None:
@@ -751,6 +808,10 @@ class JspiInterpreter(PythonInterpreter):
 
     def _read_line_raw(self) -> str:
         """Read one line from the raw stdout fd, accumulating in _read_buf."""
+        stdout = getattr(self.deno_process, "stdout", None)
+        if self._stdout_fd < 0 or stdout is None:
+            return (stdout.readline() if stdout else "").strip()
+
         while "\n" not in self._read_buf:
             chunk = os.read(self._stdout_fd, 65536)
             if not chunk:
@@ -812,8 +873,26 @@ class JspiInterpreter(PythonInterpreter):
             raise CodeInterpreterError(
                 "Deno process is no longer running — cannot write to stdin"
             )
-        self.deno_process.stdin.write(data)
-        self.deno_process.stdin.flush()
+        fd = self._stdin_fd
+        if fd < 0 or self.deno_process.stdin is None:
+            # During interpreter bootstrapping the raw fd has not been
+            # captured yet. Fall back to the blocking TextIO write that
+            # PythonInterpreter used so the health check can succeed.
+            self.deno_process.stdin.write(data)
+            self.deno_process.stdin.flush()
+            return
+
+        encoded = data.encode("utf-8")
+        view = memoryview(encoded)
+
+        while view:
+            try:
+                written = os.write(fd, view)
+                view = view[written:]
+            except BlockingIOError:
+                select.select([], [fd], [])
+            except InterruptedError:
+                continue
 
     async def _write_stdin_async(self, data: str) -> None:
         """Async write using event loop fd watching — zero threads.
