@@ -725,7 +725,7 @@ class TestToSerializableEdgeCases(unittest.TestCase):
         self.assertIsInstance(json_str, str)
 
 
-class TestPredictToolListDict(unittest.TestCase):
+class TestPredictToolListDict:
     """Test the actual predict tool from PredictRLM with list[dict] output."""
 
     @pytest.mark.asyncio
@@ -735,14 +735,10 @@ class TestPredictToolListDict(unittest.TestCase):
 
         from predict_rlm import PredictRLM
 
-        # Create a mock LM
         mock_lm = MagicMock()
         rlm = PredictRLM("text -> answer", sub_lm=mock_lm, max_iterations=1)
-
-        # Get the predict tool
         predict_tool = rlm.tools["predict"].func
 
-        # Mock dspy.Predict to return a list of dicts
         with patch("predict_rlm.predict_rlm.dspy.Predict") as mock_predict_class:
             mock_predictor = MagicMock()
             mock_prediction = MagicMock()
@@ -756,7 +752,6 @@ class TestPredictToolListDict(unittest.TestCase):
             mock_predictor.acall = AsyncMock(return_value=mock_prediction)
             mock_predict_class.return_value = mock_predictor
 
-            # Capture warnings during execution
             with warnings.catch_warnings(record=True) as w:
                 warnings.simplefilter("always")
 
@@ -765,32 +760,24 @@ class TestPredictToolListDict(unittest.TestCase):
                     context="test context",
                 )
 
-                # Should return a dict with items
-                self.assertIsInstance(result, dict)
-                self.assertIn("items", result)
-                self.assertIsInstance(result["items"], list)
-                self.assertEqual(len(result["items"]), 2)
+                assert isinstance(result, dict)
+                assert "items" in result
+                assert isinstance(result["items"], list)
+                assert len(result["items"]) == 2
+                assert result["items"][0]["category"] == "TASK"
+                assert result["items"][1]["priority"] == "high"
+                assert result["items"][0]["priority"] is None
 
-                # Check structure is preserved
-                self.assertEqual(result["items"][0]["category"], "TASK")
-                self.assertEqual(result["items"][1]["priority"], "high")
-                self.assertIsNone(result["items"][0]["priority"])
-
-                # Should be JSON serializable
                 json_str = json.dumps(result)
-                self.assertIsInstance(json_str, str)
+                assert isinstance(json_str, str)
 
-                # Check for any Pydantic serialization warnings from our code
                 pydantic_warnings = [
                     warning
                     for warning in w
                     if "PydanticSerializationUnexpectedValue" in str(warning.message)
                 ]
-                # Our code should not produce these warnings
-                self.assertEqual(
-                    len(pydantic_warnings),
-                    0,
-                    f"Got unexpected Pydantic warnings: {pydantic_warnings}",
+                assert len(pydantic_warnings) == 0, (
+                    f"Got unexpected Pydantic warnings: {pydantic_warnings}"
                 )
 
     @pytest.mark.asyncio
@@ -813,7 +800,6 @@ class TestPredictToolListDict(unittest.TestCase):
             mock_predictor = MagicMock()
             mock_prediction = MagicMock()
             mock_prediction.keys.return_value = ["items"]
-            # DSPy returns list of Pydantic model instances
             mock_prediction.items = [
                 TaskItem(category="TASK", title="Task 1", priority=None),
                 TaskItem(category="FORM", title="Form 1", priority="high"),
@@ -825,25 +811,20 @@ class TestPredictToolListDict(unittest.TestCase):
             with warnings.catch_warnings(record=True) as w:
                 warnings.simplefilter("always")
 
-                # Must provide pydantic_schemas for models defined in local scope
-                # (in real sandbox usage, this is extracted and passed automatically)
                 result = await predict_tool(
                     "context: str -> items: list[TaskItem]",
                     context="test context",
                     pydantic_schemas={"TaskItem": TaskItem.model_json_schema()},
                 )
 
-                # Should return dicts, not Pydantic models
-                self.assertIsInstance(result, dict)
-                self.assertIn("items", result)
-                self.assertIsInstance(result["items"], list)
-                # Items should be serialized to dicts
-                self.assertIsInstance(result["items"][0], dict)
-                self.assertEqual(result["items"][0]["category"], "TASK")
+                assert isinstance(result, dict)
+                assert "items" in result
+                assert isinstance(result["items"], list)
+                assert isinstance(result["items"][0], dict)
+                assert result["items"][0]["category"] == "TASK"
 
-                # Should be JSON serializable
                 json_str = json.dumps(result)
-                self.assertIsInstance(json_str, str)
+                assert isinstance(json_str, str)
 
                 # Check for Pydantic warnings
                 pydantic_warnings = [
@@ -851,7 +832,7 @@ class TestPredictToolListDict(unittest.TestCase):
                     for warning in w
                     if "PydanticSerializationUnexpectedValue" in str(warning.message)
                 ]
-                self.assertEqual(len(pydantic_warnings), 0)
+                assert len(pydantic_warnings) == 0
 
 
 @pytest.mark.integration
