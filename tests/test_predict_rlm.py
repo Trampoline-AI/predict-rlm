@@ -1,6 +1,7 @@
 """Tests for PredictRLM with predict tool for DSPy signatures."""
 
 import asyncio
+import logging
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import dspy
@@ -9,6 +10,7 @@ from pydantic import BaseModel
 
 from predict_rlm import PredictRLM
 from predict_rlm.predict_rlm import _models_from_schema
+from predict_rlm.rlm_skills import Skill
 
 
 def _run(coro):
@@ -902,3 +904,519 @@ class TestModelsFromSchema:
             # Should return the list, not {} or [] from method collision
             assert result["items"] == expected_items
             mock_prediction.__getitem__.assert_called_once_with("items")
+
+
+class TestAnnotationHelpers:
+    """Tests for _unwrap_optional, _image_field_info, _allows_none, _is_list_output.
+
+    These are inner functions of _create_predict_tool, so we test them
+    indirectly through predict() behavior.
+    """
+
+    @pytest.mark.asyncio
+    async def test_optional_image_none_passes_through(self):
+        """Optional[dspy.Image] field with None value passes through without wrapping."""
+        mock_lm = MagicMock()
+        rlm = PredictRLM(ImageAnalysisSignature, sub_lm=mock_lm, max_iterations=5)
+
+        with patch("predict_rlm.predict_rlm.dspy.Predict") as mock_predict_class:
+            mock_predictor = MagicMock()
+            mock_prediction = MagicMock()
+            values = {"answer": "no image"}
+            mock_prediction.keys.return_value = list(values.keys())
+            mock_prediction.__getitem__ = MagicMock(side_effect=lambda k: values[k])
+            mock_predictor.acall = AsyncMock(return_value=mock_prediction)
+            mock_predict_class.return_value = mock_predictor
+
+            result = await rlm.tools["predict"].func(
+                "image: Optional[dspy.Image], question -> answer",
+                image=None,
+                question="Any image?",
+            )
+
+            assert result == {"answer": "no image"}
+            call_kwargs = mock_predictor.acall.call_args.kwargs
+            assert call_kwargs["image"] is None
+
+    @pytest.mark.asyncio
+    async def test_optional_list_image_wraps_correctly(self):
+        """Optional[list[dspy.Image]] wraps URLs as dspy.Image when list is provided."""
+        mock_lm = MagicMock()
+        rlm = PredictRLM(ImageAnalysisSignature, sub_lm=mock_lm, max_iterations=5)
+
+        with patch("predict_rlm.predict_rlm.dspy.Predict") as mock_predict_class:
+            mock_predictor = MagicMock()
+            mock_prediction = MagicMock()
+            values = {"answer": "found images"}
+            mock_prediction.keys.return_value = list(values.keys())
+            mock_prediction.__getitem__ = MagicMock(side_effect=lambda k: values[k])
+            mock_predictor.acall = AsyncMock(return_value=mock_prediction)
+            mock_predict_class.return_value = mock_predictor
+
+            result = await rlm.tools["predict"].func(
+                "images: Optional[list[dspy.Image]], question -> answer",
+                images=["https://example.com/a.png", "https://example.com/b.png"],
+                question="Describe these",
+            )
+
+            assert result == {"answer": "found images"}
+            call_kwargs = mock_predictor.acall.call_args.kwargs
+            assert len(call_kwargs["images"]) == 2
+            assert all(isinstance(img, dspy.Image) for img in call_kwargs["images"])
+
+    @pytest.mark.asyncio
+    async def test_none_for_optional_list_output_passes_through(self):
+        """None for Optional[list[str]] output passes through (allows_none is True)."""
+        mock_lm = MagicMock()
+        rlm = PredictRLM(ImageAnalysisSignature, sub_lm=mock_lm, max_iterations=5)
+
+        with patch("predict_rlm.predict_rlm.dspy.Predict") as mock_predict_class:
+            mock_predictor = MagicMock()
+            mock_prediction = MagicMock()
+            values = {"items": None}
+            mock_prediction.keys.return_value = list(values.keys())
+            mock_prediction.__getitem__ = MagicMock(side_effect=lambda k: values[k])
+            mock_predictor.acall = AsyncMock(return_value=mock_prediction)
+            mock_predict_class.return_value = mock_predictor
+
+            result = await rlm.tools["predict"].func(
+                "text: str -> items: Optional[list[str]]",
+                text="some input",
+            )
+            assert result["items"] is None
+
+    @pytest.mark.asyncio
+    async def test_is_list_output_detects_list_type(self):
+        """list[str] (non-Optional) output field: None raises RuntimeError (is_list + not allows_none)."""
+        mock_lm = MagicMock()
+        rlm = PredictRLM(ImageAnalysisSignature, sub_lm=mock_lm, max_iterations=5)
+
+        with patch("predict_rlm.predict_rlm.dspy.Predict") as mock_predict_class:
+            mock_predictor = MagicMock()
+            mock_prediction = MagicMock()
+            values = {"tags": None}
+            mock_prediction.keys.return_value = list(values.keys())
+            mock_prediction.__getitem__ = MagicMock(side_effect=lambda k: values[k])
+            mock_predictor.acall = AsyncMock(return_value=mock_prediction)
+            mock_predict_class.return_value = mock_predictor
+
+            with pytest.raises(RuntimeError, match="VLM returned None for non-Optional"):
+                await rlm.tools["predict"].func(
+                    "text: str -> tags: list[str]",
+                    text="some input",
+                )
+
+    @pytest.mark.asyncio
+    async def test_non_optional_non_list_str_allows_none_false(self):
+        """Plain str output (not Optional): None raises RuntimeError."""
+        mock_lm = MagicMock()
+        rlm = PredictRLM(ImageAnalysisSignature, sub_lm=mock_lm, max_iterations=5)
+
+        with patch("predict_rlm.predict_rlm.dspy.Predict") as mock_predict_class:
+            mock_predictor = MagicMock()
+            mock_prediction = MagicMock()
+            values = {"name": None}
+            mock_prediction.keys.return_value = list(values.keys())
+            mock_prediction.__getitem__ = MagicMock(side_effect=lambda k: values[k])
+            mock_predictor.acall = AsyncMock(return_value=mock_prediction)
+            mock_predict_class.return_value = mock_predictor
+
+            with pytest.raises(RuntimeError, match="VLM returned None for non-Optional"):
+                await rlm.tools["predict"].func(
+                    "text: str -> name: str",
+                    text="some input",
+                )
+
+
+class TestSchemaTitleInjection:
+    """Tests for schema title injection when pydantic_schemas lack a 'title' key."""
+
+    @pytest.mark.asyncio
+    async def test_schema_without_title_injects_key_name(self):
+        """When pydantic_schemas has a schema missing 'title', the key name is injected."""
+        mock_lm = MagicMock()
+        rlm = PredictRLM(ImageAnalysisSignature, sub_lm=mock_lm, max_iterations=5)
+
+        schema_without_title = {
+            "properties": {
+                "description": {"type": "string"},
+                "amount": {"type": "number"},
+            },
+            "required": ["description", "amount"],
+        }
+
+        with patch("predict_rlm.predict_rlm.dspy.Predict") as mock_predict_class:
+            with patch("predict_rlm.predict_rlm.dspy.Signature") as mock_sig_class:
+                mock_predictor = MagicMock()
+                mock_prediction = MagicMock()
+                values = {"items": []}
+                mock_prediction.keys.return_value = list(values.keys())
+                mock_prediction.__getitem__ = MagicMock(side_effect=lambda k: values[k])
+                mock_predictor.acall = AsyncMock(return_value=mock_prediction)
+                mock_predict_class.return_value = mock_predictor
+                mock_sig_class.return_value = "mocked_signature"
+
+                await rlm.tools["predict"].func(
+                    "text: str -> items: list[LineItem]",
+                    pydantic_schemas={"LineItem": schema_without_title},
+                    text="test",
+                )
+
+                call_args = mock_sig_class.call_args
+                custom_types = call_args.kwargs["custom_types"]
+                assert "LineItem" in custom_types
+
+    @pytest.mark.asyncio
+    async def test_schema_with_title_preserved(self):
+        """When pydantic_schemas already has 'title', it is preserved (no overwrite)."""
+        mock_lm = MagicMock()
+        rlm = PredictRLM(ImageAnalysisSignature, sub_lm=mock_lm, max_iterations=5)
+
+        schema_with_title = {
+            "title": "LineItem",
+            "properties": {
+                "description": {"type": "string"},
+            },
+            "required": ["description"],
+        }
+
+        with patch("predict_rlm.predict_rlm.dspy.Predict") as mock_predict_class:
+            with patch("predict_rlm.predict_rlm.dspy.Signature") as mock_sig_class:
+                mock_predictor = MagicMock()
+                mock_prediction = MagicMock()
+                values = {"items": []}
+                mock_prediction.keys.return_value = list(values.keys())
+                mock_prediction.__getitem__ = MagicMock(side_effect=lambda k: values[k])
+                mock_predictor.acall = AsyncMock(return_value=mock_prediction)
+                mock_predict_class.return_value = mock_predictor
+                mock_sig_class.return_value = "mocked_signature"
+
+                await rlm.tools["predict"].func(
+                    "text: str -> items: list[LineItem]",
+                    pydantic_schemas={"LineItem": schema_with_title},
+                    text="test",
+                )
+
+                call_args = mock_sig_class.call_args
+                custom_types = call_args.kwargs["custom_types"]
+                assert "LineItem" in custom_types
+
+
+class TestUnresolvedTypesFallback:
+    """Tests for the fallback when signature has custom types that can't be resolved."""
+
+    @pytest.mark.asyncio
+    async def test_unresolved_custom_type_falls_back_to_string_signature(self, caplog):
+        """Unresolvable custom type in signature falls back to string signature with warning."""
+        mock_lm = MagicMock()
+        rlm = PredictRLM(ImageAnalysisSignature, sub_lm=mock_lm, max_iterations=5)
+
+        with patch("predict_rlm.predict_rlm.dspy.Predict") as mock_predict_class:
+            mock_predictor = MagicMock()
+            mock_prediction = MagicMock()
+            values = {"items": "raw string fallback"}
+            mock_prediction.keys.return_value = list(values.keys())
+            mock_prediction.__getitem__ = MagicMock(side_effect=lambda k: values[k])
+            mock_predictor.acall = AsyncMock(return_value=mock_prediction)
+            mock_predict_class.return_value = mock_predictor
+
+            # Patch dspy.Signature to raise on unknown type, simulating a parse failure
+            original_sig = dspy.Signature
+
+            def sig_side_effect(*args, **kwargs):
+                if kwargs.get("custom_types"):
+                    return original_sig(*args, **kwargs)
+                sig_str = args[0] if args else ""
+                if "UnknownModel" in sig_str:
+                    raise ValueError("Unknown name 'UnknownModel'")
+                return original_sig(*args, **kwargs)
+
+            with patch(
+                "predict_rlm.predict_rlm.dspy.Signature", side_effect=sig_side_effect
+            ):
+                with caplog.at_level(logging.WARNING, logger="predict_rlm.predict_rlm"):
+                    result = await rlm.tools["predict"].func(
+                        "text: str -> items: list[UnknownModel]",
+                        text="some input",
+                    )
+
+                assert result == {"items": "raw string fallback"}
+                # Verify dspy.Predict was called with a string (the fallback)
+                sig_arg = mock_predict_class.call_args[0][0]
+                assert isinstance(sig_arg, str)
+                # Verify warning was logged about the fallback
+                assert any("UnknownModel" in r.message for r in caplog.records)
+
+    @pytest.mark.asyncio
+    async def test_non_unknown_name_error_still_falls_back(self):
+        """Signature parse error without 'Unknown name' still falls back to string."""
+        mock_lm = MagicMock()
+        rlm = PredictRLM(ImageAnalysisSignature, sub_lm=mock_lm, max_iterations=5)
+
+        with patch("predict_rlm.predict_rlm.dspy.Predict") as mock_predict_class:
+            mock_predictor = MagicMock()
+            mock_prediction = MagicMock()
+            values = {"answer": "fallback"}
+            mock_prediction.keys.return_value = list(values.keys())
+            mock_prediction.__getitem__ = MagicMock(side_effect=lambda k: values[k])
+            mock_predictor.acall = AsyncMock(return_value=mock_prediction)
+            mock_predict_class.return_value = mock_predictor
+
+            with patch(
+                "predict_rlm.predict_rlm.dspy.Signature",
+                side_effect=Exception("some parse error"),
+            ):
+                result = await rlm.tools["predict"].func(
+                    "question -> answer",
+                    question="test",
+                )
+
+                assert result == {"answer": "fallback"}
+                sig_arg = mock_predict_class.call_args[0][0]
+                assert isinstance(sig_arg, str)
+
+
+class TestAexecuteIteration:
+    """Tests for _aexecute_iteration: async vs sync interpreter dispatch."""
+
+    @pytest.mark.asyncio
+    async def test_uses_aexecute_when_available(self):
+        """_aexecute_iteration calls repl.aexecute() when it has the method."""
+        mock_lm = MagicMock()
+        rlm = PredictRLM(ImageAnalysisSignature, sub_lm=mock_lm, max_iterations=5)
+
+        mock_repl = MagicMock()
+        mock_repl.aexecute = AsyncMock(return_value="output from aexecute")
+
+        mock_pred = MagicMock()
+        mock_pred.reasoning = "thinking"
+        mock_pred.code = "print('hello')"
+
+        rlm.generate_action = MagicMock()
+        rlm.generate_action.acall = AsyncMock(return_value=mock_pred)
+
+        mock_result = MagicMock()
+        with patch.object(rlm, "_process_execution_result", return_value=mock_result) as mock_process:
+            with patch("dspy.predict.rlm._strip_code_fences", return_value="print('hello')"):
+                result = await rlm._aexecute_iteration(
+                    repl=mock_repl,
+                    variables=[],
+                    history=[],
+                    iteration=0,
+                    input_args={},
+                    output_field_names=["answer"],
+                )
+
+        mock_repl.aexecute.assert_called_once_with("print('hello')", variables={})
+        assert result is mock_result
+        mock_process.assert_called_once_with(
+            mock_pred, "output from aexecute", [], ["answer"]
+        )
+
+    @pytest.mark.asyncio
+    async def test_falls_back_to_execute_when_no_aexecute(self):
+        """_aexecute_iteration falls back to repl.execute() when aexecute is absent."""
+        mock_lm = MagicMock()
+        rlm = PredictRLM(ImageAnalysisSignature, sub_lm=mock_lm, max_iterations=5)
+
+        mock_repl = MagicMock(spec=[])  # empty spec = no attributes
+        mock_repl.execute = MagicMock(return_value="output from execute")
+
+        mock_pred = MagicMock()
+        mock_pred.reasoning = "thinking"
+        mock_pred.code = "print('hi')"
+
+        rlm.generate_action = MagicMock()
+        rlm.generate_action.acall = AsyncMock(return_value=mock_pred)
+
+        mock_result = MagicMock()
+        with patch.object(rlm, "_process_execution_result", return_value=mock_result):
+            with patch("dspy.predict.rlm._strip_code_fences", return_value="print('hi')"):
+                result = await rlm._aexecute_iteration(
+                    repl=mock_repl,
+                    variables=[],
+                    history=[],
+                    iteration=0,
+                    input_args={},
+                    output_field_names=["answer"],
+                )
+
+        mock_repl.execute.assert_called_once_with("print('hi')", variables={})
+        assert result is mock_result
+
+    @pytest.mark.asyncio
+    async def test_catches_execution_exception(self):
+        """_aexecute_iteration catches exceptions from repl and formats as error."""
+        mock_lm = MagicMock()
+        rlm = PredictRLM(ImageAnalysisSignature, sub_lm=mock_lm, max_iterations=5)
+
+        mock_repl = MagicMock()
+        mock_repl.aexecute = AsyncMock(side_effect=RuntimeError("sandbox crashed"))
+
+        mock_pred = MagicMock()
+        mock_pred.reasoning = "thinking"
+        mock_pred.code = "bad_code()"
+
+        rlm.generate_action = MagicMock()
+        rlm.generate_action.acall = AsyncMock(return_value=mock_pred)
+
+        mock_result = MagicMock()
+        with patch.object(rlm, "_process_execution_result", return_value=mock_result) as mock_process:
+            with patch("dspy.predict.rlm._strip_code_fences", return_value="bad_code()"):
+                await rlm._aexecute_iteration(
+                    repl=mock_repl,
+                    variables=[],
+                    history=[],
+                    iteration=0,
+                    input_args={},
+                    output_field_names=["answer"],
+                )
+
+        # The error should be formatted as "[Error] ..."
+        error_arg = mock_process.call_args[0][1]
+        assert "[Error]" in error_arg
+        assert "sandbox crashed" in error_arg
+
+
+class TestSkillsMergeIntoInit:
+    """Tests for skills merging into PredictRLM.__init__."""
+
+    def test_skills_merge_instructions(self):
+        """Skills instructions are merged into _skill_instructions."""
+        skill = Skill(
+            name="test-skill",
+            instructions="Use the frobnicator for all extraction.",
+        )
+        rlm = PredictRLM(ImageAnalysisSignature, sub_lm=None, max_iterations=1, skills=[skill])
+        assert "frobnicator" in rlm._skill_instructions
+        assert "test-skill" in rlm._skill_instructions
+
+    def test_skills_merge_packages(self):
+        """Skills packages are merged into _skill_packages."""
+        skill = Skill(
+            name="pkg-skill",
+            packages=["pdfplumber", "pillow"],
+        )
+        rlm = PredictRLM(ImageAnalysisSignature, sub_lm=None, max_iterations=1, skills=[skill])
+        assert "pdfplumber" in rlm._skill_packages
+        assert "pillow" in rlm._skill_packages
+
+    def test_skills_merge_modules(self):
+        """Skills modules are merged into _skill_modules."""
+        skill = Skill(
+            name="mod-skill",
+            modules={"helpers": "/path/to/helpers.py"},
+        )
+        rlm = PredictRLM(ImageAnalysisSignature, sub_lm=None, max_iterations=1, skills=[skill])
+        assert rlm._skill_modules == {"helpers": "/path/to/helpers.py"}
+
+    def test_skills_merge_tools(self):
+        """Skills tools are accessible on the RLM alongside predict."""
+        def my_tool(x: str) -> str:
+            """A custom tool."""
+            return x
+
+        skill = Skill(
+            name="tool-skill",
+            tools={"my_tool": my_tool},
+        )
+        rlm = PredictRLM(ImageAnalysisSignature, sub_lm=None, max_iterations=1, skills=[skill])
+        assert "my_tool" in rlm.tools
+        assert "predict" in rlm.tools
+
+    def test_skill_tool_conflicts_with_user_tool_raises(self):
+        """Tool name conflict between a skill and the tools parameter raises ValueError."""
+        def my_tool(x: str) -> str:
+            """A tool."""
+            return x
+
+        skill = Skill(
+            name="conflict-skill",
+            tools={"my_tool": my_tool},
+        )
+        with pytest.raises(ValueError, match="Tool name conflict.*my_tool"):
+            PredictRLM(
+                ImageAnalysisSignature,
+                sub_lm=None,
+                max_iterations=1,
+                skills=[skill],
+                tools={"my_tool": my_tool},
+            )
+
+    def test_multiple_skills_merge(self):
+        """Multiple skills have their instructions, packages, and tools merged."""
+        def tool_a() -> str:
+            """Tool A."""
+            return "a"
+
+        def tool_b() -> str:
+            """Tool B."""
+            return "b"
+
+        skill_a = Skill(
+            name="skill-a",
+            instructions="Use approach A.",
+            packages=["pkg-a"],
+            tools={"tool_a": tool_a},
+        )
+        skill_b = Skill(
+            name="skill-b",
+            instructions="Use approach B.",
+            packages=["pkg-b", "pkg-a"],  # duplicate pkg-a
+            tools={"tool_b": tool_b},
+        )
+        rlm = PredictRLM(
+            ImageAnalysisSignature,
+            sub_lm=None,
+            max_iterations=1,
+            skills=[skill_a, skill_b],
+        )
+        assert "approach A" in rlm._skill_instructions
+        assert "approach B" in rlm._skill_instructions
+        assert "pkg-a" in rlm._skill_packages
+        assert "pkg-b" in rlm._skill_packages
+        # Deduplicated packages
+        assert rlm._skill_packages.count("pkg-a") == 1
+        assert "tool_a" in rlm.tools
+        assert "tool_b" in rlm.tools
+        assert "predict" in rlm.tools
+
+    def test_no_skills_leaves_defaults_empty(self):
+        """Without skills, skill fields are empty."""
+        rlm = PredictRLM(ImageAnalysisSignature, sub_lm=None, max_iterations=1)
+        assert rlm._skill_instructions == ""
+        assert rlm._skill_packages == []
+        assert rlm._skill_modules == {}
+
+
+class TestModelsFromSchemaEdgeCases:
+    """Tests for _models_from_schema edge cases: unknown $ref, anyOf with all nulls."""
+
+    def test_unknown_ref_falls_back_to_dict(self):
+        """$ref to a name not in $defs falls back to dict type."""
+        schema = {
+            "title": "Container",
+            "properties": {
+                "data": {"$ref": "#/$defs/MissingModel"},
+            },
+            "required": ["data"],
+        }
+        models = _models_from_schema(schema)
+        Model = models["Container"]
+        # Should accept a dict since the ref fell back to dict type
+        instance = Model(data={"key": "value"})
+        assert instance.data == {"key": "value"}
+
+    def test_anyof_all_null_falls_back_to_optional_str(self):
+        """anyOf with only null types falls back to Optional[str]."""
+        schema = {
+            "title": "Weird",
+            "properties": {
+                "field": {"anyOf": [{"type": "null"}]},
+            },
+            "required": ["field"],
+        }
+        models = _models_from_schema(schema)
+        Model = models["Weird"]
+        instance = Model(field=None)
+        assert instance.field is None
