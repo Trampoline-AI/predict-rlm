@@ -16,31 +16,25 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - For complex problems, throw more compute at it via subagents
 - One task per subagent for focused execution
 
-### 3. Self-Improvement Loop
-- After ANY correction from the user: update `tasks/lessons.md` with the pattern
-- Write rules for yourself that prevent the same mistake
-- Ruthlessly iterate on these lessons until mistake rate drops
-- Review lessons at session start for relevant project
-
-### 4. Verification Before Done
+### 3. Verification Before Done
 - Never mark a task complete without proving it works
 - Diff behavior between main and your changes when relevant
 - Ask yourself: "Would a staff engineer approve this?"
 - Run tests, check logs, demonstrate correctness
 
-### 5. Demand Elegance (Balanced)
+### 4. Demand Elegance (Balanced)
 - For non-trivial changes: pause and ask "is there a more elegant way?"
 - If a fix feels hacky: "Knowing everything I know now, implement the elegant solution"
 - Skip this for simple, obvious fixes -- don't over-engineer
 - Challenge your own work before presenting it
 
-### 6. Autonomous Bug Fixing
+### 7. Autonomous Bug Fixing
 - When given a bug report: just fix it. Don't ask for hand-holding
 - Point at logs, errors, failing tests -- then resolve them
 - Zero context switching required from the user
 - Go fix failing CI tests without being told how
 
-### 7. Test-Driven Bug Fixing
+### 8. Test-Driven Bug Fixing
 - **Reproduce first**: Before touching any fix, write a test that reproduces the bug
 - **Red before green**: The new test MUST fail before you change any production code -- if it passes, your test doesn't actually cover the bug
 - **Minimal regression test**: Keep the test focused on the exact failure; don't boil the ocean
@@ -48,20 +42,11 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - **Never skip this**: No matter how "obvious" the fix seems -- a bug without a test is a bug that will come back
 - **Cover edge cases**: If the bug came from an edge case, add tests for adjacent edge cases too
 
-### 8. Pull Request Descriptions
+### 9. Pull Request Descriptions
 - Every PR description must start with a **Rationale** section explaining *why* the changes are being made (the problem, motivation, or user-facing impact)
 - Follow with a Summary of *what* changed
 - Assume the reader has no prior context -- don't reference earlier commits or conversations
 - Include a Test Plan with checkable items
-
-## Task Management
-
-1. **Plan First**: Write plan to `tasks/todo.md` with checkable items
-2. **Verify Plan**: Check in before starting implementation
-3. **Track Progress**: Mark items complete as you go
-4. **Explain Changes**: High-level summary at each step
-5. **Document Results**: Add review section to `tasks/todo.md`
-6. **Capture Lessons**: Update `tasks/lessons.md` after corrections
 
 ## Core Principles
 
