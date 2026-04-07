@@ -138,32 +138,46 @@ def _models_from_schema(schema: dict) -> dict[str, type]:
 
     return built_models
 
-
 PREDICT_RLM_INSTRUCTIONS = """You are tasked with producing the following outputs given the inputs {inputs}:
 {output_fields}
 
-You have access to a Python REPL environment. Write code in ```repl blocks and it will be executed. You will see the output, then write more code based on what you learned. This is an iterative, interactive process — explore your data, plan your approach, and build up your answer step by step across multiple iterations.
+You work inside a Python REPL environment. Write code in ```repl blocks and it will be executed. You will see the output, then write more code based on what you learned. This is an iterative, interactive process — explore your data, plan your approach, and build up your answer step by step across multiple iterations.
 
-You may include multiple ```repl blocks in a single response — all of them execute in order and share state. Narrative text between blocks is dropped. This means you can think out loud between code snippets without breaking execution.
+## Workflow Overview
 
-## Available
+### Iterative loop
+- Explore first: inspect sample inputs before extracting anything complicated.
+- Plan each block: treat every iteration as a chance to learn, react to results, and refine.
+- Persist intermediate work: save state to variables (`all_items`, `page_urls`, etc.) between iterations.
 
-- Variables: {inputs} (your input data)
-- `await predict(signature, *, instructions=None, **kwargs)` — your primary analysis tool (async, must await)
-  - signature: str with type hints, e.g. `"page: dspy.Image, question: str -> answer: str"`
-  - For images, use `dspy.Image` type hint and pass URL or base64 string directly
+### Think before you build
+On your first iteration, **explore before you extract**. Print samples of your input data — check types, lengths, what the data looks like. Understand what you're working with before writing any extraction logic. Even a quick `print(type(images), len(images))` or examining the first page can save you from going down the wrong path.
+
+After exploring, plan your approach, then execute it in focused steps. Save intermediate results to variables so you can build on them across iterations.
+
+Use `predict()` for anything requiring understanding of meaning — it's a powerful vision-language model. Use Python for computation, formatting, and aggregation.
+
+## Environment & Tools
+
+### Available interfaces
+
+- Variables: {inputs} (your input data).
+- `await predict(signature, *, instructions=None, **kwargs)` — your primary analysis tool (async, must await).
+  - signature: str with type hints, e.g. `"page: dspy.Image, question: str -> answer: str"`.
+  - For images, use `dspy.Image` type hint and pass URL or base64 string directly.
   - For fields that may be absent (the caller sometimes has no value to pass), use `Optional[T]` in the signature and pass `None` when missing. Example: `"context: Optional[str], question: str -> answer: str"` lets you call `predict(..., context=None, question=q)` when no context is available. Works for any type: `Optional[int]`, `Optional[dspy.Image]`, `Optional[list[str]]`.
-  - instructions: optional str describing the task
+  - instructions: optional str describing the task.
   - Returns a result that supports BOTH `result.answer` (attribute) and `result["answer"]` (subscript). Attribute access works for ALL field names including `items`, `keys`, `values` — no collision issues.
   - **Type contract is enforced on outputs**: if you declare `field: list[X]` (non-Optional) and the VLM fails to produce a valid list, `predict()` raises `RuntimeError` with a clear message telling you to simplify the schema or mark the field `Optional`. An empty list `[]` is ALWAYS valid — it means "VLM extracted nothing matching the criteria", which is distinct from "VLM failed to produce a list". Don't speculate "predict returned None" — check what you actually got back: `[]` is valid empty output, `None` is only possible for Optional-declared fields.
-  - Capacity: ~400K tokens per call — you can pass substantial data
-- `print()` — ALWAYS print to see results (output is truncated per iteration — see "Output visibility" below)
+  - Capacity: ~400K tokens per call — you can pass substantial data.
+- `print()` — ALWAYS print to see results (output is truncated per iteration — see "Managing state & output" below).
 - `SUBMIT({final_output_names})` — submit final output when done. The argument names are EXACTLY the output field names from your task's signature (shown above) — use them verbatim. If the task outputs `-> result: SomeType`, call `SUBMIT(result=...)`, NOT `SUBMIT(items=...)` or `SUBMIT(output=...)`.
 - Standard libraries: re, json, collections, math, asyncio, etc.
 
+### Execution model
 The REPL runs inside an async event loop — use `await` directly, not `asyncio.run()`.
 
-## Output visibility between iterations
+## Managing state & output
 
 Each iteration's printed output is captured and shown to you in subsequent iterations, but **truncated to ~5000 characters**. This is a hard limit — output beyond 5K chars is cut off.
 
@@ -177,18 +191,9 @@ Each iteration's printed output is captured and shown to you in subsequent itera
 - **Slice large output:** `print(str(data)[:2000])` now, `print(str(data)[2000:4000])` next iteration.
 - **Never rely on seeing full print output** — if you need the data, it should be in a variable.
 
-## Think step by step — iterate, don't solve all at once
+## Using `predict()` effectively
 
-This is ITERATIVE. Each code block executes, you see the output, then you decide what to do next. State persists between iterations, so use variables as buffers to accumulate findings.
-
-On your first iteration, **explore before you extract**. Print samples of your input data — check types, lengths, what the data looks like. Understand what you're working with before writing any extraction logic. Even a quick `print(type(images), len(images))` or examining the first page can save you from going down the wrong path.
-
-After exploring, plan your approach, then execute it in focused steps. Save intermediate results to variables so you can build on them across iterations.
-
-Use `predict()` for anything requiring understanding of meaning — it's a powerful vision-language model. Use Python for computation, formatting, and aggregation.
-
-## Parallelizing predict() calls
-
+### Core usage pattern
 `predict()` is async and much faster when run concurrently. For independent calls, always use `asyncio.gather()`:
 
 ```repl
@@ -199,8 +204,7 @@ results = await asyncio.gather(*tasks)
 
 Use sequential iteration only when each step depends on previous results (e.g. accumulating context across pages).
 
-## Output types
-
+### Typed outputs and schemas
 Prefer typed outputs over JSON strings:
 
 ```repl
@@ -232,7 +236,7 @@ for item in result.items:                # attribute access works even for "item
 
 Important: the model MUST extend `BaseModel` (not `dict`). Only include fields the model can actually produce from the input. Any fields you populate yourself after prediction must have defaults.
 
-### Working with Pydantic values returned by predict
+### Working with Pydantic values returned by `predict`
 
 When your signature uses a custom type like `list[LineItem]`, the values inside the result are **real Pydantic instances** (not dicts):
 
@@ -244,113 +248,77 @@ When your signature uses a custom type like `list[LineItem]`, the values inside 
 
 Don't add defensive handling like `if isinstance(x, dict): ...else: ...` for fields your signature declared as typed — if the signature says `items: list[LineItem]`, predict will give you LineItem instances (or `None`/`[]`, already coerced).
 
-## Examples
+## Work patterns & examples
 
-Suppose you have a set of document images and need to extract key dates from each page. You might start by exploring the data, then process each page:
+### Explore inputs before writing logic
+Whatever the task, start by understanding what the runtime handed you. Quick probes prevent wasted iterations:
 
 ```repl
-print(f"Number of pages: {{len(images)}}")
-# Look at what we're working with
-sample = await predict(
-    "page: dspy.Image -> description: str",
-    instructions="Briefly describe what this page contains.",
-    page=images[0],
+print(f"Total inputs: {{len(documents)}}")
+print(type(documents[0]))
+
+orientation = await predict(
+    "doc: dspy.Image -> overview: str, notable_elements: list[str]",
+    instructions="Give a short description so I know what this document is about and what signals it contains.",
+    doc=documents[0],
 )
-print(sample.description)
+print(orientation.overview)
+print(orientation.notable_elements[:2])
 ```
 
-Then in the next iteration, once you understand the format, extract from all pages in parallel:
+Swap `documents` for the variables your task provides — the idea is to look before you build.
+
+### Sequential context-building
+When each step depends on the last (requirements evolving across drafts, calculations that feed future pages, etc.), surface what you already know and pass it forward:
 
 ```repl
-import asyncio
-tasks = [
-    predict(
-        "page: dspy.Image -> dates: list[str], context: str",
-        instructions="Extract all dates mentioned on this page with their context.",
-        page=img,
-    )
-    for img in images
-]
-results = await asyncio.gather(*tasks)
-for i, r in enumerate(results):
-    print(f"Page {{i}}: {{r.dates}}")
-```
-
----
-
-Suppose you're processing a long document page by page and need to track requirements as you go. Since each page's meaning depends on what came before, process sequentially and build state:
-
-```repl
-findings = []
-for i, img in enumerate(images):
-    prior_summary = "; ".join(findings[-3:]) if findings else "None yet"
+insights = []
+for i, chunk in enumerate(chunks):
+    context = "; ".join(insights[-2:]) if insights else "None yet"
     result = await predict(
-        "page: dspy.Image, prior: str -> new_requirements: list[str]",
-        instructions=f"Page {{i+1}} of {{len(images)}}. Identify new requirements not already covered in prior findings.",
-        page=img, prior=prior_summary,
+        "chunk: str, prior: str -> new_insights: list[str]",
+        instructions=f"Section {{i+1}} of {{len(chunks)}}. Capture new takeaways that aren't already in prior.",
+        chunk=chunk,
+        prior=context,
     )
-    findings.extend(result.new_requirements)
-    print(f"Page {{i+1}}: +{{len(result.new_requirements)}} requirements (total: {{len(findings)}})")
+    insights.extend(result.new_insights)
+    print(f"Section {{i+1}}: +{{len(result.new_insights)}} (total {{len(insights)}})")
 ```
 
----
+This approach works for reasoning chains, progressive audits, or simulations where later iterations depend on earlier conclusions.
 
-Suppose you have 50 pages and need to find all mentions of insurance requirements. Map across all pages in parallel, then synthesize:
+### Parallel mapping then synthesis
+If inputs are independent, fan out `predict()` calls concurrently, then use Python (or another `predict`) to combine the partial work:
 
 ```repl
 import asyncio
 tasks = [
     predict(
-        "page: dspy.Image -> insurance_items: list[str]",
-        instructions="Extract any insurance requirements, coverage amounts, or policy references.",
+        "page: dspy.Image -> signals: list[str], follow_up: Optional[str]",
+        instructions="List the most important insights on this page and anything that needs deeper review.",
         page=img,
     )
     for img in images
 ]
 page_results = await asyncio.gather(*tasks)
 
-# Collect all items with page references
-all_items = []
+signals = []
 for i, r in enumerate(page_results):
-    for item in r.insurance_items:
-        all_items.append(f"[Page {{i+1}}] {{item}}")
-print(f"Found {{len(all_items)}} insurance items across {{len(images)}} pages")
-```
+    for signal in r.signals:
+        signals.append(f"Page {{i+1}}: {{signal}}")
 
-Then synthesize into a structured answer:
-
-```repl
-combined = "\\n".join(all_items)
-final = await predict(
-    "raw_items: str -> requirements: list[str], total_coverage: str, sources: list[int]",
-    instructions="Deduplicate and organize these insurance items. Cite source page numbers.",
-    raw_items=combined,
+summary = await predict(
+    "signals: list[str] -> clusters: list[str], action_items: list[str]",
+    instructions="Group related signals and surface concrete next steps.",
+    signals=signals,
 )
-print(final)
+print(summary)
 ```
 
----
+Adjust the signatures to match your task (classification, QA, calculations, simulations, planning, etc.); the structure—map, collect, synthesize—stays the same.
 
-Suppose you've extracted items but aren't sure you got everything — maybe some pages had unusual formatting or small print. Run a targeted verification pass:
 
-```repl
-# Re-examine pages that returned few or no items
-sparse_pages = [i for i, r in enumerate(page_results) if len(r.insurance_items) == 0]
-print(f"Re-checking {{len(sparse_pages)}} pages that had no results")
-
-recheck_tasks = [
-    predict(
-        "page: dspy.Image -> missed_items: list[str], notes: str",
-        instructions="Look very carefully for any insurance-related content, including footnotes, sidebars, and fine print.",
-        page=images[i],
-    )
-    for i in sparse_pages
-]
-rechecked = await asyncio.gather(*recheck_tasks)
-for idx, r in zip(sparse_pages, rechecked):
-    if r.missed_items:
-        print(f"Page {{idx+1}} had missed items: {{r.missed_items}}")
-```
+## Submitting results
 
 Once you've verified the results, submit them. `SUBMIT` takes **one argument per output field**, named after each field. Use keyword arguments for clarity, especially when there are multiple outputs:
 
@@ -374,8 +342,6 @@ SUBMIT(result=ExtractionResult(items=[TaskItem(title="a")]))
 SUBMIT(result=[task.model_dump() for task in tasks])
 ```
 
-## When done
-
 Your work is only captured when you call `SUBMIT({final_output_names})`. The REPL loop keeps running until SUBMIT is called — it will NOT stop on its own. If the session ends without a SUBMIT call, nothing is returned and your work is lost. So always end with SUBMIT.
 
 **This is NOT a Jupyter notebook.** Writing a variable name alone as the last expression (e.g. just `result` at the end of a block) does NOT submit it — bare expressions evaluate and get discarded. You MUST call `SUBMIT(...)` explicitly. If you've done the work and put it in a variable, the final step is always `SUBMIT(field_name=your_variable)`.
@@ -388,7 +354,8 @@ SUBMIT's arguments are validated against the output field types. If validation f
 - `[Error] Missing output fields: ['sources']. Use SUBMIT(items, total_count, sources)`
 - `[Type Error] items: expected list, got str: ...`
 
-When you see these, fix the call and try SUBMIT again — the loop continues until a valid SUBMIT succeeds."""
+When you see these, fix the call and try SUBMIT again — the loop continues until a valid SUBMIT succeeds.
+"""
 
 
 class PredictRLM(dspy.RLM):
