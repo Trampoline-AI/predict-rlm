@@ -1,11 +1,57 @@
 name: Release
 
 on:
-  release:
-    types: [published]
+  push:
+    tags: [ 'v*.*.*' ]
 
 jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Verify tag is on main
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+
+          # Skip ancestry check for prerelease tags (e.g., v1.2.3-rc.1)
+          if [[ "$TAG" == *"-"* ]]; then
+            echo "::notice title=Ancestry Check Skipped::Prerelease tag '$TAG', skipping main ancestry check."
+            exit 0
+          fi
+
+          git fetch origin main
+          if git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
+            echo "Tag '$TAG' is a valid commit on main"
+          else
+            echo "::error::Tag '$TAG' is not on main. Ensure the tagged commit is on the main branch."
+            exit 1
+          fi
+
+      - name: Validate version matches tag
+        run: |
+          TAG_VERSION="${GITHUB_REF_NAME#v}"
+          PYPROJECT_VERSION=$(grep -oP '^version = "\K[^"]+' pyproject.toml)
+          if [ "$TAG_VERSION" != "$PYPROJECT_VERSION" ]; then
+            echo "::error::Tag version ($TAG_VERSION) does not match pyproject.toml version ($PYPROJECT_VERSION). Update pyproject.toml before tagging."
+            exit 1
+          fi
+
+  release:
+    needs: validate
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+
   build:
+    needs: release
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
