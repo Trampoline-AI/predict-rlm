@@ -1,9 +1,11 @@
 # predict-rlm
 
-[![Tests](https://github.com/Trampoline-AI/predict-rlm/actions/workflows/tests.yml/badge.svg)](https://github.com/Trampoline-AI/predict-rlm/actions/workflows/tests.yml)
-[![codecov](https://codecov.io/gh/Trampoline-AI/predict-rlm/graph/badge.svg?token=NNS3R7OIT2)](https://codecov.io/gh/Trampoline-AI/predict-rlm)
-[![Book a Call](https://img.shields.io/badge/Book_a_Call-Cal.com-292929?style=flat&logo=cal.com)](https://cal.com/team/trampoline)
+[![Tests](https://img.shields.io/github/actions/workflow/status/Trampoline-AI/predict-rlm/tests.yml?label=Tests)](https://github.com/Trampoline-AI/predict-rlm/actions/workflows/tests.yml)
+[![codecov](https://img.shields.io/codecov/c/github/Trampoline-AI/predict-rlm?token=NNS3R7OIT2&color=brightgreen&label=codecov)](https://codecov.io/gh/Trampoline-AI/predict-rlm)
+[![PyPI](https://img.shields.io/pypi/v/predict-rlm?color=blue)](https://pypi.org/project/predict-rlm/)
+[![Python](https://img.shields.io/pypi/pyversions/predict-rlm)](https://pypi.org/project/predict-rlm/)
 [![Discord](https://img.shields.io/badge/Discord-Join-5865F2?style=flat&logo=discord&logoColor=white)](https://discord.gg/BAkd288sGN)
+[![GitHub stars](https://img.shields.io/github/stars/trampoline-ai/predict-rlm)](https://github.com/Trampoline-AI/predict-rlm)
 
 Production-grade RLMs (Recursive Language Models) with tool use, built on [DSPy](https://github.com/stanfordnlp/dspy). By [Trampoline AI](https://www.trampoline.ai/).
 
@@ -66,10 +68,10 @@ Your agent will then know how to build RLMs using predict-rlm — including the 
 
 | Example | Description | Input / Output | Preview |
 |---|---|---|---|
-| [Document Analysis](examples/document_analysis/) | Analyze documents and extract key dates, entities, and financial information into a structured report | **Input:** 1 PDF, 136 pages<br>**Output:** Structured briefing report with key dates, entities, and financial info ([sample](examples/document_analysis/sample/output/report.md)) | <a href="examples/document_analysis/sample/output/report.md"><img src="examples/document_analysis/sample/output/screenshot.png" width="200"></a> |
-| [Document Redaction](examples/document_redaction/) | Redact PII from PDFs based on a policy, then verify the redactions visually | **Input:** 1 PDF, 6 pages<br>**Output:** 96 PII redactions across 6 categories, verified redacted PDF ([sample](examples/document_redaction/sample/output/output.md)) | <a href="examples/document_redaction/sample/output/output.md"><img src="examples/document_redaction/sample/output/screenshot.png" width="200"></a> |
-| [Invoice Processing](examples/invoice_processing/) | Extract vendor info, line items, and totals from PDF invoices into a consolidated Excel spreadsheet | **Input:** 2 PDFs, 2 pages<br>**Output:** Line items, totals, and vendor info in Excel ([sample](examples/invoice_processing/sample/output/)) | <a href="examples/invoice_processing/sample/output/output.md"><img src="examples/invoice_processing/sample/output/screenshot.png" width="200"></a> |
-| [Contract Comparison](examples/contract_comparison/) | Compare two contract versions and produce a structured diff report with per-section analysis | **Input:** 2 PDFs, 45 pages<br>**Output:** Per-section diff report with key differences ([sample](examples/contract_comparison/sample/output/)) | <a href="examples/contract_comparison/sample/output/comparison-report.md"><img src="examples/contract_comparison/sample/output/screenshot.png" width="200"></a> |
+| [Document Analysis](examples/document_analysis/) | Analyze documents and extract key dates, entities, and financial information into a structured report | **Input:** 1 PDF, 136 pages<br>**Output:** Structured briefing report with key dates, entities, and financial info ([sample](examples/document_analysis/sample/output/report.md)) | <a href="examples/document_analysis/sample/output/report.md"><img src="https://raw.githubusercontent.com/Trampoline-AI/predict-rlm/main/examples/document_analysis/sample/output/screenshot.png" width="200"></a> |
+| [Document Redaction](examples/document_redaction/) | Redact PII from PDFs based on a policy, then verify the redactions visually | **Input:** 1 PDF, 6 pages<br>**Output:** 96 PII redactions across 6 categories, verified redacted PDF ([sample](examples/document_redaction/sample/output/output.md)) | <a href="examples/document_redaction/sample/output/output.md"><img src="https://raw.githubusercontent.com/Trampoline-AI/predict-rlm/main/examples/document_redaction/sample/output/screenshot.png" width="200"></a> |
+| [Invoice Processing](examples/invoice_processing/) | Extract vendor info, line items, and totals from PDF invoices into a consolidated Excel spreadsheet | **Input:** 2 PDFs, 2 pages<br>**Output:** Line items, totals, and vendor info in Excel ([sample](examples/invoice_processing/sample/output/)) | <a href="examples/invoice_processing/sample/output/output.md"><img src="https://raw.githubusercontent.com/Trampoline-AI/predict-rlm/main/examples/invoice_processing/sample/output/screenshot.png" width="200"></a> |
+| [Contract Comparison](examples/contract_comparison/) | Compare two contract versions and produce a structured diff report with per-section analysis | **Input:** 2 PDFs, 45 pages<br>**Output:** Per-section diff report with key differences ([sample](examples/contract_comparison/sample/output/)) | <a href="examples/contract_comparison/sample/output/comparison-report.md"><img src="https://raw.githubusercontent.com/Trampoline-AI/predict-rlm/main/examples/contract_comparison/sample/output/screenshot.png" width="200"></a> |
 
 ## Why RLMs?
 
