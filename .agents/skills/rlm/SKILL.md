@@ -94,6 +94,7 @@ Use web search and the Explore subagent to:
 5. **Check for existing skills**. The built-in skills are:
    - `pdf` — pymupdf for PDF rendering, text extraction, manipulation
    - `spreadsheet` — openpyxl, pandas, formulas for Excel work
+   - `docx` — python-docx for reading, writing, and modifying Word documents
 
 Report findings to the user with a clear feasibility assessment. Flag any blockers.
 
@@ -441,12 +442,14 @@ Skills can bundle **host-side tools** via their `tools=` field. When skills are 
 ```python
 from predict_rlm.skills import pdf as pdf_skill          # pymupdf
 from predict_rlm.skills import spreadsheet as spreadsheet_skill  # openpyxl, pandas, formulas
+from predict_rlm.skills import docx as docx_skill        # python-docx
 ```
 
 | Skill | Packages | Modules | What it teaches the RLM |
 |---|---|---|---|
 | **pdf** | `pymupdf` | — | Read, render, modify, and redact PDFs |
 | **spreadsheet** | `openpyxl`, `pandas`, `formulas` | `formula_eval` | Build and modify Excel workbooks with formulas and formatting |
+| **docx** | `python-docx` | `md2docx` | Read, write, and modify Word documents with tables, formatting, and styles |
 
 ## Tools
 
@@ -494,7 +497,7 @@ Each predict() call gets its own context window. Supports `dspy.Image` for multi
 
 ```python
 from predict_rlm import PredictRLM, Skill, File
-from predict_rlm.skills import pdf, spreadsheet
+from predict_rlm.skills import pdf, spreadsheet, docx
 ```
 
 ## WASM sandbox constraints

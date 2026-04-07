@@ -239,15 +239,16 @@ report = evaluate("output.xlsx")
 predict-rlm ships a library of pre-built skills you can use directly:
 
 ```python
-from predict_rlm.skills import pdf, spreadsheet
+from predict_rlm.skills import pdf, spreadsheet, docx
 
-rlm = PredictRLM(MySignature, skills=[pdf, spreadsheet])
+rlm = PredictRLM(MySignature, skills=[pdf, spreadsheet, docx])
 ```
 
 | Skill | Import | Packages | Modules | What it teaches the RLM |
 |---|---|---|---|---|
 | **pdf** | `from predict_rlm.skills import pdf` | `pymupdf` | — | Read, render, modify, and redact PDFs |
 | **spreadsheet** | `from predict_rlm.skills import spreadsheet` | `openpyxl`, `pandas`, `formulas` | `formula_eval` | Build and modify Excel workbooks with formulas and formatting |
+| **docx** | `from predict_rlm.skills import docx` | `python-docx` | `md2docx` | Read, write, and modify Word documents with tables, formatting, and styles |
 
 ## Examples
 

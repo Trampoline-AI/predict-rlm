@@ -25,9 +25,8 @@ class AnalyzeDocuments(dspy.Signature):
        Use tables for structured data, prose for analysis and context.
     """
 
-    documents: list[File] = dspy.InputField(
-        desc="PDF documents to analyze"
-    )
+    documents: list[File] = dspy.InputField(desc="PDF documents to analyze")
     analysis: DocumentAnalysis = dspy.OutputField(
         desc="Structured analysis with markdown report, key dates, and key entities"
     )
+    docx_report: File = dspy.OutputField(desc="The report in Docx format")

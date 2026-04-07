@@ -2,12 +2,13 @@
 
 Usage::
 
-    from predict_rlm.skills import pdf, spreadsheet
+    from predict_rlm.skills import pdf, spreadsheet, docx
 
-    rlm = PredictRLM(sig, skills=[pdf, spreadsheet])
+    rlm = PredictRLM(sig, skills=[pdf, spreadsheet, docx])
 """
 
+from .docx import docx_skill as docx
 from .pdf import pdf_skill as pdf
 from .spreadsheet import spreadsheet_skill as spreadsheet
 
-__all__ = ["pdf", "spreadsheet"]
+__all__ = ["docx", "pdf", "spreadsheet"]

@@ -16,6 +16,7 @@ Usage::
 import dspy
 
 from predict_rlm import File, PredictRLM
+from predict_rlm.skills import docx as docx_skill
 from predict_rlm.skills import pdf as pdf_skill
 
 from .schema import DocumentAnalysis
@@ -37,19 +38,16 @@ class DocumentAnalyzer(dspy.Module):
         self.verbose = verbose
         self.debug = debug
 
-    async def aforward(
-        self, documents: list[File], criteria: str
-    ) -> DocumentAnalysis:
+    async def aforward(self, documents: list[File], criteria: str):
         signature = AnalyzeDocuments.with_instructions(
             AnalyzeDocuments.instructions + "\n\n# Task\n\n" + criteria.strip()
         )
         predictor = PredictRLM(
             signature,
             sub_lm=self.sub_lm,
-            skills=[pdf_skill],
+            skills=[pdf_skill, docx_skill],
             max_iterations=self.max_iterations,
             verbose=self.verbose,
             debug=self.debug,
         )
-        result = await predictor.acall(documents=documents)
-        return result.analysis
+        return await predictor.acall(documents=documents)

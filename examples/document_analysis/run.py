@@ -176,16 +176,26 @@ async def main():
     )
     start_time = time.perf_counter()
     with dspy.context(lm=lm):
-        result = await analyzer.aforward(documents=documents, criteria=CRITERIA)
+        prediction = await analyzer.aforward(documents=documents, criteria=CRITERIA)
     run_duration = time.perf_counter() - start_time
+    result = prediction.analysis
 
-    # Save report to output dir
+    # Save reports to output dir
     run_id = datetime.now().strftime("%Y%m%d-%H%M%S")
     output_dir = Path(__file__).parent / "output" / run_id
     output_dir.mkdir(parents=True, exist_ok=True)
+
     report_path = output_dir / "report.md"
     report_path.write_text(result.report)
     print(f"Report saved to: {report_path}")
+
+    if prediction.docx_report and prediction.docx_report.path:
+        import shutil
+
+        docx_src = Path(prediction.docx_report.path)
+        docx_dest = output_dir / "report.docx"
+        shutil.copy2(docx_src, docx_dest)
+        print(f"Docx report saved to: {docx_dest}")
 
     # Print results
     print()
