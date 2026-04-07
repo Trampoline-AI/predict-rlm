@@ -130,6 +130,11 @@ async def _tool_${toolName}(*args, **kwargs):
 
     try:
         result = await _js_tool_call("${toolName}", payload)
+        if isinstance(result, str):
+            try:
+                return json.loads(result)
+            except (json.JSONDecodeError, ValueError):
+                return result
         return result.to_py() if isinstance(result, JsProxy) else result
     except Exception as e:
         # Re-raise with context but don't corrupt state
@@ -393,7 +398,13 @@ async def _tool_predict(*args, **kwargs):
 
     try:
         result = await _js_tool_call("predict", payload)
-        result = result.to_py() if isinstance(result, JsProxy) else result
+        if isinstance(result, str):
+            try:
+                result = json.loads(result)
+            except (json.JSONDecodeError, ValueError):
+                pass
+        else:
+            result = result.to_py() if isinstance(result, JsProxy) else result
         # Reconstruct Pydantic model instances for output fields so that
         # both task.title (attribute) and task["title"] (subscript) work.
         if isinstance(result, dict):
@@ -574,11 +585,7 @@ function handleToolResponse(response) {
     pending.reject(new Error(response.error.message || "Tool call failed"));
   } else {
     const result = response.result;
-    if (result.type === "json") {
-      pending.resolve(JSON.parse(result.value));
-    } else {
-      pending.resolve(result.value);
-    }
+    pending.resolve(result.value);
   }
   return true;
 }
