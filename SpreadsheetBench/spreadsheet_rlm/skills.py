@@ -328,6 +328,8 @@ This sets the `fullCalcOnLoad` flag in the workbook metadata, guaranteeing that 
 ### Common traps
 
 - **`#NAME?` errors**: you used an Excel-only function. Replace with Python logic or a LibreOffice-compatible formula.
+- **`#VALUE!` from `SUMIF`/`SUMIFS` with array math**: `SUMIF` does NOT support computed arrays (e.g., multiplying two ranges) as the sum_range. Use `SUMPRODUCT` for any criteria-based calculation involving array expressions.
+- **Circular references**: never write a formula into a cell that references itself. If you need to replace a cell's value with a computed result, read the original value into Python first, then write the result back as a literal value — not as a formula referencing the same cell.
 - **Null values**: screen with `pd.notna()` before writing to cells.
 - **Wide datasets**: fiscal-year data frequently sits beyond column 50 — don't stop scanning early.
 - **Duplicate matches**: when searching for a label, verify you've found the right occurrence if it appears more than once.
