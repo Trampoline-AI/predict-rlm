@@ -1,5 +1,6 @@
 import argparse
 import asyncio
+import contextvars
 import json
 import logging
 import os
@@ -14,24 +15,56 @@ import dspy
 from predict_rlm import File
 from spreadsheet_rlm import SpreadsheetRLM
 
-LM = "openai/mercury-2"
+LM = "openai/gpt-5.4"
 SUB_LM = "openai/gpt-5.1"
 
 
 RLM_LOGGER = "dspy.predict.rlm"
 
+_current_log_file: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+    "current_log_file", default=None
+)
+
+
+class _TaskFileHandler(logging.Handler):
+    """Routes log records to the file set by each async task's ContextVar."""
+
+    def __init__(self):
+        super().__init__()
+        self._files: dict[str, object] = {}
+
+    def emit(self, record):
+        log_file = _current_log_file.get()
+        if log_file is None:
+            return
+        if log_file not in self._files:
+            self._files[log_file] = open(log_file, "a")
+        self._files[log_file].write(self.format(record) + "\n")
+        self._files[log_file].flush()
+
+    def close(self):
+        for f in self._files.values():
+            f.close()
+        self._files.clear()
+        super().close()
+
 
 def setup_run_logging(log_dir="logs"):
-    """Create a run folder and suppress noisy loggers. Returns the run dir path."""
+    """Create a run folder and suppress noisy loggers. Returns the run dir path and handler."""
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     run_dir = os.path.join(log_dir, f"run_{timestamp}")
     os.makedirs(run_dir, exist_ok=True)
 
     # Only let the RLM logger through; silence everything else
     logging.getLogger().setLevel(logging.WARNING)
-    logging.getLogger(RLM_LOGGER).setLevel(logging.DEBUG)
+    rlm_logger = logging.getLogger(RLM_LOGGER)
+    rlm_logger.setLevel(logging.DEBUG)
 
-    return run_dir
+    handler = _TaskFileHandler()
+    handler.setFormatter(logging.Formatter("%(message)s"))
+    rlm_logger.addHandler(handler)
+
+    return run_dir, handler
 
 
 def get_model_config(model: str):
@@ -55,7 +88,7 @@ def get_model_config(model: str):
 
 
 async def run_benchmark(opt):
-    run_dir = setup_run_logging()
+    run_dir, log_handler = setup_run_logging()
     print(f"Logs: {run_dir}/")
 
     dataset_path = os.path.abspath(f"data/{opt.dataset}")
@@ -83,15 +116,20 @@ async def run_benchmark(opt):
     skipped = 0
     start_time = time.time()
 
-    for data in tqdm(
-        dataset[: opt.limit] if opt.limit else dataset, desc="Running RLM"
-    ):
+    # Build work items
+    work_items = []
+    tasks = dataset[: opt.limit] if opt.limit else dataset
+    if opt.task:
+        tasks = [d for d in dataset if str(d["id"]) == opt.task]
+    for data in tasks:
         task_id = str(data["id"])
         instruction = data["instruction"]
         spreadsheet_dir = f"{dataset_path}/{data['spreadsheet_path']}"
 
         for idx in range(1, 4):
-            input_file = f"{spreadsheet_dir}/{idx}_{task_id}_input.xlsx"
+            input_file = f"{spreadsheet_dir}/{idx}_{task_id}_init.xlsx"
+            if not os.path.exists(input_file):
+                input_file = f"{spreadsheet_dir}/{idx}_{task_id}_input.xlsx"
             output_file = f"{output_dir}/{idx}_{task_id}_output.xlsx"
 
             if os.path.exists(output_file) and not opt.overwrite:
@@ -99,23 +137,33 @@ async def run_benchmark(opt):
                 continue
 
             if not os.path.exists(input_file):
-                print(f"Missing input: {input_file}, skipping")
                 skipped += 1
                 continue
 
-            # Set up per-test-case logging
+            work_items.append((task_id, idx, input_file, output_file, instruction))
+
+    queue = asyncio.Queue()
+    for item in work_items:
+        queue.put_nowait(item)
+
+    pbar = tqdm(total=len(work_items), desc="Running RLM")
+
+    async def worker():
+        nonlocal ran, succeeded
+        while True:
+            try:
+                task_id, idx, input_file, output_file, instruction = queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+
             task_dir = os.path.join(run_dir, str(task_id))
             os.makedirs(task_dir, exist_ok=True)
             log_file = os.path.join(task_dir, f"run_{idx}.log")
-            logger = logging.getLogger(RLM_LOGGER)
-            fh = logging.FileHandler(log_file)
-            fh.setLevel(logging.DEBUG)
-            fh.setFormatter(logging.Formatter("%(asctime)s %(levelname)s: %(message)s"))
-            logger.addHandler(fh)
 
             ran += 1
             t0 = time.time()
             ok = False
+            _current_log_file.set(log_file)
             try:
                 result = await rlm.aforward(
                     spreadsheet=File(path=input_file),
@@ -138,8 +186,11 @@ async def run_benchmark(opt):
                     f.write(f"{'=' * 40}\n")
                     f.write(f"Duration: {mins}m {secs}s\n")
                     f.write(f"Result: {'OK' if ok else 'FAIL'}\n")
-                logger.removeHandler(fh)
-                fh.close()
+                pbar.update(1)
+
+    await asyncio.gather(*(worker() for _ in range(opt.concurrency)))
+    pbar.close()
+    log_handler.close()
 
     run_duration = time.time() - start_time
 
@@ -226,11 +277,19 @@ def main():
         "--limit", type=int, default=None, help="Limit number of tasks (for testing)"
     )
     parser.add_argument(
+        "--task", type=str, default=None, help="Run a specific task ID (e.g. '24-23')"
+    )
+    parser.add_argument(
         "--overwrite", action="store_true", help="Overwrite existing output files"
+    )
+    parser.add_argument(
+        "--concurrency", type=int, default=10, help="Max concurrent RLM tasks"
     )
     parser.add_argument("--verbose", action="store_true", help="Verbose RLM output")
     parser.add_argument("--debug", action="store_true", help="Debug mode")
     opt = parser.parse_args()
+    import nest_asyncio
+    nest_asyncio.apply()
     asyncio.run(run_benchmark(opt))
 
 
