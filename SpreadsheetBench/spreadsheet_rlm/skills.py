@@ -57,6 +57,27 @@ These return one value per cell and work correctly:
 - **Date**: `DATE`, `YEAR`, `MONTH`, `DAY`, `TODAY`, `NOW`, `DATEDIF`, `EDATE`, `EOMONTH`, `WEEKDAY`, `NETWORKDAYS`
 - **Other**: `ROW`, `COLUMN`, `ROWS`, `COLUMNS`, `LARGE`, `SMALL`, `RANK`, `PERCENTILE`
 
+## `_xlfn.` Prefix — CRITICAL
+
+Some functions require the `_xlfn.` prefix in .xlsx format or LibreOffice will return `#NAME?`. openpyxl writes formulas exactly as given — it does **not** add the prefix automatically. You must include it yourself:
+
+| Write this | NOT this |
+|---|---|
+| `_xlfn.IFNA(...)` | `IFNA(...)` |
+| `_xlfn.IFS(...)` | `IFS(...)` |
+| `_xlfn.SWITCH(...)` | `SWITCH(...)` |
+| `_xlfn.TEXTJOIN(...)` | `TEXTJOIN(...)` |
+| `_xlfn.AGGREGATE(...)` | `AGGREGATE(...)` |
+| `_xlfn.MAXIFS(...)` | `MAXIFS(...)` |
+| `_xlfn.MINIFS(...)` | `MINIFS(...)` |
+| `_xlfn.CONCAT(...)` | `CONCAT(...)` |
+
+If in doubt whether a function needs it, prefer computing the result in Python and writing the value directly.
+
+## Array Formulas (CSE)
+
+Patterns like `SMALL(IF(...))`, `INDEX(IF(...))`, or `LOOKUP(2, 1/(...))` require array (Ctrl+Shift+Enter) evaluation. openpyxl does not write array formulas by default, so these evaluate incorrectly. **Avoid CSE formulas entirely** — compute the result in Python and write the value instead.
+
 ## When to Use Python vs Formulas
 
 | Task | Approach |
@@ -327,9 +348,12 @@ This sets the `fullCalcOnLoad` flag in the workbook metadata, guaranteeing that 
 
 ### Common traps
 
-- **`#NAME?` errors**: you used an Excel-only function. Replace with Python logic or a LibreOffice-compatible formula.
+- **`#NAME?` errors**: either you used an Excel-only function, or you forgot the `_xlfn.` prefix (see table above). Replace with Python logic or fix the prefix.
 - **`#VALUE!` from `SUMIF`/`SUMIFS` with array math**: `SUMIF` does NOT support computed arrays (e.g., multiplying two ranges) as the sum_range. Use `SUMPRODUCT` for any criteria-based calculation involving array expressions.
+- **`#VALUE!` from full-column references**: avoid `$B:$B` in `COUNTIFS`/`SUMIFS` — use bounded ranges like `$B$2:$B$1000`. Full-column refs force evaluation of ~1M cells and can produce errors with date/mixed-type data.
 - **Circular references**: never write a formula into a cell that references itself. If you need to replace a cell's value with a computed result, read the original value into Python first, then write the result back as a literal value — not as a formula referencing the same cell.
+- **OFFSET inside SUMPRODUCT**: LibreOffice doesn't support `OFFSET` returning arrays within `SUMPRODUCT`. Compute the result in Python instead.
+- **GET.CELL / XLM macros**: not supported in .xlsx or LibreOffice. Use Python to compute the equivalent.
 - **Null values**: screen with `pd.notna()` before writing to cells.
 - **Wide datasets**: fiscal-year data frequently sits beyond column 50 — don't stop scanning early.
 - **Duplicate matches**: when searching for a label, verify you've found the right occurrence if it appears more than once.
