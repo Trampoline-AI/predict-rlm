@@ -46,52 +46,67 @@ def find_libreoffice():
     return None
 
 
+_MACRO_SCRIPT = """\
+import uno
+
+def recalc_and_save():
+    ctx = uno.getComponentContext()
+    smgr = ctx.ServiceManager
+    desktop = smgr.createInstanceWithContext("com.sun.star.frame.Desktop", ctx)
+
+    url = "FILE_URL"
+    props = []
+    p = uno.createUnoStruct("com.sun.star.beans.PropertyValue")
+    p.Name = "Hidden"
+    p.Value = True
+    props.append(p)
+
+    doc = desktop.loadComponentFromURL(url, "_blank", 0, tuple(props))
+    doc.calculateAll()
+    doc.store()
+    doc.close(True)
+"""
+
+
 def just_open_libreoffice(filename, soffice_path):
     """
-    Open an xlsx/xls file in LibreOffice Calc headlessly, which triggers
-    formula recalculation, then save it back as xlsx so that openpyxl
-    can read the cached computed values with data_only=True.
+    Open an xlsx file in LibreOffice Calc headlessly, recalculate all
+    formulas, and save in place. This avoids the --convert-to path which
+    can rename sheets.
     """
     filename = os.path.abspath(filename)
     if not os.path.isfile(filename):
         print(f"File not found: {filename}")
         return False
 
-    original_dir = os.path.dirname(filename)
     basename = os.path.basename(filename)
-    name, ext = os.path.splitext(basename)
+    from urllib.parse import quote
+    file_url = "file://" + quote(filename)
 
     with tempfile.TemporaryDirectory() as tmpdir:
         try:
+            profile_dir = os.path.join(tmpdir, "profile")
+            macro_file = os.path.join(tmpdir, "recalc.py")
+
+            with open(macro_file, "w") as f:
+                f.write(_MACRO_SCRIPT.replace("FILE_URL", file_url))
+
             result = subprocess.run(
                 [
                     soffice_path,
                     "--headless",
                     "--calc",
-                    "--convert-to", "xlsx:Calc MS Excel 2007 XML",
-                    "--outdir", tmpdir,
-                    filename,
+                    f"macro:///recalc.recalc_and_save()",
                 ],
                 capture_output=True,
                 text=True,
                 timeout=120,
+                env={**os.environ, "PYTHONPATH": tmpdir},
             )
 
             if result.returncode != 0:
                 print(f"LibreOffice error for {basename}: {result.stderr.strip()}")
                 return False
-
-            converted = os.path.join(tmpdir, name + ".xlsx")
-            if not os.path.isfile(converted):
-                print(f"Converted file not found for {basename}")
-                return False
-
-            dest = os.path.join(original_dir, name + ".xlsx")
-            shutil.move(converted, dest)
-
-            # If the original was .xls (not .xlsx), remove the old file
-            if ext.lower() == ".xls":
-                os.remove(filename)
 
             return True
 
