@@ -349,6 +349,7 @@ This sets the `fullCalcOnLoad` flag in the workbook metadata, guaranteeing that 
 - To read previously computed values without formulas, open with `data_only=True`. **Caution**: saving a workbook opened this way permanently replaces formulas with their last-calculated values.
 - For very large files, `read_only=True` (reading) and `write_only=True` (writing) dramatically reduce memory consumption.
 - Formulas written by openpyxl are stored as text — use `formula_eval.evaluate()` to verify their computed values in Python.
+- **NEVER use `ws.delete_rows()` or `ws.insert_rows()`** — these are O(n²) in WASM and will hang on sheets with more than a few hundred rows. Instead, read all rows into a list, filter/transform in Python, then write back by overwriting cells in place. Clear leftover rows at the bottom by setting cell values to `None`.
 
 ## pandas Essentials
 
