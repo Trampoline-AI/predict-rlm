@@ -177,6 +177,8 @@ async def run_benchmark(opt):
                     print(f"No output for {task_id} test case {idx}")
             except Exception as e:
                 print(f"Error on {task_id} test case {idx}: {e}")
+                with open(log_file, "a") as f:
+                    f.write(f"\nERROR: {e}\n")
             finally:
                 elapsed = time.time() - t0
                 mins, secs = divmod(int(elapsed), 60)
