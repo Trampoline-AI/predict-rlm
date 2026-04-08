@@ -45,6 +45,16 @@ const jsonrpcError = (code, message, id, data = null) => {
 const jsonrpcRequest = (method, params, id) =>
   JSON.stringify({ jsonrpc: "2.0", method, params, id });
 
+/** Replace contiguous runs of binary characters (surrogates, control chars)
+ *  with a human-readable placeholder so JSON.stringify produces valid UTF-8. */
+const filterBinary = (s) => {
+  if (typeof s !== 'string') return s;
+  return s.replace(
+    /[\uD800-\uDFFF\x00-\x08\x0B\x0C\x0E-\x1F]+/g,
+    (m) => `<${m.length} binary bytes>`,
+  );
+};
+
 // =============================================================================
 // Python Code Templates
 // =============================================================================
@@ -921,6 +931,7 @@ while (true) {
         pyodide.runPython("sys.stdout, sys.stderr = old_stdout, old_stderr");
 
         let output = (result === null || result === undefined) ? capturedStdout : (result.toJs?.() ?? result);
+        if (typeof output === 'string') output = filterBinary(output);
         console.log(jsonrpcResult({ output }, requestId));
       } catch (error) {
         codeExecutionInProgress = false;
