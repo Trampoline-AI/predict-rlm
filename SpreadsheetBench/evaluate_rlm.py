@@ -6,6 +6,7 @@ import argparse
 import numpy as np
 from tqdm import tqdm
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from openpyxl.styles import PatternFill, Font
 
 
@@ -120,12 +121,25 @@ def generate_cell_names(range_str):
     return cell_names
 
 
+def expand_column_range(cell_range, ws):
+    """Expand whole-column ranges like 'A:G' to 'A1:G{max_row}' using the worksheet."""
+    if ':' not in cell_range:
+        return cell_range
+    start, end = cell_range.split(':')
+    start_has_row = any(c.isdigit() for c in start)
+    end_has_row = any(c.isdigit() for c in end)
+    if not start_has_row and not end_has_row:
+        return f"{start}1:{end}{ws.max_row}"
+    return cell_range
+
+
 def cell_level_compare(wb_gt, wb_proc, sheet_name, cell_range):
     if sheet_name not in wb_proc:
         return False, f"Sheet '{sheet_name}' not found in output (has: {wb_proc.sheetnames})"
     ws_gt = wb_gt[sheet_name]
     ws_proc = wb_proc[sheet_name]
 
+    cell_range = expand_column_range(cell_range, ws_gt)
     cell_names = generate_cell_names(cell_range)
     diffs = []
     matched = 0
@@ -147,6 +161,30 @@ def cell_level_compare(wb_gt, wb_proc, sheet_name, cell_range):
     return True, f"Sheet '{sheet_name}' range {cell_range}: all {total} cells match"
 
 
+def split_answer_position(answer_position):
+    """Split answer_position on commas, respecting single-quoted sheet names."""
+    # If quotes are balanced, use quote-aware splitting; otherwise fall back to
+    # naive split (handles malformed data like Sheet3'!A:G,'Sheet4'!A:G).
+    if answer_position.count("'") % 2 != 0:
+        return answer_position.split(',')
+
+    parts = []
+    current = []
+    in_quotes = False
+    for ch in answer_position:
+        if ch == "'":
+            in_quotes = not in_quotes
+            current.append(ch)
+        elif ch == ',' and not in_quotes:
+            parts.append(''.join(current))
+            current = []
+        else:
+            current.append(ch)
+    if current:
+        parts.append(''.join(current))
+    return parts
+
+
 def compare_workbooks(gt_file, proc_file, instruction_type, answer_position):
     if not os.path.exists(proc_file):
         return False, "Output file does not exist"
@@ -157,7 +195,7 @@ def compare_workbooks(gt_file, proc_file, instruction_type, answer_position):
     except Exception as e:
         return False, f"Failed to load workbooks: {e}"
 
-    sheet_cell_ranges = answer_position.split(',')
+    sheet_cell_ranges = split_answer_position(answer_position)
     result_list = []
     msg_list = []
     for sheet_cell_range in sheet_cell_ranges:
@@ -188,6 +226,8 @@ def parse_option():
     parser.add_argument('--dataset', type=str, default="all_data_912", help='dataset name')
     parser.add_argument('--log_dir', type=str, default=None,
         help='run log directory to write per-test-case eval logs into (e.g. logs/run_20260407_141500)')
+    parser.add_argument('--concurrency', type=int, default=4,
+        help='Number of tasks to evaluate in parallel (default: 4)')
 
     opt = parser.parse_args()
 
@@ -202,6 +242,81 @@ def parse_option():
     return opt
 
 
+def evaluate_task(data, dataset_path, output_dir, log_dir):
+    """Evaluate a single task. Returns (result_dict, skipped) tuple."""
+    task_id = data['id']
+    spreadsheet_dir = f"{dataset_path}/spreadsheet/{task_id}"
+
+    # Detect how many test cases exist for this task (1 or 3)
+    num_cases = 0
+    for idx in range(1, 4):
+        gt = f"{spreadsheet_dir}/{idx}_{task_id}_golden.xlsx"
+        if not os.path.exists(gt):
+            gt = f"{spreadsheet_dir}/{idx}_{task_id}_answer.xlsx"
+        if os.path.exists(gt):
+            num_cases = idx
+        else:
+            break
+    if num_cases == 0:
+        return None, True
+
+    # Check if any output exists for this task
+    has_output = any(
+        os.path.exists(f"{output_dir}/{idx}_{task_id}_output.xlsx")
+        for idx in range(1, num_cases + 1)
+    )
+    if not has_output:
+        return None, True
+
+    # Build answer_position with sheet info when provided separately
+    answer_position = data['answer_position']
+    answer_sheet = data.get('answer_sheet')
+    if answer_sheet and '!' not in answer_position:
+        sheets = [s.strip().strip("'") for s in answer_sheet.split(',')]
+        ranges = [r.strip() for r in answer_position.split(',')]
+        if len(sheets) > 1 and len(ranges) == 1:
+            answer_position = ','.join(f"'{s}'!{ranges[0]}" for s in sheets)
+        elif len(sheets) == 1:
+            answer_position = f"'{sheets[0]}'!{answer_position}"
+
+    test_case_results = []
+    for idx in range(1, num_cases + 1):
+        gt_path = f"{spreadsheet_dir}/{idx}_{task_id}_golden.xlsx"
+        if not os.path.exists(gt_path):
+            gt_path = f"{spreadsheet_dir}/{idx}_{task_id}_answer.xlsx"
+        proc_path = f"{output_dir}/{idx}_{task_id}_output.xlsx"
+        try:
+            result, msg = compare_workbooks(gt_path, proc_path, data['instruction_type'], answer_position)
+        except Exception as e:
+            result, msg = False, f"Exception: {e}"
+
+        if log_dir:
+            task_dir = os.path.join(log_dir, str(task_id))
+            os.makedirs(task_dir, exist_ok=True)
+            eval_log = os.path.join(task_dir, f"eval_{idx}.log")
+            with open(eval_log, 'w') as lf:
+                status = "PASS" if result else "FAIL"
+                lf.write(f"{status}\n")
+                lf.write(f"task: {task_id} test_case: {idx}\n")
+                lf.write(f"type: {data['instruction_type']}\n")
+                lf.write(f"answer_position: {answer_position}\n")
+                lf.write(f"gt:   {gt_path}\n")
+                lf.write(f"proc: {proc_path}\n")
+                lf.write(f"\n{msg}\n")
+
+        test_case_results.append(int(result))
+
+    soft_restriction = test_case_results.count(1) / len(test_case_results)
+    hard_restriction = 0 if 0 in test_case_results else 1
+    return {
+        'id': task_id,
+        'instruction_type': data['instruction_type'],
+        'test_case_results': test_case_results,
+        'soft_restriction': soft_restriction,
+        'hard_restriction': hard_restriction,
+    }, False
+
+
 def evaluation(opt):
     dataset_path = os.path.abspath(f'data/{opt.dataset}')
     with open(f'{dataset_path}/dataset.json', 'r') as fp:
@@ -211,50 +326,18 @@ def evaluation(opt):
 
     eval_results = []
     skipped = 0
-    for data in tqdm(dataset):
-        # Check if any output exists for this task
-        has_output = any(
-            os.path.exists(f"{output_dir}/{idx}_{data['id']}_output.xlsx")
-            for idx in range(1, 4)
-        )
-        if not has_output:
-            skipped += 1
-            continue
 
-        test_case_results = []
-        for test_case_idx in range(3):
-            idx = test_case_idx + 1
-            gt_path = f"{dataset_path}/spreadsheet/{data['id']}/{idx}_{data['id']}_answer.xlsx"
-            proc_path = f"{output_dir}/{idx}_{data['id']}_output.xlsx"
-            try:
-                result, msg = compare_workbooks(gt_path, proc_path, data['instruction_type'], data['answer_position'])
-            except Exception as e:
-                result, msg = False, f"Exception: {e}"
-
-            if opt.log_dir:
-                task_dir = os.path.join(opt.log_dir, str(data['id']))
-                os.makedirs(task_dir, exist_ok=True)
-                eval_log = os.path.join(task_dir, f"eval_{idx}.log")
-                with open(eval_log, 'w') as lf:
-                    status = "PASS" if result else "FAIL"
-                    lf.write(f"{status}\n")
-                    lf.write(f"task: {data['id']} test_case: {idx}\n")
-                    lf.write(f"type: {data['instruction_type']}\n")
-                    lf.write(f"answer_position: {data['answer_position']}\n")
-                    lf.write(f"gt:   {gt_path}\n")
-                    lf.write(f"proc: {proc_path}\n")
-                    lf.write(f"\n{msg}\n")
-
-            test_case_results.append(int(result))
-        soft_restriction = test_case_results.count(1) / len(test_case_results)
-        hard_restriction = 0 if 0 in test_case_results else 1
-        eval_results.append({
-            'id': data['id'],
-            'instruction_type': data['instruction_type'],
-            'test_case_results': test_case_results,
-            'soft_restriction': soft_restriction,
-            'hard_restriction': hard_restriction,
-        })
+    with ThreadPoolExecutor(max_workers=opt.concurrency) as pool:
+        futures = {
+            pool.submit(evaluate_task, data, dataset_path, output_dir, opt.log_dir): data
+            for data in dataset
+        }
+        for future in tqdm(as_completed(futures), total=len(futures)):
+            result, was_skipped = future.result()
+            if was_skipped:
+                skipped += 1
+            else:
+                eval_results.append(result)
 
     # Print summary
     total = len(eval_results)
@@ -264,7 +347,7 @@ def evaluation(opt):
         print(f"\nEvaluated: {total} tasks (skipped {skipped} without outputs)")
         print(f"Soft restriction (avg): {avg_soft:.4f}")
         print(f"Hard restriction (avg): {avg_hard:.4f}")
-        print(f"Tasks with all 3 passing: {sum(r['hard_restriction'] for r in eval_results)}/{total}")
+        print(f"Tasks with all cases passing: {sum(r['hard_restriction'] for r in eval_results)}/{total}")
     else:
         print(f"\nNo tasks with outputs found in {output_dir}")
 
