@@ -24,7 +24,7 @@ uv add predict-rlm
 ## Why RLMs?
 
 <p align="center">
-  <img src="docs/bitter_lesson_spectrum.svg" alt="Bitter Lesson Spectrum — from hand-written prompts to RLMs" width="680"/>
+  <img src="https://raw.githubusercontent.com/Trampoline-AI/predict-rlm/main/docs/bitter_lesson_spectrum.svg" alt="Bitter Lesson Spectrum — from hand-written prompts to RLMs" width="680"/>
 </p>
 
 - **Avoid context rot** —  The root LM only interacts with its context programmatically through the REPL, staying well within its comfortable operating range — enabling complex, long-horizon tasks that would otherwise cause models to silently degrade.
@@ -36,7 +36,7 @@ uv add predict-rlm
 ## Features
 
 <p align="center">
-  <img src="docs/harness_vs_rlm.svg" alt="Classic harness vs RLM architecture" width="600"/>
+  <img src="https://raw.githubusercontent.com/Trampoline-AI/predict-rlm/main/docs/harness_vs_rlm.svg" alt="Classic harness vs RLM architecture" width="600"/>
 </p>
 
 
