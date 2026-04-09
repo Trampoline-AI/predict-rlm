@@ -57,6 +57,22 @@ uv add predict-rlm
 
 ## Quick start
 
+### With your coding agent
+
+Install the [predict-rlm skill](.agents/skills/rlm/SKILL.md) in Claude Code, Codex, Cursor, or any compatible coding agent:
+
+```bash
+npx skills add Trampoline-AI/predict-rlm
+```
+
+Then ask your agent to build an RLM:
+
+```
+❯ /rlm build an RLM that extracts line items from PDF invoices into a spreadsheet
+```
+
+### Quick Example
+
 ```python
 import dspy
 from predict_rlm import File, PredictRLM
@@ -73,22 +89,14 @@ rlm = PredictRLM(
     lm="openai/gpt-5.4",
     sub_lm="openai/gpt-5.1",
 )
+
 result = rlm(
     images=[File(path="page.png")],
     query="Extract all visible text, then count each letter A-Z (case-insensitive).",
 )
+
 print(result.answer)
 ```
-
-### Use it with your coding agent
-
-Add the [predict-rlm agent skill](skills/create-rlm/SKILL.md) to Claude Code, Codex, Cursor, or any compatible coding agent:
-
-```bash
-npx skills add Trampoline-AI/predict-rlm
-```
-
-Your agent will then know how to build RLMs using predict-rlm — including the file structure, signatures, tools, and skills patterns.
 
 ## Next steps
 
