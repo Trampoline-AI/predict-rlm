@@ -1,14 +1,19 @@
 # predict-rlm
+Harness-less LM runtime built on top of [DSPy](https://dspy.ai). Define your inputs, outputs, and tools — the model handles its own control flow. Get fully interpretable trajectories and performance that scales directly with model improvements. Without context rot.
 
-[![Tests](https://img.shields.io/github/actions/workflow/status/Trampoline-AI/predict-rlm/tests.yml?label=Tests)](https://github.com/Trampoline-AI/predict-rlm/actions/workflows/tests.yml)
-[![codecov](https://img.shields.io/codecov/c/github/Trampoline-AI/predict-rlm?token=NNS3R7OIT2&color=brightgreen&label=codecov)](https://codecov.io/gh/Trampoline-AI/predict-rlm)
-[![PyPI](https://img.shields.io/pypi/v/predict-rlm?color=blue)](https://pypi.org/project/predict-rlm/)
-[![Python](https://img.shields.io/pypi/pyversions/predict-rlm)](https://pypi.org/project/predict-rlm/)
-[![Discord](https://img.shields.io/badge/Discord-Join-5865F2?style=flat&logo=discord&logoColor=white)](https://discord.gg/BAkd288sGN)
-[![GitHub stars](https://img.shields.io/github/stars/trampoline-ai/predict-rlm)](https://github.com/Trampoline-AI/predict-rlm)
+Based on the [Recursive Language Models](https://arxiv.org/abs/2512.24601v1) paper by [Alex L. Zhang](https://x.com/a1zhang), [Tim Kraska](https://x.com/tim_kraska), and [Omar Khattab](https://x.com/lateinteraction) from the Stanford NLP lab.<br/>
 
-Production-grade [Recursive Language Models](https://arxiv.org/abs/2512.24601v1).<br/>
-Based on the paper by [Alex L. Zhang](https://x.com/a1zhang), [Tim Kraska](https://x.com/tim_kraska), and [Omar Khattab](https://x.com/lateinteraction) from the Stanford NLP lab.
+<br>
+<p align="center">
+  <a href="https://github.com/Trampoline-AI/predict-rlm/actions/workflows/tests.yml"><img src="https://img.shields.io/github/actions/workflow/status/Trampoline-AI/predict-rlm/tests.yml?label=Tests" alt="Tests"></a>
+  <a href="https://codecov.io/gh/Trampoline-AI/predict-rlm"><img src="https://img.shields.io/codecov/c/github/Trampoline-AI/predict-rlm?token=NNS3R7OIT2&color=brightgreen&label=codecov" alt="codecov"></a>
+  <a href="https://pypi.org/project/predict-rlm/"><img src="https://img.shields.io/pypi/v/predict-rlm?color=blue" alt="PyPI"></a>
+  <a href="https://pypi.org/project/predict-rlm/"><img src="https://img.shields.io/pypi/pyversions/predict-rlm" alt="Python"></a>
+  <a href="https://discord.gg/BAkd288sGN"><img src="https://img.shields.io/badge/Discord-Join-5865F2?style=flat&logo=discord&logoColor=white" alt="Discord"></a>
+  <a href="https://github.com/Trampoline-AI/predict-rlm"><img src="https://img.shields.io/github/stars/trampoline-ai/predict-rlm?cacheSeconds=3600" alt="GitHub stars"></a>
+  <br/>
+  crafted  with ♥ in MTL · NYC · FLP<br>by <a href="https://trampoline.ai">Trampoline AI</a> 
+</p>
 
 ## Installation
 
@@ -16,37 +21,30 @@ Based on the paper by [Alex L. Zhang](https://x.com/a1zhang), [Tim Kraska](https
 uv add predict-rlm
 ```
 
-Or with pip:
-
-```bash
-pip install predict-rlm
-```
-
-
 ## Why RLMs?
 
-Think of an RLM as a **callable, pre-configured agent**. Like Claude Code or Cursor, it can autonomously explore context, write and execute code, call tools, inspect results, and iterate until the task is done. Unlike a chat agent, an RLM is a **function** — you define its inputs, outputs, and tools, then call it from your code. It returns structured data, not chat messages.
+<p align="center">
+  <img src="docs/bitter_lesson_spectrum.svg" alt="Bitter Lesson Spectrum — from hand-written prompts to RLMs" width="680"/>
+</p>
 
-This makes RLMs ideal for tasks that are:
+- **Avoid context rot** —  The root LM only interacts with its context programmatically through the REPL, staying well within its comfortable operating range — enabling complex, long-horizon tasks that would otherwise cause models to silently degrade.
+- **Bitter lesson-proof: RLMs improve as LMs improve** — Unlike harnesses, which can cap or constrain the base model's capabilities, the performance, speed, and cost of RLM calls correlate directly with improvements to base model capabilities. [If the base model handles 10M tokens tomorrow, the RLM handles 100M.](https://alexzhang13.github.io/blog/2025/rlm/)
+- **Symbolic reasoning & recursion** — like algebra, RLMs express the *structure* of computation rather than performing each operation individually; a single line can represent 1M sub-calls — in direct contrast to agents like Claude Code that must mechanically emit each sub-agent call one at a time.
+- **Interpretability** — RLM trajectories are fully readable: you can trace every peek, chunk, sub-call, and verification step the model takes. This not only reveals *how* the model decomposed a problem, but provides concrete optimization signals which tools like [GEPA](https://gepa-ai.github.io/gepa) can ingest to evolve the RLM's strategies.
+- **Ideal for improving performance per token** — RLMs allow small models to punch way above their weight (RLM(GPT-5-mini) outperforms base GPT-5) providing great opportunities for reducing costs or stretching limited compute budgets without sacrificing quality.
 
-- **Specific and repeatable** — tasks with a well-defined SOP and a known desired outcome. Think of an RLM as a Claude Code that's been purpose-built for one task — with the right tools, the right instructions, and a tuned workflow that reliably produces the result you want. You define the procedure once, and the RLM follows it every time.
-- **Context-heavy** — too much data to fit in a single prompt. The RLM selectively loads what it needs via tools, working through documents page by page rather than stuffing everything into one call.
-- **Multi-step** — require exploring, extracting, computing, and synthesizing. The RLM writes code to orchestrate these steps, parallelizing where possible (e.g. processing 50 pages concurrently with `asyncio.gather()`).
-- **Action-oriented** — need to make changes, not just read. By giving the RLM tools that modify state (redact text, call APIs, write files), it becomes an autonomous executor — not just an analyzer.
-- **Iterative** — the RLM can inspect its own results, catch errors, retry with different approaches, and verify its work before submitting. It self-corrects in ways a single LLM call cannot.
+## Features
 
-## What is predict-rlm?
+<p align="center">
+  <img src="docs/harness_vs_rlm.svg" alt="Classic harness vs RLM architecture" width="600"/>
+</p>
 
-`predict-rlm` extends DSPy's RLM with a built-in `predict()` tool — a sub-LM the RLM can call from within its sandbox to perform language understanding, vision analysis, and structured extraction via DSPy signatures.
 
-The architecture is two-level:
-
-1. **The outer LLM** (the RLM itself) writes and executes Python code in a sandboxed REPL. It plans, orchestrates, and iterates.
-2. **The sub-LM** (via `predict()`) handles perception and extraction — analyzing images, understanding text, and returning typed results.
-
-The sub-LM supports `dspy.Image` type hints, which means `predict()` calls can pass images (as URLs or base64) directly to a vision-capable model. This makes RLMs **natively multimodal** — the outer LLM renders a PDF page to an image, passes it to `predict()`, and gets back structured data. The RLM itself doesn't need to be a vision model; it delegates visual understanding to the sub-LM.
-
-The outer LLM decides *what* to look at and *when*; the sub-LM decides *what it sees*. This separation is key to context management — the outer LLM's context stays small (code + tool results), while context-heavy work like reading a full page image or analyzing a long text block is offloaded to `predict()` calls. Each `predict()` call gets its own context window with the sub-LM, so the RLM can process far more total data than any single LLM call could hold.
+- **Multimodal** — process images, documents, audio, and video through sub-LM calls using native provider multimodal APIs. 
+- **Async tool calling** — native RLM async support in the WASM sandbox, enabling concurrent sub-LM invocations and tool calls
+- **Prompt-optimized skills & tools** — predic-rlm skills comes tested and optimized to ensure maximum LM interoperability and performance, bundling instructions, PyPI packages, and tools for domain-specific tasks
+- **Simple file I/O** — pass local or cloud files as typed inputs and outputs via `File`, keeping interop with your existing data pipelines straightforward. (S3 files support soon)
+- **Structured sub-LM calls** — native Pydantic and DSPy signature support for type-safe sub-LM invocations with structured outputs
 
 ## Demos
 
@@ -92,101 +90,9 @@ npx skills add Trampoline-AI/predict-rlm
 
 Your agent will then know how to build RLMs using predict-rlm — including the file structure, signatures, tools, and skills patterns.
 
-## Features
+## Next steps
 
-- **Built-in `predict()` tool** — call a sub-LM from inside the sandbox with DSPy signatures and type hints
-- **JSPI-enabled WASM sandbox** — concurrent async tool execution via Pyodide with `asyncio.gather()`
-- **Structured outputs** — Pydantic models, typed fields, and lists as output types
-- **Custom tools** — give the RLM tools that read, write, or modify external state
-- **Skills** — composable bundles of instructions, PyPI packages, and tools for domain-specific tasks
-- **Multimodal** — sub-LM calls support `dspy.Image`, so the RLM can analyze images, PDFs, screenshots, etc. without the outer LLM needing vision capabilities
-- **Optimizable** — built on DSPy, so optimizers can tune prompts and few-shot examples automatically. Inference-time scaling techniques like [GEPA](https://arxiv.org/abs/2504.00294) push accuracy further by generating and selecting among multiple candidate solutions
-
-## How it works
-
-1. You define **inputs**, **outputs**, and **tools** — what the RLM receives, what it should produce, and what actions it can take
-2. The outer LLM writes Python code in a sandboxed Pyodide/WASM REPL
-3. Inside the sandbox, it calls `await predict(signature, **kwargs)` to invoke the sub-LM for understanding and extraction
-4. It iterates — exploring data, calling tools, building up intermediate results, and handling errors
-5. When done, it calls `SUBMIT()` with the final structured output
-
-Each iteration is a REPL turn: the LLM sees the output of its previous code, decides what to do next, and writes more code. State persists between iterations, so it can accumulate findings across many steps.
-
-### Signatures and file I/O
-
-The DSPy signature defines the **inputs**, **outputs**, and **strategy** (via the docstring). Use `File` for file-typed fields — input files are mounted into the sandbox, output files are synced back (see [API](#file) for details).
-
-```python
-from predict_rlm import File, PredictRLM, Skill
-
-class AnalyzeDocuments(dspy.Signature):
-    """Analyze documents and produce a structured report.
-
-    1. Survey the documents — file names, page counts, document types
-    2. Render pages as images and use predict() to extract content
-    3. Produce the report following the criteria's format
-    """
-    documents: list[File] = dspy.InputField()
-    analysis: DocumentAnalysis = dspy.OutputField()
-
-pdf_skill = Skill(
-    name="pdf",
-    instructions="Use pymupdf to open and render PDF pages...",
-    packages=["pymupdf"],
-)
-
-rlm = PredictRLM(
-    AnalyzeDocuments,
-    lm="openai/gpt-5.4",
-    sub_lm="openai/gpt-5.1",
-    skills=[pdf_skill],
-)
-
-documents = [File(path="report.pdf"), File(path="appendix.pdf")]
-result = rlm(documents=documents)
-```
-
-Inside the sandbox, the RLM autonomously decides which pages to load and when:
-
-```python
-# The RLM writes code like this — you don't write this, the LLM does:
-import pymupdf, base64, asyncio
-
-doc = pymupdf.open(documents[0])
-images = [
-    "data:image/png;base64,"
-    + base64.b64encode(
-        doc[i].get_pixmap(dpi=200).tobytes("png")
-    ).decode()
-    for i in range(3)
-]
-results = await asyncio.gather(*[
-    predict("page: dspy.Image -> dates: list[str]", page=img)
-    for img in images
-])
-```
-
-## Skills
-
-Skills extend what an RLM can do inside its sandbox — adding PyPI packages, instructions, modules, and tools. predict-rlm ships built-in skills for PDFs, spreadsheets, and Word documents, and you can define your own.
-
-```python
-from predict_rlm.skills import pdf, spreadsheet
-
-rlm = PredictRLM(MySignature, skills=[pdf, spreadsheet])
-```
-
-See the [skills documentation](docs/skills.md) for details on defining, composing, and mounting custom skills.
-
-## Examples
-
-Each example has its own README with setup and usage instructions. See the individual directories:
-
-- [Document Analysis](examples/document_analysis/) — Extract key dates, entities, and financial info into a structured report
-- [Document Redaction](examples/document_redaction/) — Redact PII from PDFs and verify the redactions visually
-- [Invoice Processing](examples/invoice_processing/) — Extract line items and totals into an Excel spreadsheet
-- [Contract Comparison](examples/contract_comparison/) — Produce a structured diff report between contract versions
-
-## API
-
-See the [API reference](docs/api.md) for `PredictRLM`, `File`, and `Skill`.
+- [How it works](docs/how-it-works.md) — understand the sandbox, REPL loop, signatures, and file I/O
+- [API reference](docs/api.md) — constructor params for `PredictRLM`, `File`, and `Skill`
+- [Skills](docs/skills.md) — define, compose, and mount custom skills
+- [Examples](examples/) — end-to-end demos with setup instructions
