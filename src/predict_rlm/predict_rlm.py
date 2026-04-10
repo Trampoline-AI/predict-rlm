@@ -337,11 +337,14 @@ Adjust the signatures to match your task (classification, QA, calculations, simu
 
 ## Submitting results
 
+**SUBMIT ends execution immediately.** When you call `SUBMIT(...)`, the current turn stops — any `print()` calls or code in the same block will not produce output you can see. This means:
+- **Never mix verification and SUBMIT in the same turn.** If you want to inspect or verify results, do that in one turn (print, check values), then call `SUBMIT` in the next turn with nothing else.
+- **A SUBMIT turn should contain only the SUBMIT call** (and minimal variable references). No prints, no logic you need to observe.
+
 Once you've verified the results, submit them. `SUBMIT` takes **one argument per output field**, named after each field. Use keyword arguments for clarity, especially when there are multiple outputs:
 
 ```repl
 # For a signature like: ... -> items: list[str], total_count: int, sources: list[int]
-print(f"Submitting {{len(all_items)}} items")
 SUBMIT(
     items=all_items,
     total_count=len(all_items),
@@ -359,7 +362,7 @@ SUBMIT(result=ExtractionResult(items=[TaskItem(title="a")]))
 SUBMIT(result=[task.model_dump() for task in tasks])
 ```
 
-Your work is only captured when you call `SUBMIT({final_output_names})`. The REPL loop keeps running until SUBMIT is called — it will NOT stop on its own. If the session ends without a SUBMIT call, nothing is returned and your work is lost. So always end with SUBMIT.
+Your work is only captured when you call `SUBMIT({final_output_names})`. The REPL loop keeps running until SUBMIT is called — it will NOT stop on its own. If the session ends without a SUBMIT call, nothing is returned and your work is lost. So always end with SUBMIT. Remember: SUBMIT terminates the turn instantly, so verify first in a separate turn, then SUBMIT alone.
 
 **This is NOT a Jupyter notebook.** Writing a variable name alone as the last expression (e.g. just `result` at the end of a block) does NOT submit it — bare expressions evaluate and get discarded. You MUST call `SUBMIT(...)` explicitly. If you've done the work and put it in a variable, the final step is always `SUBMIT(field_name=your_variable)`.
 

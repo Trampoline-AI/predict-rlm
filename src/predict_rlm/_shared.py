@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import inspect
 import textwrap
-from typing import TYPE_CHECKING, Callable
+import typing
+from pathlib import Path
+from typing import TYPE_CHECKING, Annotated, Callable
 
 import dspy
 from dspy.adapters.utils import translate_field_type
@@ -29,20 +31,32 @@ def format_tool_docs_full(tools: dict[str, Callable]) -> str:
         # Get function signature with types
         try:
             sig = inspect.signature(func)
+            # Resolve string annotations (from `from __future__ import annotations`)
+            try:
+                resolved = typing.get_type_hints(func, include_extras=True)
+            except (TypeError, NameError):
+                resolved = {}
+
             params = []
             for p in sig.parameters.values():
-                if p.annotation != inspect.Parameter.empty:
-                    type_name = getattr(p.annotation, "__name__", str(p.annotation))
+                ann = resolved.get(p.name)
+                if ann is not None:
+                    # Unwrap Annotated[X, ...] → X (e.g. SyncedFile markers)
+                    if typing.get_origin(ann) is Annotated:
+                        ann = typing.get_args(ann)[0]
+                    # Show Path as str — the RLM passes sandbox paths as strings
+                    if ann is Path:
+                        ann = str
+                    type_name = getattr(ann, "__name__", str(ann))
                     params.append(f"{p.name}: {type_name}")
                 else:
                     params.append(p.name)
             params_str = ", ".join(params)
 
             # Get return type
-            if sig.return_annotation != inspect.Parameter.empty:
-                ret_type = getattr(
-                    sig.return_annotation, "__name__", str(sig.return_annotation)
-                )
+            ret_ann = resolved.get("return")
+            if ret_ann is not None:
+                ret_type = getattr(ret_ann, "__name__", str(ret_ann))
                 sig_str = f"{name}({params_str}) -> {ret_type}"
             else:
                 sig_str = f"{name}({params_str})"

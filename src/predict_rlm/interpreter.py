@@ -16,11 +16,14 @@ from __future__ import annotations
 import asyncio
 import concurrent.futures
 import functools
+import inspect
 import json
 import logging
 import os
 import re
 import select
+import shutil
+import tempfile
 import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -225,6 +228,17 @@ class JspiInterpreter(PythonInterpreter):
         all_read_paths = list(enable_read_paths or []) + list(extra_read_paths or [])
         all_write_paths = list(enable_write_paths or []) + list(extra_write_paths or [])
 
+        # Scan tools for SyncedFile annotations with custom host_dir paths
+        # and add them to Deno permissions so the runner can write there.
+        if tools:
+            from predict_rlm.files import get_synced_file_params
+
+            for tool_fn in tools.values():
+                for sf in get_synced_file_params(tool_fn).values():
+                    if sf.host_dir is not None:
+                        all_write_paths.append(sf.host_dir)
+                        all_read_paths.append(sf.host_dir)
+
         # Build custom deno command if not provided
         if deno_command is None:
             deno_command = self._build_deno_command(
@@ -251,6 +265,9 @@ class JspiInterpreter(PythonInterpreter):
         # Per-interpreter thread pool for sync tool calls (avoids starving
         # the shared default executor when many interpreters run concurrently)
         self._executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        # Pending file-sync operations requested by tools during execution.
+        # Maps request ID → asyncio.Future resolved by the execute loop.
+        self._pending_file_ops: dict[int, asyncio.Future] = {}
 
     def _ensure_deno_process(self) -> None:
         """Override to capture raw fds for non-blocking I/O."""
@@ -328,6 +345,11 @@ class JspiInterpreter(PythonInterpreter):
         # Add user-specified read/write paths
         allowed_read.extend(str(p) for p in read_paths)
         allowed_read.extend(str(p) for p in write_paths)
+
+        # Allow reading temp dirs so @file_sync tools can mount files back
+        import tempfile as _tempfile
+        allowed_read.append(_tempfile.gettempdir())
+        allowed_read.append("/tmp")
 
         if allowed_read:
             args.append(f"--allow-read={','.join(allowed_read)}")
@@ -683,6 +705,14 @@ class JspiInterpreter(PythonInterpreter):
                 logger.info(f"Skipping malformed JSON: {output_line[:100]}")
                 continue
 
+            # Route file-sync responses to pending futures (from _execute_tool_async)
+            resp_id = result.get("id")
+            if resp_id is not None and resp_id in self._pending_file_ops:
+                future = self._pending_file_ops.pop(resp_id)
+                if not future.done():
+                    future.set_result(result)
+                continue
+
             # JSON-RPC request from sandbox (tool call)
             if "method" in result:
                 if result["method"] == "tool_call":
@@ -825,6 +855,49 @@ class JspiInterpreter(PythonInterpreter):
         line, self._read_buf = self._read_buf.split("\n", 1)
         return line.strip()
 
+    async def _sync_file_during_tool(self, virtual_path: str, host_path: str) -> None:
+        """Sync a file from sandbox MEMFS to host during a tool call.
+
+        Sends a sync_file request to the Deno runner's responseReader (which
+        handles it during tool execution) and awaits the response via a Future
+        resolved by the _execute_async loop.
+        """
+        self._request_id += 1
+        req_id = self._request_id
+        loop = asyncio.get_running_loop()
+        future = loop.create_future()
+        self._pending_file_ops[req_id] = future
+        msg = json.dumps({
+            "jsonrpc": "2.0", "method": "sync_file",
+            "params": {"virtual_path": virtual_path, "host_path": host_path},
+            "id": req_id,
+        })
+        await self._write_stdin_async(msg + "\n")
+        result = await future
+        if "error" in result:
+            raise CodeInterpreterError(
+                f"sync_file failed: {result['error'].get('message', result['error'])}"
+            )
+
+    async def _mount_file_during_tool(self, host_path: str, virtual_path: str) -> None:
+        """Mount a file from host into sandbox MEMFS during a tool call."""
+        self._request_id += 1
+        req_id = self._request_id
+        loop = asyncio.get_running_loop()
+        future = loop.create_future()
+        self._pending_file_ops[req_id] = future
+        msg = json.dumps({
+            "jsonrpc": "2.0", "method": "mount_file",
+            "params": {"host_path": host_path, "virtual_path": virtual_path},
+            "id": req_id,
+        })
+        await self._write_stdin_async(msg + "\n")
+        result = await future
+        if "error" in result:
+            raise CodeInterpreterError(
+                f"mount_file failed: {result['error'].get('message', result['error'])}"
+            )
+
     async def _execute_tool_async(self, tool_name: str, call_args: dict) -> dict:
         """Execute a tool asynchronously and return the response dict."""
         from .trace import ToolCall, ms_since, record_tool_call
@@ -838,8 +911,11 @@ class JspiInterpreter(PythonInterpreter):
             )
 
         call_start = time.perf_counter()
-        args = call_args.get("args", [])
-        kwargs = call_args.get("kwargs", {})
+        # Copy to mutable containers so the SyncedFile handler below can
+        # rewrite sandbox paths to host paths before invoking the tool.
+        args = list(call_args.get("args", []))
+        kwargs = dict(call_args.get("kwargs", {}))
+        temp_dir: str | None = None
 
         try:
             if tool_name not in self.tools:
@@ -852,6 +928,50 @@ class JspiInterpreter(PythonInterpreter):
             if pydantic_schemas and tool_name == "predict":
                 kwargs["pydantic_schemas"] = pydantic_schemas
 
+            # Handle SyncedFile-annotated tool parameters: sync sandbox files
+            # to host before calling, and mount modified files back after.
+            from predict_rlm.files import get_synced_file_params
+
+            synced_params = get_synced_file_params(tool_fn)
+            temp_dir = None
+            # (sandbox_path, host_path, writeback) for each synced param
+            synced_entries: list[tuple[str, str, bool]] = []
+
+            if synced_params:
+                sig = inspect.signature(tool_fn)
+                param_names = list(sig.parameters.keys())
+
+                for param_name, sf in synced_params.items():
+                    # Resolve the sandbox path from args or kwargs
+                    sandbox_path = kwargs.get(param_name)
+                    if sandbox_path is None and param_name in param_names:
+                        idx = param_names.index(param_name)
+                        if idx < len(args):
+                            sandbox_path = args[idx]
+                    if not sandbox_path or not isinstance(sandbox_path, str):
+                        continue
+
+                    # Determine host directory
+                    if sf.host_dir is not None:
+                        host_dir = sf.host_dir
+                        os.makedirs(host_dir, exist_ok=True)
+                    else:
+                        if temp_dir is None:
+                            temp_dir = tempfile.mkdtemp(prefix="tool-file-sync-")
+                        host_dir = temp_dir
+
+                    host_path = os.path.join(host_dir, os.path.basename(sandbox_path))
+                    await self._sync_file_during_tool(sandbox_path, host_path)
+                    synced_entries.append((sandbox_path, host_path, sf.writeback))
+
+                    # Replace the sandbox path with the host path in args/kwargs
+                    if param_name in kwargs:
+                        kwargs[param_name] = host_path
+                    elif param_name in param_names:
+                        idx = param_names.index(param_name)
+                        if idx < len(args):
+                            args[idx] = host_path
+
             # Check if tool is async or sync
             if asyncio.iscoroutinefunction(tool_fn):
                 result = await tool_fn(*args, **kwargs)
@@ -860,6 +980,14 @@ class JspiInterpreter(PythonInterpreter):
                 result = await loop.run_in_executor(
                     self._executor, functools.partial(tool_fn, *args, **kwargs)
                 )
+
+            # Mount modified files back into the sandbox (only for writeback params)
+            if synced_entries:
+                for sandbox_path, host_path, writeback in synced_entries:
+                    if writeback and os.path.isfile(host_path):
+                        await self._mount_file_during_tool(host_path, sandbox_path)
+                if temp_dir:
+                    shutil.rmtree(temp_dir, ignore_errors=True)
 
             is_json = isinstance(result, (list, dict))
             response = {
@@ -879,6 +1007,9 @@ class JspiInterpreter(PythonInterpreter):
 
             return response
         except Exception as e:
+            # Clean up any SyncedFile temp dir before returning
+            if temp_dir:
+                shutil.rmtree(temp_dir, ignore_errors=True)
             if tool_name != "predict":
                 record_tool_call(ToolCall(
                     name=tool_name,

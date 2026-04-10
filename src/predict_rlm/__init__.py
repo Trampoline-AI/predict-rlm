@@ -9,7 +9,7 @@ File I/O:
            (sync from sandbox). Use ``list[File]`` for multiple files.
 """
 
-from .files import File, LocalDir, LocalFile, OutputDir, OutputFile
+from .files import File, LocalDir, LocalFile, OutputDir, OutputFile, SyncedFile
 from .predict_rlm import PredictRLM
 from .rlm_skills import Skill
 from .trace import RunTrace
@@ -23,4 +23,5 @@ __all__ = [
     "PredictRLM",
     "RunTrace",
     "Skill",
+    "SyncedFile",
 ]

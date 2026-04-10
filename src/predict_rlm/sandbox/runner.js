@@ -651,6 +651,44 @@ async function responseReader() {
 
     try {
       const response = JSON.parse(result.value);
+
+      // Handle file-sync operations from the host during tool execution.
+      // The host sends these to transfer files between sandbox MEMFS and
+      // the host filesystem while a tool call is in flight.
+      if (response.method === "sync_file" && response.id) {
+        try {
+          const data = pyodide.FS.readFile(response.params.virtual_path);
+          await Deno.writeFile(response.params.host_path, data);
+          console.log(jsonrpcResult({ ok: true }, response.id));
+        } catch (e) {
+          console.log(jsonrpcError(
+            JSONRPC_APP_ERRORS.RuntimeError,
+            `sync_file failed: ${e.message}`, response.id
+          ));
+        }
+        continue;
+      }
+      if (response.method === "mount_file" && response.id) {
+        try {
+          const contents = await Deno.readFile(response.params.host_path);
+          const vp = response.params.virtual_path;
+          const dirs = vp.split('/').slice(1, -1);
+          let cur = '';
+          for (const d of dirs) {
+            cur += '/' + d;
+            try { pyodide.FS.mkdir(cur); } catch (_) { /* exists */ }
+          }
+          pyodide.FS.writeFile(vp, contents);
+          console.log(jsonrpcResult({ ok: true }, response.id));
+        } catch (e) {
+          console.log(jsonrpcError(
+            JSONRPC_APP_ERRORS.RuntimeError,
+            `mount_file failed: ${e.message}`, response.id
+          ));
+        }
+        continue;
+      }
+
       // JSON-RPC response: has id and either result or error
       if (response.id && (response.result !== undefined || response.error !== undefined)) {
         handleToolResponse(response);
