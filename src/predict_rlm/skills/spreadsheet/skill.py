@@ -20,11 +20,27 @@ Every generated workbook should default to a clean, widely available typeface �
 
 ### Formula Integrity
 
-Deliver workbooks with **zero** calculation errors. The five error tokens to watch for are `#REF!`, `#DIV/0!`, `#VALUE!`, `#N/A`, and `#NAME?`. Every file must be scanned and cleared of these before delivery.
+Formulas **you write** must evaluate without errors. The tokens to watch for are `#REF!`, `#DIV/0!`, `#VALUE!`, `#N/A`, and `#NAME?`. Scan your own formulas and fix any errors before delivery.
+
+However, if the task involves preserving or replicating existing formulas that produce errors, those errors may be **intentional** — do not "fix" them. Only eliminate errors in formulas you authored.
 
 ### Respecting Existing Files
 
 When a user provides a template or partially completed workbook, treat its layout, fonts, colors, and naming conventions as authoritative. Mimic the existing patterns rather than overwriting them with defaults from this guide.
+
+### Matching Existing Conventions
+
+When writing text labels, categories, or values that correspond to column headers or existing data in the workbook, match the **exact** casing, abbreviation style, and pluralization from the existing data — not from the instruction text or natural English conventions. For example, if column headers are uppercase (`CHEP`, `NEW`), your output should be uppercase too.
+
+When replacing formula-generated values with Python-computed values, inspect the original formula's output format (e.g., `TEXT(date,"ddd")` produces 3-letter abbreviations like `Mon`, not `Monday`) and match it.
+
+### Whitespace Preservation
+
+Never strip whitespace from cell values (no `.strip()`, `.rstrip()`, `.lstrip()`) unless the instruction explicitly asks for trimming. When splitting or truncating strings, preserve all characters outside the removed portion exactly as they are.
+
+### Empty Cells
+
+For blank, missing, or empty cells, write `None` (truly empty). Never use sentinel strings like `\\xa0` (non-breaking space), `"N/A"`, `"None"`, or `"-"` as placeholders for missing data unless the instruction explicitly specifies a fill value.
 
 ---
 

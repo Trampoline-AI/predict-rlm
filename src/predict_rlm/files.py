@@ -25,7 +25,8 @@ from __future__ import annotations
 
 import os
 import typing
-from typing import Any
+from dataclasses import dataclass
+from typing import Annotated, Any
 
 from pydantic import BaseModel, Field
 
@@ -62,6 +63,34 @@ LocalFile = File
 LocalDir = File
 OutputFile = File
 OutputDir = File
+
+
+@dataclass(frozen=True)
+class SyncedFile:
+    """Annotation marker for tool parameters that need sandbox-host file sync.
+
+    Use with ``typing.Annotated`` on tool function parameters to declare that
+    a parameter is a sandbox file path. The framework automatically syncs the
+    file from the sandbox to the host before calling the tool, and optionally
+    mounts the modified file back into the sandbox after the tool returns.
+
+    Example::
+
+        def recalculate(
+            workbook: Annotated[Path, SyncedFile(host_dir="/tmp/wb")],
+            reference: Annotated[Path, SyncedFile(writeback=False)],
+        ) -> str:
+            ...
+    """
+
+    writeback: bool = True
+    """If True (default), mount the file back into the sandbox after the tool
+    returns. Set to False for read-only access (skip the mount-after step)."""
+
+    host_dir: str | None = None
+    """Host directory for the synced file. If None, a temporary directory is
+    created and cleaned up after the call. If specified, the directory is used
+    as-is and not cleaned up."""
 
 
 def _unwrap_annotation(annotation: Any) -> Any:
@@ -263,3 +292,26 @@ def build_file_plan(
         "output_field_map": output_field_map,
         "instructions": instructions,
     }
+
+
+def get_synced_file_params(fn: Any) -> dict[str, SyncedFile]:
+    """Extract SyncedFile annotations from a tool function's type hints.
+
+    Returns a dict mapping parameter names to their ``SyncedFile`` marker
+    for all parameters annotated with ``Annotated[..., SyncedFile(...)]``.
+    """
+    try:
+        hints = typing.get_type_hints(fn, include_extras=True)
+    except (TypeError, NameError):
+        return {}
+
+    result: dict[str, SyncedFile] = {}
+    for name, hint in hints.items():
+        if name == "return":
+            continue
+        if typing.get_origin(hint) is Annotated:
+            for arg in typing.get_args(hint)[1:]:
+                if isinstance(arg, SyncedFile):
+                    result[name] = arg
+                    break
+    return result
