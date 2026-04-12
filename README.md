@@ -42,7 +42,7 @@ uv add predict-rlm
 
 - **Multimodal** — process images, documents, audio, and video through sub-LM calls using native provider multimodal APIs. 
 - **Async tool calling** — native RLM async support in the WASM sandbox, enabling concurrent sub-LM invocations and tool calls
-- **Prompt-optimized skills & tools** — predic-rlm skills comes tested and optimized to ensure maximum LM interoperability and performance, bundling instructions, PyPI packages, and tools for domain-specific tasks
+- **Prompt-optimized skills & tools** — predict-rlm skills comes tested and optimized to ensure maximum LM interoperability and performance, bundling instructions, PyPI packages, and tools for domain-specific tasks
 - **Simple file I/O** — pass local or cloud files as typed inputs and outputs via `File`, keeping interop with your existing data pipelines straightforward. (S3 files support soon)
 - **Structured sub-LM calls** — native Pydantic and DSPy signature support for type-safe sub-LM invocations with structured outputs
 
