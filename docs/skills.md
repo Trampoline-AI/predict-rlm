@@ -10,9 +10,9 @@ Skills are for **general capabilities** — teaching the RLM how to use a librar
 from predict_rlm import Skill
 
 pdf_skill = Skill(
-    name="pdf-extraction",
-    instructions="Use pdfplumber for table extraction. Prefer page.extract_tables() for tabular content.",
-    packages=["pdfplumber"],
+    name="pdf",
+    instructions="Use pymupdf to open PDFs. Render pages as images (dpi=200) for analysis with predict().",
+    packages=["pymupdf"],
 )
 
 rlm = PredictRLM(
@@ -113,13 +113,13 @@ from predict_rlm.skills import pdf, spreadsheet, docx
 rlm = PredictRLM(MySignature, skills=[pdf, spreadsheet, docx])
 ```
 
-| Skill | Import | Packages | Modules | What it teaches the RLM |
-|---|---|---|---|---|
-| **pdf** | `from predict_rlm.skills import pdf` | `pymupdf` | — | Read, render, modify, and redact PDFs |
-| **spreadsheet** | `from predict_rlm.skills import spreadsheet` | `openpyxl`, `pandas`, `formulas` | `formula_eval` | Build and modify Excel workbooks with formulas and formatting |
-| **docx** | `from predict_rlm.skills import docx` | `python-docx` | `md2docx` | Read, write, and modify Word documents with tables, formatting, and styles |
+| Skill | Import | Packages | Modules | What it teaches the RLM | |
+|---|---|---|---|---|---|
+| **pdf** | `from predict_rlm.skills import pdf` | `pymupdf` | — | Read, render, modify, and redact PDFs | [source](../src/predict_rlm/skills/pdf/skill.py) |
+| **spreadsheet** | `from predict_rlm.skills import spreadsheet` | `openpyxl`, `pandas`, `formulas` | `formula_eval` | Build and modify Excel workbooks with formulas and formatting | [source](../src/predict_rlm/skills/spreadsheet/skill.py) |
+| **docx** | `from predict_rlm.skills import docx` | `python-docx` | `md2docx` | Read, write, and modify Word documents with tables, formatting, and styles | [source](../src/predict_rlm/skills/docx/skill.py) |
 
-### pdf
+### pdf ([source](../src/predict_rlm/skills/pdf/skill.py))
 
 Uses [pymupdf](https://pymupdf.readthedocs.io/) for opening, inspecting, rendering, and modifying PDFs.
 
@@ -130,11 +130,11 @@ Key patterns the skill teaches the RLM:
 - **Document modification** — search-and-redact workflows using `search_for()` and `add_redact_annot()`
 - **Metadata and structure** — access TOC, annotations, links, and page-level metadata
 
-### spreadsheet
+### spreadsheet ([source](../src/predict_rlm/skills/spreadsheet/skill.py))
 
 Uses [openpyxl](https://openpyxl.readthedocs.io/) for building and modifying Excel workbooks, [pandas](https://pandas.pydata.org/) for data manipulation, and [formulas](https://pypi.org/project/formulas/) for formula evaluation.
 
-Includes the `formula_eval` sandbox module with two functions:
+Includes the [`formula_eval`](../src/predict_rlm/skills/spreadsheet/modules/formula_eval.py) sandbox module with two functions:
 - **`evaluate(path)`** — evaluates all formulas in a workbook and returns a report: `{"ok": bool, "formulas": int, "errors": int, "breakdown": dict, "computed": dict}`
 - **`ensure_recalc_on_open(path)`** — sets the `fullCalcOnLoad` flag so Excel recalculates formulas when opened
 
@@ -145,11 +145,11 @@ Key patterns the skill teaches the RLM:
 - **Formula error guarding** — handle `#REF!`, `#DIV/0!`, `#VALUE!`, `#N/A`, `#NAME?`
 - **Verification** — use `formula_eval.evaluate()` to verify formulas before submitting
 
-### docx
+### docx ([source](../src/predict_rlm/skills/docx/skill.py))
 
 Uses [python-docx](https://python-docx.readthedocs.io/) for reading, writing, and modifying Word documents.
 
-Includes the `md2docx` sandbox module with three functions:
+Includes the [`md2docx`](../src/predict_rlm/skills/docx/modules/md2docx.py) sandbox module with three functions:
 - **`add_markdown(doc, text)`** — convert markdown-formatted text into properly styled Word elements (headings, bold, italic, code, lists, tables, blockquotes)
 - **`add_styled_markdown(doc, text, confidence)`** — markdown with confidence-based coloring (high=black, medium=orange, placeholder=red)
 - **`setup_document()`** — return a pre-configured document (1-inch margins, Arial 11pt)
