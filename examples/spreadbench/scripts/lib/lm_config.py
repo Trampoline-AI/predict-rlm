@@ -19,6 +19,33 @@ SUB_LM: str = "openai/gpt-5.1"
 
 _MERCURY_MODEL = "openai/mercury-2"
 
+# Per-model price overrides as (input_usd_per_mtok, output_usd_per_mtok).
+# LiteLLM's cost map doesn't cover non-OpenAI/Anthropic providers like
+# Inception Labs, so any model listed here gets its cost recomputed from
+# token counts via :func:`compute_lm_cost` instead of relying on
+# ``lm.history[i]["cost"]`` (which is ``None``/``0`` for unknown models).
+_PRICE_OVERRIDES_USD_PER_MTOK: dict[str, tuple[float, float]] = {
+    _MERCURY_MODEL: (0.25, 0.75),
+}
+
+
+def compute_lm_cost(
+    model: str, prompt_tokens: int, completion_tokens: int
+) -> float | None:
+    """Return USD cost for *model* if it has a price override, else None.
+
+    Override entries are USD per 1M input/output tokens. Returning
+    ``None`` signals to the caller that LiteLLM's per-call cost (from
+    ``lm.history``) should be used instead.
+    """
+    override = _PRICE_OVERRIDES_USD_PER_MTOK.get(model)
+    if override is None:
+        return None
+    in_price, out_price = override
+    return (prompt_tokens / 1_000_000) * in_price + (
+        completion_tokens / 1_000_000
+    ) * out_price
+
 
 def _require_env(var_name: str, lm: str) -> None:
     if not os.environ.get(var_name):
