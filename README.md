@@ -102,5 +102,5 @@ print(result.answer)
 
 - [How it works](docs/how-it-works.md) — understand the sandbox, REPL loop, signatures, and file I/O
 - [API reference](docs/api.md) — constructor params for `PredictRLM`, `File`, and `Skill`
-- [Skills](docs/skills.md) — define, compose, and mount custom skills
+- [Skills](src/predict_rlm/skills) — define, compose, and mount custom skills
 - [Examples](examples/) — end-to-end demos with setup instructions
