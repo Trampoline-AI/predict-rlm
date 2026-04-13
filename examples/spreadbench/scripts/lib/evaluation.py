@@ -30,7 +30,7 @@ from tqdm import tqdm
 from predict_rlm import File, PredictRLM
 
 from .dataset import SpreadsheetTask, load_dataset
-from .lm_config import SUB_LM, get_lm_config, get_sub_lm_config
+from .lm_config import SUB_LM, compute_lm_cost, get_lm_config, get_sub_lm_config
 from .scoring import score_workbooks
 
 nest_asyncio.apply()
@@ -132,22 +132,29 @@ def summarize_lm_cost(role: str, lm: dspy.LM) -> LMCost:
 
     DSPy's ``LM.history`` records one dict per call (via LiteLLM), with
     ``cost`` and ``usage.prompt_tokens`` / ``usage.completion_tokens``.
-    Entries missing cost (cached hits, or models without pricing) count
-    as ``$0`` and contribute zero tokens.
+    Models that LiteLLM doesn't have pricing for (e.g. mercury-2 via
+    Inception Labs) report ``cost = None`` per call; for those models we
+    fall back to :func:`compute_lm_cost`, which applies the per-model
+    USD/MTok overrides declared in ``lm_config``.
     """
     history = getattr(lm, "history", []) or []
     calls = len(history)
     prompt_tokens = 0
     completion_tokens = 0
-    cost = 0.0
+    cost_from_litellm = 0.0
     for entry in history:
         usage = entry.get("usage") or {}
         prompt_tokens += int(usage.get("prompt_tokens") or 0)
         completion_tokens += int(usage.get("completion_tokens") or 0)
-        cost += float(entry.get("cost") or 0.0)
+        cost_from_litellm += float(entry.get("cost") or 0.0)
+
+    model = getattr(lm, "model", "unknown")
+    override_cost = compute_lm_cost(model, prompt_tokens, completion_tokens)
+    cost = override_cost if override_cost is not None else cost_from_litellm
+
     return LMCost(
         role=role,
-        model=getattr(lm, "model", "unknown"),
+        model=model,
         calls=calls,
         prompt_tokens=prompt_tokens,
         completion_tokens=completion_tokens,
