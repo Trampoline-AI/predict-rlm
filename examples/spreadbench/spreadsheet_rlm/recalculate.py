@@ -49,6 +49,44 @@ except ImportError:
 
 log = logging.getLogger("spreadsheet_rlm.recalculate")
 
+_FORMULAS_TQDM_PATCHED = False
+
+
+class _QuietTqdm:
+    """No-op stand-in for ``tqdm.tqdm`` used by the formulas library.
+
+    Mirrors the QuietTqdm pattern from ``formulas/cli.py`` — when monkey
+    patched into the tqdm reference inside ``formulas.excel``, every
+    progress bar call becomes a no-op. Used to keep the formulas
+    library's internal progress bars from interleaving with the eval
+    loop's own tqdm output during recalculation.
+    """
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        pass
+
+    def __enter__(self) -> "_QuietTqdm":
+        return self
+
+    def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> bool:
+        return False
+
+    def update(self, *args: Any, **kwargs: Any) -> None:
+        return None
+
+    def refresh(self) -> None:
+        return None
+
+    total = 0
+
+
+def _silence_formulas_tqdm() -> None:
+    global _FORMULAS_TQDM_PATCHED
+    if _FORMULAS_TQDM_PATCHED or _formulas_lib is None:
+        return
+    _formulas_lib.ExcelModel.complete.__globals__["tqdm"].tqdm = _QuietTqdm
+    _FORMULAS_TQDM_PATCHED = True
+
 _ERROR_TOKENS = frozenset(
     ["#VALUE!", "#DIV/0!", "#REF!", "#NAME?", "#NULL!", "#NUM!", "#N/A"]
 )
@@ -233,6 +271,7 @@ def _recalc_with_formulas(src: Path, dst: Path) -> None:
     if _formulas_lib is None:
         raise RuntimeError("formulas library not installed")
 
+    _silence_formulas_tqdm()
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         model = _formulas_lib.ExcelModel().loads(str(src)).finish()
