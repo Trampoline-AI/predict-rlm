@@ -30,7 +30,7 @@ from tqdm import tqdm
 from predict_rlm import File, PredictRLM
 
 from .dataset import SpreadsheetTask, load_dataset
-from .lm_config import SUB_LM, get_lm_config
+from .lm_config import SUB_LM, get_lm_config, get_sub_lm_config
 from .scoring import score_workbooks
 
 nest_asyncio.apply()
@@ -426,10 +426,9 @@ def run_evaluation(config: EvalConfig) -> EvalReport:
     sig_cls = make_dynamic_signature(prompt)
 
     lm_cfg = get_lm_config(config.lm, config.reasoning_effort)
+    sub_lm_cfg = get_sub_lm_config(config.sub_lm)
     lm = dspy.LM(**lm_cfg, cache=config.cache)
-    sub_lm = dspy.LM(
-        config.sub_lm, reasoning_effort="none", num_retries=5, cache=config.cache
-    )
+    sub_lm = dspy.LM(**sub_lm_cfg, cache=config.cache)
 
     effort_tag = (
         f" (reasoning_effort={config.reasoning_effort})"

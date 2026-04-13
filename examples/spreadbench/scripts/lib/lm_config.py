@@ -5,14 +5,42 @@ gpt-5.x, claude-*, mercury-2, or any other LiteLLM-addressable model.
 The only one that needs special handling is mercury-2 because the
 Inception Labs API is nonstandard — everyone else gets ``reasoning_effort``
 as a top-level kwarg and lets LiteLLM route it to the provider's
-extended-thinking / effort field.
+extended-thinking / effort field. We also validate required API key env vars
+for common providers so misconfiguration fails fast.
 """
 
 from __future__ import annotations
 
 import os
 
+import litellm
+
 SUB_LM: str = "openai/gpt-5.1"
+
+_MERCURY_MODEL = "openai/mercury-2"
+
+
+def _require_env(var_name: str, lm: str) -> None:
+    if not os.environ.get(var_name):
+        raise RuntimeError(f"{lm} requires the {var_name} environment variable.")
+
+
+def validate_lm_env(lm: str) -> None:
+    """Raise if *lm* requires an API key env var that is missing."""
+    if lm == _MERCURY_MODEL:
+        _require_env("INCEPTION_API_KEY", lm)
+        return
+
+    check = litellm.validate_environment(model=lm)
+    if check.get("keys_in_environment"):
+        return
+
+    missing_keys = check.get("missing_keys") or []
+    if missing_keys:
+        missing = ", ".join(missing_keys)
+        raise RuntimeError(f"{lm} is missing required environment variables: {missing}")
+
+    raise RuntimeError(f"{lm} is missing required provider environment configuration.")
 
 
 def get_lm_config(lm: str, reasoning_effort: str | None = None) -> dict:
@@ -28,26 +56,29 @@ def get_lm_config(lm: str, reasoning_effort: str | None = None) -> dict:
             applied as a top-level kwarg only when explicitly set.
 
     Raises:
-        RuntimeError: if ``lm`` is ``openai/mercury-2`` and the
-            ``INCEPTION_API_KEY`` environment variable isn't set.
+        RuntimeError: if an API key env var required by ``lm`` is missing.
     """
+    validate_lm_env(lm)
+
     cfg: dict = {"model": lm, "num_retries": 5}
 
-    if lm == "openai/mercury-2":
-        key = os.environ.get("INCEPTION_API_KEY")
-        if not key:
-            raise RuntimeError(
-                "openai/mercury-2 requires the INCEPTION_API_KEY "
-                "environment variable."
-            )
+    if lm == _MERCURY_MODEL:
         cfg.update(
             {
                 "api_base": "https://api.inceptionlabs.ai/v1",
-                "api_key": key,
+                "api_key": os.environ["INCEPTION_API_KEY"],
                 "extra_body": {"reasoning_effort": reasoning_effort or "instant"},
             }
         )
     elif reasoning_effort:
         cfg["reasoning_effort"] = reasoning_effort
 
+    return cfg
+
+
+def get_sub_lm_config(lm: str) -> dict:
+    """Return config for the sub-LM with provider-aware defaults."""
+    cfg = get_lm_config(lm)
+    if lm != _MERCURY_MODEL:
+        cfg["reasoning_effort"] = "none"
     return cfg
