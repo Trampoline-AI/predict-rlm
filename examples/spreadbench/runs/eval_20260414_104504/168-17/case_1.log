@@ -1,0 +1,140 @@
+task: 168-17  case: 1
+instruction_type: Sheet-Level Manipulation
+answer_position: 'Statement'!A2:E12
+input:  /Users/gabriel/Workspace/trampoline-ai/predict-rlm.spreadbench-release/examples/spreadbench/data/testset/spreadsheet/168-17/1_168-17_init.xlsx
+answer: /Users/gabriel/Workspace/trampoline-ai/predict-rlm.spreadbench-release/examples/spreadbench/data/testset/spreadsheet/168-17/1_168-17_golden.xlsx
+============================================================
+2026-04-14 10:49:59,645 INFO RLM iteration 1/50
+Reasoning: We need inspect workbook thoroughly first: sheet names, dimensions, headers, sample rows, and specifically inspect Statement sheet column A for "Invoice No." occurrences and values around them. Then likely delete rows before first occurrence. Must save output, recalc, verify A1.
+Code:
+```repl
+import os, json
+from openpyxl import load_workbook
+
+path = input_spreadsheet
+wb = load_workbook(path)
+print("Workbook sheets:", wb.sheetnames)
+
+for ws in wb.worksheets:
+    print(f"\n--- Sheet: {ws.title} ---")
+    print("max_row:", ws.max_row, "max_col:", ws.max_column)
+    headers = [ws.cell(1, c).value for c in range(1, ws.max_column + 1)]
+    print("Row1 headers/values:", headers)
+    
+    sample_first = []
+    for r in range(1, min(ws.max_row, 10) + 1):
+        sample_first.append([ws.cell(r, c).value for c in range(1, ws.max_column + 1)])
+    print("First rows:")
+    for row in sample_first:
+        print(row)
+    
+    start_last = max(1, ws.max_row - 4)
+    print("Last 5 rows:")
+    for r in range(start_last, ws.max_row + 1):
+        print([ws.cell(r, c).value for c in range(1, ws.max_column + 1)])
+
+if "Statement" in wb.sheetnames:
+    ws = wb["Statement"]
+    print("\nInspecting Statement!A:A for 'Invoice No.'")
+    matches = []
+    for r in range(1, ws.max_row + 1):
+        val = ws.cell(r, 1).value
+        if val is not None and str(val).strip() == "Invoice No.":
+            matches.append(r)
+    print("Exact matches rows:", matches[:20], "count:", len(matches))
+    
+    contains = []
+    for r in range(1, ws.max_row + 1):
+        val = ws.cell(r, 1).value
+        if val is not None and "Invoice No." in str(val):
+            contains.append((r, val))
+    print("Contains matches sample:", contains[:20], "count:", len(contains))
+    
+    # print first 20 values of column A and around first match
+    print("First 20 values in col A:")
+    for r in range(1, min(20, ws.max_row) + 1):
+        print(r, repr(ws.cell(r, 1).value))
+    
+    if contains:
+        first_r = contains[0][0]
+        print(f"Rows around first occurrence at row {first_r}:")
+        for r in range(max(1, first_r - 5), min(ws.max_row, first_r + 5) + 1):
+            print(r, [ws.cell(r, c).value for c in range(1, min(ws.max_column, 6) + 1)])
+```
+2026-04-14 10:51:00,992 INFO RLM iteration 2/50
+Reasoning: We inspected thoroughly. The target is clearly the existing 'Statement' sheet, and the exact operation is to delete all rows before the first occurrence of "Invoice No." in column A so that this first occurrence moves to A1. In this workbook, the first and only occurrence is at row 12, so rows 1:11 should be removed. We should preserve sheet names/structure otherwise, save to the output directory with the same filename, recalculate, verify that Statement!A1 is "Invoice No." and that sheet names remain unchanged after recalculation, renaming back if necessary.
+Code:
+```repl
+import os
+from openpyxl import load_workbook
+
+infile = input_spreadsheet
+filename = os.path.basename(infile)
+outdir = "/sandbox/output/output_spreadsheet"
+os.makedirs(outdir, exist_ok=True)
+outfile = os.path.join(outdir, filename)
+
+# Load and modify
+wb = load_workbook(infile)
+original_sheetnames = wb.sheetnames[:]
+ws = wb["Statement"]
+
+first_match = None
+for r in range(1, ws.max_row + 1):
+    val = ws.cell(r, 1).value
+    if val is not None and str(val).strip() == "Invoice No.":
+        first_match = r
+        break
+
+print("First 'Invoice No.' row in Statement col A:", first_match)
+print("Current Statement!A1:", repr(ws["A1"].value))
+print("Current target row values:", [ws.cell(first_match, c).value for c in range(1, ws.max_column + 1)])
+
+if first_match is None:
+    raise ValueError("Could not find 'Invoice No.' in column A of Statement sheet.")
+
+if first_match > 1:
+    ws.delete_rows(1, first_match - 1)
+
+print("After deletion, Statement!A1:A5 row1 values:", [ws.cell(1, c).value for c in range(1, ws.max_column + 1)])
+wb.save(outfile)
+print("Saved to", outfile)
+
+# Recalculate
+recalc_result = await recalculate(outfile)
+print("Recalc:", recalc_result)
+
+# Reload and restore sheet names if recalc changed them
+wb_check = load_workbook(outfile)
+print("Sheet names after recalc:", wb_check.sheetnames)
+if wb_check.sheetnames != original_sheetnames:
+    # rename by position back to original
+    for i, name in enumerate(original_sheetnames):
+        wb_check.worksheets[i].title = name
+    wb_check.save(outfile)
+    print("Renamed sheets back to:", original_sheetnames)
+
+# Verify data_only values
+wb_verify = load_workbook(outfile, data_only=True)
+print("Verified sheet names:", wb_verify.sheetnames)
+wsv = wb_verify["Statement"]
+print("Statement max_row/max_col:", wsv.max_row, wsv.max_column)
+print("Statement!A1:E5 after processing:")
+for r in range(1, min(5, wsv.max_row) + 1):
+    print(r, [wsv.cell(r, c).value for c in range(1, min(5, wsv.max_column) + 1)])
+
+assert wsv["A1"].value == "Invoice No.", f"A1 is not 'Invoice No.': {wsv['A1'].value!r}"
+output_spreadsheet = outfile
+print("Prepared output:", output_spreadsheet)
+```
+2026-04-14 10:51:20,148 INFO RLM iteration 3/50
+Reasoning: We have completed inspection, modification, save, recalc, and verification. The output file path is stored in `output_spreadsheet`, and verification confirmed `Statement!A1` is `"Invoice No."` with original sheet names preserved. Next step is to submit the output file only.
+Code:
+```repl
+SUBMIT(output_spreadsheet=output_spreadsheet)
+```
+
+============================================================
+recalc_source: baseline
+score:         1.0000  PASS
+All 55 cells match

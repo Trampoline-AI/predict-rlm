@@ -1,0 +1,551 @@
+task: 56225  case: 1
+instruction_type: Cell-Level Manipulation
+answer_position: 'data'!O3
+input:  /Users/gabriel/Workspace/trampoline-ai/predict-rlm.spreadbench-release/examples/spreadbench/data/testset/spreadsheet/56225/1_56225_init.xlsx
+answer: /Users/gabriel/Workspace/trampoline-ai/predict-rlm.spreadbench-release/examples/spreadbench/data/testset/spreadsheet/56225/1_56225_golden.xlsx
+============================================================
+2026-04-13 15:45:28,802 INFO RLM iteration 1/50
+Reasoning: We need to explore the input spreadsheet to understand its structure before applying any transformations. We'll load the workbook with openpyxl, list sheet names, and for each sheet print the number of rows and columns, and show the header row (first row) values. This will give us insight into where the date, mechanic, and total time columns are located (likely columns N, K, etc.) and how data is formatted. We'll also inspect a few sample rows to see date formats and the values in column K and column N. This exploratory step will guide the subsequent formula or data manipulation.
+Code:
+```repl
+import openpyxl
+from openpyxl import load_workbook
+
+# Load the workbook (read-only is fine for inspection)
+wb = load_workbook(input_spreadsheet, data_only=True)  # data_only to get computed values if any
+
+print("Sheets:", wb.sheetnames)
+
+for sheet_name in wb.sheetnames:
+    ws = wb[sheet_name]
+    max_row = ws.max_row
+    max_col = ws.max_column
+    print(f"\nSheet: {sheet_name} (Rows: {max_row}, Columns: {max_col})")
+    
+    # Get header row (first row) values
+    headers = [ws.cell(row=1, column=c).value for c in range(1, max_col+1)]
+    print("Headers (first 20 columns):", headers[:20])
+    
+    # Show a few sample rows (2-6)
+    for r in range(2, min(7, max_row+1)):
+        row_vals = [ws.cell(row=r, column=c).value for c in range(1, max_col+1)]
+        print(f"Row {r}:", row_vals[:20])
+```
+2026-04-13 15:46:07,813 INFO RLM iteration 2/50
+Reasoning: We inspected the workbook and found two sheets. The 'data' sheet contains the relevant columns: A = date, C = name, K (11) = numeric value (likely hours), M (13) = mechanic name, N (14) = start date. The task is to display per‑day totals per mechanic (date, mechanic, total time). We'll compute these sums in Python, write them to a new sheet called 'summary', and also place a single‑cell formula that reproduces the SUMIFS logic for the specific criteria (name from M3, start date from N5) as a demonstration. After saving, we'll reload the file with data_only=True and print a short verification of the summary rows.
+Code:
+```repl
+import openpyxl
+from openpyxl import load_workbook
+from collections import defaultdict
+import pathlib
+
+# Load the input workbook (read‑only for inspection, then writable)
+wb = load_workbook(input_spreadsheet)
+
+# Identify the sheet that holds the raw data – based on inspection it is named 'data'
+source_ws = wb['data']
+
+# Column indices (1‑based) based on inspection
+COL_DATE = 1   # A
+COL_MECH = 13  # M (mechanic name)
+COL_START = 14 # N (start date)
+COL_VALUE = 11 # K (numeric value to sum)
+
+# Aggregate total time per (date, mechanic)
+aggregated = defaultdict(float)
+for row in range(2, source_ws.max_row + 1):
+    date_val = source_ws.cell(row=row, column=COL_DATE).value
+    mech_val = source_ws.cell(row=row, column=COL_MECH).value
+    start_val = source_ws.cell(row=row, column=COL_START).value
+    num_val = source_ws.cell(row=row, column=COL_VALUE).value
+    # Skip rows missing any of the required fields
+    if date_val is None or mech_val is None or num_val is None:
+        continue
+    # Use the date (or string) as part of the key; keep the raw value for later display
+    key = (date_val, mech_val)
+    try:
+        aggregated[key] += float(num_val)
+    except Exception:
+        # If conversion fails, ignore this row
+        continue
+
+# Create (or replace) a sheet named 'summary'
+if 'summary' in wb.sheetnames:
+    summary_ws = wb['summary']
+else:
+    summary_ws = wb.create_sheet('summary')
+
+# Write header
+summary_ws.append(['date', 'mechanic', 'total time'])
+
+# Write aggregated rows sorted by date then mechanic
+for (date_val, mech_val), total in sorted(aggregated.items(), key=lambda x: (x[0][0], x[0][1])):
+    summary_ws.append([date_val, mech_val, total])
+
+# Demonstrate the SUMIFS logic for the specific criteria (M3 and N5) in the summary sheet
+# We'll place the criteria values in cells B1 and C1 for clarity, then compute the sum in D1.
+# B1 = name from M3, C1 = start date from N5 (taken from the source sheet)
+name_criteria = source_ws['M3'].value
+start_criteria = source_ws['N5'].value
+summary_ws['B1'] = name_criteria
+summary_ws['C1'] = start_criteria
+# Use SUMIFS (LibreOffice compatible) to sum column K where column C = name_criteria and column N = start_criteria
+# Column K is column K, name column is C, start date column is N.
+# The formula will be written as a literal string; LibreOffice will evaluate it when the file is opened.
+summary_ws['D1'] = f"=SUMIFS(K:K, C:C, \"{name_criteria}\", N:N, \"{start_criteria}\")"
+
+# Save the workbook to the output directory, preserving the original filename
+output_path = pathlib.Path('/sandbox/output/output_spreadsheet') / pathlib.Path(input_spreadsheet).name
+wb.save(output_path)
+
+# Verify by re‑loading the saved file (data_only) and printing a few summary rows
+verify_wb = load_workbook(output_path, data_only=True)
+verify_ws = verify_wb['summary']
+print('Verification – first 5 rows of summary:')
+for r in range(2, min(7, verify_ws.max_row + 1)):
+    print([verify_ws.cell(row=r, column=c).value for c in range(1, 4)])
+```
+2026-04-13 15:46:54,929 INFO RLM iteration 3/50
+Reasoning: The previous attempt aggregated using the wrong columns: it treated column M as the mechanic name, but the actual mechanic/name is in column C, and the date is in column A. We need to compute total time per day per mechanic by summing the numeric values in column K (11) for each (date, name) pair. We'll create a 'summary' sheet with columns: date, mechanic (name), total time. Additionally, we'll demonstrate a SUMIFS formula that reproduces the requested sum where the name is taken from cell M3 and the start date from N5 on the original 'data' sheet. The formula will be placed in cell D1 of the summary sheet, referencing the appropriate columns on the 'data' sheet. After saving, we'll reload the file (data_only) and print a few rows of the summary to verify the results.
+Code:
+```repl
+import openpyxl
+from openpyxl import load_workbook
+from collections import defaultdict
+import pathlib
+
+# Load the original workbook (read‑write)
+wb = load_workbook(input_spreadsheet)
+
+# Identify the source sheet (found during inspection)
+src = wb['data']
+
+# Column indices (1‑based) based on the header row
+COL_DATE   = 1   # A – date (datetime or string)
+COL_NAME   = 3   # C – mechanic/name
+COL_VALUE  = 11  # K – numeric value to sum (hours as float)
+
+# Aggregate total time per (date, mechanic)
+agg = defaultdict(float)
+for r in range(2, src.max_row + 1):
+    date_val = src.cell(row=r, column=COL_DATE).value
+    name_val = src.cell(row=r, column=COL_NAME).value
+    val      = src.cell(row=r, column=COL_VALUE).value
+    # Skip rows missing any required field
+    if date_val is None or name_val is None or val is None:
+        continue
+    # Normalise date for dictionary key (keep the original object for output)
+    key = (date_val, name_val)
+    try:
+        agg[key] += float(val)
+    except Exception:
+        # If conversion fails, ignore this row
+        continue
+
+# Create or replace a sheet named 'summary'
+if 'summary' in wb.sheetnames:
+    summary = wb['summary']
+else:
+    summary = wb.create_sheet('summary')
+
+# Write header
+summary.append(['date', 'mechanic', 'total time'])
+
+# Write aggregated rows sorted by date then mechanic
+for (date_val, name_val), total in sorted(agg.items(), key=lambda x: (x[0][0], x[0][1])):
+    summary.append([date_val, name_val, total])
+
+# Demonstrate the SUMIFS formula for the specific criteria (M3 and N5) from the 'data' sheet
+# Place the criteria values in the summary sheet for visibility (optional)
+summary['B1'] = src['M3'].value   # name criteria
+summary['C1'] = src['N5'].value   # start‑date criteria
+
+# Write a SUMIFS formula that sums column K where column C matches M3 and column A matches N5
+# Use full‑column references (LibreOffice compatible). The formula will be evaluated when the file is opened.
+# Note: SUMIFS is supported in LibreOffice; no special prefix needed.
+summary['D1'] = "=SUMIFS(data!K:K, data!C:C, data!M3, data!A:A, data!N5)"
+
+# Save the workbook to the output directory, preserving the original filename
+output_path = pathlib.Path('/sandbox/output/output_spreadsheet') / pathlib.Path(input_spreadsheet).name
+wb.save(output_path)
+
+# Verify by re‑loading the saved file (data_only) and printing a few summary rows
+verify_wb = load_workbook(output_path, data_only=True)
+verify_ws = verify_wb['summary']
+print('Verification – first 5 rows of summary:')
+for r in range(2, min(7, verify_ws.max_row + 1)):
+    print([verify_ws.cell(row=r, column=c).value for c in range(1, 4)])
+```
+2026-04-13 15:47:20,220 INFO RLM iteration 4/50
+Reasoning: The previous attempt failed during sorting because the date column contains a mixture of `datetime.datetime` objects and string values (e.g., `'3-1-21'`). Python cannot compare these types directly, causing a `TypeError`.  
+To fix this, we will sort using the string representation of the date, which works for both types. Additionally, we will keep the aggregation logic unchanged, write the summary sheet, add the requested SUMIFS formula, save the workbook to the output directory, and finally verify a few rows from the summary sheet.
+Code:
+```repl
+import pathlib
+from collections import defaultdict
+
+import openpyxl
+from openpyxl import load_workbook
+
+# Load the original workbook (read‑write)
+wb = load_workbook(input_spreadsheet)
+
+# Source sheet containing the raw data
+src = wb["data"]
+
+# Column indices (1‑based)
+COL_DATE  = 1   # A – date (datetime or string)
+COL_NAME  = 3   # C – mechanic / name
+COL_VALUE = 11  # K – numeric value to sum (float)
+
+# Aggregate total time per (date, mechanic)
+agg = defaultdict(float)
+for r in range(2, src.max_row + 1):
+    date_val = src.cell(row=r, column=COL_DATE).value
+    name_val = src.cell(row=r, column=COL_NAME).value
+    val      = src.cell(row=r, column=COL_VALUE).value
+    if date_val is None or name_val is None or val is None:
+        continue
+    try:
+        agg[(date_val, name_val)] += float(val)
+    except Exception:
+        # Skip rows where the value cannot be cast to float
+        continue
+
+# Create or replace a sheet named "summary"
+if "summary" in wb.sheetnames:
+    summary = wb["summary"]
+else:
+    summary = wb.create_sheet("summary")
+
+# Header
+summary.append(["date", "mechanic", "total time"])
+
+# Write aggregated rows sorted by date (as string) then mechanic name
+for (date_val, name_val), total in sorted(
+    agg.items(),
+    key=lambda item: (str(item[0][0]), item[0][1])
+):
+    summary.append([date_val, name_val, total])
+
+# Add the SUMIFS demonstration (criteria from M3 and N5 on the data sheet)
+summary["B1"] = src["M3"].value   # name criteria
+summary["C1"] = src["N5"].value   # start‑date criteria
+# Formula: sum column K where column C = M3 and column A = N5 (LibreOffice compatible)
+summary["D1"] = "=SUMIFS(data!K:K, data!C:C, data!M3, data!A:A, data!N5)"
+
+# Save to the output directory, preserving the original filename
+output_path = pathlib.Path("/sandbox/output/output_spreadsheet") / pathlib.Path(input_spreadsheet).name
+wb.save(output_path)
+
+# Verification: reload with data_only and print first few summary rows
+verify_wb = load_workbook(output_path, data_only=True)
+verify_ws = verify_wb["summary"]
+print("Verification – first 5 rows of summary:")
+for r in range(2, min(7, verify_ws.max_row + 1)):
+    print([verify_ws.cell(row=r, column=c).value for c in range(1, 4)])
+```
+2026-04-13 15:48:10,095 INFO RLM iteration 5/50
+Reasoning: The previous run created a “summary” sheet but did not clear any existing rows, so old data (with zeros) remained and appeared in the verification output.  
+We will now:
+1. Load the workbook.
+2. Remove any existing “summary” sheet and create a fresh one.
+3. Aggregate the numeric values from column K (index 11) for each (date, mechanic) pair, handling mixed date types by sorting on the string representation.
+4. Write the aggregated rows to the new “summary” sheet.
+5. Add a SUMIFS formula that reproduces the requested sum where the name is taken from cell M3 and the start date from N5 on the “data” sheet.
+6. Save the workbook to the output directory.
+7. Reload the saved file (data_only) and print a few rows of the new summary for verification.
+Code:
+```repl
+import pathlib
+from collections import defaultdict
+
+import openpyxl
+from openpyxl import load_workbook
+
+# 1. Load the original workbook (read‑write)
+wb = load_workbook(input_spreadsheet)
+
+# 2. Source sheet containing the raw data
+src = wb["data"]
+
+# 3. Column indices (1‑based) based on the inspected layout
+COL_DATE  = 1   # A – date (datetime or string)
+COL_NAME  = 3   # C – mechanic / name
+COL_VALUE = 11  # K – numeric value to sum (float)
+
+# 4. Aggregate total time per (date, mechanic)
+agg = defaultdict(float)
+for r in range(2, src.max_row + 1):
+    date_val = src.cell(row=r, column=COL_DATE).value
+    name_val = src.cell(row=r, column=COL_NAME).value
+    val      = src.cell(row=r, column=COL_VALUE).value
+    if date_val is None or name_val is None or val is None:
+        continue
+    try:
+        agg[(date_val, name_val)] += float(val)
+    except Exception:
+        # Skip rows where the value cannot be cast to float
+        continue
+
+# 5. Remove any existing "summary" sheet and create a fresh one
+if "summary" in wb.sheetnames:
+    wb.remove(wb["summary"])
+summary = wb.create_sheet("summary")
+
+# 6. Header
+summary.append(["date", "mechanic", "total time"])
+
+# 7. Write aggregated rows sorted by date (as string) then mechanic name
+for (date_val, name_val), total in sorted(
+    agg.items(),
+    key=lambda item: (str(item[0][0]), item[0][1])
+):
+    summary.append([date_val, name_val, total])
+
+# 8. Demonstrate the SUMIFS formula for the specific criteria (M3 and N5) from the "data" sheet
+#    Place the criteria values in the summary sheet for visibility (optional)
+summary["B1"] = src["M3"].value   # name criteria
+summary["C1"] = src["N5"].value   # start‑date criteria
+#    Formula: sum column K where column C = M3 and column A = N5 (LibreOffice compatible)
+summary["D1"] = "=SUMIFS(data!K:K, data!C:C, data!M3, data!A:A, data!N5)"
+
+# 9. Save the workbook to the output directory, preserving the original filename
+output_path = pathlib.Path("/sandbox/output/output_spreadsheet") / pathlib.Path(input_spreadsheet).name
+wb.save(output_path)
+
+# 10. Verification: reload with data_only and print first few summary rows
+verify_wb = load_workbook(output_path, data_only=True)
+verify_ws = verify_wb["summary"]
+print("Verification – first 5 rows of summary:")
+for r in range(2, min(7, verify_ws.max_row + 1)):
+    print([verify_ws.cell(row=r, column=c).value for c in range(1, 4)])
+```
+2026-04-13 15:49:01,700 INFO RLM iteration 6/50
+Reasoning: The previous aggregation used column K values directly, which are time strings like '0:37:06', resulting in zero totals. We need to parse these time strings (or datetime.time objects) into numeric hours before summing. We'll keep the date from column A and the mechanic/name from column C. We'll remove any existing 'summary' sheet, create a fresh one, write the aggregated totals, and include the requested SUMIFS formula referencing column K on the original 'data' sheet (as the instruction asks). After saving, we'll reload the file with data_only=True and print a few rows for verification.
+Code:
+```repl
+import pathlib
+from collections import defaultdict
+import openpyxl
+from openpyxl import load_workbook
+
+# Load the original workbook (read‑write)
+wb = load_workbook(input_spreadsheet)
+
+# Source sheet containing the raw data
+src = wb["data"]
+
+# Column indices (1‑based) based on the inspected layout
+COL_DATE  = 1   # A – date (datetime or string)
+COL_NAME  = 3   # C – mechanic / name
+COL_K     = 11  # K – total time as a string (e.g., "0:37:06")
+
+# Helper to convert a time string or datetime.time to hours (float)
+
+def time_to_hours(val):
+    if val is None:
+        return None
+    # datetime.time object
+    if isinstance(val, datetime.time):
+        return val.hour + val.minute/60 + val.second/3600
+    # String like "h:mm:ss" or "hh:mm:ss"
+    if isinstance(val, str):
+        parts = val.split(":")
+        if len(parts) == 3:
+            try:
+                h, m, s = map(int, parts)
+                return h + m/60 + s/3600
+            except Exception:
+                return None
+    # Already numeric (unlikely)
+    try:
+        return float(val)
+    except Exception:
+        return None
+
+# Aggregate total time per (date, mechanic)
+agg = defaultdict(float)
+for r in range(2, src.max_row + 1):
+    date_val = src.cell(row=r, column=COL_DATE).value
+    name_val = src.cell(row=r, column=COL_NAME).value
+    k_val    = src.cell(row=r, column=COL_K).value
+    if date_val is None or name_val is None or k_val is None:
+        continue
+    hours = time_to_hours(k_val)
+    if hours is None:
+        continue
+    agg[(date_val, name_val)] += hours
+
+# Remove any existing "summary" sheet and create a fresh one
+if "summary" in wb.sheetnames:
+    wb.remove(wb["summary"])
+summary = wb.create_sheet("summary")
+
+# Header
+summary.append(["date", "mechanic", "total time"])
+
+# Write aggregated rows sorted by date (as string) then mechanic name
+for (date_val, name_val), total in sorted(
+    agg.items(),
+    key=lambda item: (str(item[0][0]), item[0][1])
+):
+    summary.append([date_val, name_val, total])
+
+# Demonstrate the SUMIFS formula for the specific criteria (M3 and N5) from the "data" sheet
+summary["B1"] = src["M3"].value   # name criteria
+summary["C1"] = src["N5"].value   # start‑date criteria
+# Formula: sum column K where column C = M3 and column A = N5 (LibreOffice compatible)
+summary["D1"] = "=SUMIFS(data!K:K, data!C:C, data!M3, data!A:A, data!N5)"
+
+# Save to the output directory, preserving the original filename
+output_path = pathlib.Path("/sandbox/output/output_spreadsheet") / pathlib.Path(input_spreadsheet).name
+wb.save(output_path)
+
+# Verification: reload with data_only and print first few summary rows
+verify_wb = load_workbook(output_path, data_only=True)
+verify_ws = verify_wb["summary"]
+print("Verification – first 5 rows of summary:")
+for r in range(2, min(7, verify_ws.max_row + 1)):
+    print([verify_ws.cell(row=r, column=c).value for c in range(1, 4)])
+```
+2026-04-13 15:49:19,492 INFO RLM iteration 7/50
+Reasoning: The previous code failed because the `datetime` module was not imported, causing a `NameError` when trying to convert `datetime.time` objects.  
+We will:
+1. Import `datetime`.
+2. Load the workbook and work on the **data** sheet.
+3. Aggregate the numeric values from column K (index 11) for each (date A, mechanic C) pair, converting any time‑string values to hours if needed.
+4. Remove any existing **summary** sheet and create a fresh one with headers `date`, `mechanic`, `total time`.
+5. Write the aggregated rows sorted by the string representation of the date, then by mechanic name.
+6. Add a demonstration `SUMIFS` formula that sums column K where column C equals the name in `M3` and column N equals the start date in `N5` (as requested).
+7. Save the workbook to the output directory, preserving the original filename.
+8. Reload the saved file (with `data_only=True`) and print a few summary rows for verification.
+Code:
+```repl
+import pathlib
+import datetime
+from collections import defaultdict
+
+import openpyxl
+from openpyxl import load_workbook
+
+# Load the original workbook (read‑write)
+wb = load_workbook(input_spreadsheet)
+
+# Source sheet containing the raw data
+src = wb["data"]
+
+# Column indices (1‑based) based on the inspected layout
+COL_DATE   = 1   # A – date (datetime or string)
+COL_NAME   = 3   # C – mechanic / name
+COL_TIME   = 11  # K – total time (numeric or time string)
+
+# Helper to convert a time string or datetime.time to hours (float)
+def time_to_hours(val):
+    if val is None:
+        return None
+    if isinstance(val, datetime.time):
+        return val.hour + val.minute / 60 + val.second / 3600
+    if isinstance(val, (int, float)):
+        return float(val)
+    if isinstance(val, str):
+        parts = val.split(":")
+        if len(parts) == 3:
+            try:
+                h, m, s = map(int, parts)
+                return h + m / 60 + s / 3600
+            except Exception:
+                return None
+    return None
+
+# Aggregate total time per (date, mechanic)
+agg = defaultdict(float)
+for r in range(2, src.max_row + 1):
+    date_val = src.cell(row=r, column=COL_DATE).value
+    name_val = src.cell(row=r, column=COL_NAME).value
+    time_val = src.cell(row=r, column=COL_TIME).value
+    if date_val is None or name_val is None or time_val is None:
+        continue
+    hours = time_to_hours(time_val)
+    if hours is None:
+        continue
+    agg[(date_val, name_val)] += hours
+
+# Remove any existing "summary" sheet and create a fresh one
+if "summary" in wb.sheetnames:
+    wb.remove(wb["summary"])
+summary = wb.create_sheet("summary")
+
+# Header
+summary.append(["date", "mechanic", "total time"])
+
+# Write aggregated rows sorted by date (as string) then mechanic name
+for (date_val, name_val), total in sorted(
+    agg.items(),
+    key=lambda item: (str(item[0][0]), item[0][1])
+):
+    summary.append([date_val, name_val, total])
+
+# Demonstrate the SUMIFS formula for the specific criteria (M3 and N5) from the "data" sheet
+summary["B1"] = src["M3"].value   # name criteria
+summary["C1"] = src["N5"].value   # start‑date criteria
+# Formula: sum column K where column C = M3 and column N = N5 (LibreOffice compatible)
+summary["D1"] = "=SUMIFS(data!K:K, data!C:C, data!M3, data!N:N, data!N5)"
+
+# Save to the output directory, preserving the original filename
+output_path = pathlib.Path("/sandbox/output/output_spreadsheet") / pathlib.Path(input_spreadsheet).name
+wb.save(output_path)
+
+# Verification: reload with data_only and print first few summary rows
+verify_wb = load_workbook(output_path, data_only=True)
+verify_ws = verify_wb["summary"]
+print("Verification – first 5 rows of summary:")
+for r in range(2, min(7, verify_ws.max_row + 1)):
+    print([verify_ws.cell(row=r, column=c).value for c in range(1, 4)])
+```
+2026-04-13 15:50:00,797 INFO RLM iteration 8/50
+Reasoning: The previous attempt created a `summary` sheet but no data rows were written, resulting in an empty verification output. This indicates that the aggregation loop did not add any entries. To diagnose, we will:
+
+1. Load the workbook and reference the `data` sheet.
+2. Print the total number of rows in the sheet.
+3. For a few sample rows, display the values of the relevant columns:  
+   - Column A (date)  
+   - Column C (mechanic/name)  
+   - Column K (the numeric value to sum)  
+   - Column G (total time string) – just for reference.
+4. Count how many rows have a non‑null value in column K.
+
+This inspection will reveal whether column K contains usable numeric data or if we need to adjust the column index or handling. After confirming the correct column and data types, we will rewrite the aggregation logic, ensure the `summary` sheet is freshly created, write the aggregated rows, add the requested `SUMIFS` formula, save the file, and finally verify the output.
+Code:
+```repl
+import pathlib
+import openpyxl
+from openpyxl import load_workbook
+
+# Load the workbook (read‑only is fine for inspection)
+wb = load_workbook(input_spreadsheet, data_only=True)
+src = wb["data"]
+
+# Basic info
+print("Data sheet rows:", src.max_row, "cols:", src.max_column)
+
+# Show headers (first row)
+headers = [src.cell(row=1, column=c).value for c in range(1, src.max_column+1)]
+print("Headers (first 15):", headers[:15])
+
+# Sample rows
+for r in range(2, min(7, src.max_row+1)):
+    date_val = src.cell(row=r, column=1).value          # A
+    name_val = src.cell(row=r, column=3).value          # C
+    colK_val = src.cell(row=r, column=11).value         # K (numeric)
+    colG_val = src.cell(row=r, column=7).value          # G (time string)
+    print(f"Row {r}: date={date_val!r}, name={name_val!r}, K={colK_val!r}, G={colG_val!r}")
+
+# Count non‑null K values
+non_null_K = sum(1 for r in range(2, src.max_row+1) if src.cell(row=r, column=11).value is not None)
+print("Rows with non‑null K:", non_null_K)
+```
+```repl
+# No further code needed in this turn.
+```

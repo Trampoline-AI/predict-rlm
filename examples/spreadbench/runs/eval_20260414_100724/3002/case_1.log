@@ -1,0 +1,635 @@
+task: 3002  case: 1
+instruction_type: Cell-Level Manipulation
+answer_position: G5:G15
+input:  /Users/gabriel/Workspace/trampoline-ai/predict-rlm.spreadbench-release/examples/spreadbench/data/testset/spreadsheet/3002/1_3002_init.xlsx
+answer: /Users/gabriel/Workspace/trampoline-ai/predict-rlm.spreadbench-release/examples/spreadbench/data/testset/spreadsheet/3002/1_3002_golden.xlsx
+============================================================
+2026-04-14 10:24:26,555 INFO RLM iteration 1/50
+Reasoning: First I need to inspect the workbook thoroughly before making any changes. I should print the full instruction, list all sheets, row/column counts, headers, and sample rows from the beginning and end of each sheet. Since the task mentions the “Remark” column and possibly existing formulas/example answers, I also need to detect where that column is, inspect nearby columns, and print current values/formulas there. After that I can determine the exact target cells and implement the needed change.
+Code:
+```repl
+from openpyxl import load_workbook
+from openpyxl.utils import get_column_letter
+import os, json, textwrap
+
+print("INSTRUCTION:\n", instruction)
+
+wb = load_workbook(input_spreadsheet)
+print("\nWorkbook sheets:", wb.sheetnames)
+
+def row_values(ws, r, max_cols=None):
+    mc = max_cols or ws.max_column
+    return [ws.cell(r, c).value for c in range(1, mc+1)]
+
+for sname in wb.sheetnames:
+    ws = wb[sname]
+    print(f"\n--- Sheet: {sname} ---")
+    print("max_row:", ws.max_row, "max_column:", ws.max_column)
+    headers = row_values(ws, 1, ws.max_column)
+    print("Headers row 1:")
+    for i, h in enumerate(headers, start=1):
+        print(f"  {get_column_letter(i)}{1}: {h!r}")
+    # Also inspect row 2 in case headers are there
+    row2 = row_values(ws, 2, ws.max_column)
+    print("Row 2 preview:", row2[:min(10, ws.max_column)])
+
+    first_rows = list(range(1, min(ws.max_row, 10) + 1))
+    last_rows = list(range(max(1, ws.max_row - 4), ws.max_row + 1))
+    print("\nFirst rows:")
+    for r in first_rows:
+        print(f"R{r}:", row_values(ws, r, min(ws.max_column, 12)))
+    print("\nLast rows:")
+    for r in last_rows:
+        print(f"R{r}:", row_values(ws, r, min(ws.max_column, 12)))
+
+    # Find possible Remark / Mat Doc / Doc No columns
+    possible = []
+    for i, h in enumerate(headers, start=1):
+        hs = str(h).strip().lower() if h is not None else ""
+        if "remark" in hs or "mat" in hs or "doc" in hs or "color" in hs or "border" in hs:
+            possible.append((i, h))
+    if possible:
+        print("\nRelevant headers found on row 1:")
+        for i, h in possible:
+            print(f"  Col {get_column_letter(i)} ({i}): {h!r}")
+            # print sample values under these headers
+            vals = []
+            for r in range(2, min(ws.max_row, 8) + 1):
+                vals.append(ws.cell(r, i).value)
+            print("    Sample values:", vals)
+
+        # print formulas if any in these cols
+        for i, h in possible:
+            formulas = []
+            for r in range(2, ws.max_row + 1):
+                v = ws.cell(r, i).value
+                if isinstance(v, str) and v.startswith("="):
+                    formulas.append((r, v))
+                    if len(formulas) >= 5:
+                        break
+            if formulas:
+                print(f"    Formulas in col {get_column_letter(i)}:", formulas)
+```
+2026-04-14 10:25:24,097 INFO RLM iteration 2/50
+Reasoning: I’ve identified the likely data area and the key pattern in the sample rows, but I still need to verify the exact target range and the existing formatting before modifying anything.
+
+What I know so far:
+- The real table starts at row 4, with headers in `E4:G4`.
+- `G` is clearly the `Remark` column.
+- Sample outputs imply the rule is likely:
+  - For each `Mat Doc`, if it appears with more than one distinct `Doc No`, mark all rows for that `Mat Doc` as `"Multiple"`.
+  - Otherwise mark them `"Single"`.
+- Blank target cells appear in `G11:G15`.
+- The task also explicitly requires formatting changes, so I must inspect current fills/borders/fonts/alignment in the populated area before changing them.
+
+What remains:
+- Verify whether any formulas already exist in the target cells.
+- Inspect merged cells and exact populated range.
+- Print current formatting details for populated cells, especially `E3:G15`.
+- Confirm whether formatting should be applied to all populated cells in the sheet or just the table area.
+
+Plan:
+1. Inspect merged ranges and current values/formulas in `E3:G15`.
+2. Print concise style info (fill, font color, border presence) for populated cells in that range.
+3. Then I can safely implement formulas in the `Remark` column and update formatting.
+Code:
+```repl
+from openpyxl import load_workbook
+from openpyxl.styles import PatternFill, Border, Side
+from openpyxl.utils import get_column_letter
+
+wb = load_workbook(input_spreadsheet)
+ws = wb[wb.sheetnames[0]]
+
+print("Merged cell ranges:", list(ws.merged_cells.ranges))
+
+# Inspect exact target area E3:G15, including formulas if any
+print("\nValues/formulas in E3:G15:")
+for r in range(3, 16):
+    row_out = []
+    for c in range(5, 8):  # E:G
+        cell = ws.cell(r, c)
+        v = cell.value
+        row_out.append(f"{get_column_letter(c)}{r}={v!r}")
+    print(" | ".join(row_out))
+
+def style_summary(cell):
+    fill = cell.fill
+    border = cell.border
+    font = cell.font
+    
+    fill_info = {
+        "fill_type": fill.fill_type,
+        "fgColor": fill.fgColor.rgb if getattr(fill.fgColor, "type", None) == "rgb" else fill.fgColor.indexed if getattr(fill.fgColor, "type", None) == "indexed" else fill.fgColor.type,
+    }
+    font_color = None
+    if font.color is not None:
+        if getattr(font.color, "type", None) == "rgb":
+            font_color = font.color.rgb
+        elif getattr(font.color, "type", None) == "indexed":
+            font_color = f"indexed:{font.color.indexed}"
+        else:
+            font_color = font.color.type
+    border_info = {
+        "left": border.left.style,
+        "right": border.right.style,
+        "top": border.top.style,
+        "bottom": border.bottom.style,
+    }
+    return {
+        "style_id": cell.style_id,
+        "fill": fill_info,
+        "font_bold": font.bold,
+        "font_italic": font.italic,
+        "font_color": font_color,
+        "number_format": cell.number_format,
+        "alignment": (cell.alignment.horizontal, cell.alignment.vertical),
+        "border": border_info,
+    }
+
+print("\nStyle details for populated cells in E3:G15:")
+for r in range(3, 16):
+    for c in range(5, 8):
+        cell = ws.cell(r, c)
+        if cell.value is not None:
+            print(f"{get_column_letter(c)}{r} {cell.value!r}: {style_summary(cell)}")
+
+# Also print all populated cells in the sheet to confirm exact populated range
+print("\nAll populated cells in sheet:")
+populated = []
+for row in ws.iter_rows():
+    for cell in row:
+        if cell.value is not None:
+            populated.append(cell.coordinate)
+print(populated)
+print("Total populated cells:", len(populated))
+```
+2026-04-14 10:27:12,592 INFO RLM iteration 3/50
+Reasoning: I’ve now verified the structure and the example pattern:
+
+- The actual table is on `Sheet1`, headers at `E4:G4`.
+- Target output cells are the `Remark` cells in `G5:G15`.
+- The example rows show the intended rule:
+  - `"Multiple"` when the same `Mat Doc` appears with at least one *different* `Doc No`.
+  - `"Single"` when that `Mat Doc` only appears with one `Doc No` value, even if repeated across multiple rows.
+- Existing example answers in `G5:G10` confirm that pattern.
+- Formatting requirement applies to populated cells: remove fills/borders, then reapply thin borders to populated cells except cells whose displayed remark is `"Multiple"` or `"Single"`.
+
+Plan:
+1. Load the workbook and locate the `Mat Doc`, `Doc No`, and `Remark` columns programmatically.
+2. Write a compatible Excel/LibreOffice formula into all relevant `Remark` cells.
+   - Simpler formula than distinct-count:
+     `=IF(E5="","",IF(COUNTIFS($E$5:$E$15,E5,$F$5:$F$15,"<>"&F5)>0,"Multiple","Single"))`
+   - This matches the sample behavior exactly.
+3. Remove fills/borders from populated cells, then reapply thin borders except to the remark result cells.
+4. Save, recalculate, reload, verify values and styles.
+5. If formulas fail after recalc, fall back to Python-computed literal values.
+Code:
+```repl
+from openpyxl import load_workbook
+from openpyxl.styles import PatternFill, Border, Side
+from openpyxl.utils import get_column_letter
+import os
+from copy import copy
+
+infile = input_spreadsheet
+outdir = "/sandbox/output/output_spreadsheet"
+os.makedirs(outdir, exist_ok=True)
+outfile = os.path.join(outdir, os.path.basename(infile))
+
+original_wb = load_workbook(infile)
+original_sheetnames = list(original_wb.sheetnames)
+ws = original_wb[original_sheetnames[0]]
+
+print("Instruction:", instruction)
+
+# Locate header row / target columns by content, not assumption
+header_row = None
+mat_col = doc_col = remark_col = None
+for r in range(1, ws.max_row + 1):
+    vals = [ws.cell(r, c).value for c in range(1, ws.max_column + 1)]
+    normalized = {str(v).strip().lower(): i for i, v in enumerate(vals, start=1) if v is not None}
+    if "mat doc" in normalized and "doc no" in normalized and "remark" in normalized:
+        header_row = r
+        mat_col = normalized["mat doc"]
+        doc_col = normalized["doc no"]
+        remark_col = normalized["remark"]
+        break
+
+print("Detected header row:", header_row)
+print("Mat Doc col:", mat_col, get_column_letter(mat_col))
+print("Doc No col:", doc_col, get_column_letter(doc_col))
+print("Remark col:", remark_col, get_column_letter(remark_col))
+
+data_start = header_row + 1
+last_data_row = 0
+for r in range(data_start, ws.max_row + 1):
+    if ws.cell(r, mat_col).value is not None or ws.cell(r, doc_col).value is not None:
+        last_data_row = r
+
+print("Data rows:", data_start, "to", last_data_row)
+
+# Show current target values/formulas before modification
+print("\nCurrent target cells:")
+for r in range(data_start, last_data_row + 1):
+    print(
+        r,
+        ws.cell(r, mat_col).value,
+        ws.cell(r, doc_col).value,
+        ws.cell(r, remark_col).value
+    )
+
+# Compute expected remarks in Python for verification and border logic
+mat_to_docs = {}
+for r in range(data_start, last_data_row + 1):
+    mat = ws.cell(r, mat_col).value
+    doc = ws.cell(r, doc_col).value
+    if mat is not None and doc is not None:
+        mat_to_docs.setdefault(mat, set()).add(doc)
+
+expected = {}
+for r in range(data_start, last_data_row + 1):
+    mat = ws.cell(r, mat_col).value
+    doc = ws.cell(r, doc_col).value
+    if mat is None and doc is None:
+        expected[r] = None
+    else:
+        expected[r] = "Multiple" if len(mat_to_docs.get(mat, set())) > 1 else "Single"
+
+print("\nExpected remarks from sample logic:")
+for r in range(data_start, last_data_row + 1):
+    print(f"G{r} -> {expected[r]}")
+
+# Write formulas to ALL relevant remark rows
+mat_letter = get_column_letter(mat_col)
+doc_letter = get_column_letter(doc_col)
+remark_letter = get_column_letter(remark_col)
+
+for r in range(data_start, last_data_row + 1):
+    mat = ws.cell(r, mat_col).value
+    doc = ws.cell(r, doc_col).value
+    if mat is None and doc is None:
+        continue
+    formula = (
+        f'=IF({mat_letter}{r}="","",'
+        f'IF(COUNTIFS(${mat_letter}${data_start}:${mat_letter}${last_data_row},{mat_letter}{r},'
+        f'${doc_letter}${data_start}:${doc_letter}${last_data_row},"<>"&{doc_letter}{r})>0,'
+        f'"Multiple","Single"))'
+    )
+    ws.cell(r, remark_col).value = formula
+
+print("\nFormulas written:")
+for r in range(data_start, last_data_row + 1):
+    print(f"{remark_letter}{r}:", ws.cell(r, remark_col).value)
+
+# Formatting:
+# 1) remove fill and border formatting from all populated cells
+# 2) re-apply thin all borders to all populated cells except ones that display Multiple/Single
+no_fill = PatternFill(fill_type=None)
+no_border = Border()
+thin = Side(style="thin", color="000000")
+thin_border = Border(left=thin, right=thin, top=thin, bottom=thin)
+
+populated_coords = []
+for row in ws.iter_rows():
+    for cell in row:
+        if cell.value is not None:
+            populated_coords.append(cell.coordinate)
+            cell.fill = copy(no_fill)
+            cell.border = copy(no_border)
+
+# Re-apply borders except remark result cells
+for row in ws.iter_rows():
+    for cell in row:
+        if cell.value is None:
+            continue
+        skip_border = (
+            cell.column == remark_col
+            and data_start <= cell.row <= last_data_row
+            and expected.get(cell.row) in {"Multiple", "Single"}
+        )
+        if not skip_border:
+            cell.border = copy(thin_border)
+
+print("\nTotal populated cells formatted:", len(populated_coords))
+
+# Save first pass
+original_wb.save(outfile)
+print("Saved to:", outfile)
+
+# Recalculate
+recalc_result = await recalculate(outfile)
+print("Recalculate result:", recalc_result)
+
+# Restore sheet names if recalculate changed them
+post_wb = load_workbook(outfile)
+post_sheetnames = list(post_wb.sheetnames)
+print("Sheet names after recalc:", post_sheetnames)
+if post_sheetnames != original_sheetnames:
+    if len(post_sheetnames) == len(original_sheetnames):
+        for old_name, desired_name in zip(post_sheetnames, original_sheetnames):
+            if old_name != desired_name:
+                post_wb[old_name].title = desired_name
+        post_wb.save(outfile)
+        print("Restored original sheet names:", original_sheetnames)
+
+# Verify formula results
+verify_wb = load_workbook(outfile, data_only=True)
+vws = verify_wb[original_sheetnames[0]]
+
+verified_values = {}
+for r in range(data_start, last_data_row + 1):
+    verified_values[r] = vws.cell(r, remark_col).value
+
+print("\nVerified target values after recalc:")
+for r in range(data_start, last_data_row + 1):
+    print(f"{remark_letter}{r} =", verified_values[r], "| expected:", expected[r])
+
+formula_ok = all(
+    (expected[r] is None and verified_values[r] in (None, ""))
+    or (verified_values[r] == expected[r])
+    for r in range(data_start, last_data_row + 1)
+)
+
+print("Formula verification passed:", formula_ok)
+
+# If formula evaluation failed, fall back to Python literal values
+if not formula_ok:
+    print("\nFalling back to Python-computed literal values.")
+    wb2 = load_workbook(infile)
+    ws2 = wb2[original_sheetnames[0]]
+
+    # rewrite values
+    for r in range(data_start, last_data_row + 1):
+        if expected[r] is not None:
+            ws2.cell(r, remark_col).value = expected[r]
+
+    # reapply formatting from scratch
+    for row in ws2.iter_rows():
+        for cell in row:
+            if cell.value is not None:
+                cell.fill = copy(no_fill)
+                cell.border = copy(no_border)
+    for row in ws2.iter_rows():
+        for cell in row:
+            if cell.value is None:
+                continue
+            if not (cell.column == remark_col and data_start <= cell.row <= last_data_row and ws2.cell(cell.row, remark_col).value in {"Multiple", "Single"}):
+                cell.border = copy(thin_border)
+
+    wb2.save(outfile)
+    print("Saved fallback literal-value workbook.")
+    recalc_result2 = await recalculate(outfile)
+    print("Fallback recalculate result:", recalc_result2)
+
+    post_wb2 = load_workbook(outfile)
+    if list(post_wb2.sheetnames) != original_sheetnames and len(post_wb2.sheetnames) == len(original_sheetnames):
+        for old_name, desired_name in zip(list(post_wb2.sheetnames), original_sheetnames):
+            if old_name != desired_name:
+                post_wb2[old_name].title = desired_name
+        post_wb2.save(outfile)
+        print("Restored original sheet names after fallback.")
+
+    verify_wb = load_workbook(outfile, data_only=True)
+    vws = verify_wb[original_sheetnames[0]]
+    verified_values = {r: vws.cell(r, remark_col).value for r in range(data_start, last_data_row + 1)}
+    print("\nVerified target values after fallback:")
+    for r in range(data_start, last_data_row + 1):
+        print(f"{remark_letter}{r} =", verified_values[r], "| expected:", expected[r])
+
+# Final style spot-check using non-data_only load
+style_wb = load_workbook(outfile)
+sws = style_wb[original_sheetnames[0]]
+
+def border_summary(cell):
+    b = cell.border
+    return (b.left.style, b.right.style, b.top.style, b.bottom.style)
+
+def fill_summary(cell):
+    f = cell.fill
+    return (f.fill_type, f.fgColor.rgb if getattr(f.fgColor, "type", None) == "rgb" else None)
+
+print("\nStyle verification spot-check:")
+for coord in [f"{mat_letter}5", f"{doc_letter}5", f"{remark_letter}5", f"{remark_letter}11", f"{mat_letter}4", f"{remark_letter}4"]:
+    cell = sws[coord]
+    print(
+        coord,
+        "value=", cell.value,
+        "border=", border_summary(cell),
+        "fill=", fill_summary(cell)
+    )
+
+print("\nOutput ready at:", outfile)
+```
+2026-04-14 10:27:57,485 INFO RLM iteration 4/50
+Reasoning: The previous run likely completed the workbook modification and failed only during the final style spot-check because some border sides are `None`, so accessing `.style` raised an error. I need to:
+1. Reload the output file if it exists and inspect the actual target cells and styles safely.
+2. If the output file is missing or incorrect, rerun the manipulation with a safer verification function.
+3. Confirm:
+   - `G5:G15` contain the correct `"Multiple"` / `"Single"` results after recalculation.
+   - fills are removed.
+   - borders are thin on populated cells except the remark result cells.
+   - sheet name remains `Sheet1`.
+Then I can submit the saved output file.
+Code:
+```repl
+from openpyxl import load_workbook
+from openpyxl.styles import PatternFill, Border, Side
+from openpyxl.utils import get_column_letter
+from copy import copy
+import os
+
+infile = input_spreadsheet
+outdir = "/sandbox/output/output_spreadsheet"
+os.makedirs(outdir, exist_ok=True)
+outfile = os.path.join(outdir, os.path.basename(infile))
+
+def safe_border_summary(cell):
+    b = cell.border
+    def sty(side):
+        return None if side is None else side.style
+    return (sty(b.left), sty(b.right), sty(b.top), sty(b.bottom))
+
+def safe_fill_summary(cell):
+    f = cell.fill
+    rgb = None
+    if getattr(f.fgColor, "type", None) == "rgb":
+        rgb = f.fgColor.rgb
+    return (f.fill_type, rgb)
+
+def build_and_save():
+    wb = load_workbook(infile)
+    original_sheetnames = list(wb.sheetnames)
+    ws = wb[original_sheetnames[0]]
+
+    # detect header row / columns
+    header_row = None
+    mat_col = doc_col = remark_col = None
+    for r in range(1, ws.max_row + 1):
+        vals = [ws.cell(r, c).value for c in range(1, ws.max_column + 1)]
+        norm = {str(v).strip().lower(): i for i, v in enumerate(vals, start=1) if v is not None}
+        if "mat doc" in norm and "doc no" in norm and "remark" in norm:
+            header_row = r
+            mat_col = norm["mat doc"]
+            doc_col = norm["doc no"]
+            remark_col = norm["remark"]
+            break
+
+    data_start = header_row + 1
+    last_data_row = 0
+    for r in range(data_start, ws.max_row + 1):
+        if ws.cell(r, mat_col).value is not None or ws.cell(r, doc_col).value is not None:
+            last_data_row = r
+
+    mat_to_docs = {}
+    for r in range(data_start, last_data_row + 1):
+        mat = ws.cell(r, mat_col).value
+        doc = ws.cell(r, doc_col).value
+        if mat is not None and doc is not None:
+            mat_to_docs.setdefault(mat, set()).add(doc)
+
+    expected = {}
+    for r in range(data_start, last_data_row + 1):
+        mat = ws.cell(r, mat_col).value
+        doc = ws.cell(r, doc_col).value
+        if mat is None and doc is None:
+            expected[r] = None
+        else:
+            expected[r] = "Multiple" if len(mat_to_docs.get(mat, set())) > 1 else "Single"
+
+    mat_letter = get_column_letter(mat_col)
+    doc_letter = get_column_letter(doc_col)
+
+    # write formulas in remark column
+    for r in range(data_start, last_data_row + 1):
+        mat = ws.cell(r, mat_col).value
+        doc = ws.cell(r, doc_col).value
+        if mat is None and doc is None:
+            continue
+        ws.cell(r, remark_col).value = (
+            f'=IF({mat_letter}{r}="","",'
+            f'IF(COUNTIFS(${mat_letter}${data_start}:${mat_letter}${last_data_row},{mat_letter}{r},'
+            f'${doc_letter}${data_start}:${doc_letter}${last_data_row},"<>"&{doc_letter}{r})>0,'
+            f'"Multiple","Single"))'
+        )
+
+    # remove color and border formatting from all populated cells
+    no_fill = PatternFill(fill_type=None)
+    no_border = Border()
+    thin = Side(style="thin", color="000000")
+    thin_border = Border(left=thin, right=thin, top=thin, bottom=thin)
+
+    for row in ws.iter_rows():
+        for cell in row:
+            if cell.value is not None:
+                cell.fill = copy(no_fill)
+                cell.border = copy(no_border)
+
+    # reapply thin all-borders to all populated cells except cells that say Multiple or Single
+    for row in ws.iter_rows():
+        for cell in row:
+            if cell.value is None:
+                continue
+            if cell.column == remark_col and data_start <= cell.row <= last_data_row:
+                # these are formula cells; skip border based on intended displayed value
+                if expected.get(cell.row) in {"Multiple", "Single"}:
+                    continue
+            elif isinstance(cell.value, str) and cell.value in {"Multiple", "Single"}:
+                continue
+            cell.border = copy(thin_border)
+
+    wb.save(outfile)
+    return original_sheetnames, header_row, mat_col, doc_col, remark_col, data_start, last_data_row, expected
+
+need_rebuild = not os.path.exists(outfile)
+if need_rebuild:
+    meta = build_and_save()
+else:
+    # still compute metadata from source workbook
+    meta = build_and_save()
+
+original_sheetnames, header_row, mat_col, doc_col, remark_col, data_start, last_data_row, expected = meta
+print("Saved workbook:", outfile)
+
+recalc_result = await recalculate(outfile)
+print("Recalculate:", recalc_result)
+
+# restore original sheet names if changed
+wb_post = load_workbook(outfile)
+if wb_post.sheetnames != original_sheetnames and len(wb_post.sheetnames) == len(original_sheetnames):
+    for old, new in zip(list(wb_post.sheetnames), original_sheetnames):
+        if old != new:
+            wb_post[old].title = new
+    wb_post.save(outfile)
+    print("Restored sheet names:", wb_post.sheetnames)
+else:
+    print("Sheet names after recalc:", wb_post.sheetnames)
+
+# verify values with data_only
+vwb = load_workbook(outfile, data_only=True)
+vws = vwb[original_sheetnames[0]]
+
+remark_letter = get_column_letter(remark_col)
+mat_letter = get_column_letter(mat_col)
+doc_letter = get_column_letter(doc_col)
+
+print("\nVerified target values:")
+all_ok = True
+for r in range(data_start, last_data_row + 1):
+    val = vws.cell(r, remark_col).value
+    print(f"{remark_letter}{r}: {val!r} expected={expected[r]!r}")
+    if val != expected[r]:
+        all_ok = False
+
+# inspect formulas too
+fwb = load_workbook(outfile, data_only=False)
+fws = fwb[original_sheetnames[0]]
+print("\nTarget formulas:")
+for r in range(data_start, last_data_row + 1):
+    print(f"{remark_letter}{r}: {fws.cell(r, remark_col).value}")
+
+# style verification
+print("\nStyle verification:")
+for coord in [f"{mat_letter}4", f"{doc_letter}4", f"{remark_letter}4",
+              f"{mat_letter}5", f"{doc_letter}5", f"{remark_letter}5",
+              f"{remark_letter}8", f"{remark_letter}11", f"{mat_letter}11"]:
+    cell = fws[coord]
+    print(
+        coord,
+        "value=", cell.value,
+        "border=", safe_border_summary(cell),
+        "fill=", safe_fill_summary(cell)
+    )
+
+print("\nOverall verification passed:", all_ok)
+print("Output path:", outfile)
+```
+2026-04-14 10:28:04,299 INFO RLM iteration 5/50
+Reasoning: The workbook has been fully inspected, modified, saved, recalculated, and verified:
+
+- Target sheet: `Sheet1`
+- Target output cells: `G5:G15`
+- Verified results after recalculation:
+  - `G5:G7`, `G11:G12` = `"Multiple"`
+  - `G8:G10`, `G13:G15` = `"Single"`
+- Formatting verified:
+  - fills removed
+  - thin borders applied to populated cells except remark-result cells containing `"Multiple"` or `"Single"`
+- Sheet name preserved as `Sheet1`
+
+The output file is ready, so I should submit the saved spreadsheet path now.
+Code:
+```repl
+SUBMIT(output_spreadsheet="/sandbox/output/output_spreadsheet/1_3002_init.xlsx")
+```
+
+============================================================
+recalc_source: baseline
+score:         0.4545  FAIL
+Sheet 'Sheet1' range G5:G15: 5/11 cells match
+  Sheet1!G7: expected='Single' got='Multiple'
+  Sheet1!G8: expected='Multiple' got='Single'
+  Sheet1!G9: expected='Multiple' got='Single'
+  Sheet1!G10: expected='Multiple' got='Single'
+  Sheet1!G11: expected='Single' got='Multiple'
+  Sheet1!G12: expected='Single' got='Multiple'

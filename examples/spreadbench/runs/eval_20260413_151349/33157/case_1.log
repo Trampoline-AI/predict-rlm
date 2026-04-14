@@ -1,0 +1,262 @@
+task: 33157  case: 1
+instruction_type: Cell-Level Manipulation
+answer_position: 'Sheet1'!K2:K6
+input:  /Users/gabriel/Workspace/trampoline-ai/predict-rlm.spreadbench-release/examples/spreadbench/data/testset/spreadsheet/33157/1_33157_init.xlsx
+answer: /Users/gabriel/Workspace/trampoline-ai/predict-rlm.spreadbench-release/examples/spreadbench/data/testset/spreadsheet/33157/1_33157_golden.xlsx
+============================================================
+2026-04-13 15:39:06,465 INFO RLM iteration 1/50
+Reasoning: We need to understand the workbook structure before implementing the transformation. We'll load the workbook, list sheet names, inspect the first row (headers) and a few data rows to see what columns B, D, F, H, J, K contain. This will guide how to compute the earliest activity number and populate column K.
+Code:
+```repl
+import openpyxl, os, json, sys
+
+# Load the workbook (read only for inspection)
+wb_path = '/sandbox/input/input_spreadsheet/1_33157_init.xlsx'
+wb = openpyxl.load_workbook(wb_path, data_only=True)
+print('Sheets:', wb.sheetnames)
+
+# Assume the first sheet is the target
+ws = wb[wb.sheetnames[0]]
+
+# Get headers from the first row (row 1)
+headers = [ws.cell(row=1, column=c).value for c in range(1, ws.max_column+1)]
+print('Headers (first 15 columns):', headers[:15])
+
+# Show column letters for reference
+col_letters = [openpyxl.utils.get_column_letter(c) for c in range(1, ws.max_column+1)]
+print('Column letters (first 15):', col_letters[:15])
+
+# Print first 5 data rows (excluding header)
+for r in range(2, min(7, ws.max_row+1)):
+    row_vals = [ws.cell(row=r, column=c).value for c in range(1, ws.max_column+1)]
+    print(f'Row {r}:', row_vals[:15])
+```
+2026-04-13 15:39:23,250 INFO RLM iteration 2/50
+Reasoning: We inspected the workbook and identified the relevant columns:
+- Activity description columns: B (2), D (4), F (6), H (8)
+- Corresponding date columns: C (3), E (5), G (7), I (9)
+- Earliest date already computed in column J (10)
+- Target column for the activity header is column K (11)
+
+The task is to fill column K with the header (e.g., "Activity 1") of the activity whose date matches the earliest date in column J for each row.
+
+Implementation steps:
+1. Load the workbook (write mode) from the given input path.
+2. Iterate over data rows (starting at row 2).
+3. For each row, read the earliest date from column J.
+4. Compare it to the four activity dates (C, E, G, I) to find the index of the matching (or minimum) date.
+5. Retrieve the corresponding activity header from row 1 of the description column (B, D, F, H).
+6. Write that header into column K.
+7. Save the modified workbook to the output directory, preserving the original filename.
+8. Print a few sample rows to verify the new values.
+
+The code below follows this plan.
+Code:
+```repl
+import openpyxl
+import os
+
+# Paths
+input_path = "/sandbox/input/input_spreadsheet/1_33157_init.xlsx"
+output_dir = "/sandbox/output/output_spreadsheet"
+os.makedirs(output_dir, exist_ok=True)
+output_path = os.path.join(output_dir, "1_33157_init.xlsx")
+
+# Load workbook (write mode)
+wb = openpyxl.load_workbook(input_path)  # keep formulas if any
+ws = wb[wb.sheetnames[0]]  # assume first sheet
+
+# Header mapping: description columns -> their headers
+desc_cols = [2, 4, 6, 8]   # B, D, F, H
+date_cols = [3, 5, 7, 9]   # C, E, G, I
+header_row = 1
+
+# Build a list of headers for quick lookup
+activity_headers = [ws.cell(row=header_row, column=c).value for c in desc_cols]
+
+# Process each data row
+for row in range(2, ws.max_row + 1):
+    earliest_date = ws.cell(row=row, column=10).value  # column J
+    if earliest_date is None:
+        # No earliest date; leave K blank
+        ws.cell(row=row, column=11).value = None
+        continue
+
+    # Gather the four activity dates
+    dates = [ws.cell(row=row, column=c).value for c in date_cols]
+
+    # Find the index of the date that matches earliest_date.
+    # If multiple match, pick the first.
+    match_idx = None
+    for i, d in enumerate(dates):
+        if d == earliest_date:
+            match_idx = i
+            break
+
+    # Fallback: if no exact match (possible due to time components), use min date
+    if match_idx is None:
+        # Filter out None values
+        valid_dates = [(i, d) for i, d in enumerate(dates) if d is not None]
+        if valid_dates:
+            match_idx = min(valid_dates, key=lambda x: x[1])[0]
+        else:
+            match_idx = None
+
+    # Write the corresponding activity header into column K
+    if match_idx is not None:
+        header = activity_headers[match_idx]
+        ws.cell(row=row, column=11).value = header
+    else:
+        ws.cell(row=row, column=11).value = None
+
+# Save to output path
+wb.save(output_path)
+
+# Verify a few rows (print row number and new K value)
+print("Verification (first 5 data rows):")
+for row in range(2, min(7, ws.max_row + 1)):
+    name = ws.cell(row=row, column=1).value
+    earliest = ws.cell(row=row, column=10).value
+    activity = ws.cell(row=row, column=11).value
+    print(f"Row {row}: Name={name}, EarliestDate={earliest}, ActivityHeader={activity}")
+```
+2026-04-13 15:40:30,204 INFO RLM iteration 3/50
+Reasoning: The previous run used column J's formula text as the earliest date, resulting in incorrect matching (all rows got Activity 1). We need to compute the earliest date ourselves by examining the four date columns (C, E, G, I) for each row, find the minimum date, then write the corresponding activity header (from B, D, F, H) into column K. This avoids relying on the formula in J and ensures correct matching. We'll reload the workbook, process each row, compute the min date, locate its column, write the header, save to the output path, and print a few rows for verification.
+Code:
+```repl
+import openpyxl, os
+
+# Paths
+input_path = "/sandbox/input/input_spreadsheet/1_33157_init.xlsx"
+output_dir = "/sandbox/output/output_spreadsheet"
+os.makedirs(output_dir, exist_ok=True)
+output_path = os.path.join(output_dir, "1_33157_init.xlsx")
+
+# Load workbook (preserve formulas, but we will compute dates in Python)
+wb = openpyxl.load_workbook(input_path)
+ws = wb[wb.sheetnames[0]]  # assume first sheet
+
+# Column indices (1‑based)
+# Description columns (headers) -> B, D, F, H
+_desc_cols = [2, 4, 6, 8]
+# Corresponding date columns -> C, E, G, I
+date_cols = [3, 5, 7, 9]
+# Target column K = 11
+target_col = 11
+
+# Grab activity headers from the first row for quick lookup
+activity_headers = [ws.cell(row=1, column=c).value for c in desc_cols]
+
+# Process each data row (starting at row 2)
+for row in range(2, ws.max_row + 1):
+    # Collect the four activity dates (may be None)
+    dates = [ws.cell(row=row, column=c).value for c in date_cols]
+
+    # Filter out None values and keep original index positions
+    valid = [(i, d) for i, d in enumerate(dates) if d is not None]
+    if not valid:
+        # No dates present – leave K blank
+        ws.cell(row=row, column=target_col).value = None
+        continue
+
+    # Determine the earliest date among the valid ones
+    earliest_idx, earliest_date = min(valid, key=lambda x: x[1])
+
+    # Write the corresponding activity header into column K
+    header = activity_headers[earliest_idx]
+    ws.cell(row=row, column=target_col).value = header
+
+# Save the modified workbook
+wb.save(output_path)
+
+# Verification: print first few rows (name, computed earliest date, activity header)
+print("Verification (first 5 data rows):")
+for row in range(2, min(7, ws.max_row + 1)):
+    name = ws.cell(row=row, column=1).value
+    # Re‑compute earliest date for display (same logic as above)
+    dates = [ws.cell(row=row, column=c).value for c in date_cols]
+    valid = [d for d in dates if d is not None]
+    earliest = min(valid) if valid else None
+    activity = ws.cell(row=row, column=target_col).value
+    print(f"Row {row}: Name={name}, EarliestDate={earliest}, ActivityHeader={activity}")
+```
+2026-04-13 15:40:59,067 INFO RLM iteration 4/50
+Reasoning: The previous attempt read the date columns without `data_only=True`, so the cell values were the underlying formulas (e.g., `=IFERROR(VALUE(REPLACE(B2,11,500,"")),"")`) instead of the evaluated dates. As a result, the computed “earliest date” was a formula string and the activity header was always the first one.
+
+To fix this we will:
+1. Load the workbook with `data_only=True` so that date cells return their cached datetime values.
+2. Read the activity description headers from row 1 (columns B, D, F, H).
+3. For each data row (starting at row 2):
+   - Collect the four date values from columns C, E, G, I.
+   - Filter out `None` values, find the minimum date, and note its index.
+   - Write the corresponding activity header (from B, D, F, H) into column K.
+4. Save the modified workbook to the output directory.
+5. Print a short verification of the first few rows (name, computed earliest date, activity header) to ensure correctness.
+
+This approach uses the evaluated dates, correctly identifies the earliest activity, and populates column K with the appropriate header.
+Code:
+```repl
+import openpyxl, os
+
+# Paths
+input_path = "/sandbox/input/input_spreadsheet/1_33157_init.xlsx"
+output_dir = "/sandbox/output/output_spreadsheet"
+os.makedirs(output_dir, exist_ok=True)
+output_path = os.path.join(output_dir, "1_33157_init.xlsx")
+
+# Load workbook with cached values (formulas evaluated)
+wb = openpyxl.load_workbook(input_path, data_only=True)
+ws = wb[wb.sheetnames[0]]  # assume first sheet is the target
+
+# Column indices (1‑based)
+desc_cols = [2, 4, 6, 8]   # B, D, F, H (activity description headers)
+date_cols = [3, 5, 7, 9]   # C, E, G, I (corresponding dates)
+target_col = 11            # K (output column)
+
+# Grab activity headers from the first row for quick lookup
+activity_headers = [ws.cell(row=1, column=c).value for c in desc_cols]
+
+# Process each data row (starting at row 2)
+for row in range(2, ws.max_row + 1):
+    # Collect the four activity dates (may be None)
+    dates = [ws.cell(row=row, column=c).value for c in date_cols]
+
+    # Keep only non‑None dates together with their original index
+    valid = [(i, d) for i, d in enumerate(dates) if d is not None]
+
+    if not valid:
+        # No dates present – leave K blank
+        ws.cell(row=row, column=target_col).value = None
+        continue
+
+    # Find the index of the earliest date
+    earliest_idx, earliest_date = min(valid, key=lambda x: x[1])
+
+    # Write the corresponding activity header into column K
+    ws.cell(row=row, column=target_col).value = activity_headers[earliest_idx]
+
+# Save the modified workbook
+wb.save(output_path)
+
+# Verification: print first few rows (name, computed earliest date, activity header)
+print("Verification (first 5 data rows):")
+for row in range(2, min(7, ws.max_row + 1)):
+    name = ws.cell(row=row, column=1).value
+    # Re‑compute earliest date for display (same logic as above)
+    dates = [ws.cell(row=row, column=c).value for c in date_cols]
+    valid_dates = [d for d in dates if d is not None]
+    earliest = min(valid_dates) if valid_dates else None
+    activity = ws.cell(row=row, column=target_col).value
+    print(f"Row {row}: Name={name}, EarliestDate={earliest}, ActivityHeader={activity}")
+```
+2026-04-13 15:41:04,497 INFO RLM iteration 5/50
+Reasoning: The worksheet has been processed: column K now contains the activity header (Activity 1‑4) corresponding to the earliest activity date among columns C, E, G, I for each row. The modified workbook has been saved to the required output directory.
+Code:
+```repl
+SUBMIT(output_spreadsheet="/sandbox/output/output_spreadsheet/1_33157_init.xlsx")
+```
+
+============================================================
+recalc_source: baseline
+score:         1.0000  PASS
+All 5 cells match

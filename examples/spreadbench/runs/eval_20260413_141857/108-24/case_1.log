@@ -1,0 +1,142 @@
+task: 108-24  case: 1
+instruction_type: Sheet-Level Manipulation
+answer_position: 'Tema UV COS'!A1:D22
+input:  /Users/gabriel/Workspace/trampoline-ai/predict-rlm.spreadbench-release/examples/spreadbench/data/testset/spreadsheet/108-24/1_108-24_init.xlsx
+answer: /Users/gabriel/Workspace/trampoline-ai/predict-rlm.spreadbench-release/examples/spreadbench/data/testset/spreadsheet/108-24/1_108-24_golden.xlsx
+============================================================
+2026-04-13 14:24:08,571 INFO RLM iteration 1/50
+Reasoning: Need first inspect workbook structure and relevant sheets/columns before modifying. I should load the workbook with openpyxl, list sheet names, dimensions, and sample rows from 'BZTB' and 'Tema UV COS', then plan the filter. The instruction says extract rows from BZTB where column B starts with one of "COS Pass", "COS Comm", "COS W/S" and includes "Used", excluding "398726", and paste columns A:D into Tema UV COS starting at row 1. I should verify whether exclusion refers to column A or any text occurrence by inspecting data. Then I can implement and save to output path.
+Code:
+```repl
+import os, json, re
+from openpyxl import load_workbook
+
+print("Input:", input_spreadsheet)
+print("Instruction:", instruction)
+
+wb = load_workbook(input_spreadsheet)
+print("Sheets:", wb.sheetnames)
+
+for ws in wb.worksheets:
+    print({
+        "sheet": ws.title,
+        "max_row": ws.max_row,
+        "max_col": ws.max_column,
+    })
+
+# Inspect relevant sheets
+for sheet_name in ["BZTB", "Tema UV COS"]:
+    ws = wb[sheet_name]
+    print(f"\n--- {sheet_name} sample rows ---")
+    for r in range(1, min(ws.max_row, 12) + 1):
+        vals = [ws.cell(r, c).value for c in range(1, min(ws.max_column, 6) + 1)]
+        print(r, vals)
+
+# Find likely matching rows in BZTB by looking at column A-D around rows with COS/Used
+ws = wb["BZTB"]
+matches_preview = []
+for r in range(1, ws.max_row + 1):
+    a = ws.cell(r, 1).value
+    b = ws.cell(r, 2).value
+    c = ws.cell(r, 3).value
+    d = ws.cell(r, 4).value
+    b_str = "" if b is None else str(b)
+    if "COS" in b_str or "Used" in b_str:
+        matches_preview.append((r, a, b, c, d))
+        if len(matches_preview) >= 20:
+            break
+
+print("\nPotential relevant rows preview:")
+for item in matches_preview:
+    print(item)
+```
+2026-04-13 14:24:26,743 INFO RLM iteration 2/50
+Reasoning: I inspected the workbook and confirmed the relevant sheets. Now I need to identify exactly which rows in `BZTB` satisfy the literal condition:
+
+- column B starts with one of:
+  - `COS Pass`
+  - `COS Comm`
+  - `COS W/S`
+- and column B contains `Used`
+- exclude `398726` from results, which likely refers to column A based on the preview.
+
+Before writing, I should enumerate all matching rows to confirm how many there are and whether there are headers or existing formatting on `Tema UV COS` to preserve. Then I can clear/populate `Tema UV COS` columns A:D starting from row 1, save to the output folder, and verify contents.
+Code:
+```repl
+import os, re, shutil
+from openpyxl import load_workbook
+
+wb = load_workbook(input_spreadsheet)
+ws = wb["BZTB"]
+
+prefixes = ("COS Pass", "COS Comm", "COS W/S")
+matches = []
+
+for r in range(1, ws.max_row + 1):
+    vals = [ws.cell(r, c).value for c in range(1, 5)]
+    a, b, c, d = vals
+    b_str = "" if b is None else str(b)
+    a_str = "" if a is None else str(a)
+    if any(b_str.startswith(p) for p in prefixes) and ("Used" in b_str) and a_str != "398726":
+        matches.append((r, a, b, c, d))
+
+print("Match count:", len(matches))
+for item in matches[:50]:
+    print(item)
+
+# Inspect target sheet dimensions and any existing cells in first few rows/cols
+target = wb["Tema UV COS"]
+print("Target sheet dimensions:", target.max_row, target.max_column)
+for r in range(1, min(target.max_row, 10) + 1):
+    print("target row", r, [target.cell(r, c).value for c in range(1, 5)])
+
+# Save manipulated workbook
+infile = input_spreadsheet
+outfile = os.path.join("/sandbox/output/output_spreadsheet", os.path.basename(infile))
+
+# reload fresh workbook for writing
+wb2 = load_workbook(infile)
+src = wb2["BZTB"]
+dst = wb2["Tema UV COS"]
+
+# Clear existing content in destination sheet
+for row in dst.iter_rows():
+    for cell in row:
+        cell.value = None
+
+out_row = 1
+for r in range(1, src.max_row + 1):
+    a = src.cell(r, 1).value
+    b = src.cell(r, 2).value
+    c = src.cell(r, 3).value
+    d = src.cell(r, 4).value
+    a_str = "" if a is None else str(a)
+    b_str = "" if b is None else str(b)
+    if any(b_str.startswith(p) for p in prefixes) and ("Used" in b_str) and a_str != "398726":
+        for col, val in enumerate([a, b, c, d], start=1):
+            dst.cell(out_row, col).value = val
+        out_row += 1
+
+wb2.save(outfile)
+print("Saved to:", outfile, "rows written:", out_row - 1)
+
+# Verify saved output
+check = load_workbook(outfile, data_only=True)
+chk = check["Tema UV COS"]
+print("Verified target dimensions:", chk.max_row, chk.max_column)
+for r in range(1, min(chk.max_row, 10) + 1):
+    print("out row", r, [chk.cell(r, c).value for c in range(1, 5)])
+
+output_path = outfile
+```
+2026-04-13 14:24:52,299 INFO RLM iteration 3/50
+Reasoning: I have already inspected the workbook, applied the literal filter, saved the modified file to the required output directory with the same filename, and verified that `Tema UV COS` contains 18 rows in columns A:D starting at row 1. The output path is stored in `output_path`. The next step is to submit that file path only.
+Code:
+```repl
+SUBMIT(output_spreadsheet=output_path)
+```
+
+============================================================
+recalc_source: baseline
+score:         1.0000  PASS
+All 88 cells match

@@ -1,0 +1,165 @@
+task: 38074  case: 1
+instruction_type: Cell-Level Manipulation
+answer_position: K2:K5
+input:  /Users/gabriel/Workspace/trampoline-ai/predict-rlm.spreadbench-release/examples/spreadbench/data/testset/spreadsheet/38074/1_38074_init.xlsx
+answer: /Users/gabriel/Workspace/trampoline-ai/predict-rlm.spreadbench-release/examples/spreadbench/data/testset/spreadsheet/38074/1_38074_golden.xlsx
+============================================================
+2026-04-14 08:34:25,792 INFO RLM iteration 1/50
+Reasoning: First I need to inspect the workbook thoroughly before changing anything: sheet names, dimensions, headers, sample rows, and specifically cells J2:K5 since the instruction references them. I also need to identify which columns contain profit and expenses (1,2,3), and whether K2:K5 already contain formulas/examples that reveal the expected pattern. After that I can determine the exact formula needed and whether it should be written as formulas or static values. Since the instruction explicitly asks for a formula and mentions vectorized operations / case-sensitive matching, I should inspect existing formulas carefully.
+Code:
+```repl
+import os, json, math, statistics
+from openpyxl import load_workbook
+from openpyxl.utils import get_column_letter
+
+path = input_spreadsheet
+wb = load_workbook(path)
+print("Workbook path:", path)
+print("Sheet names:", wb.sheetnames)
+
+for ws in wb.worksheets:
+    print("\n--- SHEET:", ws.title, "---")
+    print("max_row:", ws.max_row, "max_col:", ws.max_column)
+    
+    # detect headers from first 3 rows for context
+    for header_row in range(1, min(4, ws.max_row + 1)):
+        vals = [ws.cell(header_row, c).value for c in range(1, ws.max_column + 1)]
+        print(f"Row {header_row}:", vals)
+    
+    # sample first 10 rows
+    print("First rows:")
+    for r in range(1, min(ws.max_row, 10) + 1):
+        vals = [ws.cell(r, c).value for c in range(1, ws.max_column + 1)]
+        print(f"R{r}:", vals)
+    
+    # sample last 5 rows
+    print("Last rows:")
+    start = max(1, ws.max_row - 4)
+    for r in range(start, ws.max_row + 1):
+        vals = [ws.cell(r, c).value for c in range(1, ws.max_column + 1)]
+        print(f"R{r}:", vals)
+
+    # print formulas / values in J2:K5 if within range
+    for r in range(2, min(5, ws.max_row) + 1):
+        j = ws[f"J{r}"].value if ws.max_column >= 10 else None
+        k = ws[f"K{r}"].value if ws.max_column >= 11 else None
+        print(f"J{r}={j!r}, K{r}={k!r}")
+
+    # print column letters and top header row 1 values
+    print("Column map:")
+    for c in range(1, ws.max_column + 1):
+        print(get_column_letter(c), ws.cell(1, c).value)
+```
+2026-04-14 08:34:59,724 INFO RLM iteration 2/50
+Reasoning: I’ve confirmed the workbook layout and the exact target range: `Sheet1!K2:K5`, with lookup values in `J2:J5`. Relevant columns are:
+- `A`: Type
+- `B`: Profit
+- `C`: Expenses 1
+- `E`: Expenses 2
+- `G`: Expenses 3
+
+The instruction says to calculate profit by subtracting expenses 1, 2, and 3, based on rows where column A matches the case-sensitive value in `J2`, and to use a vectorized formula. Since the output is a per-lookup aggregate in `K2:K5`, the right pattern is a case-sensitive `SUMPRODUCT` over bounded ranges. To treat blanks as zero, I can wrap each numeric range with `N(...)`, which coerces blanks to 0. For no decimals, I can wrap the result in `ROUND(...,0)`.
+
+So the formula pattern for each row in K should be like:
+`=ROUND(SUMPRODUCT(--EXACT($A$2:$A$13,J2),N($B$2:$B$13)-N($C$2:$C$13)-N($E$2:$E$13)-N($G$2:$G$13)),0)`
+
+Next I should:
+1. Compute expected values in Python as a sanity check.
+2. Write formulas into `K2:K5`.
+3. Save to output path.
+4. Recalculate.
+5. Reload and verify both formulas and computed values.
+6. Ensure sheet name remains unchanged after recalculation.
+Code:
+```repl
+import os, shutil
+from openpyxl import load_workbook
+
+infile = input_spreadsheet
+filename = os.path.basename(infile)
+outdir = "/sandbox/output/output_spreadsheet"
+outfile = os.path.join(outdir, filename)
+
+# Reload original workbook for modification
+wb = load_workbook(infile)
+ws = wb["Sheet1"]
+
+# Sanity-check expected results in Python using case-sensitive matching
+data_rows = list(range(2, ws.max_row + 1))
+def num(v):
+    return 0 if v in (None, "") else float(v)
+
+expected = {}
+for jr in range(2, 6):
+    key = ws[f"J{jr}"].value
+    total = 0
+    matched_rows = []
+    for r in data_rows:
+        if ws[f"A{r}"].value == key:  # case-sensitive match
+            val = num(ws[f"B{r}"].value) - num(ws[f"C{r}"].value) - num(ws[f"E{r}"].value) - num(ws[f"G{r}"].value)
+            total += val
+            matched_rows.append((r, ws[f"A{r}"].value, val))
+    expected[jr] = {"key": key, "total": round(total, 0), "matches": matched_rows}
+
+print("Expected case-sensitive totals:")
+for jr, info in expected.items():
+    print(f"J{jr}={info['key']!r} -> {info['total']}, matches={info['matches']}")
+
+# Write formulas to K2:K5
+last_row = ws.max_row
+for r in range(2, 6):
+    formula = f'=ROUND(SUMPRODUCT(--EXACT($A$2:$A${last_row},J{r}),N($B$2:$B${last_row})-N($C$2:$C${last_row})-N($E$2:$E${last_row})-N($G$2:$G${last_row})),0)'
+    ws[f"K{r}"] = formula
+    ws[f"K{r}"].number_format = '0'
+
+print("Written formulas:")
+for r in range(2, 6):
+    print(f"K{r} formula:", ws[f"K{r}"].value)
+
+wb.save(outfile)
+print("Saved to:", outfile)
+
+# Recalculate
+recalc_result = await recalculate(outfile)
+print("Recalculate result:", recalc_result)
+
+# Check sheet names after recalc and restore if changed
+wb_after = load_workbook(outfile)
+current_names = wb_after.sheetnames
+original_names = ["Sheet1"]
+print("Sheet names after recalc:", current_names)
+if current_names != original_names:
+    for i, orig in enumerate(original_names):
+        if i < len(wb_after.worksheets):
+            wb_after.worksheets[i].title = orig
+    wb_after.save(outfile)
+    print("Renamed sheets back to:", original_names)
+
+# Verify formulas and cached results
+wb_formula = load_workbook(outfile, data_only=False)
+ws_formula = wb_formula["Sheet1"]
+wb_values = load_workbook(outfile, data_only=True)
+ws_values = wb_values["Sheet1"]
+
+print("Verification target cells J2:K5")
+for r in range(2, 6):
+    print({
+        "row": r,
+        "J": ws_values[f"J{r}"].value,
+        "K_formula": ws_formula[f"K{r}"].value,
+        "K_value": ws_values[f"K{r}"].value,
+        "expected": expected[r]["total"],
+    })
+```
+```
+2026-04-14 08:35:34,894 INFO RLM iteration 3/50
+Reasoning: The workbook has been fully inspected, the target range `K2:K5` was identified and verified, formulas were written and recalculated successfully, and cached values match the expected case-sensitive totals. The sheet name remained correct after recalculation. The output file is ready to submit.
+Code:
+```repl
+SUBMIT(output_spreadsheet="/sandbox/output/output_spreadsheet/1_38074_init.xlsx")
+```
+
+============================================================
+recalc_source: baseline
+score:         1.0000  PASS
+All 4 cells match

@@ -1,0 +1,623 @@
+task: 247-24  case: 1
+instruction_type: Sheet-Level Manipulation
+answer_position: 'Main!'A2:M70
+input:  /Users/gabriel/Workspace/trampoline-ai/predict-rlm.spreadbench-release/examples/spreadbench/data/testset/spreadsheet/247-24/1_247-24_init.xlsx
+answer: /Users/gabriel/Workspace/trampoline-ai/predict-rlm.spreadbench-release/examples/spreadbench/data/testset/spreadsheet/247-24/1_247-24_golden.xlsx
+============================================================
+2026-04-14 10:13:42,538 INFO RLM iteration 1/50
+Reasoning: First I need to inspect the workbook and the full instruction before making any changes. I should load the spreadsheet with openpyxl, print the full instruction, list all sheet names, row/column counts, headers, and sample rows from the relevant sheet(s), especially the Main sheet mentioned in the instruction. I also need to inspect any existing formulas or placeholder columns around the target data. After that, I can determine exactly which rows need deletion/modification/insertion and where new values should go.
+Code:
+```repl
+from openpyxl import load_workbook
+from openpyxl.utils import get_column_letter
+import os, json, math, statistics
+
+print("INPUT FILE:", input_spreadsheet)
+print("\nFULL INSTRUCTION:\n")
+print(instruction)
+
+wb = load_workbook(input_spreadsheet)
+orig_sheet_names = wb.sheetnames
+print("\nSHEET NAMES:", orig_sheet_names)
+
+def sheet_summary(ws):
+    print(f"\n=== Sheet: {ws.title} ===")
+    print("max_row:", ws.max_row, "max_column:", ws.max_column)
+    
+    # find first 10 rows with values across used columns
+    for r in range(1, min(ws.max_row, 10) + 1):
+        vals = [ws.cell(r, c).value for c in range(1, ws.max_column + 1)]
+        print(f"Row {r}:", vals)
+    
+    # last 5 rows
+    start_last = max(1, ws.max_row - 4)
+    if start_last > 10:
+        print("...")
+    for r in range(start_last, ws.max_row + 1):
+        vals = [ws.cell(r, c).value for c in range(1, ws.max_column + 1)]
+        print(f"Row {r}:", vals)
+    
+    # header guess from first non-empty row among first 5 rows
+    header_row = None
+    for r in range(1, min(5, ws.max_row) + 1):
+        vals = [ws.cell(r, c).value for c in range(1, ws.max_column + 1)]
+        nonempty = sum(v is not None and v != "" for v in vals)
+        if nonempty >= max(2, min(3, ws.max_column)):
+            header_row = r
+            break
+    print("Guessed header row:", header_row)
+    if header_row:
+        headers = [ws.cell(header_row, c).value for c in range(1, ws.max_column + 1)]
+        print("Headers:", headers)
+        print("Header letters:", [f"{get_column_letter(c)}={headers[c-1]}" for c in range(1, ws.max_column + 1)])
+
+for ws in wb.worksheets:
+    sheet_summary(ws)
+
+# Focus on Main sheet if present
+if "Main" in wb.sheetnames:
+    ws = wb["Main"]
+    print("\n=== Detailed inspection of Main sheet ===")
+    # Print rows 1-15 with coordinates for clarity
+    for r in range(1, min(15, ws.max_row) + 1):
+        row_repr = []
+        for c in range(1, ws.max_column + 1):
+            cell = ws.cell(r, c)
+            row_repr.append(f"{cell.coordinate}={cell.value!r}")
+        print(" | ".join(row_repr))
+    
+    # Detect non-empty rows and columns
+    nonempty_rows = []
+    for r in range(1, ws.max_row + 1):
+        vals = [ws.cell(r, c).value for c in range(1, ws.max_column + 1)]
+        if any(v not in (None, "") for v in vals):
+            nonempty_rows.append(r)
+    print("First non-empty rows:", nonempty_rows[:20])
+    print("Last non-empty rows:", nonempty_rows[-10:] if nonempty_rows else [])
+    
+    # Unique values preview for column A and B
+    colA = [ws.cell(r, 1).value for r in range(1, ws.max_row + 1)]
+    colB = [ws.cell(r, 2).value for r in range(1, ws.max_row + 1)]
+    uniqA = []
+    seen = set()
+    for v in colA:
+        if v not in seen:
+            seen.add(v)
+            uniqA.append(v)
+    uniqB = []
+    seen = set()
+    for v in colB:
+        if v not in seen:
+            seen.add(v)
+            uniqB.append(v)
+    print("Column A unique preview:", uniqA[:20])
+    print("Column B unique preview:", uniqB[:20])
+    
+    # Search for rows matching likely instruction criteria
+    targets = []
+    for r in range(1, ws.max_row + 1):
+        a = ws.cell(r, 1).value
+        b = ws.cell(r, 2).value
+        g = ws.cell(r, 7).value if ws.max_column >= 7 else None
+        if a in ("Motorcycle", "Ahmed Sons", "National TV") or b in ("Canada", "India"):
+            targets.append((r, a, b, g, [ws.cell(r,c).value for c in range(1, min(ws.max_column, 10)+1)]))
+    print("\nMatching rows preview (up to 30):")
+    for item in targets[:30]:
+        print(item)
+    print("Total matching rows found:", len(targets))
+```
+2026-04-14 10:14:18,364 INFO RLM iteration 2/50
+Reasoning: I’ve confirmed the workbook structure and target sheet/columns. Before modifying, I should inspect the exact rows affected by each rule and quantify them so I can apply the transformation correctly to all rows. I also want to confirm whether inserting rows after each "Ahmed Sons" row should create blank rows (most likely, since no content is specified) and ensure Column M is only populated for actual data rows, not inserted blanks. Given that row deletions/insertions can make existing formulas misalign, the safest approach will likely be to rebuild the Main sheet row-by-row: keep the header, filter/delete target rows, modify G where needed, insert two blank rows after each retained Ahmed Sons row, then regenerate formulas in I:L and fill M from Lookup. First I’ll inspect the exact affected rows and counts.
+Code:
+```repl
+from collections import Counter, defaultdict
+from openpyxl import load_workbook
+
+wb = load_workbook(input_spreadsheet)
+ws = wb["Main"]
+lookup_ws = wb["Lookup"]
+
+print("Instruction again:\n", instruction)
+
+# Print all data rows in compact form
+print("\n=== Main sheet all non-header rows (compact) ===")
+all_rows = []
+for r in range(2, ws.max_row + 1):
+    vals = [ws.cell(r, c).value for c in range(1, 14)]
+    all_rows.append(vals)
+    print(r, vals[:7], "M=", vals[12])
+
+# Counts by company and company/location
+company_counter = Counter()
+company_loc_counter = Counter()
+for r in range(2, ws.max_row + 1):
+    a = ws.cell(r, 1).value
+    b = ws.cell(r, 2).value
+    company_counter[a] += 1
+    company_loc_counter[(a, b)] += 1
+
+print("\nCompany counts:", dict(company_counter))
+print("Company/location counts:")
+for k, v in company_loc_counter.items():
+    print(k, v)
+
+# Exact rows matching each rule
+motorcycle_rows = []
+ahmed_canada_rows = []
+national_india_rows = []
+ahmed_rows_all = []
+
+for r in range(2, ws.max_row + 1):
+    a = ws.cell(r, 1).value
+    b = ws.cell(r, 2).value
+    rowvals = [ws.cell(r, c).value for c in range(1, 14)]
+    if a == "Motorcycle":
+        motorcycle_rows.append((r, rowvals))
+    if a == "Ahmed Sons":
+        ahmed_rows_all.append((r, rowvals))
+        if b == "Canada":
+            ahmed_canada_rows.append((r, rowvals))
+    if a == "National TV" and b == "India":
+        national_india_rows.append((r, rowvals))
+
+print("\nRows to delete because Company='Motorcycle':", len(motorcycle_rows))
+for r, vals in motorcycle_rows:
+    print(r, vals)
+
+print("\nRows to delete because Company='Ahmed Sons' and Location='Canada':", len(ahmed_canada_rows))
+for r, vals in ahmed_canada_rows:
+    print(r, vals)
+
+print("\nRows where Company='National TV' and Location='India' (G should become 180):", len(national_india_rows))
+for r, vals in national_india_rows:
+    print(r, vals)
+
+print("\nAll retained/considered Ahmed Sons rows before deletion rule (for row insertion after each retained Ahmed Sons row):", len(ahmed_rows_all))
+for r, vals in ahmed_rows_all:
+    print(r, vals[:7])
+
+# Inspect lookup contents and whether all kept IDs exist
+lookup_map = {}
+for r in range(2, lookup_ws.max_row + 1):
+    lookup_map[lookup_ws.cell(r,1).value] = lookup_ws.cell(r,2).value
+
+print("\nLookup sample first 10:")
+for i, (k, v) in enumerate(lookup_map.items()):
+    if i >= 10:
+        break
+    print(repr(k), "->", repr(v))
+
+# Determine IDs that would remain after deletions
+remaining_ids = []
+for r in range(2, ws.max_row + 1):
+    a = ws.cell(r,1).value
+    b = ws.cell(r,2).value
+    if a == "Motorcycle":
+        continue
+    if a == "Ahmed Sons" and b == "Canada":
+        continue
+    remaining_ids.append(ws.cell(r,3).value)
+
+missing_lookup = [emp for emp in remaining_ids if emp not in lookup_map]
+print("\nRemaining data rows after deletions:", len(remaining_ids))
+print("Missing lookup IDs among remaining rows:", missing_lookup)
+
+# Print header and current formulas in key columns
+print("\nHeader row with columns:")
+for c in range(1, ws.max_column + 1):
+    print(c, ws.cell(1,c).coordinate, ws.cell(1,c).value)
+
+print("\nSample formulas in I:L and M values around affected regions:")
+for r in range(2, ws.max_row + 1):
+    a = ws.cell(r,1).value
+    if a in ("Ahmed Sons", "Motorcycle", "National TV"):
+        print(
+            r,
+            "A=", ws.cell(r,1).value,
+            "B=", ws.cell(r,2).value,
+            "G=", ws.cell(r,7).value,
+            "I=", ws.cell(r,9).value,
+            "J=", ws.cell(r,10).value,
+            "K=", ws.cell(r,11).value,
+            "L=", ws.cell(r,12).value,
+            "M=", ws.cell(r,13).value,
+        )
+```
+2026-04-14 10:16:02,328 INFO RLM iteration 3/50
+Reasoning: I now know the exact workbook structure and the affected rows. The safest way to satisfy all requirements is to rebuild the `Main` sheet contents in-place: keep the header, remove only the specified rows, modify column G for `National TV` + `India`, insert two blank rows after each remaining `Ahmed Sons` row, and then regenerate the row-based formulas in columns I:L plus the lookup formula/value in column M only for actual data rows. This avoids misaligned formulas after deletions/insertions and ensures deleted rows truly disappear. I’ll save the transformed workbook to the required output path, recalculate it, restore sheet names if LibreOffice changes them, then reload and print verification for the target areas.
+Code:
+```repl
+from openpyxl import load_workbook
+from copy import copy
+from pathlib import Path
+import os
+
+# Load workbook
+wb = load_workbook(input_spreadsheet)
+orig_sheet_names = wb.sheetnames[:]
+ws = wb["Main"]
+lookup_ws = wb["Lookup"]
+
+print("Original sheet names:", orig_sheet_names)
+print("Main size before:", ws.max_row, ws.max_column)
+print("Lookup size:", lookup_ws.max_row, lookup_ws.max_column)
+
+# Build lookup map for verification/fallback/sanity
+lookup_map = {}
+for r in range(2, lookup_ws.max_row + 1):
+    lookup_map[lookup_ws.cell(r, 1).value] = lookup_ws.cell(r, 2).value
+
+# Inspect exact target columns
+headers = [ws.cell(1, c).value for c in range(1, ws.max_column + 1)]
+print("Headers:", headers)
+print("Target columns confirmed:")
+print("A =", ws["A1"].value)
+print("B =", ws["B1"].value)
+print("C =", ws["C1"].value)
+print("G =", ws["G1"].value)
+print("M =", ws["M1"].value)
+
+# Capture existing styles from a representative data row
+style_template = {}
+template_row = 2
+for c in range(1, ws.max_column + 1):
+    cell = ws.cell(template_row, c)
+    style_template[c] = {
+        "font": copy(cell.font),
+        "fill": copy(cell.fill),
+        "border": copy(cell.border),
+        "alignment": copy(cell.alignment),
+        "number_format": cell.number_format,
+        "protection": copy(cell.protection),
+    }
+
+template_height = ws.row_dimensions[template_row].height
+
+# Read original data rows
+source_rows = []
+for r in range(2, ws.max_row + 1):
+    vals = [ws.cell(r, c).value for c in range(1, ws.max_column + 1)]
+    if any(v not in (None, "") for v in vals):
+        source_rows.append(vals)
+
+print("Original non-header data rows:", len(source_rows))
+
+# Transform rows
+output_rows = []   # row content only, excluding header
+deleted_motorcycle = 0
+deleted_ahmed_canada = 0
+modified_national_india = 0
+inserted_blank_rows = 0
+
+# Track positions for verification
+kept_row_positions = []         # list of dicts with output row metadata
+inserted_blank_positions = []   # output row numbers that should be blank
+national_india_output_rows = []
+
+for vals in source_rows:
+    company = vals[0]
+    location = vals[1]
+
+    # Rule 1: delete Company == Motorcycle
+    if company == "Motorcycle":
+        deleted_motorcycle += 1
+        continue
+
+    # Rule 2: delete Ahmed Sons + Canada
+    if company == "Ahmed Sons" and location == "Canada":
+        deleted_ahmed_canada += 1
+        continue
+
+    new_vals = list(vals)
+
+    # Rule 3: change G to 180 for National TV + India
+    if company == "National TV" and location == "India":
+        new_vals[6] = 180
+        modified_national_india += 1
+
+    output_rows.append(new_vals)
+    current_output_excel_row = len(output_rows) + 1  # +1 because header is row 1
+    kept_row_positions.append({
+        "row": current_output_excel_row,
+        "company": company,
+        "location": location,
+        "emp_id": new_vals[2],
+    })
+    if company == "National TV" and location == "India":
+        national_india_output_rows.append(current_output_excel_row)
+
+    # Rule 4: insert two new blank rows after each remaining Ahmed Sons row
+    if company == "Ahmed Sons":
+        output_rows.append([None] * ws.max_column)
+        inserted_blank_positions.append(len(output_rows) + 1)
+        output_rows.append([None] * ws.max_column)
+        inserted_blank_positions.append(len(output_rows) + 1)
+        inserted_blank_rows += 2
+
+print("Deleted Motorcycle rows:", deleted_motorcycle)
+print("Deleted Ahmed Sons/Canada rows:", deleted_ahmed_canada)
+print("Modified National TV/India rows:", modified_national_india)
+print("Inserted blank rows:", inserted_blank_rows)
+print("Final data row count (excluding header):", len(output_rows))
+print("Final worksheet row count (including header):", len(output_rows) + 1)
+
+# Verify expected counts before writing
+remaining_ahmed_rows = sum(1 for d in kept_row_positions if d["company"] == "Ahmed Sons")
+print("Remaining Ahmed Sons rows:", remaining_ahmed_rows)
+print("Expected inserted rows (2 each):", remaining_ahmed_rows * 2)
+
+# Rewrite the Main sheet in-place
+# First clear a sufficiently large area across all used columns and new row extent
+clear_to_row = max(ws.max_row, len(output_rows) + 5)
+for r in range(2, clear_to_row + 1):
+    for c in range(1, ws.max_column + 1):
+        ws.cell(r, c).value = None
+
+# Write transformed rows
+lookup_last_row = lookup_ws.max_row
+for idx, vals in enumerate(output_rows, start=2):
+    is_blank_row = all(v in (None, "") for v in vals)
+
+    # Set row height template
+    if template_height is not None:
+        ws.row_dimensions[idx].height = template_height
+
+    for c in range(1, ws.max_column + 1):
+        cell = ws.cell(idx, c)
+        # Apply style template for consistency
+        cell.font = copy(style_template[c]["font"])
+        cell.fill = copy(style_template[c]["fill"])
+        cell.border = copy(style_template[c]["border"])
+        cell.alignment = copy(style_template[c]["alignment"])
+        cell.number_format = style_template[c]["number_format"]
+        cell.protection = copy(style_template[c]["protection"])
+
+        # Fill base values first
+        cell.value = vals[c - 1]
+
+    # Regenerate formulas only for actual data rows
+    if not is_blank_row:
+        ws.cell(idx, 9).value  = f"=G{idx}*H{idx}"             # I
+        ws.cell(idx,10).value  = f"=G{idx}-30"                # J
+        ws.cell(idx,11).value  = f"=J{idx}*H{idx}"            # K
+        ws.cell(idx,12).value  = f"=I{idx}-K{idx}"            # L
+        ws.cell(idx,13).value  = f'=IF(C{idx}="","",VLOOKUP(C{idx},Lookup!$A$2:$B${lookup_last_row},2,FALSE))'  # M
+    else:
+        # Ensure inserted rows are truly blank, including formula columns
+        for c in range(1, ws.max_column + 1):
+            ws.cell(idx, c).value = None
+
+# Extra cleanup for any rows beyond final data
+for r in range(len(output_rows) + 2, clear_to_row + 1):
+    for c in range(1, ws.max_column + 1):
+        ws.cell(r, c).value = None
+
+# Save output
+output_path = os.path.join("/sandbox/output/output_spreadsheet", os.path.basename(input_spreadsheet))
+wb.save(output_path)
+print("Saved to:", output_path)
+
+# Recalculate
+recalc_result = await recalculate(output_path)
+print("Recalculate result:", recalc_result)
+
+# Restore sheet names if LibreOffice changed them
+wb_after = load_workbook(output_path)
+if wb_after.sheetnames != orig_sheet_names:
+    print("Sheet names changed after recalc:", wb_after.sheetnames)
+    if len(wb_after.sheetnames) == len(orig_sheet_names):
+        for i, original_name in enumerate(orig_sheet_names):
+            wb_after.worksheets[i].title = original_name
+        wb_after.save(output_path)
+        print("Sheet names restored to:", orig_sheet_names)
+else:
+    print("Sheet names unchanged after recalc.")
+
+# Reload for verification
+wb_formula = load_workbook(output_path, data_only=False)
+wb_data = load_workbook(output_path, data_only=True)
+wsf = wb_formula["Main"]
+wsd = wb_data["Main"]
+
+print("\n=== VERIFICATION ===")
+print("Output sheet names:", wb_data.sheetnames)
+print("Main size after:", wsf.max_row, wsf.max_column)
+
+# Verify there are no deleted rows left
+remaining_motorcycle = []
+remaining_ahmed_canada = []
+for r in range(2, wsd.max_row + 1):
+    a = wsd.cell(r, 1).value
+    b = wsd.cell(r, 2).value
+    if a == "Motorcycle":
+        remaining_motorcycle.append(r)
+    if a == "Ahmed Sons" and b == "Canada":
+        remaining_ahmed_canada.append(r)
+
+print("Remaining Motorcycle rows:", remaining_motorcycle)
+print("Remaining Ahmed Sons + Canada rows:", remaining_ahmed_canada)
+
+# Verify blank inserted rows
+print("\nInserted blank row checks (first 10):")
+for r in inserted_blank_positions[:10]:
+    vals = [wsd.cell(r, c).value for c in range(1, 14)]
+    print(r, vals)
+
+# Verify first 25 rows to ensure Ahmed Sons rows followed by blanks
+print("\nFirst 25 rows after transformation:")
+for r in range(1, min(25, wsd.max_row) + 1):
+    vals = [wsd.cell(r, c).value for c in range(1, 14)]
+    print(r, vals)
+
+# Verify National TV India rows changed and formulas evaluated
+print("\nNational TV India verification:")
+for r in national_india_output_rows:
+    print(
+        "Row", r,
+        "A=", wsd.cell(r,1).value,
+        "B=", wsd.cell(r,2).value,
+        "C=", wsd.cell(r,3).value,
+        "G=", wsd.cell(r,7).value,
+        "I=", wsd.cell(r,9).value,
+        "J=", wsd.cell(r,10).value,
+        "K=", wsd.cell(r,11).value,
+        "L=", wsd.cell(r,12).value,
+        "M=", wsd.cell(r,13).value,
+        "| formulas:",
+        wsf.cell(r,9).value,
+        wsf.cell(r,10).value,
+        wsf.cell(r,11).value,
+        wsf.cell(r,12).value,
+        wsf.cell(r,13).value,
+    )
+
+# Verify column M populated for actual data rows and blank for inserted rows
+nonblank_data_rows = []
+blank_data_rows = []
+for r in range(2, wsd.max_row + 1):
+    row_vals = [wsd.cell(r, c).value for c in range(1, 14)]
+    if any(v not in (None, "") for v in row_vals):
+        nonblank_data_rows.append(r)
+        if wsd.cell(r,13).value in (None, ""):
+            blank_data_rows.append(r)
+
+print("\nNonblank rows count:", len(nonblank_data_rows))
+print("Rows with blank M among nonblank rows:", blank_data_rows[:20], "count=", len(blank_data_rows))
+
+# Print selected M lookups
+print("\nSample M values for actual rows:")
+sample_rows = [r for r in nonblank_data_rows[:12]] + national_india_output_rows[:]
+seen = set()
+for r in sample_rows:
+    if r in seen:
+        continue
+    seen.add(r)
+    print(
+        r,
+        "EmpID=", wsd.cell(r,3).value,
+        "M=", wsd.cell(r,13).value,
+        "Expected=", lookup_map.get(wsd.cell(r,3).value)
+    )
+
+# Extra targeted checks around rows where Ahmed Sons appear
+print("\nAhmed Sons rows and immediate following rows:")
+checked = 0
+for item in kept_row_positions:
+    if item["company"] == "Ahmed Sons":
+        r = item["row"]
+        for rr in [r, r+1, r+2]:
+            if rr <= wsd.max_row:
+                vals = [wsd.cell(rr, c).value for c in range(1, 14)]
+                print(rr, vals)
+        checked += 1
+        if checked >= 5:
+            break
+
+# Sanity summary
+print("\nSummary:")
+print("Expected final row count incl header:", len(output_rows) + 1)
+print("Actual final row count:", wsf.max_row)
+print("National TV India rows verified:", national_india_output_rows)
+print("Output file ready:", output_path)
+```
+2026-04-14 10:16:41,344 INFO RLM iteration 4/50
+Reasoning: The transformation appears successful, but before submitting I should do one concise verification pass to ensure there are no hidden issues from truncation: confirm final sheet names, row counts, no forbidden/deleted rows remain, all nonblank data rows have column M populated, inserted rows are blank, and inspect whether I:L/M contain formulas or evaluated values. If everything looks correct, I can submit the saved output path next turn.
+Code:
+```repl
+from openpyxl import load_workbook
+import os
+
+output_path = os.path.join("/sandbox/output/output_spreadsheet", os.path.basename(input_spreadsheet))
+
+wbf = load_workbook(output_path, data_only=False)
+wbd = load_workbook(output_path, data_only=True)
+
+print("Sheet names:", wbf.sheetnames)
+wsf = wbf["Main"]
+wsd = wbd["Main"]
+print("Main rows/cols:", wsf.max_row, wsf.max_column)
+
+# Check remaining forbidden rows
+motorcycle = []
+ahmed_canada = []
+nonblank_rows = []
+blank_m = []
+blank_insert_rows_nonblank = []
+for r in range(2, wsd.max_row + 1):
+    vals = [wsd.cell(r,c).value for c in range(1,14)]
+    a, b = vals[0], vals[1]
+    if a == "Motorcycle":
+        motorcycle.append(r)
+    if a == "Ahmed Sons" and b == "Canada":
+        ahmed_canada.append(r)
+    if any(v not in (None, "") for v in vals):
+        nonblank_rows.append(r)
+        if vals[12] in (None, ""):
+            blank_m.append(r)
+
+print("Remaining Motorcycle rows:", motorcycle)
+print("Remaining Ahmed Sons Canada rows:", ahmed_canada)
+print("Nonblank data rows:", len(nonblank_rows))
+print("Nonblank rows with blank M:", blank_m)
+
+# Verify inserted rows after Ahmed Sons
+ahmed_positions = [r for r in nonblank_rows if wsd.cell(r,1).value == "Ahmed Sons"]
+checks = []
+for r in ahmed_positions[:10]:
+    after1 = [wsd.cell(r+1,c).value for c in range(1,14)] if r+1 <= wsd.max_row else None
+    after2 = [wsd.cell(r+2,c).value for c in range(1,14)] if r+2 <= wsd.max_row else None
+    checks.append((r, all(v in (None,"") for v in after1), all(v in (None,"") for v in after2)))
+print("Ahmed Sons blank-row checks (first 10):", checks)
+
+# Verify National TV India G values
+ntv_india = []
+for r in nonblank_rows:
+    if wsd.cell(r,1).value == "National TV" and wsd.cell(r,2).value == "India":
+        ntv_india.append((r, wsd.cell(r,7).value, wsd.cell(r,13).value))
+print("National TV India rows:", ntv_india)
+
+# Inspect formula/value status in a few target rows
+sample_rows = [2,5,17,26,60,61,62,63]
+print("Sample formula vs data:")
+for r in sample_rows:
+    if r <= wsf.max_row:
+        print(
+            r,
+            "A", wsd.cell(r,1).value,
+            "C", wsd.cell(r,3).value,
+            "I_formula", wsf.cell(r,9).value,
+            "M_formula", wsf.cell(r,13).value,
+            "I_value", wsd.cell(r,9).value,
+            "M_value", wsd.cell(r,13).value,
+        )
+
+# Show last 8 rows
+print("Last 8 rows:")
+for r in range(max(1, wsd.max_row-7), wsd.max_row+1):
+    print(r, [wsd.cell(r,c).value for c in range(1,14)])
+
+print("Output path:", output_path)
+```
+```
+2026-04-14 10:16:48,188 INFO RLM iteration 5/50
+Reasoning: The workbook has been fully inspected, transformed, saved, recalculated, and verified. Final checks confirmed:
+- sheet names remain `Main` and `Lookup`
+- no rows remain with Company = `Motorcycle`
+- no rows remain with Company = `Ahmed Sons` and Location = `Canada`
+- all retained `Ahmed Sons` rows are followed by two blank rows
+- all `National TV` + `India` rows have Column G = 180
+- all nonblank data rows have Column M populated
+- output file exists at the required path
+
+I should now submit the saved output spreadsheet path and nothing else.
+Code:
+```repl
+import os
+output_path = os.path.join("/sandbox/output/output_spreadsheet", os.path.basename(input_spreadsheet))
+SUBMIT(output_spreadsheet=output_path)
+```
+
+============================================================
+recalc_source: baseline
+score:         1.0000  PASS
+All 897 cells match

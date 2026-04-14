@@ -1,0 +1,90 @@
+task: 12307  case: 1
+instruction_type: Cell-Level Manipulation
+answer_position: I12:I13
+input:  /Users/gabriel/Workspace/trampoline-ai/predict-rlm.spreadbench-release/examples/spreadbench/data/testset/spreadsheet/12307/1_12307_init.xlsx
+answer: /Users/gabriel/Workspace/trampoline-ai/predict-rlm.spreadbench-release/examples/spreadbench/data/testset/spreadsheet/12307/1_12307_golden.xlsx
+============================================================
+2026-04-13 14:27:46,024 INFO RLM iteration 1/50
+Reasoning: First I need to inspect the workbook structure and find the relevant sheet, tables, and target cells around I12/I13. I should load the workbook with openpyxl, print sheet names, dimensions, and a sample of the cells around the used range so I can understand where Table-1 and the company list are located before writing any formula.
+Code:
+```repl
+from openpyxl import load_workbook
+from openpyxl.utils import get_column_letter
+import os, json, math
+
+print("Input:", input_spreadsheet)
+print("Instruction:", instruction)
+
+wb = load_workbook(input_spreadsheet)
+print("Sheets:", wb.sheetnames)
+
+for ws in wb.worksheets:
+    print(f"\nSheet: {ws.title}")
+    print("max_row:", ws.max_row, "max_col:", ws.max_column)
+    # print a compact grid of first up to 25 rows and 12 cols
+    max_r = min(ws.max_row, 25)
+    max_c = min(ws.max_column, 12)
+    headers = [get_column_letter(c) for c in range(1, max_c+1)]
+    print("Cols:", headers)
+    for r in range(1, max_r+1):
+        vals = [ws.cell(r, c).value for c in range(1, max_c+1)]
+        print(r, vals)
+```
+2026-04-13 14:28:31,449 INFO RLM iteration 2/50
+Reasoning: I now understand the layout:
+
+- `A1:A3` is Table-1 with the countries list:
+  - `A1 = Country`
+  - `A2 = B`
+  - `A3 = F`
+- Row 11 contains the country/company matrix headers:
+  - `B11:H11 = A, B, C, D, E, F, G`
+- Company rows are:
+  - Row 12: `ABC`
+  - Row 13: `EFG`
+- Target output column is `I` with header `No of countries`.
+
+We need a formula in `I12` and `I13` that counts how many country columns are listed in Table-1 *and* have employee count > 0 for that company row.
+
+A good LibreOffice-compatible formula is `SUMPRODUCT`, comparing the country headers against the Table-1 list and multiplying by the `>0` condition for the current row. I’ll write the formula to both rows, save to the output directory with the same filename, recalculate, and verify the cached values.
+Code:
+```repl
+from openpyxl import load_workbook
+import os
+
+infile = input_spreadsheet
+outfile = os.path.join("/sandbox/output/output_spreadsheet", os.path.basename(infile))
+
+wb = load_workbook(infile)
+ws = wb["Sheet1"]
+
+# Apply formula to count countries from Table-1 (A2:A3) where employee count > 0
+for r in [12, 13]:
+    ws[f"I{r}"] = f'=SUMPRODUCT(COUNTIF($A$2:$A$3,$B$11:$H$11)*--($B{r}:$H{r}>0))'
+
+wb.save(outfile)
+print("Saved:", outfile)
+
+# Recalculate and verify
+recalc_result = await recalculate(outfile)
+print("Recalc:", recalc_result)
+
+wb_check = load_workbook(outfile, data_only=False)
+ws_check = wb_check["Sheet1"]
+print("Formulas:", ws_check["I12"].value, ws_check["I13"].value)
+
+wb_vals = load_workbook(outfile, data_only=True)
+ws_vals = wb_vals["Sheet1"]
+print("Values:", ws_vals["I12"].value, ws_vals["I13"].value)
+```
+2026-04-13 14:29:30,397 INFO RLM iteration 3/50
+Reasoning: The workbook has been updated, saved to the required output path, and verified after recalculation. The output file is ready to submit.
+Code:
+```repl
+SUBMIT(output_spreadsheet="/sandbox/output/output_spreadsheet/1_12307_init.xlsx")
+```
+
+============================================================
+recalc_source: baseline
+score:         1.0000  PASS
+All 2 cells match

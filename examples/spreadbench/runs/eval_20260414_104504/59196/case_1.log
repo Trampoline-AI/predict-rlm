@@ -1,0 +1,109 @@
+task: 59196  case: 1
+instruction_type: Cell-Level Manipulation
+answer_position: H3:H5
+input:  /Users/gabriel/Workspace/trampoline-ai/predict-rlm.spreadbench-release/examples/spreadbench/data/testset/spreadsheet/59196/1_59196_init.xlsx
+answer: /Users/gabriel/Workspace/trampoline-ai/predict-rlm.spreadbench-release/examples/spreadbench/data/testset/spreadsheet/59196/1_59196_golden.xlsx
+============================================================
+2026-04-14 11:12:16,291 INFO RLM iteration 1/50
+Reasoning: Need inspect workbook thoroughly first: sheet names, dimensions, headers, sample rows, identify likely target cells/formulas/example answers. Then can implement.
+Code:
+```repl
+from openpyxl import load_workbook
+from openpyxl.utils import get_column_letter
+import os, json, math
+
+path = input_spreadsheet
+wb = load_workbook(path)
+print("Instruction:", instruction)
+print("Workbook sheets:", wb.sheetnames)
+
+def row_values(ws, r, max_cols=None):
+    mc = max_cols or ws.max_column
+    return [ws.cell(r, c).value for c in range(1, mc+1)]
+
+for s in wb.sheetnames:
+    ws = wb[s]
+    print(f"\n--- Sheet: {s} ---")
+    print("max_row:", ws.max_row, "max_column:", ws.max_column)
+    headers = row_values(ws, 1, ws.max_column)
+    print("Row1 headers/values:", headers)
+    if ws.max_row >= 2:
+        print("Row2:", row_values(ws, 2, ws.max_column))
+    # first 10 rows
+    first_n = min(ws.max_row, 10)
+    print(f"First {first_n} rows:")
+    for r in range(1, first_n + 1):
+        print(r, row_values(ws, r, ws.max_column))
+    # last 5 rows
+    start_last = max(1, ws.max_row - 4)
+    print("Last rows:")
+    for r in range(start_last, ws.max_row + 1):
+        print(r, row_values(ws, r, ws.max_column))
+```
+2026-04-14 11:12:44,921 INFO RLM iteration 2/50
+Reasoning: We found the exact layout: on Sheet1, headers are in row 2, columns D:G = A, B, C, D, and column H has header MAX. There is an example answer already in H3 = "D", corresponding to the maximum among D3:G3 = 0,0,1,2. So the target cells are H4:H5 (and generally H3:H5 where data rows exist, but H3 already matches). We should inspect any existing formulas in H3:H5 and nearby cells, then write a formula in column H that returns the header from row 2 for the max value in the same row. A robust formula is `=INDEX($D$2:$G$2,1,MATCH(MAX(D3:G3),D3:G3,0))`. Then save, recalculate, verify H3:H5, and preserve sheet name if needed.
+Code:
+```repl
+from openpyxl import load_workbook
+import os
+
+infile = input_spreadsheet
+filename = os.path.basename(infile)
+outdir = "/sandbox/output/output_spreadsheet"
+outfile = os.path.join(outdir, filename)
+
+# Inspect target area and existing formulas/values
+wb = load_workbook(infile)
+ws = wb["Sheet1"]
+
+for r in range(2, ws.max_row + 1):
+    print(f"Row {r} D:H values:", [ws.cell(r, c).value for c in range(4, 9)])
+    print("H cell raw:", ws.cell(r, 8).value)
+
+# Write formula to MAX column for actual data rows under header
+for r in range(3, ws.max_row + 1):
+    row_vals = [ws.cell(r, c).value for c in range(4, 8)]
+    if all(v is None or v == "" for v in row_vals):
+        continue
+    ws.cell(r, 8).value = f'=INDEX($D$2:$G$2,1,MATCH(MAX(D{r}:G{r}),D{r}:G{r},0))'
+
+wb.save(outfile)
+print("Saved to", outfile)
+
+# Recalculate
+result = await recalculate(outfile)
+print("Recalculate:", result)
+
+# Check/restore sheet names if changed
+orig_names = wb.sheetnames
+wb2 = load_workbook(outfile)
+print("Sheet names after recalc:", wb2.sheetnames)
+if wb2.sheetnames != orig_names:
+    # rename by position back to original
+    for i, name in enumerate(orig_names):
+        wb2.worksheets[i].title = name
+    wb2.save(outfile)
+    print("Restored sheet names to:", orig_names)
+
+# Verify with formulas visible
+wbf = load_workbook(outfile, data_only=False)
+wsf = wbf["Sheet1"]
+print("Formulas in H3:H5:", [wsf[f"H{r}"].value for r in range(3, min(5, wsf.max_row)+1)])
+
+# Verify cached values
+wbd = load_workbook(outfile, data_only=True)
+wsd = wbd["Sheet1"]
+for r in range(3, wsd.max_row + 1):
+    print(f"Verified row {r} D:G -> H:", [wsd.cell(r, c).value for c in range(4, 8)], "->", wsd.cell(r, 8).value)
+```
+2026-04-14 11:13:44,315 INFO RLM iteration 3/50
+Reasoning: The workbook has been fully inspected, modified, saved, recalculated, and verified. Target column H ("MAX") now contains the header of the highest-valued column for each populated row, and verification showed correct results in H3:H5. The output file is ready. I should now submit the saved spreadsheet path only.
+Code:
+```repl
+SUBMIT(output_spreadsheet="/sandbox/output/output_spreadsheet/1_59196_init.xlsx")
+```
+
+============================================================
+recalc_source: baseline
+score:         1.0000  PASS
+All 3 cells match

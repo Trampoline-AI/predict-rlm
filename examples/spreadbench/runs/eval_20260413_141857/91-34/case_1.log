@@ -1,0 +1,166 @@
+task: 91-34  case: 1
+instruction_type: Sheet-Level Manipulation
+answer_position: 'SwiftMD'!B2:O42
+input:  /Users/gabriel/Workspace/trampoline-ai/predict-rlm.spreadbench-release/examples/spreadbench/data/testset/spreadsheet/91-34/1_91-34_init.xlsx
+answer: /Users/gabriel/Workspace/trampoline-ai/predict-rlm.spreadbench-release/examples/spreadbench/data/testset/spreadsheet/91-34/1_91-34_golden.xlsx
+============================================================
+2026-04-13 14:22:08,140 INFO RLM iteration 1/50
+Reasoning: Need to explore the workbook structure first: load the file, inspect sheet names, dimensions, headers, and sample rows to identify the relevant columns (`Duplicate?`, `Relationship`, names, DOB). Then I can determine exactly which duplicate rows should be deleted and how the sheet is laid out before modifying anything.
+Code:
+```repl
+from openpyxl import load_workbook
+from pathlib import Path
+import os, json
+
+print("Input:", input_spreadsheet)
+print("Instruction:", instruction)
+
+wb = load_workbook(input_spreadsheet)
+print("Sheets:", wb.sheetnames)
+
+for ws in wb.worksheets:
+    print(f"\nSheet: {ws.title}")
+    print("Dimensions:", ws.max_row, "rows x", ws.max_column, "cols")
+    # print first 10 rows / up to 12 cols for inspection
+    for r in range(1, min(ws.max_row, 10) + 1):
+        vals = [ws.cell(r, c).value for c in range(1, min(ws.max_column, 12) + 1)]
+        print(r, vals)
+```
+2026-04-13 14:22:34,886 INFO RLM iteration 2/50
+Reasoning: I’ve identified the relevant sheet and header row. Next I should inspect all rows with the key columns (`Last Name`, `First Name`, `Date Of Birth`, `Duplicate?`, `Relationship`) and compute duplicate groups so I can apply the instruction precisely: delete only one row for people whose duplicate-marked entries are all non-employees, while leaving groups untouched if any duplicate entry is an Employee. After confirming the exact row(s), I can modify the workbook, save it, and verify the result.
+Code:
+```repl
+from collections import defaultdict
+
+ws = wb["SwiftMD"]
+
+# Map headers to column indexes from row 2
+headers = {ws.cell(2, c).value: c for c in range(1, ws.max_column + 1)}
+print("Headers:", headers)
+
+key_cols = ["Last Name", "First Name", "Date Of Birth", "Duplicate?", "Relationship"]
+for r in range(3, ws.max_row + 1):
+    vals = {k: ws.cell(r, headers[k]).value for k in key_cols}
+    print(r, vals)
+
+groups = defaultdict(list)
+for r in range(3, ws.max_row + 1):
+    last = ws.cell(r, headers["Last Name"]).value
+    first = ws.cell(r, headers["First Name"]).value
+    dob = ws.cell(r, headers["Date Of Birth"]).value
+    dup = ws.cell(r, headers["Duplicate?"]).value
+    rel = ws.cell(r, headers["Relationship"]).value
+    groups[(last, first, dob)].append((r, dup, rel))
+
+print("\nPotential duplicate groups:")
+for person, items in groups.items():
+    if len(items) > 1:
+        print(person, items)
+```
+2026-04-13 14:23:05,682 INFO RLM iteration 3/50
+Reasoning: I’ve already identified the relevant columns and most duplicate groups. The instruction is specific: for people with the same last name, first name, and DOB, if they are marked `Yes` in `Duplicate?` and their duplicate entries are all non-`Employee`, delete only one of those entries. If any entry in that duplicate set has `Relationship = Employee`, do not delete any.
+
+So now I should:
+1. Programmatically determine exactly which groups qualify.
+2. Delete one row from each qualifying group, likely keeping the first occurrence and deleting the second.
+3. Save the workbook to the required output path with the same filename.
+4. Reopen and verify that only the intended rows were removed and that protected employee-involved duplicates remain untouched.
+Code:
+```repl
+from openpyxl import load_workbook
+from pathlib import Path
+from collections import defaultdict
+import os
+
+# Reload clean workbook from input
+infile = input_spreadsheet
+outfile = os.path.join("/sandbox/output/output_spreadsheet", Path(input_spreadsheet).name)
+
+wb = load_workbook(infile)
+ws = wb["SwiftMD"]
+
+headers = {ws.cell(2, c).value: c for c in range(1, ws.max_column + 1)}
+
+# Build groups by person
+groups = defaultdict(list)
+for r in range(3, ws.max_row + 1):
+    last = ws.cell(r, headers["Last Name"]).value
+    first = ws.cell(r, headers["First Name"]).value
+    dob = ws.cell(r, headers["Date Of Birth"]).value
+    dup = ws.cell(r, headers["Duplicate?"]).value
+    rel = ws.cell(r, headers["Relationship"]).value
+    groups[(last, first, dob)].append({"row": r, "dup": dup, "rel": rel})
+
+# Determine qualifying groups:
+# - more than one row
+# - all rows marked Yes in Duplicate?
+# - none of the rows has Relationship == Employee
+qualifying = {}
+for person, items in groups.items():
+    if len(items) > 1:
+        all_yes = all(str(x["dup"]).strip().lower() == "yes" for x in items)
+        any_employee = any(str(x["rel"]).strip().lower() == "employee" for x in items)
+        if all_yes and not any_employee:
+            qualifying[person] = items
+
+print("Qualifying groups to delete one entry from:")
+for person, items in qualifying.items():
+    print(person, [(x["row"], x["rel"], x["dup"]) for x in items])
+
+# Delete one entry from each qualifying group: remove the later row, keep the first
+rows_to_delete = sorted([items[-1]["row"] for items in qualifying.values()], reverse=True)
+print("Rows to delete:", rows_to_delete)
+
+for r in rows_to_delete:
+    ws.delete_rows(r, 1)
+
+wb.save(outfile)
+print("Saved to:", outfile)
+
+# Verify output
+wb2 = load_workbook(outfile)
+ws2 = wb2["SwiftMD"]
+headers2 = {ws2.cell(2, c).value: c for c in range(1, ws2.max_column + 1)}
+
+groups2 = defaultdict(list)
+for r in range(3, ws2.max_row + 1):
+    last = ws2.cell(r, headers2["Last Name"]).value
+    first = ws2.cell(r, headers2["First Name"]).value
+    dob = ws2.cell(r, headers2["Date Of Birth"]).value
+    dup = ws2.cell(r, headers2["Duplicate?"]).value
+    rel = ws2.cell(r, headers2["Relationship"]).value
+    groups2[(last, first, dob)].append((r, dup, rel))
+
+# Print verification for targeted examples and any remaining all-nonemployee duplicate groups
+targets = [
+    ("Doees", "Emily"),
+    ("Doees", "Ryan"),
+    ("Doees", "Lisa"),
+    ("Smith", "Antoinette"),
+]
+print("\nVerification samples:")
+for person, items in groups2.items():
+    if person[0] in [t[0] for t in targets] and person[1] in [t[1] for t in targets]:
+        print(person, items)
+
+remaining_nonemployee_dupes = []
+for person, items in groups2.items():
+    if len(items) > 1:
+        all_yes = all(str(x[1]).strip().lower() == "yes" for x in items)
+        any_employee = any(str(x[2]).strip().lower() == "employee" for x in items)
+        if all_yes and not any_employee:
+            remaining_nonemployee_dupes.append((person, items))
+print("\nRemaining duplicate groups with all non-employees:", remaining_nonemployee_dupes)
+print("Final row count:", ws2.max_row)
+```
+2026-04-13 14:23:11,713 INFO RLM iteration 4/50
+Reasoning: The workbook has already been modified, saved to the required output path, and verified. The qualifying non-employee duplicate groups had one row removed, while duplicate groups involving an Employee were left intact. I should now submit the saved output spreadsheet path and nothing else.
+Code:
+```repl
+SUBMIT(output_spreadsheet="/sandbox/output/output_spreadsheet/1_91-34_init.xlsx")
+```
+
+============================================================
+recalc_source: baseline
+score:         1.0000  PASS
+All 574 cells match

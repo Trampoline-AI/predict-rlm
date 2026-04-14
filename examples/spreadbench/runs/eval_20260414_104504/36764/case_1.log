@@ -1,0 +1,110 @@
+task: 36764  case: 1
+instruction_type: Cell-Level Manipulation
+answer_position: 'Sheet1'!C2
+input:  /Users/gabriel/Workspace/trampoline-ai/predict-rlm.spreadbench-release/examples/spreadbench/data/testset/spreadsheet/36764/1_36764_init.xlsx
+answer: /Users/gabriel/Workspace/trampoline-ai/predict-rlm.spreadbench-release/examples/spreadbench/data/testset/spreadsheet/36764/1_36764_golden.xlsx
+============================================================
+2026-04-14 11:05:27,874 INFO RLM iteration 1/50
+Reasoning: Need inspect workbook thoroughly first: sheet names, dimensions, headers, sample rows, target C2 and relevant ranges. Then likely write SUMIF formula in Sheet1 C2 referencing Sheet2 A and R. Need identify actual sheet names maybe "Sheet 1".
+Code:
+```repl
+from openpyxl import load_workbook
+from openpyxl.utils import get_column_letter
+import os, json, math
+
+path = input_spreadsheet
+wb = load_workbook(path)
+print("Instruction:", instruction)
+print("Workbook sheets:", wb.sheetnames)
+
+for ws in wb.worksheets:
+    print(f"\n--- Sheet: {ws.title} ---")
+    print("max_row:", ws.max_row, "max_col:", ws.max_column)
+    headers = [ws.cell(1, c).value for c in range(1, ws.max_column + 1)]
+    print("Row1 headers/values:", headers[:30])
+    # first 10 rows
+    first_n = min(ws.max_row, 10)
+    print("First rows:")
+    for r in range(1, first_n + 1):
+        row = [ws.cell(r, c).value for c in range(1, min(ws.max_column, 20) + 1)]
+        print(r, row)
+    # last 5 rows
+    start_last = max(1, ws.max_row - 4)
+    print("Last rows:")
+    for r in range(start_last, ws.max_row + 1):
+        row = [ws.cell(r, c).value for c in range(1, min(ws.max_column, 20) + 1)]
+        print(r, row)
+
+# Inspect exact target and referenced cells/ranges
+ws1 = wb[wb.sheetnames[0]]
+ws2 = wb[wb.sheetnames[1]]
+print("\nTarget sheet/cell:", ws1.title, "C2 current value:", ws1["C2"].value)
+print("Sheet1 A2:", ws1["A2"].value)
+print("Sheet2 sample A and R values rows 2:10")
+for r in range(2, min(11, ws2.max_row + 1)):
+    print(r, ws2[f"A{r}"].value, ws2[f"R{r}"].value)
+
+print("Sheet2 rows 359:363 A and R")
+for r in range(359, min(364, ws2.max_row + 1)):
+    print(r, ws2[f"A{r}"].value, ws2[f"R{r}"].value)
+```
+2026-04-14 11:06:20,896 INFO RLM iteration 2/50
+Reasoning: Inspection shows workbook has sheets `Sheet1` and `Sheet2`. Target is `Sheet1!C2`, currently static `0`. `Sheet1!A2` contains `"Fully linked                                      "` with trailing spaces; `Sheet2!A2:A363` contains matching category strings with same trailing spaces; the sum range is actually column R (18), rows 2:363. Existing headers confirm R is `UK purchases`, and C in Sheet1 also corresponds to `UK purchases`. Need write a formula into exact target cell C2. Since the instruction asks for a formula in C2 only, not all rows, I should fill C2 with a SUMIF over `Sheet2!A2:A363` and `Sheet2!R2:R363` using `A2` as criterion. Then save, recalculate, reload data_only, verify `C2` is populated and plausibly equals expected hint. Also ensure sheet names preserved after recalc.
+Code:
+```repl
+from openpyxl import load_workbook
+import os, shutil
+
+infile = input_spreadsheet
+filename = os.path.basename(infile)
+outdir = "/sandbox/output/output_spreadsheet"
+os.makedirs(outdir, exist_ok=True)
+outfile = os.path.join(outdir, filename)
+
+# Load and write formula
+wb = load_workbook(infile)
+original_sheetnames = wb.sheetnames[:]
+ws1 = wb["Sheet1"]
+ws2 = wb["Sheet2"]
+
+print("Before write - Sheet1!C2:", ws1["C2"].value)
+print("Target exact columns: Sheet1 C header row1:", ws1["C1"].value, "| Sheet2 A col criteria, R col sum")
+print("Formula to write:", '=SUMIF(Sheet2!$A$2:$A$363,A2,Sheet2!$R$2:$R$363)')
+
+ws1["C2"] = '=SUMIF(Sheet2!$A$2:$A$363,A2,Sheet2!$R$2:$R$363)'
+
+wb.save(outfile)
+print("Saved to", outfile)
+
+# Recalculate
+recalc_result = await recalculate(outfile)
+print("Recalculate result:", recalc_result)
+
+# Restore sheet names if needed after recalc
+wb_check = load_workbook(outfile)
+print("Sheet names after recalc:", wb_check.sheetnames)
+if wb_check.sheetnames != original_sheetnames and len(wb_check.sheetnames) == len(original_sheetnames):
+    for ws, orig_name in zip(wb_check.worksheets, original_sheetnames):
+        ws.title = orig_name
+    wb_check.save(outfile)
+    print("Renamed sheets back to:", original_sheetnames)
+
+# Verify formula and cached value
+wb_formula = load_workbook(outfile, data_only=False)
+wb_values = load_workbook(outfile, data_only=True)
+print("Verified formula in Sheet1!C2:", wb_formula["Sheet1"]["C2"].value)
+print("Verified cached value in Sheet1!C2:", wb_values["Sheet1"]["C2"].value)
+print("A2 criterion repr:", repr(wb_values["Sheet1"]["A2"].value))
+print("Sheet names final:", wb_values.sheetnames)
+```
+2026-04-14 11:06:37,528 INFO RLM iteration 3/50
+Reasoning: The task is complete: I inspected the workbook, identified the exact target cell `Sheet1!C2`, wrote the correct `SUMIF` formula, saved to the output path, recalculated, and verified the cached result is `126741` with correct sheet names preserved. The output file is ready, so I should now submit the saved spreadsheet path and nothing else.
+Code:
+```repl
+SUBMIT(output_spreadsheet="/sandbox/output/output_spreadsheet/1_36764_init.xlsx")
+```
+
+============================================================
+recalc_source: baseline
+score:         1.0000  PASS
+All 1 cells match

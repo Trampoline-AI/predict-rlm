@@ -1,0 +1,123 @@
+task: 192-22  case: 1
+instruction_type: Sheet-Level Manipulation
+answer_position: 'Sheet1'!F2:F71
+input:  /Users/gabriel/Workspace/trampoline-ai/predict-rlm.spreadbench-release/examples/spreadbench/data/testset/spreadsheet/192-22/1_192-22_init.xlsx
+answer: /Users/gabriel/Workspace/trampoline-ai/predict-rlm.spreadbench-release/examples/spreadbench/data/testset/spreadsheet/192-22/1_192-22_golden.xlsx
+============================================================
+2026-04-13 14:24:14,637 INFO RLM iteration 1/50
+Reasoning: Need inspect workbook structure and full instruction text first, especially since user asks for VBA code but our task is to manipulate spreadsheet directly. I should explore sheets, dimensions, headers, and sample values in column D / existing column F on Sheet1 before making changes.
+Code:
+```repl
+from openpyxl import load_workbook
+import os, json, textwrap
+
+print("Instruction:")
+print(instruction)
+
+wb = load_workbook(input_spreadsheet)
+print("Sheets:", wb.sheetnames)
+
+for ws in wb.worksheets:
+    print(f"Sheet {ws.title}: rows={ws.max_row}, cols={ws.max_column}")
+    headers = [ws.cell(1, c).value for c in range(1, min(ws.max_column, 10)+1)]
+    print(" Row1 sample:", headers)
+
+ws = wb["Sheet1"] if "Sheet1" in wb.sheetnames else wb[wb.sheetnames[0]]
+print("Using sheet:", ws.title)
+
+# Print first 15 rows of cols A-F
+for r in range(1, min(ws.max_row, 15)+1):
+    vals = [ws.cell(r, c).value for c in range(1, 7)]
+    print(r, vals)
+
+# Find populated cells in D and sample them
+pop_d = []
+for r in range(1, ws.max_row + 1):
+    v = ws.cell(r, 4).value
+    if v not in (None, ""):
+        pop_d.append((r, v))
+print("Populated D count:", len(pop_d))
+print("First 20 populated D values:")
+for item in pop_d[:20]:
+    print(item)
+```
+2026-04-13 14:24:46,363 INFO RLM iteration 2/50
+Reasoning: I’ve inspected the workbook and confirmed there is a single sheet, `Sheet1`, with data in column D and output column F. Next I should apply the instruction literally: scan every populated cell in column D, case-insensitive partial match against the provided keywords, and write `Billing PO` to the same row in column F when matched; otherwise leave column F blank. I also need to preserve all other data/formatting, so I’ll only modify column F values. After saving, I’ll reopen and verify matched rows/counts.
+Code:
+```repl
+from openpyxl import load_workbook
+import os
+
+input_path = input_spreadsheet
+filename = os.path.basename(input_path)
+output_path = os.path.join("/sandbox/output/output_spreadsheet", filename)
+
+keywords = [
+    "Core Activation",
+    "Core Design",
+    "Mobile Terminology",
+    "Mobile Design",
+    "Mobile Integration",
+    "Testing Layer",
+    "Testing Offshore",
+    "Carrier",
+    "Barrier",
+]
+keywords_lower = [k.lower() for k in keywords]
+
+wb = load_workbook(input_path)
+ws = wb["Sheet1"]
+
+match_rows = []
+nonblank_d_rows = 0
+
+for r in range(2, ws.max_row + 1):  # keep header row as-is
+    d_val = ws.cell(r, 4).value
+    f_cell = ws.cell(r, 6)
+    if d_val not in (None, ""):
+        nonblank_d_rows += 1
+        text = str(d_val).lower()
+        matched = any(k in text for k in keywords_lower)
+        if matched:
+            f_cell.value = "Billing PO"
+            match_rows.append((r, d_val))
+        else:
+            f_cell.value = None
+    else:
+        f_cell.value = None
+
+wb.save(output_path)
+
+# Verify by reopening
+wb_check = load_workbook(output_path, data_only=False)
+ws_check = wb_check["Sheet1"]
+
+verified_matches = []
+for r in range(2, ws_check.max_row + 1):
+    d_val = ws_check.cell(r, 4).value
+    f_val = ws_check.cell(r, 6).value
+    if f_val == "Billing PO":
+        verified_matches.append((r, d_val, f_val))
+
+print("Saved to:", output_path)
+print("Nonblank D rows scanned:", nonblank_d_rows)
+print("Billing PO rows:", len(verified_matches))
+print("First 20 matches:")
+for row in verified_matches[:20]:
+    print(row)
+
+print("Sample rows 2-20, D/F after update:")
+for r in range(2, min(20, ws_check.max_row) + 1):
+    print(r, ws_check.cell(r,4).value, "=>", ws_check.cell(r,6).value)
+```
+2026-04-13 14:24:52,306 INFO RLM iteration 3/50
+Reasoning: The workbook has been updated and saved to the required output directory with the same filename. I verified that column F on `Sheet1` now contains `Billing PO` only for rows where column D contains one of the specified keywords via case-insensitive partial matching, and blanks otherwise. The output file path is ready to submit.
+Code:
+```repl
+SUBMIT(output_spreadsheet="/sandbox/output/output_spreadsheet/1_192-22_init.xlsx")
+```
+
+============================================================
+recalc_source: formulas
+score:         1.0000  PASS
+All 70 cells match

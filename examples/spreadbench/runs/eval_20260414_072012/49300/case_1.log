@@ -1,0 +1,159 @@
+task: 49300  case: 1
+instruction_type: Cell-Level Manipulation
+answer_position:  'Sheet1'!C2:C3
+input:  /Users/gabriel/Workspace/trampoline-ai/predict-rlm.spreadbench-release/examples/spreadbench/data/testset/spreadsheet/49300/1_49300_init.xlsx
+answer: /Users/gabriel/Workspace/trampoline-ai/predict-rlm.spreadbench-release/examples/spreadbench/data/testset/spreadsheet/49300/1_49300_golden.xlsx
+============================================================
+2026-04-14 07:32:37,326 INFO RLM iteration 1/50
+Reasoning: First, load the workbook to inspect its structure: list sheet names, header rows, and sample data. This will help identify the target columns and where to place the corrected INDEX/MATCH formula. We'll print sheet names, row counts, column headers, and a few rows from each sheet.
+Code:
+```repl
+import openpyxl, os, json
+
+# Load workbook
+wb_path = '/sandbox/input/input_spreadsheet/1_49300_init.xlsx'
+wb = openpyxl.load_workbook(wb_path, data_only=False)
+
+# List sheet names and dimensions
+for ws in wb.worksheets:
+    print(f"Sheet: {ws.title}, max_row: {ws.max_row}, max_column: {ws.max_column}")
+    # Print header row (first row)
+    headers = [ws.cell(row=1, column=c).value for c in range(1, ws.max_column+1)]
+    print("Headers:", headers)
+    # Print first 5 data rows
+    for r in range(2, min(ws.max_row, 6)):
+        row_vals = [ws.cell(row=r, column=c).value for c in range(1, ws.max_column+1)]
+        print(f"Row {r}:", row_vals)
+    # Print last 5 data rows
+    for r in range(max(2, ws.max_row-4), ws.max_row+1):
+        row_vals = [ws.cell(row=r, column=c).value for c in range(1, ws.max_column+1)]
+        print(f"Row {r}:", row_vals)
+    print("---" * 10)
+```
+2026-04-14 07:33:00,967 INFO RLM iteration 2/50
+Reasoning: We inspected the workbook. Sheet1 has columns: A = Job Title, B = Months, C currently contains a faulty INDEX/MATCH formula in row 2. The task is to correct the formula so that column C of Sheet1 returns the value from the Data sheet based on the two criteria (Job Title in A and Months in B). The Data sheet layout shows:
+- Row 2 (C2:AY2) holds the month headers (1‑72).
+- Column B (B3:B4) holds the job titles (BM, DM).
+- The data table is in C3:AY4 (rows 3‑4, columns C‑AY).
+
+Thus the correct formula for each row i in Sheet1 is:
+`=INDEX(Data!C3:AY4, MATCH(1, (Data!B3:B4=Sheet1!A{i})*(Data!C2:AY2=Sheet1!B{i}), 0))`
+
+We will write this formula into column C for all data rows (starting at row 2 up to the last row). Then we will save the workbook to the output directory, recalculate formulas, and verify that the target cells now contain numeric results.
+Code:
+```repl
+import openpyxl, os
+from openpyxl.utils import get_column_letter
+
+# Paths
+input_path = "/sandbox/input/input_spreadsheet/1_49300_init.xlsx"
+output_dir = "/sandbox/output/output_spreadsheet/"
+os.makedirs(output_dir, exist_ok=True)
+output_path = os.path.join(output_dir, "1_49300_init.xlsx")
+
+# Load workbook (preserve formulas)
+wb = openpyxl.load_workbook(input_path, data_only=False)
+ws = wb["Sheet1"]
+
+# Determine the last row with data in column A (job title)
+max_row = ws.max_row
+# Apply corrected formula to each row that has a job title (skip header)
+for r in range(2, max_row + 1):
+    job = ws.cell(row=r, column=1).value
+    months = ws.cell(row=r, column=2).value
+    # Only write formula if both criteria are present
+    if job is not None and months is not None:
+        formula = f"=INDEX(Data!C3:AY4, MATCH(1, (Data!B3:B4=Sheet1!A{r})*(Data!C2:AY2=Sheet1!B{r}), 0))"
+        ws.cell(row=r, column=3).value = formula
+
+# Save to output location
+wb.save(output_path)
+
+# Recalculate formulas
+calc_result = await recalculate(output_path)
+print("Recalc result:", calc_result)
+
+# Reload with data_only to verify results
+wb_check = openpyxl.load_workbook(output_path, data_only=True)
+ws_check = wb_check["Sheet1"]
+print("Verification values in column C:")
+for r in range(2, max_row + 1):
+    val = ws_check.cell(row=r, column=3).value
+    print(f"C{r} =", val)
+```
+2026-04-14 07:33:52,597 INFO RLM iteration 3/50
+Reasoning: The previous formula used an array expression `(Data!B3:B4=Sheet1!A2)*(Data!C2:AY2=Sheet1!B2)` which LibreOffice does not evaluate without special array‑formula handling, resulting in `None` after recalculation.  
+A non‑array equivalent is to separate the row lookup and column lookup with two `MATCH` functions and feed those indices to `INDEX`.  
+The correct formula for each data row `r` in **Sheet1** is:
+
+```
+=INDEX(Data!C3:AY4,
+       MATCH(Sheet1!A{r}, Data!B3:B4, 0),
+       MATCH(Sheet1!B{r}, Data!C2:AY2, 0))
+```
+
+This works with standard LibreOffice functions and returns the numeric value from the **Data** table that matches the job title (column A) and month (column B).  
+
+The plan:
+1. Load the workbook, locate **Sheet1**.
+2. For every row with a job title and month (rows 2 … max_row), write the above formula into column C.
+3. Save the workbook to the output folder.
+4. Recalculate formulas, reload the file with `data_only=True`, and print the resulting values in column C to verify they are numeric.
+Code:
+```repl
+import openpyxl, os
+from openpyxl.utils import get_column_letter
+
+# Paths
+input_path = "/sandbox/input/input_spreadsheet/1_49300_init.xlsx"
+output_dir = "/sandbox/output/output_spreadsheet/"
+os.makedirs(output_dir, exist_ok=True)
+output_path = os.path.join(output_dir, "1_49300_init.xlsx")
+
+# Load workbook (preserve formulas)
+wb = openpyxl.load_workbook(input_path, data_only=False)
+ws = wb["Sheet1"]
+
+# Determine last row with data (assume column A defines the extent)
+max_row = ws.max_row
+
+# Write corrected non‑array INDEX/MATCH formula into column C for each data row
+for r in range(2, max_row + 1):
+    job = ws.cell(row=r, column=1).value
+    month = ws.cell(row=r, column=2).value
+    if job is not None and month is not None:
+        formula = (
+            f"=INDEX(Data!C3:AY4,"
+            f"MATCH(Sheet1!A{r},Data!B3:B4,0),"
+            f"MATCH(Sheet1!B{r},Data!C2:AY2,0))"
+        )
+        ws.cell(row=r, column=3).value = formula
+
+# Save to the output location
+wb.save(output_path)
+
+# Recalculate formulas using the provided tool
+calc_result = await recalculate(output_path)
+print("Recalc result:", calc_result)
+
+# Reload with data_only=True to read the computed values
+wb_check = openpyxl.load_workbook(output_path, data_only=True)
+ws_check = wb_check["Sheet1"]
+print("Verification of column C values after recalculation:")
+for r in range(2, max_row + 1):
+    val = ws_check.cell(row=r, column=3).value
+    print(f"C{r} =", val)
+```
+2026-04-14 07:34:12,153 INFO RLM iteration 4/50
+Reasoning: The corrected non‑array INDEX/MATCH formula has been written to column C for each data row in Sheet1. After saving and recalculating, the values in column C are now numeric (C2 = 35, C3 = 37), indicating the formula correctly retrieves the intersecting value from the Data sheet based on the Job Title and Month criteria.
+Code:
+```python
+SUBMIT(
+    output_spreadsheet="/sandbox/output/output_spreadsheet/1_49300_init.xlsx"
+)
+```
+
+============================================================
+recalc_source: baseline
+score:         1.0000  PASS
+All 2 cells match

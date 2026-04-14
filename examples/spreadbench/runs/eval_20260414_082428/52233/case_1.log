@@ -1,0 +1,171 @@
+task: 52233  case: 1
+instruction_type: Cell-Level Manipulation
+answer_position: B7:B10
+input:  /Users/gabriel/Workspace/trampoline-ai/predict-rlm.spreadbench-release/examples/spreadbench/data/testset/spreadsheet/52233/1_52233_init.xlsx
+answer: /Users/gabriel/Workspace/trampoline-ai/predict-rlm.spreadbench-release/examples/spreadbench/data/testset/spreadsheet/52233/1_52233_golden.xlsx
+============================================================
+2026-04-14 08:48:04,554 INFO RLM iteration 1/50
+Reasoning: Need inspect workbook structure and locate the existing formula/target cells referenced by the instruction. I'll load the workbook, print all sheet names, dimensions, headers, sample rows (first 10 and last 5), and scan for formulas containing SUM/INDEX/MATCH or the exact provided formula pattern. Then I can identify the exact cells/column to update.
+Code:
+```repl
+import os, json, math, statistics
+from openpyxl import load_workbook
+from openpyxl.utils import get_column_letter
+
+print("Input:", input_spreadsheet)
+print("Instruction:", instruction)
+
+wb = load_workbook(input_spreadsheet)
+orig_sheet_names = wb.sheetnames
+print("Sheet names:", orig_sheet_names)
+
+def row_values(ws, r, max_cols=None):
+    mc = max_cols or ws.max_column
+    return [ws.cell(r, c).value for c in range(1, mc+1)]
+
+for ws in wb.worksheets:
+    print("\n--- SHEET:", ws.title, "---")
+    print("max_row:", ws.max_row, "max_column:", ws.max_column)
+    
+    # find a likely header row among first 5 rows: the one with most non-empty values
+    best_row = 1
+    best_count = -1
+    for r in range(1, min(5, ws.max_row)+1):
+        vals = row_values(ws, r)
+        count = sum(v is not None and v != "" for v in vals)
+        if count > best_count:
+            best_count = count
+            best_row = r
+    print("Likely header row:", best_row)
+    headers = row_values(ws, best_row)
+    print("Headers:", headers)
+    
+    # first 10 rows
+    first_n = min(10, ws.max_row)
+    print("First rows:")
+    for r in range(1, first_n+1):
+        print(r, row_values(ws, r))
+    
+    # last 5 rows
+    start_last = max(1, ws.max_row - 4)
+    print("Last rows:")
+    for r in range(start_last, ws.max_row+1):
+        print(r, row_values(ws, r))
+    
+    # scan formulas
+    formula_hits = []
+    for row in ws.iter_rows():
+        for cell in row:
+            if isinstance(cell.value, str) and cell.value.startswith("="):
+                f = cell.value
+                if ("INDEX" in f.upper()) or ("MATCH" in f.upper()) or ("SUM(" in f.upper()):
+                    formula_hits.append((cell.coordinate, f))
+    print("Formula hits count:", len(formula_hits))
+    for hit in formula_hits[:20]:
+        print("Formula:", hit)
+
+# Also search specifically for exact text fragments
+search_terms = ["=SUM(INDEX(B3:B5,0,MATCH(A7,$B$2:$Z$2,0)))", "MATCH(A7", "INDEX(B3:B5", "B3:B5", "$B$2:$Z$2"]
+for term in search_terms:
+    found = []
+    for ws in wb.worksheets:
+        for row in ws.iter_rows():
+            for cell in row:
+                v = cell.value
+                if isinstance(v, str) and term in v:
+                    found.append((ws.title, cell.coordinate, v))
+    print(f"\nSearch term {term!r}: {len(found)} hits")
+    for item in found[:20]:
+        print(item)
+```
+2026-04-14 08:48:33,660 INFO RLM iteration 2/50
+Reasoning: I inspected the workbook and found the exact target range and current formulas:
+
+- Sheet: `Sheet1`
+- Target cells with existing formulas: `B7:B10`
+- Current formulas incorrectly shift the row range downward:
+  - `B7 = =SUM(INDEX(B3:B5,0,MATCH(A7,$B$2:$Z$2,0)))`
+  - `B8 = =SUM(INDEX(B4:B6,0,MATCH(A8,$B$2:$Z$2,0)))`
+  - etc.
+
+From the layout, the intended behavior is:
+- keep the source row range fixed at rows `3:5`
+- change the source column based on the company matched from `A7:A10` against headers in `B2:E2`
+
+So the correct formula pattern is to use a fixed 2D range and let `MATCH` choose the column:
+`=SUM(INDEX($B$3:$Z$5,0,MATCH(A7,$B$2:$Z$2,0)))`
+
+Dragging this down from `B7` to `B10` changes only `A7` to `A8`, etc., while keeping rows `3:5` fixed. I’ll write this formula into `B7:B10`, save, recalculate, reload, and verify values.
+Code:
+```repl
+import os
+from openpyxl import load_workbook
+
+infile = input_spreadsheet
+filename = os.path.basename(infile)
+outdir = "/sandbox/output/output_spreadsheet"
+outfile = os.path.join(outdir, filename)
+
+wb = load_workbook(infile)
+orig_sheet_names = wb.sheetnames[:]
+ws = wb["Sheet1"]
+
+# Print existing target area before modification
+print("Before modification:")
+for r in range(7, 11):
+    print(f"A{r}={ws[f'A{r}'].value!r}, B{r}={ws[f'B{r}'].value!r}")
+
+# Write corrected formula to the exact target cells
+for r in range(7, 11):
+    ws[f"B{r}"] = f"=SUM(INDEX($B$3:$Z$5,0,MATCH(A{r},$B$2:$Z$2,0)))"
+
+# Save
+wb.save(outfile)
+print("Saved to:", outfile)
+
+# Recalculate
+recalc_result = await recalculate(outfile)
+print("Recalculate:", recalc_result)
+
+# Reload after recalculation, restore sheet names if needed
+wb_check = load_workbook(outfile)
+if wb_check.sheetnames != orig_sheet_names:
+    print("Sheet names changed after recalc:", wb_check.sheetnames, "-> restoring to", orig_sheet_names)
+    # rename by position
+    for i, sname in enumerate(orig_sheet_names):
+        wb_check.worksheets[i].title = sname
+    wb_check.save(outfile)
+    wb_check = load_workbook(outfile)
+
+print("Final sheet names:", wb_check.sheetnames)
+
+# Verify formulas
+ws_formula = wb_check["Sheet1"]
+print("Formulas written:")
+for r in range(7, 11):
+    print(f"B{r} formula:", ws_formula[f"B{r}"].value)
+
+# Verify calculated values
+wb_values = load_workbook(outfile, data_only=True)
+ws_values = wb_values["Sheet1"]
+print("Calculated values after recalc:")
+for r in range(7, 11):
+    print(f"A{r}={ws_values[f'A{r}'].value!r}, B{r}={ws_values[f'B{r}'].value!r}")
+
+output_spreadsheet = outfile
+```
+2026-04-14 08:48:45,284 INFO RLM iteration 3/50
+Reasoning: The spreadsheet has been modified and verified successfully. The correct target cells were `B7:B10` on `Sheet1`, and after writing the corrected formulas and recalculating, the output values are valid (`500, 150, 600, 200`). The output file is saved at `/sandbox/output/output_spreadsheet/1_52233_init.xlsx`. Next step: submit that file path.
+Code:
+```repl
+SUBMIT(output_spreadsheet=output_spreadsheet)
+```
+
+============================================================
+recalc_source: baseline
+score:         0.0000  FAIL
+Sheet 'Sheet1' range B7:B10: 0/4 cells match
+  Sheet1!B7: expected=1000 got=500
+  Sheet1!B8: expected=700 got=150
+  Sheet1!B9: expected=1400 got=600
+  Sheet1!B10: expected=1550 got=200
