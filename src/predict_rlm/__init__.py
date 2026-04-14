@@ -12,6 +12,7 @@ File I/O:
 from .files import File, LocalDir, LocalFile, OutputDir, OutputFile
 from .predict_rlm import PredictRLM
 from .rlm_skills import Skill
+from .trace import RunTrace
 
 __all__ = [
     "File",
@@ -20,5 +21,6 @@ __all__ = [
     "OutputDir",
     "OutputFile",
     "PredictRLM",
+    "RunTrace",
     "Skill",
 ]

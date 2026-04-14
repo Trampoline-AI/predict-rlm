@@ -275,16 +275,16 @@ class TestPredictTool:
 
         assert rlm._context_lm is None
 
-        with patch.object(dspy.RLM, "forward") as mock_super_forward:
-            mock_super_forward.return_value = dspy.Prediction(answer="Test")
+        with patch.object(PredictRLM, "_forward_traced") as mock_traced:
+            mock_traced.return_value = dspy.Prediction(answer="Test")
 
             with dspy.context(lm=context_lm):
 
-                def check_context_lm(**kwargs):
+                def check_context_lm(file_plan, **kwargs):
                     assert rlm._context_lm is context_lm
                     return dspy.Prediction(answer="Test")
 
-                mock_super_forward.side_effect = check_context_lm
+                mock_traced.side_effect = check_context_lm
 
                 _ = rlm.forward(images=["img"], query="test?")
 
@@ -485,17 +485,17 @@ class TestMainLMParameter:
         mock_lm = MagicMock()
         rlm = PredictRLM(ImageAnalysisSignature, lm=mock_lm, max_iterations=1)
 
-        with patch.object(dspy.RLM, "forward") as mock_super_forward:
-            mock_super_forward.return_value = dspy.Prediction(answer="Test")
+        with patch.object(PredictRLM, "_forward_traced") as mock_traced:
+            mock_traced.return_value = dspy.Prediction(answer="Test")
 
             captured_lm = None
 
-            def capture_context(**kwargs):
+            def capture_context(file_plan, **kwargs):
                 nonlocal captured_lm
                 captured_lm = dspy.settings.lm
                 return dspy.Prediction(answer="Test")
 
-            mock_super_forward.side_effect = capture_context
+            mock_traced.side_effect = capture_context
             rlm.forward(images=["img"], query="test?")
             assert captured_lm is mock_lm
 
@@ -504,17 +504,17 @@ class TestMainLMParameter:
         external_lm = MagicMock()
         rlm = PredictRLM(ImageAnalysisSignature, lm=None, max_iterations=1)
 
-        with patch.object(dspy.RLM, "forward") as mock_super_forward:
-            mock_super_forward.return_value = dspy.Prediction(answer="Test")
+        with patch.object(PredictRLM, "_forward_traced") as mock_traced:
+            mock_traced.return_value = dspy.Prediction(answer="Test")
 
             captured_lm = None
 
-            def capture_context(**kwargs):
+            def capture_context(file_plan, **kwargs):
                 nonlocal captured_lm
                 captured_lm = dspy.settings.lm
                 return dspy.Prediction(answer="Test")
 
-            mock_super_forward.side_effect = capture_context
+            mock_traced.side_effect = capture_context
 
             with dspy.context(lm=external_lm):
                 rlm.forward(images=["img"], query="test?")
@@ -526,8 +526,8 @@ class TestMainLMParameter:
         mock_lm = MagicMock()
         rlm = PredictRLM(ImageAnalysisSignature, lm=mock_lm, max_iterations=1)
 
-        with patch.object(dspy.RLM, "forward") as mock_super_forward:
-            mock_super_forward.return_value = dspy.Prediction(answer="Test")
+        with patch.object(PredictRLM, "_forward_traced") as mock_traced:
+            mock_traced.return_value = dspy.Prediction(answer="Test")
             rlm.forward(images=["img"], query="test?")
 
         assert rlm._context_lm is None
@@ -537,8 +537,8 @@ class TestMainLMParameter:
         mock_lm = MagicMock()
         rlm = PredictRLM(ImageAnalysisSignature, lm=mock_lm, max_iterations=1)
 
-        with patch.object(dspy.RLM, "forward") as mock_super_forward:
-            mock_super_forward.side_effect = RuntimeError("boom")
+        with patch.object(PredictRLM, "_forward_traced") as mock_traced:
+            mock_traced.side_effect = RuntimeError("boom")
 
             with pytest.raises(RuntimeError):
                 rlm.forward(images=["img"], query="test?")
@@ -564,15 +564,15 @@ class TestMainLMParameter:
         mock_lm = MagicMock()
         rlm = PredictRLM(ImageAnalysisSignature, lm=mock_lm, max_iterations=1)
 
-        with patch.object(dspy.RLM, "aforward") as mock_super_aforward:
+        with patch.object(PredictRLM, "_aforward_traced") as mock_traced:
             captured_lm = None
 
-            async def capture_context(**kwargs):
+            async def capture_context(file_plan, **kwargs):
                 nonlocal captured_lm
                 captured_lm = dspy.settings.lm
                 return dspy.Prediction(answer="Test")
 
-            mock_super_aforward.side_effect = capture_context
+            mock_traced.side_effect = capture_context
             await rlm.aforward(images=["img"], query="test?")
             assert captured_lm is mock_lm
 
@@ -582,8 +582,8 @@ class TestMainLMParameter:
         mock_lm = MagicMock()
         rlm = PredictRLM(ImageAnalysisSignature, lm=mock_lm, max_iterations=1)
 
-        with patch.object(dspy.RLM, "aforward") as mock_super_aforward:
-            mock_super_aforward.return_value = dspy.Prediction(answer="Test")
+        with patch.object(PredictRLM, "_aforward_traced") as mock_traced:
+            mock_traced.return_value = dspy.Prediction(answer="Test")
             await rlm.aforward(images=["img"], query="test?")
 
         assert rlm._context_lm is None
@@ -594,15 +594,15 @@ class TestMainLMParameter:
         external_lm = MagicMock()
         rlm = PredictRLM(ImageAnalysisSignature, lm=None, max_iterations=1)
 
-        with patch.object(dspy.RLM, "aforward") as mock_super_aforward:
+        with patch.object(PredictRLM, "_aforward_traced") as mock_traced:
             captured_lm = None
 
-            async def capture_context(**kwargs):
+            async def capture_context(file_plan, **kwargs):
                 nonlocal captured_lm
                 captured_lm = dspy.settings.lm
                 return dspy.Prediction(answer="Test")
 
-            mock_super_aforward.side_effect = capture_context
+            mock_traced.side_effect = capture_context
 
             with dspy.context(lm=external_lm):
                 await rlm.aforward(images=["img"], query="test?")
