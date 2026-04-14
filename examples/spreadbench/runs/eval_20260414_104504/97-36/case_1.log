@@ -1,0 +1,143 @@
+task: 97-36  case: 1
+instruction_type: Sheet-Level Manipulation
+answer_position: 'Sheet1'!A1:A22
+input:  /Users/gabriel/Workspace/trampoline-ai/predict-rlm.spreadbench-release/examples/spreadbench/data/testset/spreadsheet/97-36/1_97-36_init.xlsx
+answer: /Users/gabriel/Workspace/trampoline-ai/predict-rlm.spreadbench-release/examples/spreadbench/data/testset/spreadsheet/97-36/1_97-36_golden.xlsx
+============================================================
+2026-04-14 10:49:21,444 INFO RLM iteration 1/50
+Reasoning: Need inspect workbook thoroughly first. Likely task means delete rows above first occurrence of substring "domestic" searching from A1 across sheet? Need identify actual target sheet/cells by inspection. Then perform row deletion preserving from row containing domestic onward maybe based on first cell containing substring scanning row-major. Need inspect all sheets names, dimensions, headers, samples.
+Code:
+```repl
+import os, shutil, json, re
+from openpyxl import load_workbook
+from openpyxl.utils import get_column_letter
+
+print("Instruction:", instruction)
+print("Input:", input_spreadsheet)
+
+wb = load_workbook(input_spreadsheet)
+orig_sheet_names = wb.sheetnames
+print("Sheet names:", orig_sheet_names)
+
+def sheet_nonempty_bounds(ws):
+    max_r, max_c = ws.max_row, ws.max_column
+    last_r = 0
+    last_c = 0
+    for row in ws.iter_rows():
+        row_has = False
+        for cell in row:
+            if cell.value not in (None, ""):
+                row_has = True
+                if cell.column > last_c:
+                    last_c = cell.column
+        if row_has:
+            last_r = cell.row
+    return last_r or max_r, last_c or max_c
+
+for ws in wb.worksheets:
+    last_r, last_c = sheet_nonempty_bounds(ws)
+    headers = [ws.cell(1, c).value for c in range(1, min(last_c, 15)+1)]
+    print(f"\n--- Sheet: {ws.title} ---")
+    print("max_row/max_col:", ws.max_row, ws.max_column, "nonempty approx:", last_r, last_c)
+    print("Row 1 headers/sample:", headers)
+    
+    sample_rows = list(range(1, min(last_r, 10)+1))
+    tail_start = max(1, last_r-4)
+    tail_rows = list(range(tail_start, last_r+1))
+    seen = set()
+    print("Top rows:")
+    for r in sample_rows:
+        vals = [ws.cell(r, c).value for c in range(1, min(last_c, 10)+1)]
+        print(r, vals)
+        seen.add(r)
+    print("Bottom rows:")
+    for r in tail_rows:
+        if r in seen:
+            continue
+        vals = [ws.cell(r, c).value for c in range(1, min(last_c, 10)+1)]
+        print(r, vals)
+    
+    matches = []
+    for r in range(1, last_r+1):
+        for c in range(1, last_c+1):
+            v = ws.cell(r, c).value
+            if isinstance(v, str) and "domestic" in v.lower():
+                matches.append((r, c, v))
+    print("Matches containing 'domestic':", matches[:20], "count=", len(matches))
+```
+2026-04-14 10:49:59,693 INFO RLM iteration 2/50
+Reasoning: We inspected the workbook: one sheet, one column, 22 rows. The first and only occurrence of the substring "domestic" is in cell A19. The instruction asks to delete all rows above the specified substring, starting from the first row and first column, so the correct operation is to delete rows 1:18 and keep row 19 onward. I should now perform the modification directly in the existing sheet, save to the output directory with the same filename, recalculate, then reload and verify that the remaining rows start with the domestic row and sheet names remain correct.
+Code:
+```repl
+import os, shutil
+from openpyxl import load_workbook
+
+infile = input_spreadsheet
+outfile = os.path.join("/sandbox/output/output_spreadsheet", os.path.basename(infile))
+
+# Load workbook for editing
+wb = load_workbook(infile)
+original_sheet_names = wb.sheetnames[:]
+ws = wb[original_sheet_names[0]]
+
+# Find first occurrence of substring "domestic" scanning row-major from A1
+target_sub = "domestic"
+found = None
+for r in range(1, ws.max_row + 1):
+    for c in range(1, ws.max_column + 1):
+        v = ws.cell(r, c).value
+        if isinstance(v, str) and target_sub in v.lower():
+            found = (r, c, v)
+            break
+    if found:
+        break
+
+print("Found target:", found)
+
+if found is None:
+    raise ValueError("Substring 'domestic' not found")
+
+target_row = found[0]
+if target_row > 1:
+    print(f"Deleting rows 1 to {target_row-1}")
+    ws.delete_rows(1, target_row - 1)
+else:
+    print("Target already on first row; no deletion needed")
+
+wb.save(outfile)
+print("Saved to:", outfile)
+
+# Recalculate
+recalc_result = await recalculate(outfile)
+print("Recalculate result:", recalc_result)
+
+# Reload and restore sheet names if changed
+wb2 = load_workbook(outfile)
+print("Sheet names after recalc/reload:", wb2.sheetnames)
+if wb2.sheetnames != original_sheet_names:
+    for i, old_name in enumerate(original_sheet_names):
+        wb2.worksheets[i].title = old_name
+    wb2.save(outfile)
+    print("Restored original sheet names:", original_sheet_names)
+
+# Verify using data_only and normal load
+wb_verify = load_workbook(outfile, data_only=True)
+wsv = wb_verify[original_sheet_names[0]]
+print("Verified sheet names:", wb_verify.sheetnames)
+print("Verified max_row/max_col:", wsv.max_row, wsv.max_column)
+for r in range(1, min(wsv.max_row, 10) + 1):
+    print("Row", r, [wsv.cell(r, c).value for c in range(1, wsv.max_column + 1)])
+
+output_spreadsheet = outfile
+```
+2026-04-14 10:50:02,648 INFO RLM iteration 3/50
+Reasoning: The workbook has already been inspected, modified, saved, recalculated, and verified. The output file path is stored in `output_spreadsheet`, and verification showed the first row now starts with the row containing `"domestic"`, with rows above removed. The next step is to submit the saved output file and nothing else.
+Code:
+```repl
+SUBMIT(output_spreadsheet=output_spreadsheet)
+```
+
+============================================================
+recalc_source: baseline
+score:         1.0000  PASS
+All 22 cells match

@@ -1,0 +1,111 @@
+task: 40757  case: 1
+instruction_type: Cell-Level Manipulation
+answer_position: B10:B11
+input:  /Users/gabriel/Workspace/trampoline-ai/predict-rlm.spreadbench-release/examples/spreadbench/data/testset/spreadsheet/40757/1_40757_init.xlsx
+answer: /Users/gabriel/Workspace/trampoline-ai/predict-rlm.spreadbench-release/examples/spreadbench/data/testset/spreadsheet/40757/1_40757_golden.xlsx
+============================================================
+2026-04-14 07:39:23,655 INFO RLM iteration 1/50
+Reasoning: We need to inspect the spreadsheet to see its structure: sheet names, headers, sample rows. The instruction asks to sum values in second column where first column equals a specific month, and ignore zero results. Likely we need to add a formula that does SUMIF with condition, and maybe wrap with IF to ignore zero. First, load workbook, list sheets, print headers and some rows.
+Code:
+```repl
+import openpyxl
+from openpyxl.utils import get_column_letter
+
+# Load workbook
+wb = openpyxl.load_workbook("/sandbox/input/input_spreadsheet/1_40757_init.xlsx")
+print("Sheet names:", wb.sheetnames)
+
+# Assume first sheet is the target
+ws = wb[wb.sheetnames[0]]
+
+# Determine max rows and columns
+max_row = ws.max_row
+max_col = ws.max_column
+print(f"Rows: {max_row}, Columns: {max_col}")
+
+# Print header row (row 1)
+headers = [ws.cell(row=1, column=c).value for c in range(1, max_col+1)]
+print("Headers:", headers)
+
+# Print first 5 data rows
+print("First 5 rows:")
+for r in range(2, min(2+5, max_row+1)):
+    row_vals = [ws.cell(row=r, column=c).value for c in range(1, max_col+1)]
+    print(r, row_vals)
+
+# Print last 5 rows
+print("Last 5 rows:")
+for r in range(max_row-4, max_row+1):
+    row_vals = [ws.cell(row=r, column=c).value for c in range(1, max_col+1)]
+    print(r, row_vals)
+```
+2026-04-14 07:39:37,978 INFO RLM iteration 2/50
+Reasoning: The spreadsheet has two columns: column A contains dates (rows 3‑6) and column B contains amounts. Rows 10 and 11 in column A hold month names ("July", "August") and row 9 column B is a header "Result". The user wants a sum of the amounts in column B for a specific month listed in column A, and to ignore a zero result (i.e., show a blank instead of 0).  
+
+To achieve this we will write a formula into the cells next to the month names (B10 and B11). The formula will:
+1. Convert the dates in column A to month names using `TEXT(A3:A6,"MMMM")`.
+2. Compare those month names to the month name in the same row (A10 or A11).
+3. Multiply the boolean result by the amounts in B3:B6 and sum with `SUMPRODUCT`.
+4. Wrap the sum in `IF(...=0,"",…)` so a zero result displays as a blank.
+
+We will:
+- Load the workbook.
+- Write the formula into B10 and copy it to B11 (the reference to A10 will adjust automatically).
+- Save the modified workbook to the output directory.
+- Call `recalculate()` to evaluate the formulas.
+- Reload the file with `data_only=True` and print the resulting values for B10 and B11 to verify they are correct.
+Code:
+```repl
+import openpyxl
+from openpyxl.utils import get_column_letter
+import os
+
+# Paths
+input_path = "/sandbox/input/input_spreadsheet/1_40757_init.xlsx"
+output_dir = "/sandbox/output/output_spreadsheet/"
+os.makedirs(output_dir, exist_ok=True)
+output_path = os.path.join(output_dir, "1_40757_init.xlsx")
+
+# Load workbook
+wb = openpyxl.load_workbook(input_path)
+ws = wb[wb.sheetnames[0]]
+
+# Determine data range (assume rows 3‑6 contain the data)
+data_start = 3
+data_end = 6
+
+# Build the SUMPRODUCT formula that matches month name in column A of the same row
+# and returns blank if the sum is zero.
+# We'll write it into B10 (row 10) and then copy to B11.
+month_cell = "A10"  # will be relative when copied
+formula = f"""=IF(SUMPRODUCT((TEXT(A{data_start}:A{data_end},"MMMM")={month_cell})*B{data_start}:B{data_end})=0,"",SUMPRODUCT((TEXT(A{data_start}:A{data_end},"MMMM")={month_cell})*B{data_start}:B{data_end}))"""
+
+# Write to B10
+ws["B10"] = formula
+# Write to B11 (adjust month reference to A11)
+ws["B11"] = formula.replace(month_cell, "A11")
+
+# Save workbook
+wb.save(output_path)
+
+# Recalculate formulas
+await recalculate(output_path)
+
+# Verify results
+wb_check = openpyxl.load_workbook(output_path, data_only=True)
+ws_check = wb_check[wb_check.sheetnames[0]]
+print("Result for July (B10):", ws_check["B10"].value)
+print("Result for August (B11):", ws_check["B11"].value)
+```
+2026-04-14 07:39:58,872 INFO RLM iteration 3/50
+Reasoning: The formula has been written to cells B10 and B11, summing amounts for the month specified in column A and showing a blank if the sum is zero. After recalculation, the results are 4 for July and 6 for August, confirming correct operation. The workbook has been saved to the required output directory.
+Code:
+```repl
+# Submit the final output spreadsheet
+SUBMIT(output_spreadsheet="/sandbox/output/output_spreadsheet/1_40757_init.xlsx")
+```
+
+============================================================
+recalc_source: baseline
+score:         1.0000  PASS
+All 2 cells match

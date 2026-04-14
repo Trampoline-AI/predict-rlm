@@ -1,0 +1,148 @@
+task: 168-17  case: 1
+instruction_type: Sheet-Level Manipulation
+answer_position: 'Statement'!A2:E12
+input:  /Users/gabriel/Workspace/trampoline-ai/predict-rlm.spreadbench-release/examples/spreadbench/data/testset/spreadsheet/168-17/1_168-17_init.xlsx
+answer: /Users/gabriel/Workspace/trampoline-ai/predict-rlm.spreadbench-release/examples/spreadbench/data/testset/spreadsheet/168-17/1_168-17_golden.xlsx
+============================================================
+2026-04-14 08:28:43,004 INFO RLM iteration 1/50
+Reasoning: I need to inspect the workbook structure before modifying anything. The instruction refers to the 'Statement' sheet, column A, and the text 'Invoice No.'. So first I'll load the workbook, list sheet names, row counts, and headers, print first/last rows for each sheet, and specifically inspect column A on the Statement sheet to find occurrences of 'Invoice No.' and see whether there are already example/formula patterns. Then I can safely delete preceding rows and verify A1 afterward.
+Code:
+```repl
+import os, json, textwrap
+from openpyxl import load_workbook
+from openpyxl.utils import get_column_letter
+
+input_path = input_spreadsheet
+print("Input:", input_path)
+print("Instruction:", instruction)
+
+wb = load_workbook(input_path)
+original_sheet_names = wb.sheetnames
+print("Sheet names:", original_sheet_names)
+
+def nonempty_row_values(ws, r, max_cols=None):
+    max_cols = max_cols or ws.max_column
+    vals = [ws.cell(r, c).value for c in range(1, max_cols + 1)]
+    return vals
+
+for ws in wb.worksheets:
+    print(f"\n--- Sheet: {ws.title} ---")
+    print("Dimensions:", ws.max_row, "rows x", ws.max_column, "cols")
+    headers = nonempty_row_values(ws, 1, ws.max_column)
+    print("Row 1 headers/values:", headers)
+    sample_first = list(range(1, min(ws.max_row, 10) + 1))
+    sample_last = list(range(max(1, ws.max_row - 4), ws.max_row + 1))
+    print("First rows:")
+    for r in sample_first:
+        print(r, nonempty_row_values(ws, r, min(ws.max_column, 8)))
+    print("Last rows:")
+    for r in sample_last:
+        print(r, nonempty_row_values(ws, r, min(ws.max_column, 8)))
+
+if "Statement" in wb.sheetnames:
+    ws = wb["Statement"]
+    print("\nInspecting 'Statement' sheet column A for 'Invoice No.':")
+    matches = []
+    for r in range(1, ws.max_row + 1):
+        v = ws.cell(r, 1).value
+        if v is not None and str(v).strip() == "Invoice No.":
+            matches.append(r)
+    print("Exact matches in col A:", matches[:20], "count=", len(matches))
+    
+    # Also show non-empty values in first 30 rows of col A
+    print("First 30 values in column A:")
+    for r in range(1, min(30, ws.max_row) + 1):
+        print(r, repr(ws.cell(r, 1).value))
+else:
+    print("No 'Statement' sheet found.")
+```
+2026-04-14 08:29:09,171 INFO RLM iteration 2/50
+Reasoning: I’ve confirmed the exact target: on sheet **Statement**, the first and only exact `"Invoice No."` in column A is at **row 12**, so rows 1–11 should be deleted so that row 12 becomes row 1. There are no formulas involved in the target area, and the instruction is operational rather than asking for literal VBA text, so I should directly modify the workbook.
+
+Next I’ll:
+1. Reload the workbook fresh from input.
+2. Delete rows 1 through 11 on `Statement`.
+3. Save to the output directory with the same filename.
+4. Recalculate the file.
+5. Reload and verify that sheet names remain correct and that `Statement!A1` is exactly `"Invoice No."`, plus print the first few rows after the change.
+Code:
+```repl
+import os
+from openpyxl import load_workbook
+
+input_path = input_spreadsheet
+filename = os.path.basename(input_path)
+output_path = os.path.join("/sandbox/output/output_spreadsheet", filename)
+
+# Reload fresh workbook for modification
+wb = load_workbook(input_path)
+original_sheet_names = wb.sheetnames.copy()
+ws = wb["Statement"]
+
+# Find first exact instance of 'Invoice No.' in column A
+target_row = None
+for r in range(1, ws.max_row + 1):
+    v = ws.cell(r, 1).value
+    if v is not None and str(v).strip() == "Invoice No.":
+        target_row = r
+        break
+
+print("Original sheet names:", original_sheet_names)
+print("Found target row:", target_row)
+print("Current A1 before change:", repr(ws["A1"].value))
+if target_row:
+    print(f"Current values around target row {target_row}:")
+    for r in range(max(1, target_row-2), min(ws.max_row, target_row+2) + 1):
+        print(r, [ws.cell(r, c).value for c in range(1, ws.max_column + 1)])
+
+if target_row is None:
+    raise ValueError("Could not find 'Invoice No.' in column A of Statement sheet.")
+
+# Delete all preceding rows so the target row becomes row 1
+if target_row > 1:
+    ws.delete_rows(1, target_row - 1)
+
+# Save
+wb.save(output_path)
+print("Saved to:", output_path)
+
+# Recalculate
+recalc_result = await recalculate(output_path)
+print("Recalculate result:", recalc_result)
+
+# Reload and fix sheet names if recalculate changed them
+wb_check = load_workbook(output_path)
+print("Sheet names after recalc:", wb_check.sheetnames)
+if wb_check.sheetnames != original_sheet_names:
+    # rename by position to restore original names
+    for i, expected in enumerate(original_sheet_names):
+        if i < len(wb_check.worksheets):
+            wb_check.worksheets[i].title = expected
+    wb_check.save(output_path)
+    print("Restored sheet names to:", original_sheet_names)
+
+# Verification with data_only after recalculation
+wb_verify = load_workbook(output_path, data_only=True)
+print("Verified sheet names:", wb_verify.sheetnames)
+wsv = wb_verify["Statement"]
+
+print("Statement dimensions after change:", wsv.max_row, "x", wsv.max_column)
+print("A1 after change:", repr(wsv["A1"].value))
+print("First 5 rows after change:")
+for r in range(1, min(5, wsv.max_row) + 1):
+    print(r, [wsv.cell(r, c).value for c in range(1, wsv.max_column + 1)])
+
+# keep output path for submission
+final_output_path = output_path
+```
+2026-04-14 08:29:15,964 INFO RLM iteration 3/50
+Reasoning: I have completed the required spreadsheet manipulation and verified the result: on the `Statement` sheet, all rows before the first `Invoice No.` in column A were deleted, and `Statement!A1` is now exactly `Invoice No.`. The output file is saved in the required directory with the same filename. I should now submit the output path and nothing else.
+Code:
+```repl
+SUBMIT(output_spreadsheet=final_output_path)
+```
+
+============================================================
+recalc_source: baseline
+score:         1.0000  PASS
+All 55 cells match

@@ -1,0 +1,802 @@
+task: 73-45  case: 1
+instruction_type: Sheet-Level Manipulation
+answer_position: 'Sheet1'!BD2:308
+input:  /Users/gabriel/Workspace/trampoline-ai/predict-rlm.spreadbench-release/examples/spreadbench/data/testset/spreadsheet/73-45/1_73-45_init.xlsx
+answer: /Users/gabriel/Workspace/trampoline-ai/predict-rlm.spreadbench-release/examples/spreadbench/data/testset/spreadsheet/73-45/1_73-45_golden.xlsx
+============================================================
+2026-04-14 08:27:44,210 INFO RLM iteration 1/50
+Reasoning: We need start by inspecting the workbook structure in detail before making any modifications. The instruction mentions column BD and possibly sample highlighting already present, so I should:
+1. Load workbook and list all sheet names.
+2. For each sheet, print dimensions, headers, and sample rows from the start and end.
+3. Specifically inspect column BD values and any nearby columns/formatting.
+4. Check for existing highlighted/example cells in BD or related ranges to infer the expected behavior.
+5. Read the full instruction text so I can identify whether a pattern list already exists in the workbook or needs to be inferred from examples.
+
+After inspection, I can decide where to apply fills/highlighting and whether there is an existing editable pattern list area in the sheet.
+Code:
+```repl
+import os, json, textwrap
+from openpyxl import load_workbook
+from openpyxl.styles import PatternFill
+from openpyxl.utils import get_column_letter, column_index_from_string
+
+print("Instruction:")
+print(instruction)
+
+wb = load_workbook(input_spreadsheet)
+orig_sheet_names = wb.sheetnames
+print("\nWorkbook sheets:", orig_sheet_names)
+
+def row_values(ws, r, max_cols=None):
+    mc = max_cols or ws.max_column
+    vals = []
+    for c in range(1, mc+1):
+        vals.append(ws.cell(r, c).value)
+    return vals
+
+for s in wb.sheetnames:
+    ws = wb[s]
+    print(f"\n--- Sheet: {s} ---")
+    print("max_row:", ws.max_row, "max_col:", ws.max_column)
+    headers1 = row_values(ws, 1, min(ws.max_column, 60))
+    headers2 = row_values(ws, 2, min(ws.max_column, 60))
+    print("Row1 first 60 cols:", headers1)
+    print("Row2 first 60 cols:", headers2)
+
+    # print non-empty headers among first 60 cols
+    nonempty = []
+    for c in range(1, min(ws.max_column, 60)+1):
+        v = ws.cell(1,c).value
+        if v not in (None, ""):
+            nonempty.append((get_column_letter(c), v))
+    print("Non-empty row1 headers first 60 cols:", nonempty[:40])
+
+    # sample first 8 and last 5 rows, limited columns
+    sample_cols = min(ws.max_column, 60)
+    first_rows = list(range(1, min(ws.max_row, 8)+1))
+    last_rows = list(range(max(1, ws.max_row-4), ws.max_row+1))
+    print("First rows sample:")
+    for r in first_rows:
+        print(r, row_values(ws, r, sample_cols))
+    print("Last rows sample:")
+    for r in last_rows:
+        print(r, row_values(ws, r, sample_cols))
+
+# specifically inspect BD and surrounding columns if present
+bd_idx = column_index_from_string("BD")
+print("\nBD index:", bd_idx)
+for s in wb.sheetnames:
+    ws = wb[s]
+    if ws.max_column >= bd_idx:
+        print(f"\nSheet {s} has BD. Inspecting BA:BF and BD samples.")
+        # print row 1-10 and last 5 around BA:BF
+        for r in list(range(1, min(ws.max_row, 10)+1)) + list(range(max(1, ws.max_row-4), ws.max_row+1)):
+            vals = [ws.cell(r, c).value for c in range(column_index_from_string("BA"), column_index_from_string("BF")+1)]
+            print(r, vals)
+        # find non-empty BD cells
+        nonempty_bd = []
+        for r in range(1, ws.max_row+1):
+            v = ws[f"BD{r}"].value
+            if v not in (None, ""):
+                nonempty_bd.append((r, v))
+        print(f"Non-empty BD count: {len(nonempty_bd)}")
+        print("First 15 non-empty BD:", nonempty_bd[:15])
+        print("Last 10 non-empty BD:", nonempty_bd[-10:])
+
+        # inspect fills/font in BD for first 30 non-empty cells
+        fill_info = []
+        for r, v in nonempty_bd[:30]:
+            cell = ws[f"BD{r}"]
+            fill = cell.fill
+            fill_info.append((r, v, fill.fill_type, fill.start_color.rgb, fill.end_color.rgb))
+        print("BD fill info first 30 non-empty:", fill_info)
+
+        # detect any cells in BD with non-default fill
+        highlighted = []
+        for r, v in nonempty_bd:
+            cell = ws[f"BD{r}"]
+            f = cell.fill
+            if f and f.fill_type:
+                rgb = getattr(f.start_color, "rgb", None)
+                if f.fill_type != None and (rgb not in (None, "00000000", "000000", "FFFFFFFF", "00FFFFFF")):
+                    highlighted.append((r, v, f.fill_type, rgb))
+        print("Potentially highlighted BD cells:", highlighted[:30], "count=", len(highlighted))
+```
+2026-04-14 08:28:12,469 INFO RLM iteration 2/50
+Reasoning: I’ve confirmed the workbook has a single sheet and that column BD is the last column with the text data. The instruction says the first 32 rows contain manual examples in bold red, so the critical next step is to inspect BD much more carefully:
+
+1. Print BD for rows 1–40 and the tail rows, since the examples should be near the top.
+2. Inspect whether the formatting is applied to the whole cell or only parts of the text. For partial formatting, I should reload with `rich_text=True` and inspect the rich text runs in BD cells.
+3. Check if rows 33+ are unformatted, which would indicate the first 32 data rows are the examples and the rest are targets.
+4. If example patterns can be inferred from the red/bold substrings, extract them from the rich text runs.
+5. Then I can implement the highlighting across all BD cells using the inferred list, likely as partial rich text formatting in the same cells.
+
+I should not write anything yet; first I need to inspect the formatting structure and infer the exact matching pattern behavior from the examples.
+Code:
+```repl
+from openpyxl import load_workbook
+from openpyxl.utils import column_index_from_string, get_column_letter
+
+bd_col = column_index_from_string("BD")
+
+# Reload with rich text support if available
+try:
+    wb_rt = load_workbook(input_spreadsheet, rich_text=True)
+    print("Loaded workbook with rich_text=True")
+except TypeError:
+    wb_rt = load_workbook(input_spreadsheet)
+    print("rich_text=True not supported; loaded normally")
+
+ws = wb_rt[wb_rt.sheetnames[0]]
+
+print("Sheet:", ws.title, "rows:", ws.max_row, "cols:", ws.max_column)
+print("BD header:", ws["BD1"].value)
+
+# Print BD rows 1-40 and last 10
+print("\nBD rows 1-40:")
+for r in range(1, min(40, ws.max_row) + 1):
+    print(r, repr(ws[f"BD{r}"].value))
+
+print("\nBD last 10 non-empty rows:")
+nonempty_bd_rows = [r for r in range(1, ws.max_row + 1) if ws[f"BD{r}"].value not in (None, "")]
+for r in nonempty_bd_rows[-10:]:
+    print(r, repr(ws[f"BD{r}"].value))
+
+# Inspect formatting of BD cells in sample region
+print("\nCell-level font/fill for BD2:BD40:")
+for r in range(2, min(40, ws.max_row) + 1):
+    cell = ws[f"BD{r}"]
+    font = cell.font
+    fill = cell.fill
+    print(
+        r,
+        "value=", repr(cell.value),
+        "font.color=", getattr(font.color, "rgb", None),
+        "bold=", font.bold,
+        "italic=", font.italic,
+        "fill_type=", fill.fill_type,
+        "fill_color=", getattr(fill.start_color, "rgb", None)
+    )
+
+# Try to inspect rich text runs / inline formatting
+def inspect_cell_runs(cell):
+    v = cell.value
+    print(f"\nInspect {cell.coordinate}: type={type(v)} repr={repr(v)}")
+    # generic introspection to avoid relying on exact class names
+    attrs = [a for a in dir(v) if not a.startswith("_")]
+    print("attrs:", attrs[:40])
+    # print iterable pieces if possible
+    try:
+        pieces = list(v)
+        print("iter pieces len:", len(pieces))
+        for i, p in enumerate(pieces[:20]):
+            print(" piece", i, "type=", type(p), "repr=", repr(p))
+            p_attrs = [a for a in dir(p) if not a.startswith("_")]
+            print("   attrs:", p_attrs[:25])
+            for attr in ["text", "font", "rPr", "value"]:
+                if hasattr(p, attr):
+                    print(f"   {attr}=", repr(getattr(p, attr)))
+    except Exception as e:
+        print("not iterable / no pieces:", e)
+
+for coord in ["BD2", "BD3", "BD4", "BD5", "BD6", "BD7", "BD8", "BD9", "BD10",
+              "BD20", "BD30", "BD33", "BD34", "BD35"]:
+    inspect_cell_runs(ws[coord])
+
+# Compare nearby columns too, to ensure BD is truly the target and no pattern list exists elsewhere
+print("\nBA:BD rows 1:15")
+for r in range(1, min(15, ws.max_row) + 1):
+    vals = [ws.cell(r, c).value for c in range(column_index_from_string("BA"), bd_col + 1)]
+    print(r, vals)
+```
+2026-04-14 08:28:53,239 INFO RLM iteration 3/50
+Reasoning: I need to inspect the workbook at the XML/shared strings level, because the cell-level font shows the whole BD cells as bold, which does not tell me which substrings were manually marked in red. The instruction says the sample rows have desired patterns highlighted in bold red, likely as partial rich text within the cell. To reproduce the intended result, I should:
+
+1. Parse the `.xlsx` as a zip and inspect `xl/sharedStrings.xml` and worksheet XML.
+2. Map BD cells to shared string indices or inline strings.
+3. Extract rich text runs and identify which text fragments have red/bold formatting in rows 2–32.
+4. Infer the pattern list from those fragments, check duplicates, and see whether the examples imply whole-word matching.
+5. Then I can apply matching/highlighting across all non-empty BD cells.
+
+I'll keep output concise and store extracted structures in variables for later use.
+Code:
+```repl
+import zipfile, xml.etree.ElementTree as ET, re, os, json, collections
+from openpyxl.utils import column_index_from_string
+
+xlsx_path = input_spreadsheet
+ns = {
+    "a": "http://schemas.openxmlformats.org/spreadsheetml/2006/main",
+    "r": "http://schemas.openxmlformats.org/officeDocument/2006/relationships",
+}
+
+zf = zipfile.ZipFile(xlsx_path)
+
+print("ZIP entries sample:", [n for n in zf.namelist() if "shared" in n or "sheet" in n or "style" in n][:20])
+
+# Load workbook relationships to locate the first worksheet xml
+wb_xml = ET.fromstring(zf.read("xl/workbook.xml"))
+sheet_elems = wb_xml.find("a:sheets", ns)
+sheet_names = []
+for s in sheet_elems:
+    sheet_names.append((s.attrib.get("name"), s.attrib.get("{http://schemas.openxmlformats.org/officeDocument/2006/relationships}id")))
+print("Workbook sheets+rIds:", sheet_names)
+
+rels = ET.fromstring(zf.read("xl/_rels/workbook.xml.rels"))
+rel_map = {}
+for rel in rels:
+    rel_map[rel.attrib["Id"]] = rel.attrib["Target"]
+print("rel_map subset:", rel_map)
+
+first_sheet_name, first_rid = sheet_names[0]
+first_target = rel_map[first_rid]
+if not first_target.startswith("xl/"):
+    first_sheet_xml = "xl/" + first_target
+else:
+    first_sheet_xml = first_target
+print("First sheet xml:", first_sheet_xml)
+
+# Parse shared strings with rich text runs
+shared_items = []
+if "xl/sharedStrings.xml" in zf.namelist():
+    sst = ET.fromstring(zf.read("xl/sharedStrings.xml"))
+    for si in sst.findall("a:si", ns):
+        runs = []
+        # plain t directly under si
+        direct_t = si.find("a:t", ns)
+        if direct_t is not None:
+            runs.append({
+                "text": direct_t.text or "",
+                "bold": False,
+                "color": None,
+            })
+        for r in si.findall("a:r", ns):
+            t = r.find("a:t", ns)
+            rpr = r.find("a:rPr", ns)
+            bold = False
+            color = None
+            if rpr is not None:
+                if rpr.find("a:b", ns) is not None:
+                    bold = True
+                color_el = rpr.find("a:color", ns)
+                if color_el is not None:
+                    color = color_el.attrib.get("rgb") or color_el.attrib.get("theme") or color_el.attrib.get("indexed")
+            runs.append({
+                "text": t.text if t is not None and t.text is not None else "",
+                "bold": bold,
+                "color": color,
+            })
+        full_text = "".join(r["text"] for r in runs)
+        shared_items.append({"text": full_text, "runs": runs})
+print("Shared strings count:", len(shared_items))
+
+# Parse sheet cells in BD rows 1:40
+sheet_root = ET.fromstring(zf.read(first_sheet_xml))
+sheetdata = sheet_root.find("a:sheetData", ns)
+
+bd_cells_xml = {}
+for row in sheetdata.findall("a:row", ns):
+    rnum = int(row.attrib["r"])
+    if 1 <= rnum <= 40:
+        for c in row.findall("a:c", ns):
+            ref = c.attrib.get("r")
+            if ref and re.match(r"BD\d+$", ref):
+                bd_cells_xml[rnum] = c
+                break
+
+print("Found BD XML cells rows:", sorted(bd_cells_xml.keys())[:15], "...", sorted(bd_cells_xml.keys())[-10:])
+
+def extract_cell_xml_info(c):
+    info = {"type": c.attrib.get("t"), "style": c.attrib.get("s"), "value": None, "runs": None}
+    t = c.attrib.get("t")
+    v = c.find("a:v", ns)
+    is_el = c.find("a:is", ns)
+    if t == "s" and v is not None:
+        idx = int(v.text)
+        info["value"] = shared_items[idx]["text"]
+        info["runs"] = shared_items[idx]["runs"]
+        info["shared_idx"] = idx
+    elif is_el is not None:
+        runs = []
+        direct_t = is_el.find("a:t", ns)
+        if direct_t is not None:
+            runs.append({"text": direct_t.text or "", "bold": False, "color": None})
+        for r in is_el.findall("a:r", ns):
+            txt = r.find("a:t", ns)
+            rpr = r.find("a:rPr", ns)
+            bold = False
+            color = None
+            if rpr is not None:
+                if rpr.find("a:b", ns) is not None:
+                    bold = True
+                color_el = rpr.find("a:color", ns)
+                if color_el is not None:
+                    color = color_el.attrib.get("rgb") or color_el.attrib.get("theme") or color_el.attrib.get("indexed")
+            runs.append({"text": txt.text if txt is not None and txt.text is not None else "", "bold": bold, "color": color})
+        info["runs"] = runs
+        info["value"] = "".join(r["text"] for r in runs)
+    else:
+        info["value"] = v.text if v is not None else None
+    return info
+
+sample_rich = {}
+for r in sorted(bd_cells_xml):
+    sample_rich[r] = extract_cell_xml_info(bd_cells_xml[r])
+
+# Print concise summary for rows 2:32
+for r in range(2, 33):
+    inf = sample_rich.get(r)
+    if not inf:
+        print(r, "NO CELL")
+        continue
+    redbold = []
+    if inf["runs"]:
+        for run in inf["runs"]:
+            color = str(run.get("color"))
+            if run.get("text") and (run.get("bold") or color not in (None, "None")):
+                redbold.append((run["text"], run["bold"], run["color"]))
+    print(f"Row {r}: text={inf['value']!r}")
+    print("  runs:", inf["runs"][:10])
+    print("  formatted candidates:", redbold[:10])
+
+# Collect possible highlighted fragments from rows 2:32
+def normalized_color(c):
+    if c is None:
+        return None
+    c = str(c)
+    return c.upper()
+
+highlight_fragments = []
+for r in range(2, 33):
+    inf = sample_rich.get(r)
+    if not inf or not inf["runs"]:
+        continue
+    for run in inf["runs"]:
+        txt = (run.get("text") or "")
+        color = normalized_color(run.get("color"))
+        bold = bool(run.get("bold"))
+        # look for obvious manual-highlight formatting
+        if txt.strip() and (bold or color not in (None, "NONE")):
+            highlight_fragments.append((r, txt, bold, color))
+
+print("Highlight fragment count:", len(highlight_fragments))
+print("First 80 highlight fragments:", highlight_fragments[:80])
+
+# Aggregate candidate phrases
+counter = collections.Counter(txt.strip() for _, txt, _, _ in highlight_fragments if txt.strip())
+print("Unique candidate fragments:", len(counter))
+print("Most common fragments:", counter.most_common(60))
+```
+2026-04-14 08:29:40,199 INFO RLM iteration 4/50
+Reasoning: The previous step failed because the worksheet relationship target was joined incorrectly (`xl//xl/...`). I now know:
+
+- Single sheet workbook.
+- Target data is in column BD (56), header `Cour Dist 2ndup`.
+- Rows 2–32 appear to be the manually formatted examples mentioned in the instruction.
+- Cell-level formatting shows whole cells bold, so I still need XML/rich-text-level inspection to detect partial red/bold substrings.
+
+Next action:
+1. Re-parse workbook relationships with correct path normalization.
+2. Extract shared strings / inline rich text runs for BD rows 2–40.
+3. Identify runs with red formatting and/or bold differences to infer the example pattern list.
+4. Print a concise summary of the highlighted fragments and store them for later application.
+Code:
+```repl
+import zipfile, xml.etree.ElementTree as ET, re, os, posixpath, collections, json
+
+xlsx_path = input_spreadsheet
+ns = {"a": "http://schemas.openxmlformats.org/spreadsheetml/2006/main",
+      "r": "http://schemas.openxmlformats.org/officeDocument/2006/relationships",
+      "pr": "http://schemas.openxmlformats.org/package/2006/relationships"}
+
+zf = zipfile.ZipFile(xlsx_path)
+
+print("Has sharedStrings:", "xl/sharedStrings.xml" in zf.namelist())
+print("Relevant files:", [n for n in zf.namelist() if n.startswith("xl/") and ("sheet" in n or "workbook" in n or "sharedStrings" in n or "styles" in n)][:20])
+
+# workbook sheets
+wb_xml = ET.fromstring(zf.read("xl/workbook.xml"))
+sheet_elems = wb_xml.find("a:sheets", ns)
+sheet_meta = []
+for s in sheet_elems:
+    rid = s.attrib.get("{http://schemas.openxmlformats.org/officeDocument/2006/relationships}id")
+    sheet_meta.append((s.attrib.get("name"), rid))
+print("sheet_meta:", sheet_meta)
+
+# rel targets
+rels = ET.fromstring(zf.read("xl/_rels/workbook.xml.rels"))
+rel_map = {}
+for rel in rels:
+    rel_map[rel.attrib["Id"]] = rel.attrib["Target"]
+print("rel targets:", rel_map)
+
+first_sheet_name, first_rid = sheet_meta[0]
+target = rel_map[first_rid]
+# normalize target relative to xl/workbook.xml
+if target.startswith("/"):
+    first_sheet_xml = target.lstrip("/")
+elif target.startswith("xl/"):
+    first_sheet_xml = target
+else:
+    first_sheet_xml = posixpath.normpath(posixpath.join("xl", target))
+print("Normalized first sheet xml:", first_sheet_xml)
+print("Exists in zip:", first_sheet_xml in zf.namelist())
+
+# shared strings parser
+shared_items = []
+if "xl/sharedStrings.xml" in zf.namelist():
+    sst = ET.fromstring(zf.read("xl/sharedStrings.xml"))
+    for si in sst.findall("a:si", ns):
+        runs = []
+        direct_t = si.find("a:t", ns)
+        if direct_t is not None:
+            runs.append({"text": direct_t.text or "", "bold": False, "color": None})
+        for r in si.findall("a:r", ns):
+            t = r.find("a:t", ns)
+            rpr = r.find("a:rPr", ns)
+            bold = False
+            color = None
+            if rpr is not None:
+                if rpr.find("a:b", ns) is not None:
+                    bold = True
+                color_el = rpr.find("a:color", ns)
+                if color_el is not None:
+                    color = color_el.attrib.get("rgb") or color_el.attrib.get("theme") or color_el.attrib.get("indexed")
+            runs.append({"text": t.text if t is not None and t.text is not None else "", "bold": bold, "color": color})
+        text = "".join(x["text"] for x in runs)
+        shared_items.append({"text": text, "runs": runs})
+print("shared strings:", len(shared_items))
+
+# style inspection
+styles_root = ET.fromstring(zf.read("xl/styles.xml"))
+fonts = styles_root.find("a:fonts", ns)
+font_info = []
+for f in fonts.findall("a:font", ns):
+    bold = f.find("a:b", ns) is not None
+    color_el = f.find("a:color", ns)
+    color = None
+    if color_el is not None:
+        color = color_el.attrib.get("rgb") or color_el.attrib.get("theme") or color_el.attrib.get("indexed")
+    font_info.append({"bold": bold, "color": color})
+print("Fonts:", font_info)
+
+cellxfs = styles_root.find("a:cellXfs", ns)
+xf_font_ids = []
+for xf in cellxfs.findall("a:xf", ns):
+    xf_font_ids.append(int(xf.attrib.get("fontId", 0)))
+print("First 10 xf->fontId:", xf_font_ids[:10])
+
+# parse worksheet XML
+sheet_root = ET.fromstring(zf.read(first_sheet_xml))
+sheetdata = sheet_root.find("a:sheetData", ns)
+
+def extract_runs_from_is(is_el):
+    runs = []
+    direct_t = is_el.find("a:t", ns)
+    if direct_t is not None:
+        runs.append({"text": direct_t.text or "", "bold": False, "color": None})
+    for r in is_el.findall("a:r", ns):
+        txt = r.find("a:t", ns)
+        rpr = r.find("a:rPr", ns)
+        bold = False
+        color = None
+        if rpr is not None:
+            if rpr.find("a:b", ns) is not None:
+                bold = True
+            color_el = rpr.find("a:color", ns)
+            if color_el is not None:
+                color = color_el.attrib.get("rgb") or color_el.attrib.get("theme") or color_el.attrib.get("indexed")
+        runs.append({"text": txt.text if txt is not None and txt.text is not None else "", "bold": bold, "color": color})
+    return runs
+
+def cell_info(c):
+    info = {"ref": c.attrib.get("r"), "type": c.attrib.get("t"), "style": c.attrib.get("s"), "value": None, "runs": None}
+    t = c.attrib.get("t")
+    v = c.find("a:v", ns)
+    is_el = c.find("a:is", ns)
+    if t == "s" and v is not None:
+        idx = int(v.text)
+        info["shared_idx"] = idx
+        info["value"] = shared_items[idx]["text"]
+        info["runs"] = shared_items[idx]["runs"]
+    elif is_el is not None:
+        runs = extract_runs_from_is(is_el)
+        info["runs"] = runs
+        info["value"] = "".join(r["text"] for r in runs)
+    else:
+        info["value"] = v.text if v is not None else None
+    # style-derived font info
+    s = info["style"]
+    if s is not None:
+        s = int(s)
+        fid = xf_font_ids[s] if s < len(xf_font_ids) else None
+        info["fontId"] = fid
+        info["styleFont"] = font_info[fid] if fid is not None and fid < len(font_info) else None
+    else:
+        info["fontId"] = None
+        info["styleFont"] = None
+    return info
+
+bd_infos = {}
+for row in sheetdata.findall("a:row", ns):
+    rnum = int(row.attrib["r"])
+    for c in row.findall("a:c", ns):
+        ref = c.attrib.get("r", "")
+        if ref.startswith("BD"):
+            bd_infos[rnum] = cell_info(c)
+            break
+
+print("BD rows found in xml:", min(bd_infos), max(bd_infos), "count:", len(bd_infos))
+
+# concise print for rows 2:40
+for r in range(2, 41):
+    inf = bd_infos.get(r)
+    if not inf:
+        print(r, "NO BD CELL")
+        continue
+    print(f"Row {r}: style={inf['style']} styleFont={inf['styleFont']} value={inf['value']!r}")
+    if inf["runs"]:
+        # summarize only runs with explicit formatting or multiple runs
+        print("  run_count:", len(inf["runs"]), "runs:", inf["runs"][:12])
+
+# infer highlighted fragments:
+# prefer run-level red/bold fragments; if no rich runs exist, compare sample rows style vs later rows
+highlight_fragments = []
+for r in range(2, 33):
+    inf = bd_infos.get(r)
+    if not inf:
+        continue
+    runs = inf["runs"] or []
+    for run in runs:
+        txt = (run.get("text") or "")
+        if not txt.strip():
+            continue
+        color = run.get("color")
+        bold = run.get("bold")
+        # explicit run-level formatting
+        if bold or color not in (None, "0", 0):
+            highlight_fragments.append((r, txt, bold, color))
+
+frag_counter = collections.Counter(txt.strip() for _, txt, _, _ in highlight_fragments if txt.strip())
+
+print("\nRun-level highlighted fragment count:", len(highlight_fragments))
+print("Unique run-level fragments:", len(frag_counter))
+print("Top run-level fragments:", frag_counter.most_common(80))
+
+# if there are no run-level fragments, inspect styles of sample rows vs non-sample rows
+sample_style_rows = [(r, bd_infos[r]["style"], bd_infos[r]["styleFont"], bd_infos[r]["value"]) for r in range(2, 33) if r in bd_infos]
+later_style_rows = [(r, bd_infos[r]["style"], bd_infos[r]["styleFont"], bd_infos[r]["value"]) for r in range(33, 46) if r in bd_infos]
+print("\nSample row style summary (2:32):", sample_style_rows[:10])
+print("Later row style summary (33:45):", later_style_rows[:10])
+
+# store for next step
+xml_bd_infos = bd_infos
+xml_highlight_fragments = highlight_fragments
+xml_frag_counter = frag_counter
+```
+2026-04-14 08:30:36,767 INFO RLM iteration 5/50
+Reasoning: I still haven’t identified the exact editable pattern list the workbook already contains. The sheet structure strongly suggests the numbered columns 1–50 (F:BC) may correspond to pattern categories/flags, and the first ~32 sample rows may already encode which patterns are expected for each BD text. Before writing anything, I need to verify:
+
+1. Which columns besides BD contain actual sample answers.
+2. Whether rows 2–32 have marks under columns 1–50 that reveal the intended pattern list.
+3. Whether there is any existing red font in those numbered headers or elsewhere indicating pattern names.
+4. Whether the task should highlight the entire BD cell or partial text; if partial formatting is absent from the file, I need a defensible fallback. A practical spreadsheet-side implementation is to apply a highlight fill/font to the entire BD cell when it contains any target pattern(s), because openpyxl cannot reliably preserve/apply partial rich-text formatting across all cells. But first I should infer the target patterns from the sample data if possible.
+
+Next step: inspect all non-empty columns in rows 1–40, especially F:BC and BD, and summarize which numbered columns are populated in sample rows. That will tell me if the pattern list is encoded structurally in the workbook.
+Code:
+```repl
+from openpyxl import load_workbook
+from openpyxl.utils import get_column_letter, column_index_from_string
+from collections import Counter, defaultdict
+
+wb = load_workbook(input_spreadsheet)
+ws = wb[wb.sheetnames[0]]
+
+# Print exact sheet info again, but focused and concise
+print("Sheet:", ws.title, "rows:", ws.max_row, "cols:", ws.max_column)
+print("Headers A:BD")
+headers = [(get_column_letter(c), ws.cell(1, c).value) for c in range(1, ws.max_column + 1)]
+print(headers)
+
+# Find non-empty cells across rows 2:40 to identify where sample answers live
+nonempty_by_col = Counter()
+sample_nonempty = defaultdict(list)
+
+for r in range(2, min(40, ws.max_row) + 1):
+    for c in range(1, ws.max_column + 1):
+        v = ws.cell(r, c).value
+        if v not in (None, ""):
+            col = get_column_letter(c)
+            nonempty_by_col[col] += 1
+            if len(sample_nonempty[col]) < 8:
+                sample_nonempty[col].append((r, v))
+
+print("\nNon-empty counts by column for rows 2:40:")
+print(sorted([(col, nonempty_by_col[col], ws[f"{col}1"].value) for col in nonempty_by_col], key=lambda x: (x[0])))
+
+print("\nSample non-empty values by column:")
+for col in sorted(sample_nonempty.keys(), key=lambda x: column_index_from_string(x)):
+    print(col, "header=", ws[f"{col}1"].value, "samples=", sample_nonempty[col])
+
+# Inspect rows 2:40 for columns A:BD but only show non-empty entries per row
+print("\nRows 2:40 non-empty cells:")
+for r in range(2, min(40, ws.max_row) + 1):
+    entries = []
+    for c in range(1, ws.max_column + 1):
+        v = ws.cell(r, c).value
+        if v not in (None, ""):
+            entries.append((get_column_letter(c), ws.cell(1, c).value, v))
+    print("Row", r, entries)
+
+# Specifically inspect headers/fonts/fills in numbered columns and BD
+print("\nHeader styles F:BD")
+for c in range(column_index_from_string("F"), column_index_from_string("BD") + 1):
+    cell = ws.cell(1, c)
+    print(
+        get_column_letter(c),
+        "header=", cell.value,
+        "font.bold=", cell.font.bold,
+        "font.color.type=", getattr(cell.font.color, "type", None),
+        "font.color.rgb=", getattr(cell.font.color, "rgb", None),
+        "fill=", cell.fill.fill_type,
+        getattr(cell.fill.start_color, "rgb", None)
+    )
+
+# Check if any of F:BC have formulas / markers in later rows
+print("\nRows 2:20 values F:BC where non-empty:")
+for r in range(2, min(20, ws.max_row) + 1):
+    vals = []
+    for c in range(column_index_from_string("F"), column_index_from_string("BC") + 1):
+        v = ws.cell(r, c).value
+        if v not in (None, ""):
+            vals.append((get_column_letter(c), ws.cell(1, c).value, v))
+    print(r, vals)
+
+# Look for cells anywhere in workbook with red font to infer examples/pattern list
+print("\nScanning workbook for red-font cells (first 200 hits)...")
+red_hits = []
+for row in ws.iter_rows():
+    for cell in row:
+        color = getattr(cell.font.color, "rgb", None)
+        if color in ("FFFF0000", "00FF0000"):
+            red_hits.append((cell.coordinate, cell.value, cell.font.bold))
+print("Red font hit count:", len(red_hits))
+print(red_hits[:200])
+
+# Also scan for bold cells outside BD
+bold_hits = []
+for row in ws.iter_rows(min_row=1, max_row=min(40, ws.max_row), min_col=1, max_col=ws.max_column):
+    for cell in row:
+        if cell.font.bold and cell.value not in (None, ""):
+            bold_hits.append((cell.coordinate, cell.value, getattr(cell.font.color, "rgb", None)))
+print("\nBold non-empty hits rows 1:40 count:", len(bold_hits))
+print(bold_hits[:250])
+```
+2026-04-14 08:31:25,866 INFO RLM iteration 6/50
+Reasoning: I’ve identified the real target column (`BD`) and confirmed the rest of the numbered columns `F:BC` are currently empty data-wise, but their yellow-fill/red-font headers strongly suggest they were intentionally laid out as some kind of editable helper area. Before writing anything, I need one more focused inspection to verify:
+
+1. Whether there are comments, notes, hidden rows/columns, merged regions, named ranges, or conditional formatting that indicate where a pattern list is supposed to live.
+2. Whether rows `2:32` vs later rows use different cell styles in `BD`, confirming those are just sample/example rows.
+3. Whether `openpyxl` rich text writing support is available, since partial in-cell formatting would be ideal if I can infer a usable pattern list.
+4. Whether there is any existing workbook metadata/designated blank area I should use for storing the editable search list.
+
+If no explicit list location exists, the safest spreadsheet-equivalent action will likely be:
+- use the existing sample/example rows to infer candidate patterns,
+- place an editable pattern list into the existing empty helper columns (not a new sheet),
+- and apply direct formatting/highlighting in column `BD` for all non-empty rows.
+
+But I need this last inspection first so I don’t guess the wrong target area.
+Code:
+```repl
+from openpyxl import load_workbook
+from openpyxl.utils import get_column_letter, column_index_from_string
+from collections import Counter, defaultdict
+import os
+
+wb = load_workbook(input_spreadsheet, rich_text=True)
+ws = wb[wb.sheetnames[0]]
+
+print("Sheet:", ws.title)
+print("Dimensions:", ws.max_row, ws.max_column)
+print("Merged ranges:", list(ws.merged_cells.ranges))
+print("Freeze panes:", ws.freeze_panes)
+print("Auto filter:", ws.auto_filter.ref if ws.auto_filter else None)
+print("Conditional formatting ranges:", list(ws.conditional_formatting._cf_rules.keys())[:20])
+
+# Hidden rows/cols
+hidden_cols = []
+for key, dim in ws.column_dimensions.items():
+    if dim.hidden:
+        hidden_cols.append(key)
+hidden_rows = [idx for idx, dim in ws.row_dimensions.items() if dim.hidden]
+print("Hidden cols:", hidden_cols[:50], "count=", len(hidden_cols))
+print("Hidden rows:", hidden_rows[:50], "count=", len(hidden_rows))
+
+# Named ranges / defined names
+print("Defined names:")
+for dn in wb.defined_names.definedName:
+    print(" ", dn.name, dn.attr_text)
+
+# Comments / notes
+comments = []
+for row in ws.iter_rows():
+    for cell in row:
+        if cell.comment:
+            comments.append((cell.coordinate, cell.comment.text[:200]))
+print("Comments count:", len(comments))
+print("Comments sample:", comments[:20])
+
+# Exact style comparison BD rows sample vs later
+bd = column_index_from_string("BD")
+style_summary = []
+for r in list(range(1, 41)) + list(range(295, ws.max_row + 1)):
+    cell = ws.cell(r, bd)
+    if cell.value not in (None, "") or r == 1:
+        style_summary.append((
+            r,
+            cell.value,
+            cell.style_id,
+            cell.font.bold,
+            getattr(cell.font.color, "type", None),
+            getattr(cell.font.color, "rgb", None),
+            cell.fill.fill_type,
+            getattr(cell.fill.start_color, "rgb", None)
+        ))
+print("\nBD style summary sample:")
+for x in style_summary[:50]:
+    print(x)
+print("...")
+for x in style_summary[-20:]:
+    print(x)
+
+# Inspect entire used area F:BC for any formatting/data patterns
+f_col = column_index_from_string("F")
+bc_col = column_index_from_string("BC")
+
+nonempty_or_styled = []
+for r in range(1, min(ws.max_row, 20) + 1):
+    row_hits = []
+    for c in range(f_col, bc_col + 1):
+        cell = ws.cell(r, c)
+        styled = (
+            cell.value not in (None, "") or
+            cell.style_id != 0 or
+            cell.fill.fill_type is not None or
+            cell.font.bold or
+            getattr(cell.font.color, "rgb", None) not in (None, "00000000")
+        )
+        if styled:
+            row_hits.append((get_column_letter(c), cell.value, cell.style_id,
+                             cell.font.bold, getattr(cell.font.color, "rgb", None),
+                             cell.fill.fill_type, getattr(cell.fill.start_color, "rgb", None)))
+    if row_hits:
+        nonempty_or_styled.append((r, row_hits[:20], len(row_hits)))
+print("\nRows 1:20 styled/nonempty in F:BC:")
+for item in nonempty_or_styled:
+    print(item)
+
+# Count distinct styles by column in sample rows
+print("\nDistinct style IDs by column for rows 1:40:")
+for c in [1, bd] + list(range(f_col, min(f_col+10, bc_col+1))):
+    col = get_column_letter(c)
+    styles = Counter()
+    vals = 0
+    for r in range(1, 41):
+        cell = ws.cell(r, c)
+        if cell.value not in (None, ""):
+            vals += 1
+        styles[cell.style_id] += 1
+    print(col, "header=", ws.cell(1,c).value, "nonempty=", vals, "styles=", styles)
+
+# Test whether rich text write classes exist
+try:
+    from openpyxl.cell.rich_text import CellRichText, TextBlock
+    from openpyxl.cell.text import InlineFont
+    print("\nRich text writing support: YES")
+    print("CellRichText:", CellRichText, "TextBlock:", TextBlock, "InlineFont:", InlineFont)
+except Exception as e:
+    print("\nRich text writing support unavailable:", repr(e))
+
+# Show workbook file name for output planning
+print("Input filename:", os.path.basename(input_spreadsheet))
+```

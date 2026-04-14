@@ -1,0 +1,160 @@
+task: 50324  case: 1
+instruction_type: Cell-Level Manipulation
+answer_position: Analyse'!D5:K12
+input:  /Users/gabriel/Workspace/trampoline-ai/predict-rlm.spreadbench-release/examples/spreadbench/data/testset/spreadsheet/50324/1_50324_init.xlsx
+answer: /Users/gabriel/Workspace/trampoline-ai/predict-rlm.spreadbench-release/examples/spreadbench/data/testset/spreadsheet/50324/1_50324_golden.xlsx
+============================================================
+2026-04-13 15:28:24,093 INFO RLM iteration 1/50
+Reasoning: First, I need to load the input Excel file and inspect its structure: list sheet names, and for each sheet, get the number of rows and columns, and maybe peek at a few cells to understand where the tables are located. This will help me later write the formula for cross‑selling percentages. I'll use openpyxl to open the workbook in read‑only mode, then print a summary of each sheet.
+Code:
+```repl
+import openpyxl, os, json
+
+# Load the workbook (read‑only for quick inspection)
+wb_path = '/sandbox/input/input_spreadsheet/1_50324_init.xlsx'
+wb = openpyxl.load_workbook(wb_path, read_only=True, data_only=True)
+
+# Gather summary information
+summary = {}
+for ws in wb.worksheets:
+    # Get max row/column (may be over‑estimated if there are empty trailing rows/cols)
+    max_row = ws.max_row
+    max_col = ws.max_column
+    # Sample a few cells from the top‑left corner to see content
+    sample = []
+    for r in range(1, min(6, max_row+1)):
+        row_vals = []
+        for c in range(1, min(6, max_col+1)):
+            val = ws.cell(row=r, column=c).value
+            row_vals.append(val)
+        sample.append(row_vals)
+    summary[ws.title] = {
+        'max_row': max_row,
+        'max_col': max_col,
+        'sample_top_left': sample,
+    }
+
+print(json.dumps(summary, indent=2, default=str))
+```
+2026-04-13 15:29:22,404 INFO RLM iteration 2/50
+Reasoning: We need to add a formula to every cell of the 'Analyse' sheet that computes the percentage of customers who bought both products (cross‑selling). The data is in the 'Datensatz' sheet where row 3 contains product names (columns D‑K) and column C contains customer names (rows 4‑33). For a given cell in Analyse (row product = header in column C, column product = header in row 4) the formula should:
+1. Find the column of each product in Datensatz using MATCH on the product header row.
+2. Use INDEX to pull the whole column of sales for each product.
+3. Count rows where both columns are >0 with SUMPRODUCT.
+4. Divide by the total number of customers (COUNTA of column C).
+5. Round to 9 decimal places.
+We will write this formula into every data cell of Analyse (starting at D5) using openpyxl, save the workbook to the output directory, recalculate formulas, and finally submit the output file path.
+Code:
+```repl
+import os
+import openpyxl
+from openpyxl.utils import get_column_letter
+
+# Paths
+input_path = '/sandbox/input/input_spreadsheet/1_50324_init.xlsx'
+output_dir = '/sandbox/output/output_spreadsheet'
+output_path = os.path.join(output_dir, '1_50324_init.xlsx')
+
+# Ensure output directory exists
+os.makedirs(output_dir, exist_ok=True)
+
+# Load workbook for editing (default read/write mode)
+wb = openpyxl.load_workbook(input_path)
+ws_data = wb['Datensatz']
+ws_out = wb['Analyse']
+
+# ---- Determine ranges in Datensatz ----
+# Product header row is row 3, find first and last non‑empty column
+header_row = 3
+product_start_col = None
+product_end_col = None
+for col in range(1, ws_data.max_column + 1):
+    val = ws_data.cell(row=header_row, column=col).value
+    if val is not None:
+        if product_start_col is None:
+            product_start_col = col
+        product_end_col = col
+
+# Customer column is column 3 (C), find first and last non‑empty row
+customer_col = 3
+customer_start_row = None
+customer_end_row = None
+for row in range(1, ws_data.max_row + 1):
+    val = ws_data.cell(row=row, column=customer_col).value
+    if val is not None:
+        if customer_start_row is None:
+            customer_start_row = row
+        customer_end_row = row
+
+# Build absolute range strings for the data matrix in Datensatz
+data_start_cell = f"${get_column_letter(product_start_col)}${customer_start_row}"
+data_end_cell = f"${get_column_letter(product_end_col)}${customer_end_row}"
+product_header_range = f"${get_column_letter(product_start_col)}${header_row}:${get_column_letter(product_end_col)}${header_row}"
+customer_range = f"${get_column_letter(customer_col)}${customer_start_row}:${get_column_letter(customer_col)}${customer_end_row}"
+
+# ---- Write formula into Analyse sheet ----
+# Analyse layout: row 4 contains column product headers, column C contains row product headers
+# Data matrix starts at row 5, column D (i.e., first product column in Analyse)
+out_start_row = 5
+out_start_col = None
+# Find first product column in Analyse (first non‑empty cell in row 4 after column C)
+for col in range(4, ws_out.max_column + 1):
+    if ws_out.cell(row=4, column=col).value is not None:
+        out_start_col = col
+        break
+if out_start_col is None:
+    raise ValueError('Could not locate product header row in Analyse sheet')
+
+# Determine last column and last row of the matrix (stop at first empty header)
+out_end_col = out_start_col
+while True:
+    val = ws_out.cell(row=4, column=out_end_col).value
+    if val is None:
+        out_end_col -= 1
+        break
+    out_end_col += 1
+    if out_end_col > ws_out.max_column:
+        out_end_col -= 1
+        break
+
+out_end_row = out_start_row
+while True:
+    val = ws_out.cell(row=out_end_row, column=3).value
+    if val is None:
+        out_end_row -= 1
+        break
+    out_end_row += 1
+    if out_end_row > ws_out.max_row:
+        out_end_row -= 1
+        break
+
+# Write formula for each cell in the matrix
+for r in range(out_start_row, out_end_row + 1):
+    row_header = f"$C{r}"  # absolute column C, relative row
+    for c in range(out_start_col, out_end_col + 1):
+        col_letter = get_column_letter(c)
+        col_header = f"${col_letter}$4"  # absolute row 4, relative column
+        # Build the formula string
+        formula = (
+            f"=ROUND(SUMPRODUCT((INDEX(Datensatz!{data_start_cell}:{data_end_cell},0,MATCH({col_header},Datensatz!{product_header_range},0))>0)"
+            f"*(INDEX(Datensatz!{data_start_cell}:{data_end_cell},0,MATCH({row_header},Datensatz!{product_header_range},0))>0))/"
+            f"COUNTA(Datensatz!{customer_range}),9)"
+        )
+        ws_out.cell(row=r, column=c).value = formula
+
+# Save the modified workbook
+wb.save(output_path)
+
+# Recalculate formulas (LibreOffice fallback) and verify a sample cell
+recalc_result = await recalculate(output_path)
+print('Recalculate result:', recalc_result)
+
+# Load with data_only to check a sample value (e.g., top‑left data cell of Analyse)
+wb_check = openpyxl.load_workbook(output_path, data_only=True)
+ws_check = wb_check['Analyse']
+sample_val = ws_check.cell(row=out_start_row, column=out_start_col).value
+print('Sample computed value (row', out_start_row, 'col', out_start_col, '):', sample_val)
+
+# Store output path for final submission
+output_spreadsheet = output_path
+```

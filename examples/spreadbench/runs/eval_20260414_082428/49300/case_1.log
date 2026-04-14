@@ -1,0 +1,173 @@
+task: 49300  case: 1
+instruction_type: Cell-Level Manipulation
+answer_position:  'Sheet1'!C2:C3
+input:  /Users/gabriel/Workspace/trampoline-ai/predict-rlm.spreadbench-release/examples/spreadbench/data/testset/spreadsheet/49300/1_49300_init.xlsx
+answer: /Users/gabriel/Workspace/trampoline-ai/predict-rlm.spreadbench-release/examples/spreadbench/data/testset/spreadsheet/49300/1_49300_golden.xlsx
+============================================================
+2026-04-14 08:37:54,266 INFO RLM iteration 1/50
+Reasoning: We need first inspect the workbook structure carefully before making any edits. The instruction mentions fixing an INDEX/MATCH with two criteria and writing output to column C of Sheet1 using values in columns A and B against the table in Data. I should verify sheet names, dimensions, headers, sample rows, and any existing formulas/example answers in column C or nearby. Then I can determine the exact target cells and whether to use formulas or literal values. Since multi-criteria INDEX/MATCH array formulas can be fragile in LibreOffice, if needed I can compute the lookup in Python and write numeric results directly, but first I need to inspect the actual layout and any example formulas.
+Code:
+```repl
+import os, json, math, statistics
+from openpyxl import load_workbook
+from openpyxl.utils import get_column_letter
+
+print("Input:", input_spreadsheet)
+print("Instruction:", instruction)
+
+wb = load_workbook(input_spreadsheet)
+orig_sheet_names = wb.sheetnames
+print("Sheet names:", orig_sheet_names)
+
+def sheet_summary(ws, sample_first=10, sample_last=5):
+    print(f"\n--- Sheet: {ws.title} ---")
+    print("max_row:", ws.max_row, "max_column:", ws.max_column)
+    headers = [ws.cell(1, c).value for c in range(1, ws.max_column + 1)]
+    print("Row 1 values / headers:", headers)
+    
+    # print first rows
+    first_end = min(ws.max_row, sample_first)
+    print(f"First {first_end} rows:")
+    for r in range(1, first_end + 1):
+        vals = [ws.cell(r, c).value for c in range(1, ws.max_column + 1)]
+        print(r, vals)
+    # print last rows
+    start_last = max(1, ws.max_row - sample_last + 1)
+    if start_last <= ws.max_row and start_last > first_end:
+        print(f"Last rows {start_last}-{ws.max_row}:")
+        for r in range(start_last, ws.max_row + 1):
+            vals = [ws.cell(r, c).value for c in range(1, ws.max_column + 1)]
+            print(r, vals)
+
+for ws in wb.worksheets:
+    sheet_summary(ws)
+
+# Print relevant cells/ranges mentioned by instruction
+for sname in ["Sheet1", "Data"]:
+    if sname in wb.sheetnames:
+        ws = wb[sname]
+        print(f"\nDetailed check for {sname}:")
+        for coord in ["A1","A2","B1","B2","C1","C2","B3","B4","C3","AY4","C3:AY4","B3:B4","C2:AY2"]:
+            try:
+                if ":" in coord:
+                    start, end = coord.split(":")
+                    # print compact range values
+                    from openpyxl.utils.cell import coordinate_to_tuple
+                    r1,c1 = coordinate_to_tuple(start)
+                    r2,c2 = coordinate_to_tuple(end)
+                    print(coord, "=>")
+                    for r in range(r1, r2+1):
+                        rowvals = [ws.cell(r, c).value for c in range(c1, c2+1)]
+                        print(f" row {r}: {rowvals[:12]}{' ...' if len(rowvals)>12 else ''}")
+                else:
+                    print(coord, "=", ws[coord].value)
+            except Exception as e:
+                print("Error reading", coord, e)
+
+# inspect formulas / existing values in Sheet1 col C
+if "Sheet1" in wb.sheetnames:
+    ws = wb["Sheet1"]
+    print("\nSheet1 columns A-C all used rows:")
+    for r in range(1, ws.max_row + 1):
+        print(r, ws.cell(r,1).value, ws.cell(r,2).value, ws.cell(r,3).value)
+```
+2026-04-14 08:38:09,997 INFO RLM iteration 2/50
+Reasoning: I’ve now verified the workbook layout and the exact target area:
+
+- `Sheet1` has headers `Job Title`, `Months`, `Salary` in columns A:C.
+- Target output cells are `Sheet1!C2:C3`.
+- `C2` already contains a broken formula; `C3` is blank.
+- The lookup table is on `Data`:
+  - row labels in `Data!B3:B4` (`BM`, `DM`)
+  - column labels in `Data!C2:AY2` (`1,2,3,...,48,>48`)
+  - values in `Data!C3:AY4`
+
+The user’s formula is failing because it tries to use a single `MATCH` over a 2D condition. The correct approach is a two-dimensional lookup:
+- one `MATCH` for the row (`Job Title`)
+- one `MATCH` for the column (`Months`)
+- then `INDEX` into `Data!C3:AY4`
+
+So I should write a corrected formula into `Sheet1!C2` and `Sheet1!C3`, save, recalculate, verify results, and ensure sheet names remain unchanged after recalculation.
+Code:
+```repl
+import os
+from openpyxl import load_workbook
+
+infile = input_spreadsheet
+filename = os.path.basename(infile)
+outdir = "/sandbox/output/output_spreadsheet"
+outfile = os.path.join(outdir, filename)
+
+wb = load_workbook(infile)
+original_sheetnames = wb.sheetnames[:]
+
+ws = wb["Sheet1"]
+
+# Print existing target cells before modification
+print("Before modification:")
+for r in range(2, ws.max_row + 1):
+    print(f"C{r} current:", ws.cell(r, 3).value)
+
+# Write corrected 2D INDEX/MATCH formula into column C for all populated data rows
+for r in range(2, ws.max_row + 1):
+    job = ws.cell(r, 1).value
+    month = ws.cell(r, 2).value
+    if job is None and month is None:
+        continue
+    formula = (
+        f'=INDEX(Data!$C$3:$AY$4,'
+        f'MATCH(A{r},Data!$B$3:$B$4,0),'
+        f'MATCH(B{r},Data!$C$2:$AY$2,0))'
+    )
+    ws.cell(r, 3).value = formula
+    print(f"Wrote C{r}:", formula)
+
+wb.save(outfile)
+print("Saved to:", outfile)
+
+# Recalculate
+recalc_result = await recalculate(outfile)
+print("Recalculate result:", recalc_result)
+
+# Reload and restore sheet names if needed
+wb_after = load_workbook(outfile)
+print("Sheet names after recalc:", wb_after.sheetnames)
+if wb_after.sheetnames != original_sheetnames:
+    # rename by position to preserve original names
+    for i, desired in enumerate(original_sheetnames):
+        wb_after.worksheets[i].title = desired
+    wb_after.save(outfile)
+    print("Renamed sheets back to:", original_sheetnames)
+
+# Verify formulas and cached values
+wb_formula = load_workbook(outfile, data_only=False)
+wb_values = load_workbook(outfile, data_only=True)
+
+print("\nVerification:")
+print("Final sheet names:", wb_formula.sheetnames)
+
+wsf = wb_formula["Sheet1"]
+wsv = wb_values["Sheet1"]
+
+for r in range(1, wsf.max_row + 1):
+    print(
+        f"Row {r}:",
+        "A=", repr(wsf.cell(r,1).value),
+        "B=", repr(wsf.cell(r,2).value),
+        "C formula=", repr(wsf.cell(r,3).value),
+        "C value=", repr(wsv.cell(r,3).value),
+    )
+
+output_spreadsheet = outfile
+```
+2026-04-14 08:38:28,782 INFO RLM iteration 3/50
+Reasoning: The workbook has been inspected, the corrected 2D `INDEX/MATCH` formulas were written into the exact target cells `Sheet1!C2:C3`, recalculation succeeded, and verification confirmed numeric outputs (`35`, `37`) with sheet names preserved. The output file is ready to submit.
+Code:
+```repl
+SUBMIT(output_spreadsheet=output_spreadsheet)
+```
+
+============================================================
+recalc_source: baseline
+score:         1.0000  PASS
+All 2 cells match

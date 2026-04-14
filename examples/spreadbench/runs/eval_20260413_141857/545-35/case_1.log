@@ -1,0 +1,162 @@
+task: 545-35  case: 1
+instruction_type: Sheet-Level Manipulation
+answer_position: 'Data'!U3:AI20
+input:  /Users/gabriel/Workspace/trampoline-ai/predict-rlm.spreadbench-release/examples/spreadbench/data/testset/spreadsheet/545-35/1_545-35_init.xlsx
+answer: /Users/gabriel/Workspace/trampoline-ai/predict-rlm.spreadbench-release/examples/spreadbench/data/testset/spreadsheet/545-35/1_545-35_golden.xlsx
+============================================================
+2026-04-13 14:27:32,181 INFO RLM iteration 1/50
+Reasoning: First I need to inspect the workbook structure and read the full instruction text so I can apply it literally. I'll load the workbook, list sheets, dimensions, sample cells, and print the full instruction. Then I can determine what range/sheet needs modification and how the workbook is laid out before editing anything.
+Code:
+```repl
+from openpyxl import load_workbook
+from pathlib import Path
+import os, json
+
+print("Instruction:")
+print(instruction)
+print("\nInput file exists:", os.path.exists(input_spreadsheet), input_spreadsheet)
+
+wb = load_workbook(input_spreadsheet)
+print("Sheet names:", wb.sheetnames)
+
+for ws in wb.worksheets:
+    print(f"\nSheet: {ws.title}")
+    print("  size:", ws.max_row, "rows x", ws.max_column, "cols")
+    # show a small sample of used area
+    max_r = min(ws.max_row, 8)
+    max_c = min(ws.max_column, 8)
+    for r in range(1, max_r + 1):
+        row_vals = [ws.cell(r, c).value for c in range(1, max_c + 1)]
+        print(f"  row {r}:", row_vals)
+```
+2026-04-13 14:28:04,871 INFO RLM iteration 2/50
+Reasoning: I know the workbook has one sheet and a nominal used range of 23x37, but the top-left sample was empty, so the actual populated region is likely farther right/down. I need to inspect where non-empty cells are, identify the relevant range, and understand whether the workbook is showing an example before/after or just a data block to clean. Then I can replace any cell whose entire content is not purely numeric with 0, while preserving cells that are already numeric. After that I'll save, verify, and submit.
+Code:
+```repl
+from openpyxl import load_workbook
+from openpyxl.utils import get_column_letter
+
+wb = load_workbook(input_spreadsheet)
+ws = wb["Data"]
+
+# Find non-empty cells
+nonempty = []
+for row in ws.iter_rows():
+    for cell in row:
+        if cell.value is not None:
+            nonempty.append((cell.coordinate, cell.value))
+
+print("Non-empty cell count:", len(nonempty))
+print("First 80 non-empty cells:")
+for coord, val in nonempty[:80]:
+    print(coord, repr(val))
+
+# Bounding box of non-empty cells
+rows = [ws[c].row for c, _ in nonempty]
+cols = [ws[c].column for c, _ in nonempty]
+print("Bounds:",
+      f"rows {min(rows)}-{max(rows)}, cols {min(cols)}-{max(cols)}",
+      f"({get_column_letter(min(cols))}:{get_column_letter(max(cols))})")
+
+# Print populated area row by row across bounding box
+min_r, max_r = min(rows), max(rows)
+min_c, max_c = min(cols), max(cols)
+print("\nPopulated area preview:")
+for r in range(min_r, max_r + 1):
+    vals = [ws.cell(r, c).value for c in range(min_c, max_c + 1)]
+    print(r, vals)
+```
+2026-04-13 14:28:31,628 INFO RLM iteration 3/50
+Reasoning: I’ve identified the workbook’s meaningful populated area: sheet `Data`, with headers in `U2:AI2`, a date in `U1`, and data entries in rows `3:20` across columns `U:AI`. The instruction says to replace the entire contents of a cell with `0` if it contains anything other than pure numeric values. So I should clean the data region while preserving headers/date.
+
+Plan:
+1. Reload workbook with openpyxl.
+2. Apply the rule to `U3:AI20`:
+   - keep actual numeric cell values,
+   - keep strings that are only digits (`0-9`),
+   - replace everything else with numeric `0`.
+3. Save to the output folder with the same filename.
+4. Reopen and verify a sample plus replacement counts.
+If verification looks right, I’ll submit next turn.
+Code:
+```repl
+from openpyxl import load_workbook
+from pathlib import Path
+import os, re
+
+infile = Path(input_spreadsheet)
+outdir = Path("/sandbox/output/output_spreadsheet")
+outdir.mkdir(parents=True, exist_ok=True)
+outfile = outdir / infile.name
+
+wb = load_workbook(infile)
+ws = wb["Data"]
+
+digit_only = re.compile(r"^\d+$")
+
+changed = 0
+kept_numeric = 0
+kept_digit_strings = 0
+range_coords = []
+
+for row in range(3, 21):          # rows 3-20 inclusive
+    for col in range(21, 36):     # cols U-AI inclusive
+        cell = ws.cell(row=row, column=col)
+        val = cell.value
+        keep = False
+        
+        if isinstance(val, (int, float)) and not isinstance(val, bool):
+            keep = True
+            kept_numeric += 1
+        elif isinstance(val, str) and digit_only.fullmatch(val):
+            keep = True
+            kept_digit_strings += 1
+        
+        if not keep:
+            if val != 0:
+                changed += 1
+            cell.value = 0
+            range_coords.append(cell.coordinate)
+
+wb.save(outfile)
+
+# Verify by reopening
+wb2 = load_workbook(outfile)
+ws2 = wb2["Data"]
+
+# Count remaining non-pure-numeric strings in cleaned area
+remaining_bad = []
+remaining_good_strings = []
+for row in range(3, 21):
+    for col in range(21, 36):
+        cell = ws2.cell(row=row, column=col)
+        val = cell.value
+        if isinstance(val, str):
+            if digit_only.fullmatch(val):
+                remaining_good_strings.append((cell.coordinate, val))
+            else:
+                remaining_bad.append((cell.coordinate, val))
+
+print("Saved:", outfile)
+print("Changed cells to 0:", changed)
+print("Kept numeric values:", kept_numeric)
+print("Kept digit-only strings:", kept_digit_strings)
+print("Remaining bad strings:", len(remaining_bad))
+print("Sample changed coords:", range_coords[:20])
+
+print("\nVerification preview rows 3-7, cols U:AI")
+for r in range(3, 8):
+    vals = [ws2.cell(r, c).value for c in range(21, 36)]
+    print(r, vals)
+```
+2026-04-13 14:28:47,923 INFO RLM iteration 4/50
+Reasoning: I inspected the workbook, identified the populated data region, applied the literal rule to replace any non-pure-numeric cell contents with `0` in the data block while preserving the header/date area, saved the modified workbook to the required output directory with the same filename, and verified there are no remaining invalid strings in the cleaned range. The output file is ready to submit.
+Code:
+```repl
+SUBMIT(output_spreadsheet="/sandbox/output/output_spreadsheet/1_545-35_init.xlsx")
+```
+
+============================================================
+recalc_source: baseline
+score:         1.0000  PASS
+All 270 cells match

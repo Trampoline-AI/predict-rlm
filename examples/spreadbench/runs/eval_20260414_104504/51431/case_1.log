@@ -1,0 +1,116 @@
+task: 51431  case: 1
+instruction_type: Cell-Level Manipulation
+answer_position: B2
+input:  /Users/gabriel/Workspace/trampoline-ai/predict-rlm.spreadbench-release/examples/spreadbench/data/testset/spreadsheet/51431/1_51431_init.xlsx
+answer: /Users/gabriel/Workspace/trampoline-ai/predict-rlm.spreadbench-release/examples/spreadbench/data/testset/spreadsheet/51431/1_51431_golden.xlsx
+============================================================
+2026-04-14 11:01:00,450 INFO RLM iteration 1/50
+Reasoning: Need inspect workbook thoroughly first: sheet names, dimensions, headers, samples, target cells A2/B2 and existing formulas. Then likely write formula in B2 extracting text before semicolon from A2. Need verify exact sheet and maybe only one cell. Let's inspect.
+Code:
+```repl
+from openpyxl import load_workbook
+from openpyxl.utils import get_column_letter
+import os, json, math
+
+print("Instruction:", instruction)
+
+wb = load_workbook(input_spreadsheet)
+print("Sheet names:", wb.sheetnames)
+
+for ws in wb.worksheets:
+    print(f"\n--- Sheet: {ws.title} ---")
+    print("max_row:", ws.max_row, "max_col:", ws.max_column)
+    headers = [ws.cell(1, c).value for c in range(1, ws.max_column + 1)]
+    print("Row 1 headers/values:", headers)
+    
+    # first 10 rows
+    first_n = min(ws.max_row, 10)
+    print("First rows:")
+    for r in range(1, first_n + 1):
+        vals = [ws.cell(r, c).value for c in range(1, ws.max_column + 1)]
+        print(r, vals)
+    
+    # last 5 rows
+    start_last = max(1, ws.max_row - 4)
+    print("Last rows:")
+    for r in range(start_last, ws.max_row + 1):
+        vals = [ws.cell(r, c).value for c in range(1, ws.max_column + 1)]
+        print(r, vals)
+    
+    # specific cells from instruction
+    print("A2:", ws["A2"].value)
+    print("B2:", ws["B2"].value)
+```
+2026-04-14 11:01:11,276 INFO RLM iteration 2/50
+Reasoning: We inspected the workbook: one sheet `Sheet1`, headers `Names:` in A1 and `Primary Provider` in B1, only data row 2. Target is clearly B2, currently blank, and A2 contains semicolon-separated full names. Since the instruction explicitly asks to build a formula, I should write an Excel/LibreOffice-compatible formula in B2 that extracts everything before the first semicolon, trimming spaces. A robust formula is `=TRIM(LEFT(A2,FIND(";",A2&";")-1))`, which also works even if no semicolon exists because of `A2&";"`. Then save to output path, recalculate, reload, verify B2 cached value, and ensure sheet name preserved.
+Code:
+```repl
+from openpyxl import load_workbook
+import os, shutil
+
+infile = input_spreadsheet
+filename = os.path.basename(infile)
+outdir = "/sandbox/output/output_spreadsheet"
+outfile = os.path.join(outdir, filename)
+
+# Load and inspect target again before writing
+wb = load_workbook(infile)
+orig_sheetnames = wb.sheetnames[:]
+ws = wb["Sheet1"]
+
+print("Before write:")
+print("A2 =", ws["A2"].value)
+print("B2 =", ws["B2"].value)
+print("Header B1 =", ws["B1"].value)
+
+# Write formula to exact target cell
+formula = '=TRIM(LEFT(A2,FIND(";",A2&";")-1))'
+ws["B2"] = formula
+print("Written formula in B2:", ws["B2"].value)
+
+# Save
+os.makedirs(outdir, exist_ok=True)
+wb.save(outfile)
+print("Saved to:", outfile)
+
+# Recalculate
+recalc_result = await recalculate(outfile)
+print("Recalculate result:", recalc_result)
+
+# Reload after recalc, fix any sheet renames if needed
+wb_check = load_workbook(outfile)
+if wb_check.sheetnames != orig_sheetnames:
+    print("Sheet names changed after recalc:", wb_check.sheetnames, "-> restoring", orig_sheetnames)
+    # rename by position
+    for i, name in enumerate(orig_sheetnames):
+        wb_check.worksheets[i].title = name
+    wb_check.save(outfile)
+    wb_check = load_workbook(outfile)
+
+print("Final sheet names:", wb_check.sheetnames)
+
+# Verify formula and cached value
+wb_formula = load_workbook(outfile, data_only=False)
+wb_values = load_workbook(outfile, data_only=True)
+
+wsf = wb_formula["Sheet1"]
+wsv = wb_values["Sheet1"]
+
+print("Verification:")
+print("Formula B2 =", wsf["B2"].value)
+print("Cached value B2 =", wsv["B2"].value)
+print("A2 =", wsv["A2"].value)
+
+output_spreadsheet = outfile
+```
+2026-04-14 11:02:05,369 INFO RLM iteration 3/50
+Reasoning: Workbook has been fully inspected and modified. Target cell B2 on Sheet1 now contains a working formula and recalculated cached value is verified as "Nizghi, Righat". Sheet name preserved. Next step is just submit the saved output file path.
+Code:
+```repl
+SUBMIT(output_spreadsheet=output_spreadsheet)
+```
+
+============================================================
+recalc_source: baseline
+score:         1.0000  PASS
+All 1 cells match

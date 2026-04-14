@@ -1,0 +1,149 @@
+task: 50250  case: 1
+instruction_type: Cell-Level Manipulation
+answer_position: H2
+input:  /Users/gabriel/Workspace/trampoline-ai/predict-rlm.spreadbench-release/examples/spreadbench/data/testset/spreadsheet/50250/1_50250_init.xlsx
+answer: /Users/gabriel/Workspace/trampoline-ai/predict-rlm.spreadbench-release/examples/spreadbench/data/testset/spreadsheet/50250/1_50250_golden.xlsx
+============================================================
+2026-04-14 11:08:16,526 INFO RLM iteration 1/50
+Reasoning: Need inspect workbook thoroughly first: sheet names, dimensions, headers, sample rows, current G2/H2 and possibly nearby formulas/values. Then compute exact logic and write H2, save, recalc, verify.
+Code:
+```repl
+import os, json, math
+from openpyxl import load_workbook
+from openpyxl.utils import get_column_letter
+
+print("Input:", input_spreadsheet)
+print("Instruction:", instruction)
+
+wb = load_workbook(input_spreadsheet)
+orig_sheet_names = wb.sheetnames
+print("Sheet names:", orig_sheet_names)
+
+for ws in wb.worksheets:
+    print(f"\n--- Sheet: {ws.title} ---")
+    print("max_row:", ws.max_row, "max_col:", ws.max_column)
+    headers = [ws.cell(1, c).value for c in range(1, ws.max_column + 1)]
+    print("Row1 headers/values:", headers)
+    # print first 10 rows and last 5 rows
+    sample_rows = list(range(1, min(ws.max_row, 10) + 1))
+    tail_rows = list(range(max(1, ws.max_row - 4), ws.max_row + 1))
+    rows_to_show = []
+    seen = set()
+    for r in sample_rows + tail_rows:
+        if r not in seen:
+            seen.add(r)
+            rows_to_show.append(r)
+    for r in rows_to_show:
+        vals = [ws.cell(r, c).value for c in range(1, ws.max_column + 1)]
+        print(f"Row {r}:", vals)
+
+# inspect specific cells/range from instruction
+ws = wb[wb.sheetnames[0]]
+for coord in ["A1","B1","C1","D1","E1","F1","G1","H1","A2","B2","C2","D2","E2","F2","G2","H2"]:
+    cell = ws[coord]
+    print(coord, "value=", cell.value, "data_type=", cell.data_type)
+
+# print formulas/values in H column nearby if any
+for r in range(1, min(ws.max_row, 10) + 1):
+    print(f"H{r}:", ws[f'H{r}'].value)
+```
+2026-04-14 11:08:52,670 INFO RLM iteration 2/50
+Reasoning: We inspected the workbook. There is one sheet, Sheet1, with 18 rows and 8 columns. Relevant cells:
+- G2 = "sela"
+- H2 is blank and is the exact target.
+Data layout has identifiers in columns A or B, and candidate numeric values in columns C:E. Need sum values in C:E for rows where either A or B equals G2, counting only numeric cells.
+
+From visible rows matching "sela":
+- Row 1: A1="sela", C1=123
+- Row 3: B3="sela", E3=123
+- Row 6: A6="sela", D6=21
+- Row 8: B8="sela", C8=100
+- Row 16: A16="sela", C16="xx" (non-numeric, exclude)
+
+Expected total = 123 + 123 + 21 + 100 = 367.
+
+Need still to inspect all rows fully / matching rows to verify no other "sela" entries, then write H2. Since this is a one-off based on current data, a static computed value is acceptable. Then save, recalc, reload, verify H2 and sheet names.
+Code:
+```repl
+import os, shutil
+from openpyxl import load_workbook
+
+# Reopen and inspect all matching/nonmatching rows explicitly
+wb = load_workbook(input_spreadsheet)
+ws = wb[wb.sheetnames[0]]
+
+ref = ws["G2"].value
+print("Reference from G2:", ref)
+
+matches = []
+for r in range(1, ws.max_row + 1):
+    a = ws.cell(r, 1).value
+    b = ws.cell(r, 2).value
+    cde = [ws.cell(r, col).value for col in range(3, 6)]
+    is_match = (a == ref) or (b == ref)
+    if is_match:
+        matches.append((r, a, b, cde))
+print("Matching rows:")
+for item in matches:
+    print(item)
+
+total = 0
+included = []
+excluded = []
+for r, a, b, cde in matches:
+    for idx, v in enumerate(cde, start=3):
+        if isinstance(v, (int, float)) and not isinstance(v, bool):
+            total += v
+            included.append((r, idx, v))
+        else:
+            if v is not None:
+                excluded.append((r, idx, v, type(v).__name__))
+
+print("Included numeric cells:", included)
+print("Excluded non-numeric/nonfilled cells (non-None only):", excluded)
+print("Computed total:", total)
+
+# Confirm target cell before writing
+print("Before write H2:", ws["H2"].value)
+
+ws["H2"] = total
+
+out_dir = "/sandbox/output/output_spreadsheet"
+os.makedirs(out_dir, exist_ok=True)
+out_path = os.path.join(out_dir, os.path.basename(input_spreadsheet))
+wb.save(out_path)
+print("Saved to:", out_path)
+
+# recalc
+recalc_result = await recalculate(out_path)
+print("Recalculate:", recalc_result)
+
+# Ensure sheet names preserved after recalc
+wb_after = load_workbook(out_path)
+print("Sheet names after recalc:", wb_after.sheetnames)
+if wb_after.sheetnames != wb.sheetnames:
+    sheets = wb_after.sheetnames[:]
+    for i, old_name in enumerate(sheets):
+        wb_after[old_name].title = wb.sheetnames[i]
+    wb_after.save(out_path)
+    print("Renamed sheets back to:", wb.sheetnames)
+
+# Verify with data_only
+verify_wb = load_workbook(out_path, data_only=True)
+verify_ws = verify_wb[wb.sheetnames[0]]
+print("Verified G2:", verify_ws["G2"].value)
+print("Verified H2:", verify_ws["H2"].value)
+
+output_spreadsheet = out_path
+```
+2026-04-14 11:09:15,207 INFO RLM iteration 3/50
+Reasoning: We have already inspected thoroughly, identified the exact target cell H2, computed the value, wrote it, saved, recalculated, and verified H2=867 with sheet name preserved. The only remaining action is to submit the output file path. Per instructions, submit in a turn by itself.
+Code:
+```repl
+SUBMIT(output_spreadsheet=output_spreadsheet)
+```
+
+============================================================
+recalc_source: baseline
+score:         1.0000  PASS
+All 1 cells match

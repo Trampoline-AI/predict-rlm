@@ -1,0 +1,113 @@
+task: 585-41  case: 1
+instruction_type: Sheet-Level Manipulation
+answer_position: 'Sheet1'!A1:H1
+input:  /Users/gabriel/Workspace/trampoline-ai/predict-rlm.spreadbench-release/examples/spreadbench/data/testset/spreadsheet/585-41/1_585-41_init.xlsx
+answer: /Users/gabriel/Workspace/trampoline-ai/predict-rlm.spreadbench-release/examples/spreadbench/data/testset/spreadsheet/585-41/1_585-41_golden.xlsx
+============================================================
+2026-04-14 10:56:10,786 INFO RLM iteration 1/50
+Reasoning: Need inspect workbook thoroughly first: list sheets, dimensions, headers, sample rows, current values in Sheet1 A1:H1, and any formulas. Then likely modify those cells to strip non-numeric chars while preserving digits and decimal points, probably direct values not formulas unless current cells formulas? Need inspect.
+Code:
+```repl
+import os, re, json
+from openpyxl import load_workbook
+from openpyxl.utils import get_column_letter
+
+path = input_spreadsheet
+wb = load_workbook(path)
+print("Workbook:", path)
+print("Sheet names:", wb.sheetnames)
+
+for ws in wb.worksheets:
+    print(f"\n--- Sheet: {ws.title} ---")
+    print("max_row:", ws.max_row, "max_col:", ws.max_column)
+    headers = [ws.cell(1, c).value for c in range(1, ws.max_column + 1)]
+    print("Row1 headers/values:", headers)
+    sample_first = []
+    for r in range(1, min(ws.max_row, 10) + 1):
+        sample_first.append([ws.cell(r, c).value for c in range(1, ws.max_column + 1)])
+    print("First rows sample:")
+    for row in sample_first:
+        print(row)
+    start_last = max(1, ws.max_row - 4)
+    print("Last rows sample:")
+    for r in range(start_last, ws.max_row + 1):
+        print([ws.cell(r, c).value for c in range(1, ws.max_column + 1)])
+
+if "Sheet1" in wb.sheetnames:
+    ws = wb["Sheet1"]
+    print("\nTarget range Sheet1!A1:H1 current values/formulas:")
+    for c in range(1, 9):
+        cell = ws.cell(1, c)
+        print(cell.coordinate, "value=", cell.value, "data_type=", cell.data_type)
+else:
+    print("Sheet1 not found")
+```
+2026-04-14 10:56:41,578 INFO RLM iteration 2/50
+Reasoning: Inspected workbook: only Sheet1 with a single row A1:H1. Target range is confirmed as Sheet1!A1:H1. Values alternate between already-numeric cells (A,C,E,G) and strings with currency/non-numeric characters (B,D,F,H). No formulas. Need execute task by updating range to remove all non-numeric characters except decimal points, while preserving numeric values/decimals. To avoid changing already numeric cells, leave numeric types as-is. For string cells, strip everything except digits and ".". Then save to output path, recalculate, reload, verify A1:H1 values, and ensure sheet name remains Sheet1.
+Code:
+```repl
+import os, re, shutil
+from openpyxl import load_workbook
+
+infile = input_spreadsheet
+filename = os.path.basename(infile)
+outdir = "/sandbox/output/output_spreadsheet"
+outfile = os.path.join(outdir, filename)
+
+wb = load_workbook(infile)
+orig_sheetnames = wb.sheetnames[:]
+ws = wb["Sheet1"]
+
+print("Before:")
+before_vals = [ws.cell(1, c).value for c in range(1, 9)]
+print(before_vals)
+
+for c in range(1, 9):
+    cell = ws.cell(1, c)
+    val = cell.value
+    if isinstance(val, str):
+        cleaned = re.sub(r"[^0-9.]", "", val)
+        cell.value = cleaned
+    else:
+        # preserve existing numeric values
+        cell.value = val
+
+print("After write (in-memory):")
+after_vals = [ws.cell(1, c).value for c in range(1, 9)]
+print(after_vals)
+
+wb.save(outfile)
+
+recalc_result = await recalculate(outfile)
+print("Recalculate:", recalc_result)
+
+# Reload and restore sheet names if recalculate changed them
+wb_chk = load_workbook(outfile)
+if wb_chk.sheetnames != orig_sheetnames:
+    print("Sheet names changed after recalc:", wb_chk.sheetnames, "-> restoring", orig_sheetnames)
+    for i, expected in enumerate(orig_sheetnames):
+        wb_chk.worksheets[i].title = expected
+    wb_chk.save(outfile)
+    wb_chk = load_workbook(outfile)
+
+print("Final sheet names:", wb_chk.sheetnames)
+
+# Verify final values
+wb_data = load_workbook(outfile, data_only=True)
+ws_data = wb_data["Sheet1"]
+verified = [ws_data.cell(1, c).value for c in range(1, 9)]
+print("Verified Sheet1!A1:H1:", verified)
+
+output_spreadsheet = outfile
+```
+2026-04-14 10:56:47,667 INFO RLM iteration 3/50
+Reasoning: The task is already completed and verified: the workbook was inspected thoroughly, target range Sheet1!A1:H1 was confirmed, non-numeric characters were removed from string cells while preserving digits and decimal points, numeric cells were left unchanged, and the output file was saved and reloaded successfully. Final verified values look correct. Next step is just to submit the saved output spreadsheet path.
+Code:
+```repl
+SUBMIT(output_spreadsheet=output_spreadsheet)
+```
+
+============================================================
+recalc_source: baseline
+score:         1.0000  PASS
+All 8 cells match
