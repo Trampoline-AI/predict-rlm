@@ -49,6 +49,15 @@ try:
 except ImportError:
     _formulas_lib = None
 
+# Suppress openpyxl's benign UserWarnings about dropped xlsx features
+# (e.g. "Data Validation extension is not supported and will be removed",
+# "Conditional Formatting extension is not supported and will be removed",
+# "Title is more than 31 characters..."). These fire frequently on the
+# spreadbench dataset — they're informational about what openpyxl won't
+# round-trip on save, and have no effect on our scoring. Scoped to the
+# openpyxl module only so we don't hide warnings from anything else.
+warnings.filterwarnings("ignore", category=UserWarning, module=r"openpyxl\..*")
+
 log = logging.getLogger("spreadsheet_rlm.recalculate")
 
 _FORMULAS_TQDM_PATCHED = False
