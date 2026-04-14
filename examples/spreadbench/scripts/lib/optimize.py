@@ -67,6 +67,9 @@ from .scoring import score_workbooks
 
 nest_asyncio.apply()
 
+log = logging.getLogger("spreadsheet_rlm.optimize")
+
+
 # ---------------------------------------------------------------------------
 # Component identifiers
 # ---------------------------------------------------------------------------
@@ -196,7 +199,10 @@ class OptimizeConfig:
 
     # Reflection / proposer LM
     reflection_lm: str = "anthropic/claude-opus-4-6"
-    reflection_reasoning_effort: str | None = "medium"
+    # Default unset (no extended thinking). On Claude 4.6 any non-empty
+    # value maps to adaptive thinking via LiteLLM, which meaningfully
+    # raises proposer cost. The sibling repo's validated run used None.
+    reflection_reasoning_effort: str | None = None
 
     # Datasets
     train_dataset: str = "trainset"
@@ -240,6 +246,14 @@ class OptimizeReport:
     costs: list[LMCost]
 
     @property
+    def rollout_cost_usd(self) -> float:
+        return sum(c.cost_usd for c in self.costs if c.role in {"main", "sub"})
+
+    @property
+    def optimization_cost_usd(self) -> float:
+        return self.total_cost_usd - self.rollout_cost_usd
+
+    @property
     def total_cost_usd(self) -> float:
         return sum(c.cost_usd for c in self.costs)
 
@@ -274,6 +288,8 @@ class OptimizeReport:
             "best_candidate": self.best_candidate,
             "val_aggregate_scores": self.val_aggregate_scores,
             "costs": [c.to_dict() for c in self.costs],
+            "rollout_cost_usd": self.rollout_cost_usd,
+            "optimization_cost_usd": self.optimization_cost_usd,
             "total_cost_usd": self.total_cost_usd,
         }
 
@@ -311,6 +327,8 @@ class SpreadsheetAdapter:
         proposer_sub_lm: dspy.LM | None = None,
         proposer_max_iterations: int = 20,
         proposer_trace_dir: str | None = None,
+        reflection_lm_instance: dspy.LM | None = None,
+        cost_snapshot_path: Path | None = None,
     ):
         self.lm = lm
         self.sub_lm = sub_lm
@@ -322,6 +340,16 @@ class SpreadsheetAdapter:
         self.proposer_max_iterations = proposer_max_iterations
         self.proposer_trace_dir = proposer_trace_dir
         self._proposer_call_count = 0
+        # Handle to the reflection LM instance so we can summarise its cost
+        # even when --rlm_proposer is off (in which case proposer_lm is None
+        # but GEPA still uses reflection_lm_instance for its default
+        # reflection-LM flow). When --rlm_proposer is on, this is the same
+        # object as proposer_lm.
+        self.reflection_lm_instance = reflection_lm_instance
+        # When set, the adapter dumps a fresh LiteLLM-authoritative cost
+        # snapshot to this file after every evaluate() and every proposer
+        # call. The file is overwritten each time — latest state only.
+        self.cost_snapshot_path = cost_snapshot_path
 
         # GEPA's adapter Protocol: setting propose_new_texts on the instance
         # opts in to our custom proposer; leaving it None falls back to GEPA's
@@ -330,6 +358,41 @@ class SpreadsheetAdapter:
             self.propose_new_texts = self._rlm_propose_new_texts
         else:
             self.propose_new_texts = None
+
+    # -- cost snapshotting --------------------------------------------------
+
+    def _dump_costs(self) -> None:
+        """Write current LiteLLM-authoritative costs to ``cost_snapshot_path``.
+
+        Best-effort: any failure is logged at debug level and swallowed so
+        the snapshot code path cannot break the eval loop. Walks
+        ``lm.history`` via :func:`summarize_lm_cost`, which honours the
+        per-model price overrides (mercury-2) and reports real cache-hit
+        costs from LiteLLM. The file is overwritten each call — readers
+        get the latest snapshot by cat'ing it.
+        """
+        if self.cost_snapshot_path is None:
+            return
+        try:
+            costs = [
+                summarize_lm_cost("main", self.lm),
+                summarize_lm_cost("sub", self.sub_lm),
+            ]
+            if self.reflection_lm_instance is not None:
+                role = "proposer" if self.proposer_lm is not None else "reflection"
+                costs.append(summarize_lm_cost(role, self.reflection_lm_instance))
+            payload = {
+                "timestamp": datetime.now().isoformat(),
+                "proposer_calls_so_far": self._proposer_call_count,
+                "total_cost_usd": sum(c.cost_usd for c in costs),
+                "costs": [c.to_dict() for c in costs],
+            }
+            self.cost_snapshot_path.parent.mkdir(parents=True, exist_ok=True)
+            self.cost_snapshot_path.write_text(
+                json.dumps(payload, indent=2, default=str)
+            )
+        except Exception as e:
+            log.debug("cost snapshot write failed: %s", e)
 
     # -- evaluate -----------------------------------------------------------
 
@@ -405,6 +468,11 @@ class SpreadsheetAdapter:
                         "cases": case_results,
                     }
                 )
+
+        # Snapshot LiteLLM-authoritative costs after each evaluate() call.
+        # Best-effort — any failure is swallowed by _dump_costs so the
+        # eval loop can't be broken by file I/O problems.
+        self._dump_costs()
 
         return EvaluationBatch(
             outputs=outputs,
@@ -729,6 +797,10 @@ class SpreadsheetAdapter:
                 component_name, current_text, records
             )
             new_texts[component_name] = new_text
+        # Snapshot costs after the proposer has finished — the reflection LM
+        # history now includes the new calls, so the dump captures them
+        # promptly rather than waiting for the next evaluate() call.
+        self._dump_costs()
         return new_texts
 
     def _propose_one_component(
@@ -902,12 +974,8 @@ def run_optimization(config: OptimizeConfig) -> OptimizeReport:
     # --- Task LMs ----------------------------------------------------------
     lm = dspy.LM(**get_lm_config(config.lm, config.reasoning_effort), cache=config.cache)
     sub_lm = dspy.LM(**get_sub_lm_config(config.sub_lm), cache=config.cache)
-    effort_tag = (
-        f" (reasoning_effort={config.reasoning_effort})"
-        if config.reasoning_effort
-        else ""
-    )
-    print(f"Task LM:    {config.lm}{effort_tag}")
+    task_effort = config.reasoning_effort if config.reasoning_effort else "none"
+    print(f"Task LM:    {config.lm}  (reasoning_effort={task_effort})")
     print(f"Task sub:   {config.sub_lm}")
 
     # --- Reflection / proposer LM ------------------------------------------
@@ -921,17 +989,24 @@ def run_optimization(config: OptimizeConfig) -> OptimizeReport:
     def reflection_lm_call(prompt: str) -> str:
         return reflection_lm_instance(prompt)[0]
 
-    reflect_effort_tag = (
-        f" (reasoning_effort={config.reflection_reasoning_effort})"
+    reflect_effort = (
+        config.reflection_reasoning_effort
         if config.reflection_reasoning_effort
-        else ""
+        else "none"
     )
-    print(f"Reflection: {config.reflection_lm}{reflect_effort_tag}")
+    print(f"Reflection: {config.reflection_lm}  (reasoning_effort={reflect_effort})")
 
     # --- Adapter ------------------------------------------------------------
     proposer_trace_dir = (
         str(run_dir / "proposer_traces") if config.rlm_proposer else None
     )
+    proposer_sub_lm: dspy.LM | None = None
+    if config.rlm_proposer:
+        proposer_sub_lm = dspy.LM(
+            **get_sub_lm_config(config.sub_lm),
+            cache=config.cache,
+        )
+
     adapter = SpreadsheetAdapter(
         lm=lm,
         sub_lm=sub_lm,
@@ -939,10 +1014,15 @@ def run_optimization(config: OptimizeConfig) -> OptimizeReport:
         concurrency=config.concurrency,
         task_timeout=config.task_timeout,
         proposer_lm=reflection_lm_instance if config.rlm_proposer else None,
-        proposer_sub_lm=sub_lm,
+        proposer_sub_lm=proposer_sub_lm,
         proposer_max_iterations=config.proposer_max_iterations,
         proposer_trace_dir=proposer_trace_dir,
+        reflection_lm_instance=reflection_lm_instance,
+        cost_snapshot_path=run_dir / "costs_live.json",
     )
+    # Write an initial zero-cost snapshot so the file exists from the start
+    # and readers have something to cat even before the first evaluate().
+    adapter._dump_costs()
     print(
         "Proposer:  "
         + (
@@ -999,6 +1079,8 @@ def run_optimization(config: OptimizeConfig) -> OptimizeReport:
             reflection_lm_instance,
         ),
     ]
+    if proposer_sub_lm is not None:
+        costs.append(summarize_lm_cost("proposer_sub", proposer_sub_lm))
 
     best_idx = result.best_idx
     best_candidate = result.candidates[best_idx]
