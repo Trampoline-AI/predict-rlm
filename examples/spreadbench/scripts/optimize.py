@@ -23,8 +23,11 @@ from __future__ import annotations
 
 import argparse
 import json
+import shlex
 import sys
+from datetime import datetime
 from pathlib import Path
+from typing import Any
 
 _SCRIPTS_DIR = Path(__file__).resolve().parent
 if str(_SCRIPTS_DIR) not in sys.path:
@@ -32,6 +35,118 @@ if str(_SCRIPTS_DIR) not in sys.path:
 
 from lib.lm_config import SUB_LM  # noqa: E402
 from lib.optimize import OptimizeConfig, run_optimization  # noqa: E402
+
+
+def _load_previous_summary(path: Path) -> dict[str, Any] | None:
+    if not path.is_file():
+        return None
+    try:
+        data = json.loads(path.read_text())
+    except Exception:
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _extract_cost_rows(summary: dict[str, Any] | None) -> list[dict[str, Any]]:
+    if not summary:
+        return []
+    rows = summary.get("cumulative_costs")
+    if not isinstance(rows, list):
+        rows = summary.get("costs")
+    return [r for r in rows or [] if isinstance(r, dict)]
+
+
+def _merge_cost_rows(
+    previous: list[dict[str, Any]],
+    current: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    totals: dict[tuple[str, str], dict[str, Any]] = {}
+
+    def _add(row: dict[str, Any]) -> None:
+        role = str(row.get("role") or "unknown")
+        model = str(row.get("model") or "unknown")
+        key = (role, model)
+        if key not in totals:
+            totals[key] = {
+                "role": role,
+                "model": model,
+                "calls": 0,
+                "prompt_tokens": 0,
+                "completion_tokens": 0,
+                "cost_usd": 0.0,
+            }
+        dst = totals[key]
+        dst["calls"] += int(row.get("calls") or 0)
+        dst["prompt_tokens"] += int(row.get("prompt_tokens") or 0)
+        dst["completion_tokens"] += int(row.get("completion_tokens") or 0)
+        dst["cost_usd"] += float(row.get("cost_usd") or 0.0)
+
+    for row in previous:
+        _add(row)
+    for row in current:
+        _add(row)
+
+    return sorted(totals.values(), key=lambda r: (r["role"], r["model"]))
+
+
+def _build_summary_payload(
+    report_dict: dict[str, Any],
+    previous: dict[str, Any] | None,
+) -> dict[str, Any]:
+    current_rows = [r for r in report_dict.get("costs", []) if isinstance(r, dict)]
+    cumulative_rows = _merge_cost_rows(_extract_cost_rows(previous), current_rows)
+
+    cumulative_rollout_cost = sum(
+        float(r.get("cost_usd") or 0.0)
+        for r in cumulative_rows
+        if r.get("role") in {"main", "sub"}
+    )
+    cumulative_total_cost = sum(float(r.get("cost_usd") or 0.0) for r in cumulative_rows)
+
+    report_dict["cumulative_costs"] = cumulative_rows
+    report_dict["cumulative_rollout_cost_usd"] = cumulative_rollout_cost
+    report_dict["cumulative_optimization_cost_usd"] = (
+        cumulative_total_cost - cumulative_rollout_cost
+    )
+    report_dict["cumulative_total_cost_usd"] = cumulative_total_cost
+    return report_dict
+
+
+def _resolve_run_dir_for_cli(config: OptimizeConfig) -> Path:
+    """Resolve and pin ``config.run_dir`` before optimization starts."""
+    if config.run_dir is not None:
+        return Path(config.run_dir)
+    example_dir = Path(__file__).resolve().parent.parent
+    runs_dir = example_dir / "runs"
+    runs_dir.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    run_dir = runs_dir / f"optimize_{timestamp}"
+    config.run_dir = run_dir
+    return run_dir
+
+
+def _build_resume_argv(run_dir: Path, argv: list[str]) -> list[str]:
+    """Return ``argv`` with ``--run_dir`` set to *run_dir*."""
+    updated: list[str] = []
+    i = 0
+    saw_run_dir = False
+    while i < len(argv):
+        token = argv[i]
+        if token == "--run_dir":
+            saw_run_dir = True
+            updated.extend(["--run_dir", str(run_dir)])
+            i += 2
+            continue
+        if token.startswith("--run_dir="):
+            saw_run_dir = True
+            updated.append(f"--run_dir={run_dir}")
+            i += 1
+            continue
+        updated.append(token)
+        i += 1
+    if not saw_run_dir:
+        updated.extend(["--run_dir", str(run_dir)])
+    return updated
 
 
 def _parse_args() -> argparse.Namespace:
@@ -61,8 +176,11 @@ def _parse_args() -> argparse.Namespace:
     )
     p.add_argument(
         "--reflection_reasoning_effort",
-        default="medium",
-        help="reasoning effort for the reflection LM. Pass the empty string to omit.",
+        default=None,
+        help="reasoning effort for the reflection LM. Default: unset (no "
+        "extended thinking — matches the sibling repo's validated config). "
+        "On Claude 4.6 any non-empty value maps to adaptive thinking, which "
+        "increases cost ~2-3x on the proposer.",
     )
 
     # Datasets
@@ -144,15 +262,23 @@ def _parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 
+def _normalize_effort(value: str | None) -> str | None:
+    if not value:
+        return None
+    if value.strip().lower() == "none":
+        return None
+    return value
+
+
 def main() -> int:
     args = _parse_args()
 
     config = OptimizeConfig(
         lm=args.lm,
         sub_lm=args.sub_lm,
-        reasoning_effort=args.reasoning_effort or None,
+        reasoning_effort=_normalize_effort(args.reasoning_effort),
         reflection_lm=args.reflection_lm,
-        reflection_reasoning_effort=args.reflection_reasoning_effort or None,
+        reflection_reasoning_effort=_normalize_effort(args.reflection_reasoning_effort),
         train_dataset=args.train_dataset,
         val_ratio=args.val_ratio,
         val_limit=args.val_limit,
@@ -170,11 +296,28 @@ def main() -> int:
         run_dir=Path(args.run_dir) if args.run_dir else None,
     )
 
-    report = run_optimization(config)
+    run_dir = _resolve_run_dir_for_cli(config)
+    resume_argv = _build_resume_argv(run_dir, sys.argv[1:])
+
+    try:
+        report = run_optimization(config)
+    except KeyboardInterrupt:
+        print()
+        print("Optimization interrupted (Ctrl+C).")
+        print(f"Run dir:           {run_dir}")
+        print("To resume from this checkpoint, run:")
+        print(
+            "  python examples/spreadbench/scripts/optimize.py "
+            + shlex.join(resume_argv)
+        )
+        print("(prepend your usual uv/env-file wrapper if needed)")
+        return 130
 
     # Persist the report alongside the run dir
     report_path = Path(report.run_dir) / "optimization_summary.json"
-    report_path.write_text(json.dumps(report.to_dict(), indent=2, default=str))
+    previous_summary = _load_previous_summary(report_path)
+    summary_payload = _build_summary_payload(report.to_dict(), previous_summary)
+    report_path.write_text(json.dumps(summary_payload, indent=2, default=str))
 
     mins, secs = divmod(int(report.duration_seconds), 60)
 
@@ -197,8 +340,20 @@ def main() -> int:
             f"${c.cost_usd:>9.4f}"
         )
     print(
+        f"  {'rollouts':<10s} {'':<32s} {'':<5s}         "
+        f"{'':<27s}  ${report.rollout_cost_usd:>9.4f}"
+    )
+    print(
+        f"  {'optimize':<10s} {'':<32s} {'':<5s}         "
+        f"{'':<27s}  ${report.optimization_cost_usd:>9.4f}"
+    )
+    print(
         f"  {'total':<10s} {'':<32s} {'':<5s}         "
         f"{'':<27s}  ${report.total_cost_usd:>9.4f}"
+    )
+    print(
+        f"  {'cum_total':<10s} {'':<32s} {'':<5s}         "
+        f"{'':<27s}  ${summary_payload['cumulative_total_cost_usd']:>9.4f}"
     )
     print()
     print("Best candidate written:")
