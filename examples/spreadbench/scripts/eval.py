@@ -59,8 +59,18 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument(
         "--run_dir",
         default=None,
-        help="optional GEPA run dir to extract the best prompt from; "
-        "when omitted, the eval uses the seed ManipulateSpreadsheet docstring",
+        help="optional GEPA run dir to extract evolved components from; "
+        "when omitted, the eval uses the seed ManipulateSpreadsheet docstring "
+        "and seed skill instructions. By default both evolved components "
+        "(signature + skill) are loaded; use --only to apply just one.",
+    )
+    p.add_argument(
+        "--only",
+        choices=["signature", "skill"],
+        default=None,
+        help="when --run_dir is set, apply only one evolved component and "
+        "use the seed value for the other (useful for A/B'ing each component's "
+        "individual contribution). Default: apply both.",
     )
     p.add_argument("--limit", type=int, default=None, help="cap tasks for smoke tests")
     p.add_argument("--concurrency", type=int, default=30)
@@ -121,6 +131,7 @@ def main() -> int:
         reasoning_effort=args.reasoning_effort or None,
         dataset=args.dataset,
         run_dir=args.run_dir,
+        only=args.only,
         limit=args.limit,
         concurrency=args.concurrency,
         max_iterations=args.max_iterations,
@@ -138,7 +149,8 @@ def main() -> int:
     print("=" * 60)
     print("EVALUATION COMPLETE")
     print("=" * 60)
-    print(f"Prompt:         {report.prompt_source}")
+    print(f"Signature:      {report.signature_source} ({report.signature_length} chars)")
+    print(f"Skill:          {report.skill_source} ({report.skill_length} chars)")
     print(f"Model:          {config.lm}" + (
         f" (reasoning_effort={config.reasoning_effort})"
         if config.reasoning_effort
