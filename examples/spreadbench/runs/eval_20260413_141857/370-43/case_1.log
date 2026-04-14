@@ -1,0 +1,181 @@
+task: 370-43  case: 1
+instruction_type: Sheet-Level Manipulation
+answer_position: 'Before Insert Row'!A1:A70
+input:  /Users/gabriel/Workspace/trampoline-ai/predict-rlm.spreadbench-release/examples/spreadbench/data/testset/spreadsheet/370-43/1_370-43_init.xlsx
+answer: /Users/gabriel/Workspace/trampoline-ai/predict-rlm.spreadbench-release/examples/spreadbench/data/testset/spreadsheet/370-43/1_370-43_golden.xlsx
+============================================================
+2026-04-13 14:25:14,967 INFO RLM iteration 1/50
+Reasoning: First I should inspect the workbook structure and see what sheets/data exist, especially any “before/after” example mentioned in the instruction. I need sheet names, dimensions, and values in Column A around rows 1–30 and within A7:A1000. Then I can determine which sheet should be modified and how the workbook is laid out before writing the transformation.
+Code:
+```repl
+import os, json, textwrap
+from openpyxl import load_workbook
+
+print("Input:", input_spreadsheet)
+print("Instruction:", instruction)
+
+wb = load_workbook(input_spreadsheet)
+print("Sheets:", wb.sheetnames)
+
+for ws in wb.worksheets:
+    print(f"\nSheet: {ws.title}")
+    print("Dimensions:", ws.max_row, "rows x", ws.max_column, "cols")
+    # print rows 1-25 columns A-F
+    for r in range(1, min(ws.max_row, 25) + 1):
+        vals = [ws.cell(r, c).value for c in range(1, min(ws.max_column, 6) + 1)]
+        print(r, vals)
+    # summarize Xs in A7:A1000
+    x_rows = []
+    for r in range(7, min(ws.max_row, 1000) + 1):
+        v = ws.cell(r, 1).value
+        if isinstance(v, str) and v.strip().upper() == "X":
+            x_rows.append(r)
+    print("X rows in A7:A1000:", x_rows[:20], "count=", len(x_rows))
+```
+2026-04-13 14:25:43,571 INFO RLM iteration 2/50
+Reasoning: I’ve confirmed there is a single sheet and that Column A within A7:A1000 contains `"X"` at rows 18, 32, and 43. The instruction says to insert a row above every line where there is an `"X"` in Column A, so I should modify that sheet directly.
+
+Before saving, I want to inspect the rows around each `"X"` and also whether there are merged cells, formatting patterns, or formulas that could be affected. Then I can insert rows from bottom to top so earlier insertions don’t shift later target rows unexpectedly. After insertion, I should verify that blank rows now appear above each former `"X"` row and save to the output path with the same filename.
+Code:
+```repl
+from openpyxl import load_workbook
+import os, shutil
+
+wb = load_workbook(input_spreadsheet)
+ws = wb[wb.sheetnames[0]]
+
+# Inspect around each X row
+x_rows = []
+for r in range(7, min(ws.max_row, 1000) + 1):
+    v = ws.cell(r, 1).value
+    if isinstance(v, str) and v.strip().upper() == "X":
+        x_rows.append(r)
+
+print("Target X rows:", x_rows)
+for xr in x_rows:
+    print(f"\nAround row {xr}:")
+    for r in range(max(1, xr-2), min(ws.max_row, xr+3) + 1):
+        vals = [ws.cell(r, c).value for c in range(1, 7)]
+        print(r, vals)
+
+print("\nMerged ranges count:", len(ws.merged_cells.ranges))
+print("First merged ranges:", list(ws.merged_cells.ranges)[:10])
+
+# Perform insertion bottom-up
+for xr in sorted(x_rows, reverse=True):
+    ws.insert_rows(xr, 1)
+
+# Verify inserted rows and shifted X rows
+new_x_rows = []
+for r in range(7, min(ws.max_row, 1005) + 1):
+    v = ws.cell(r, 1).value
+    if isinstance(v, str) and v.strip().upper() == "X":
+        new_x_rows.append(r)
+
+print("\nNew X rows after insertion:", new_x_rows)
+for xr in new_x_rows:
+    print(f"\nCheck around new X row {xr}:")
+    for r in range(max(1, xr-1), min(ws.max_row, xr+1) + 1):
+        vals = [ws.cell(r, c).value for c in range(1, 7)]
+        print(r, vals)
+
+# Save output
+out_dir = "/sandbox/output/output_spreadsheet"
+os.makedirs(out_dir, exist_ok=True)
+out_path = os.path.join(out_dir, os.path.basename(input_spreadsheet))
+wb.save(out_path)
+
+print("\nSaved to:", out_path)
+print("Exists:", os.path.exists(out_path), "Size:", os.path.getsize(out_path))
+```
+2026-04-13 14:26:20,724 INFO RLM iteration 3/50
+Reasoning: The rows were inserted correctly, but I need to verify whether formulas stayed valid after the row insertions. In openpyxl, inserting rows can leave formulas unchanged, which may create incorrect or circular references in the moved total rows. I should inspect the formulas on the affected `"X"` rows in the saved file. If they are wrong, I need to regenerate the output from the original workbook and correct those formulas after inserting rows, then save again and verify.
+Code:
+```repl
+from openpyxl import load_workbook
+import os
+import re
+
+out_path = "/sandbox/output/output_spreadsheet/" + os.path.basename(input_spreadsheet)
+
+# Inspect current saved output formulas around affected rows
+wb_chk = load_workbook(out_path)
+ws_chk = wb_chk[wb_chk.sheetnames[0]]
+
+print("Current output inspection:")
+for r in [6, 19, 34, 46]:
+    vals = [ws_chk.cell(r, c).value for c in range(1, 7)]
+    print(r, vals)
+
+# If formulas are stale/circular, rebuild from original and fix formulas in the moved X rows.
+# We'll identify original X rows, insert rows bottom-up, then update formulas on the moved X rows
+# by shifting any row references in that cell's formula by +1.
+wb = load_workbook(input_spreadsheet)
+ws = wb[wb.sheetnames[0]]
+
+orig_x_rows = []
+for r in range(7, min(ws.max_row, 1000) + 1):
+    v = ws.cell(r, 1).value
+    if isinstance(v, str) and v.strip().upper() == "X":
+        orig_x_rows.append(r)
+
+print("Original X rows:", orig_x_rows)
+
+for xr in sorted(orig_x_rows, reverse=True):
+    ws.insert_rows(xr, 1)
+
+def shift_formula_rows(formula, delta=1):
+    if not isinstance(formula, str) or not formula.startswith("="):
+        return formula
+    # Shift row numbers in cell refs like F19, $F19, F$19, $F$19
+    pattern = re.compile(r'(?P<sheet>(?:\'[^\']+\'|[A-Za-z0-9_]+)!)?(?P<col>\$?[A-Z]{1,3})(?P<row>\$?\d+)')
+    def repl(m):
+        sheet = m.group('sheet') or ''
+        col = m.group('col')
+        row_token = m.group('row')
+        abs_row = row_token.startswith('$')
+        row_num = int(row_token.replace('$', '')) + delta
+        return f"{sheet}{col}{'$' if abs_row else ''}{row_num}"
+    return pattern.sub(repl, formula)
+
+# Fix formula cells on the moved X rows (now at original row + insertion count before them)
+new_x_rows = []
+for r in range(7, min(ws.max_row, 1010) + 1):
+    v = ws.cell(r, 1).value
+    if isinstance(v, str) and v.strip().upper() == "X":
+        new_x_rows.append(r)
+
+print("New X rows before formula fix:", new_x_rows)
+
+for r in new_x_rows:
+    for c in range(1, ws.max_column + 1):
+        cell = ws.cell(r, c)
+        if isinstance(cell.value, str) and cell.value.startswith("="):
+            old_formula = cell.value
+            cell.value = shift_formula_rows(cell.value, delta=1)
+            print(f"Adjusted formula at {cell.coordinate}: {old_formula} -> {cell.value}")
+
+wb.save(out_path)
+
+# Verify final result
+wb_v = load_workbook(out_path)
+ws_v = wb_v[wb_v.sheetnames[0]]
+print("\nFinal verification:")
+for r in [18, 19, 33, 34, 45, 46]:
+    vals = [ws_v.cell(r, c).value for c in range(1, 7)]
+    print(r, vals)
+
+print("Saved:", out_path, os.path.exists(out_path), os.path.getsize(out_path))
+```
+2026-04-13 14:26:38,368 INFO RLM iteration 4/50
+Reasoning: The workbook has been modified and verified: blank rows were inserted above each `"X"` in Column A within the target range, and the affected subtotal formulas were corrected after the row insertions. The output file is saved in the required directory with the same filename. The next step is to submit that output path only.
+Code:
+```repl
+output_path = "/sandbox/output/output_spreadsheet/1_370-43_init.xlsx"
+SUBMIT(output_spreadsheet=output_path)
+```
+
+============================================================
+recalc_source: libreoffice
+score:         1.0000  PASS
+All 70 cells match

@@ -1,0 +1,137 @@
+task: 414-20  case: 1
+instruction_type: Sheet-Level Manipulation
+answer_position: 'Sheet1'!A4:A18
+input:  /Users/gabriel/Workspace/trampoline-ai/predict-rlm.spreadbench-release/examples/spreadbench/data/testset/spreadsheet/414-20/1_414-20_init.xlsx
+answer: /Users/gabriel/Workspace/trampoline-ai/predict-rlm.spreadbench-release/examples/spreadbench/data/testset/spreadsheet/414-20/1_414-20_golden.xlsx
+============================================================
+2026-04-14 10:54:10,220 INFO RLM iteration 1/50
+Reasoning: Need inspect workbook thoroughly first: list sheets, dimensions, headers/sample rows, find first occurrence of "Invoice No." in col A case-insensitive, and likely target is deleting rows above on relevant sheet(s). Then perform deletion, save, recalc, verify top row starts at found row.
+Code:
+```repl
+import os, shutil
+from openpyxl import load_workbook
+
+print("Input:", input_spreadsheet)
+print("Instruction:", instruction)
+
+wb = load_workbook(input_spreadsheet)
+orig_sheet_names = wb.sheetnames
+print("Sheet names:", orig_sheet_names)
+
+def row_values(ws, r, max_cols=None):
+    mc = max_cols or ws.max_column
+    return [ws.cell(r, c).value for c in range(1, mc+1)]
+
+inspection = {}
+targets = []
+
+for ws in wb.worksheets:
+    print(f"\n--- Sheet: {ws.title} ---")
+    print("max_row:", ws.max_row, "max_col:", ws.max_column)
+    headers = row_values(ws, 1, ws.max_column)
+    print("Row 1 values / headers:", headers)
+    first_rows = []
+    for r in range(1, min(ws.max_row, 10) + 1):
+        first_rows.append((r, row_values(ws, r, min(ws.max_column, 8))))
+    last_rows = []
+    start_last = max(1, ws.max_row - 4)
+    for r in range(start_last, ws.max_row + 1):
+        last_rows.append((r, row_values(ws, r, min(ws.max_column, 8))))
+    print("First rows sample:", first_rows)
+    print("Last rows sample:", last_rows)
+    
+    match_rows = []
+    for r in range(1, ws.max_row + 1):
+        val = ws.cell(r, 1).value
+        if isinstance(val, str) and val.strip().lower() == "invoice no.":
+            match_rows.append(r)
+        elif val is not None and str(val).strip().lower() == "invoice no.":
+            match_rows.append(r)
+    print("Matching 'Invoice No.' rows in col A:", match_rows[:10], "count=", len(match_rows))
+    if match_rows:
+        first_match = match_rows[0]
+        around = []
+        for r in range(max(1, first_match-3), min(ws.max_row, first_match+3)+1):
+            around.append((r, row_values(ws, r, min(ws.max_column, 8))))
+        print("Rows around first match:", around)
+        targets.append((ws.title, first_match))
+    inspection[ws.title] = {"matches": match_rows}
+
+print("\nTargets found:", targets)
+```
+2026-04-14 10:55:03,339 INFO RLM iteration 2/50
+Reasoning: We inspected thoroughly. There is one sheet, Sheet1, with the first case-insensitive exact occurrence of "Invoice No." in A14. The target action is to delete rows 1:13 so row 14 becomes the new row 1, preserving that row and anything below. Need save to output path, recalculate, reload, verify top rows and sheet names.
+Code:
+```repl
+import os, shutil
+from openpyxl import load_workbook
+
+infile = input_spreadsheet
+filename = os.path.basename(infile)
+outdir = "/sandbox/output/output_spreadsheet"
+outfile = os.path.join(outdir, filename)
+os.makedirs(outdir, exist_ok=True)
+
+# Reload fresh workbook for modification
+wb = load_workbook(infile)
+orig_sheet_names = wb.sheetnames[:]
+
+modifications = []
+for ws in wb.worksheets:
+    first_match = None
+    for r in range(1, ws.max_row + 1):
+        val = ws.cell(r, 1).value
+        if val is not None and str(val).strip().lower() == "invoice no.":
+            first_match = r
+            break
+    if first_match and first_match > 1:
+        print(f"Deleting rows 1:{first_match-1} on sheet {ws.title}")
+        ws.delete_rows(1, first_match - 1)
+        modifications.append((ws.title, first_match))
+    else:
+        print(f"No deletion needed on sheet {ws.title}; first_match={first_match}")
+
+wb.save(outfile)
+print("Saved to:", outfile)
+
+recalc_result = await recalculate(outfile)
+print("Recalc:", recalc_result)
+
+# Ensure sheet names preserved after recalculation
+wb_check = load_workbook(outfile)
+if wb_check.sheetnames != orig_sheet_names:
+    print("Sheet names changed after recalc:", wb_check.sheetnames, "-> restoring", orig_sheet_names)
+    # rename sheets positionally if counts match
+    if len(wb_check.sheetnames) == len(orig_sheet_names):
+        for ws, orig_name in zip(wb_check.worksheets, orig_sheet_names):
+            ws.title = orig_name
+        wb_check.save(outfile)
+    else:
+        print("Warning: sheet count mismatch; not renaming automatically")
+else:
+    print("Sheet names preserved:", wb_check.sheetnames)
+
+# Verify with data_only reload
+verify_wb = load_workbook(outfile, data_only=True)
+print("Verification sheet names:", verify_wb.sheetnames)
+for ws in verify_wb.worksheets:
+    print(f"Sheet {ws.title}: max_row={ws.max_row}, max_col={ws.max_column}")
+    top_rows = []
+    for r in range(1, min(ws.max_row, 5) + 1):
+        top_rows.append((r, [ws.cell(r, c).value for c in range(1, ws.max_column + 1)]))
+    print("Top rows after deletion:", top_rows)
+    print("A1 value:", ws["A1"].value)
+
+output_spreadsheet = outfile
+```
+2026-04-14 10:55:09,587 INFO RLM iteration 3/50
+Reasoning: The workbook has been inspected, modified, saved, recalculated, and verified successfully. The target sheet is `Sheet1`, and rows 1–13 were deleted so that the first occurrence of `Invoice No.` in column A is now at `A1`. Verification shows the output is correct. Next step is to submit the output spreadsheet path only.
+Code:
+```repl
+SUBMIT(output_spreadsheet=output_spreadsheet)
+```
+
+============================================================
+recalc_source: baseline
+score:         1.0000  PASS
+All 15 cells match

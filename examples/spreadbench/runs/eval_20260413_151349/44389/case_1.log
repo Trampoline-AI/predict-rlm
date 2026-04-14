@@ -1,0 +1,163 @@
+task: 44389  case: 1
+instruction_type: Cell-Level Manipulation
+answer_position: P2:P7
+input:  /Users/gabriel/Workspace/trampoline-ai/predict-rlm.spreadbench-release/examples/spreadbench/data/testset/spreadsheet/44389/1_44389_init.xlsx
+answer: /Users/gabriel/Workspace/trampoline-ai/predict-rlm.spreadbench-release/examples/spreadbench/data/testset/spreadsheet/44389/1_44389_golden.xlsx
+============================================================
+2026-04-13 15:24:20,604 INFO RLM iteration 1/50
+Reasoning: We need to add a column that, for each row, returns the header(s) of the smallest positive value in that row.  
+- Load the workbook from the provided path.  
+- Determine the existing data range (all columns except the new result column).  
+- Insert a new column after the last existing column and label it (e.g., "MinPosHeader").  
+- For each data row, write a LibreOffice‑compatible formula that:  
+  1. Finds the minimum value > 0 with `MINIFS`.  
+  2. Uses `IF` to compare each cell in the row to that minimum.  
+  3. Returns the matching header(s) via `_xlfn.TEXTJOIN(",", TRUE, …)`.  
+- Save the modified workbook to the output directory with the same filename.  
+- Recalculate formulas to ensure they are cached, then reload with `data_only=True` for a quick sanity check.  
+
+The formula (LibreOffice‑compatible) looks like:  
+
+```
+=_xlfn.TEXTJOIN(",", TRUE, IF(B2:Z2=MINIFS(B2:Z2, B2:Z2, ">0"), $B$1:$Z$1, ""))
+```
+
+where `B2:Z2` and `$B$1:$Z$1` are the data and header ranges for that row.  
+The code will construct these ranges dynamically for each row.
+Code:
+```repl
+import os
+from openpyxl import load_workbook
+from openpyxl.utils import get_column_letter
+
+# Paths
+input_path = input_spreadsheet  # provided variable
+output_dir = "/sandbox/output/output_spreadsheet/"
+os.makedirs(output_dir, exist_ok=True)
+output_path = os.path.join(output_dir, os.path.basename(input_path))
+
+# Load workbook (read/write)
+wb = load_workbook(input_path)
+ws = wb.active  # assume single sheet
+
+# Determine original max column before we insert the result column
+orig_max_col = ws.max_column
+orig_max_row = ws.max_row
+
+# Insert a new column after the last existing column
+result_col_idx = orig_max_col + 1
+ws.insert_cols(result_col_idx)
+
+# Set header for the new column
+ws.cell(row=1, column=result_col_idx, value="MinPosHeader")
+
+# Build column letters for the data range (original columns only)
+start_col_letter = get_column_letter(1)
+end_col_letter = get_column_letter(orig_max_col)
+
+# Header range (absolute references)
+header_range = f"${start_col_letter}$1:${end_col_letter}$1"
+
+# For each data row, write the formula
+for row in range(2, orig_max_row + 1):
+    data_range = f"{start_col_letter}{row}:{end_col_letter}{row}"
+    formula = (
+        f"=_xlfn.TEXTJOIN(\",\", TRUE, IF({data_range}=MINIFS({data_range}, {data_range}, \">0\"), "
+        f"{header_range}, \"\"))"
+    )
+    ws.cell(row=row, column=result_col_idx, value=formula)
+
+# Save the modified workbook
+wb.save(output_path)
+
+# Recalculate formulas to cache values (optional verification)
+recalc_result = await recalculate(output_path)
+print("Recalculate result:", recalc_result)
+
+# Load with data_only to verify a few cells (debug only)
+wb_check = load_workbook(output_path, data_only=True)
+ws_check = wb_check.active
+print("Sample output values:")
+for r in range(2, min(5, orig_max_row + 1)):
+    print(f"Row {r}:", ws_check.cell(row=r, column=result_col_idx).value)
+```
+2026-04-13 15:26:59,791 INFO RLM iteration 2/50
+Reasoning: The previous attempt used `MINIFS`, which is not supported by LibreOffice Calc, resulting in incorrect or empty outputs.  
+To obtain the smallest positive value in a row we can use `AGGREGATE(15,6,range/(range>0),1)`, which LibreOffice supports (via the `_xlfn.AGGREGATE` prefix).  
+We then compare each cell in the row to that aggregate result and join the matching column headers with `_xlfn.TEXTJOIN`.  
+The new formula for a row `r` (data columns B‑Z) is:
+
+```
+=_xlfn.TEXTJOIN(",",TRUE,IF(B2:Z2=_xlfn.AGGREGATE(15,6,B2:Z2/(B2:Z2>0),1),$B$1:$Z$1,""))
+```
+
+We will:
+1. Load the workbook.
+2. Insert a new column after the existing data (if not already present).
+3. Write the corrected formula for each data row, using the dynamic column range based on the original max column.
+4. Save to the output directory.
+5. Recalculate formulas and verify a few rows.
+Code:
+```repl
+import os
+from openpyxl import load_workbook
+from openpyxl.utils import get_column_letter
+
+# Paths
+input_path = input_spreadsheet
+output_dir = "/sandbox/output/output_spreadsheet/"
+os.makedirs(output_dir, exist_ok=True)
+output_path = os.path.join(output_dir, os.path.basename(input_path))
+
+# Load workbook (read/write)
+wb = load_workbook(input_path)
+ws = wb.active  # assume single sheet
+
+# Determine original data range (exclude any previously added result column)
+orig_max_col = ws.max_column
+orig_max_row = ws.max_row
+
+# Check if the last column already contains our header; if so, reuse it
+header_cell = ws.cell(row=1, column=orig_max_col)
+if header_cell.value == "MinPosHeader":
+    result_col_idx = orig_max_col
+    # Do not insert a new column; just overwrite formulas
+else:
+    # Insert a new column after the last existing column
+    result_col_idx = orig_max_col + 1
+    ws.insert_cols(result_col_idx)
+    ws.cell(row=1, column=result_col_idx, value="MinPosHeader")
+
+# Column letters for original data columns (1 .. orig_max_col if result column not yet added)
+data_start_col = 1
+data_end_col = orig_max_col if result_col_idx != orig_max_col + 1 else orig_max_col
+
+start_letter = get_column_letter(data_start_col)
+end_letter = get_column_letter(data_end_col)
+
+# Header range (absolute)
+header_range = f"${start_letter}$1:${end_letter}$1"
+
+# Write formula for each data row
+for row in range(2, orig_max_row + 1):
+    data_range = f"{start_letter}{row}:{end_letter}{row}"
+    formula = (
+        f"=_xlfn.TEXTJOIN(\",\", TRUE, IF({data_range}= _xlfn.AGGREGATE(15,6,{data_range}/({data_range}>0),1), "
+        f"{header_range}, \"\"))"
+    )
+    ws.cell(row=row, column=result_col_idx, value=formula)
+
+# Save workbook
+wb.save(output_path)
+
+# Recalculate formulas to cache values
+recalc_result = await recalculate(output_path)
+print("Recalculate result:", recalc_result)
+
+# Verify a few rows (data_only)
+wb_check = load_workbook(output_path, data_only=True)
+ws_check = wb_check.active
+print("Sample output values:")
+for r in range(2, min(6, orig_max_row + 1)):
+    print(f"Row {r}:", ws_check.cell(row=r, column=result_col_idx).value)
+```

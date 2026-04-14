@@ -1,0 +1,100 @@
+task: 49196  case: 1
+instruction_type: Cell-Level Manipulation
+answer_position: C2:C47
+input:  /Users/gabriel/Workspace/trampoline-ai/predict-rlm.spreadbench-release/examples/spreadbench/data/testset/spreadsheet/49196/1_49196_init.xlsx
+answer: /Users/gabriel/Workspace/trampoline-ai/predict-rlm.spreadbench-release/examples/spreadbench/data/testset/spreadsheet/49196/1_49196_golden.xlsx
+============================================================
+2026-04-13 14:31:28,601 INFO RLM iteration 1/50
+Reasoning: First I need to inspect the workbook structure and read the full instruction carefully. Then I can identify which sheet/column C formula needs modification, update it using openpyxl, save to the output path, and verify the changed cells/formulas.
+Code:
+```repl
+import os, shutil, json
+from openpyxl import load_workbook
+
+print("Input file:", input_spreadsheet)
+print("Instruction:", instruction)
+
+# Inspect workbook structure
+wb = load_workbook(input_spreadsheet)
+print("Sheet names:", wb.sheetnames)
+
+for ws in wb.worksheets:
+    print(f"\nSheet: {ws.title}")
+    print("Dimensions:", ws.max_row, "rows x", ws.max_column, "cols")
+    # Print first few rows/cols to understand structure
+    for row in ws.iter_rows(min_row=1, max_row=min(8, ws.max_row), values_only=True):
+        print(row)
+
+# Also inspect formulas in column C and relevant columns K around first rows
+for ws in wb.worksheets:
+    print(f"\nFormula scan for sheet {ws.title}:")
+    for r in range(1, min(ws.max_row, 12) + 1):
+        vals = [ws.cell(r, c).value for c in [1,2,3,10,11]]
+        print(f"Row {r}: A,B,C,J,K = {vals}")
+```
+2026-04-13 14:31:58,327 INFO RLM iteration 2/50
+Reasoning: The workbook has one sheet, `Sheet1`, with 47 rows and 12 columns. Column C contains formulas that currently:
+- build a date using pieces of column K,
+- force the year from `TEXT(TODAY(),"yy")`,
+- and therefore won’t change to `22` when K’s year becomes `22`.
+
+The instruction also says the source data in column K uses periods (`.`) instead of slashes (`/`), and the output should use slashes in UK-style dates without manual replacing.
+
+A literal fix is to change the formula in column C so it uses the year from column K itself and replaces periods with slashes. The simplest robust formula is:
+`=SUBSTITUTE(LEFT(K2,8),".","/")&MID(K2,FIND(" ",K2),6)`
+
+Why:
+- `LEFT(K2,8)` extracts `dd.mm.yy`
+- `SUBSTITUTE(...,".","/")` converts it to `dd/mm/yy`
+- `MID(K2,FIND(" ",K2),6)` appends the time portion like ` 14:28`
+
+I should update all formula cells in column C from row 2 through the data rows, preserve the workbook otherwise, save it to the output folder with the same filename, and verify the saved formulas.
+Code:
+```repl
+import os, shutil
+from openpyxl import load_workbook
+
+infile = input_spreadsheet
+outfile = os.path.join("/sandbox/output/output_spreadsheet", os.path.basename(infile))
+
+# Load workbook normally to preserve formulas/styles
+wb = load_workbook(infile)
+ws = wb["Sheet1"]
+
+# Update formulas in column C for data rows
+updated = []
+for r in range(2, ws.max_row + 1):
+    k_val = ws[f"K{r}"].value
+    c_val = ws[f"C{r}"].value
+    # Only update rows that appear to contain data/formulas tied to K
+    if k_val not in (None, ""):
+        new_formula = f'=SUBSTITUTE(LEFT(K{r},8),".","/")&MID(K{r},FIND(" ",K{r}),6)'
+        ws[f"C{r}"] = new_formula
+        updated.append((r, new_formula, k_val))
+
+wb.save(outfile)
+
+# Verify saved workbook and inspect representative rows
+wb_verify = load_workbook(outfile, data_only=False)
+wsv = wb_verify["Sheet1"]
+
+print("Saved to:", outfile)
+print("Updated rows:", len(updated))
+for r in [2, 3, 10, 12, 20, ws.max_row]:
+    print(
+        r,
+        "K=", wsv[f"K{r}"].value,
+        "C formula=", wsv[f"C{r}"].value
+    )
+```
+2026-04-13 14:32:14,987 INFO RLM iteration 3/50
+Reasoning: The workbook has been updated and verified: column C formulas now pull the full date directly from column K, converting periods to slashes so dates like `16.01.22 00:53` become `16/01/22 00:53`, which satisfies the instruction and updates the year automatically when K changes to `22`. The output file is saved in the required directory with the same filename. Next step is to submit the output path only.
+Code:
+```repl
+SUBMIT(output_spreadsheet="/sandbox/output/output_spreadsheet/1_49196_init.xlsx")
+```
+
+============================================================
+recalc_source: formulas
+score:         1.0000  PASS
+All 46 cells match

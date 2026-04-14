@@ -1,0 +1,198 @@
+task: 374-31  case: 1
+instruction_type: Sheet-Level Manipulation
+answer_position: 'Sheet1'!A1:D5
+input:  /Users/gabriel/Workspace/trampoline-ai/predict-rlm.spreadbench-release/examples/spreadbench/data/testset/spreadsheet/374-31/1_374-31_init.xlsx
+answer: /Users/gabriel/Workspace/trampoline-ai/predict-rlm.spreadbench-release/examples/spreadbench/data/testset/spreadsheet/374-31/1_374-31_golden.xlsx
+============================================================
+2026-04-14 10:14:42,816 INFO RLM iteration 1/50
+Reasoning: I need first inspect the workbook thoroughly before modifying anything: list sheet names, dimensions, headers, and sample rows from each sheet; also locate rows in column A containing "Code" and examine surrounding blank/nonblank rows to infer exactly which blank rows should be deleted. Then I can implement the row-deletion logic directly in the workbook, save, recalculate, reload, and verify the targeted areas.
+Code:
+```repl
+import os, json, shutil
+from openpyxl import load_workbook
+from openpyxl.utils import get_column_letter
+
+print("Input:", input_spreadsheet)
+print("Instruction:", instruction)
+
+wb = load_workbook(input_spreadsheet)
+orig_sheet_names = wb.sheetnames[:]
+print("Original sheet names:", orig_sheet_names)
+
+def row_values(ws, r, max_cols=None):
+    if max_cols is None:
+        max_cols = ws.max_column
+    vals = []
+    for c in range(1, max_cols + 1):
+        vals.append(ws.cell(r, c).value)
+    return vals
+
+def is_blank_row(ws, r):
+    for c in range(1, ws.max_column + 1):
+        v = ws.cell(r, c).value
+        if v is not None and str(v) != "":
+            return False
+    return True
+
+for ws in wb.worksheets:
+    print("\n--- SHEET:", ws.title, "---")
+    print("max_row:", ws.max_row, "max_column:", ws.max_column)
+    headers = row_values(ws, 1, ws.max_column)
+    print("Row 1 headers/values:", headers)
+    
+    # first 10 rows
+    print("First rows:")
+    for r in range(1, min(ws.max_row, 10) + 1):
+        print(r, row_values(ws, r, min(ws.max_column, 10)))
+    
+    # last 5 rows
+    print("Last rows:")
+    start = max(1, ws.max_row - 4)
+    for r in range(start, ws.max_row + 1):
+        print(r, row_values(ws, r, min(ws.max_column, 10)))
+    
+    # Find "Code" in col A
+    code_rows = []
+    for r in range(1, ws.max_row + 1):
+        v = ws.cell(r, 1).value
+        if isinstance(v, str) and v.strip() == "Code":
+            code_rows.append(r)
+    print('Rows with exact "Code" in column A:', code_rows[:50], "count=", len(code_rows))
+    
+    # Print surrounding context for first several Code rows
+    for cr in code_rows[:10]:
+        print(f"Context around Code row {cr}:")
+        for r in range(max(1, cr-3), min(ws.max_row, cr+3) + 1):
+            print(" ", r, row_values(ws, r, min(ws.max_column, 8)), "blank_row=", is_blank_row(ws, r))
+```
+2026-04-14 10:15:22,216 INFO RLM iteration 2/50
+Reasoning: The workbook inspection shows only one sheet and one `"Code"` row at row 4. Critically, rows 1–3 are **not** blank rows; they contain values in columns B and/or D. So there are currently **no fully blank rows immediately above** a `"Code"` row to delete.
+
+I should still implement the requested logic generically and safely:
+1. Reload/copy the workbook.
+2. For each sheet, find rows where column A is exactly `"Code"`.
+3. For each such row, look upward and delete only the **contiguous fully blank rows immediately above it**.
+4. Preserve all rows below `"Code"` and any nonblank rows above it.
+5. Save to the required output directory with the same filename.
+6. Recalculate, reload, restore original sheet names if needed, and verify the relevant area around the `"Code"` row.
+
+Since this file has no matching blank rows, the result will likely be unchanged, but that is the correct outcome based on the actual data.
+Code:
+```repl
+import os, shutil
+from openpyxl import load_workbook
+
+infile = input_spreadsheet
+outdir = "/sandbox/output/output_spreadsheet"
+os.makedirs(outdir, exist_ok=True)
+outfile = os.path.join(outdir, os.path.basename(infile))
+
+# Copy input file first, then modify the copy
+shutil.copy2(infile, outfile)
+
+wb2 = load_workbook(outfile)
+original_sheet_names = wb2.sheetnames[:]
+
+def row_vals(ws, r, max_cols=None):
+    max_cols = max_cols or ws.max_column
+    return [ws.cell(r, c).value for c in range(1, max_cols + 1)]
+
+def is_fully_blank_row(ws, r):
+    for c in range(1, ws.max_column + 1):
+        v = ws.cell(r, c).value
+        if v is not None and str(v) != "":
+            return False
+    return True
+
+deletions_summary = {}
+
+for ws in wb2.worksheets:
+    code_rows = []
+    for r in range(1, ws.max_row + 1):
+        v = ws.cell(r, 1).value
+        if isinstance(v, str) and v.strip() == "Code":
+            code_rows.append(r)
+
+    # Determine exact blank rows immediately above each Code row
+    rows_to_delete = set()
+    contexts = []
+    for cr in code_rows:
+        blank_block = []
+        r = cr - 1
+        while r >= 1 and is_fully_blank_row(ws, r):
+            blank_block.append(r)
+            r -= 1
+        contexts.append((cr, list(reversed(blank_block))))
+        rows_to_delete.update(blank_block)
+
+    print(f"Sheet {ws.title}: code_rows={code_rows}")
+    print(f"Sheet {ws.title}: blank rows immediately above each Code row={contexts}")
+
+    # Delete bottom-up so row indices remain valid
+    for r in sorted(rows_to_delete, reverse=True):
+        ws.delete_rows(r, 1)
+
+    deletions_summary[ws.title] = sorted(rows_to_delete)
+
+wb2.save(outfile)
+print("Saved output to:", outfile)
+print("Deletion summary:", deletions_summary)
+
+# Recalculate
+recalc_result = await recalculate(outfile)
+print("Recalculate result:", recalc_result)
+
+# Reload and restore sheet names if recalculate altered them
+wb_check = load_workbook(outfile)
+current_names = wb_check.sheetnames[:]
+print("Sheet names after recalc:", current_names)
+
+if current_names != original_sheet_names and len(current_names) == len(original_sheet_names):
+    for ws, desired in zip(wb_check.worksheets, original_sheet_names):
+        ws.title = desired
+    wb_check.save(outfile)
+    print("Restored original sheet names:", original_sheet_names)
+
+# Verification with data_only
+wb_verify = load_workbook(outfile, data_only=True)
+print("Verified sheet names:", wb_verify.sheetnames)
+
+for ws in wb_verify.worksheets:
+    print(f"\nVERIFY SHEET: {ws.title}")
+    print("max_row:", ws.max_row, "max_column:", ws.max_column)
+    code_rows_after = []
+    for r in range(1, ws.max_row + 1):
+        v = ws.cell(r, 1).value
+        if isinstance(v, str) and v.strip() == "Code":
+            code_rows_after.append(r)
+    print("Code rows after:", code_rows_after)
+
+    # Print all rows for this small sheet to verify exact output
+    for r in range(1, ws.max_row + 1):
+        print(r, row_vals(ws, r, ws.max_column), "blank=", is_fully_blank_row(ws, r))
+
+output_spreadsheet = outfile
+```
+2026-04-14 10:16:02,232 INFO RLM iteration 3/50
+Reasoning: I’ve fully inspected the workbook, implemented the row-deletion logic safely, saved the modified file, recalculated, reloaded, and verified the result. The workbook contains no fully blank rows immediately above a `"Code"` cell in column A, so the correct output is an unchanged workbook with the requested logic applied. The output file path is stored in `output_spreadsheet`, so the next step is to submit it.
+Code:
+```repl
+SUBMIT(output_spreadsheet=output_spreadsheet)
+```
+
+============================================================
+recalc_source: baseline
+score:         0.4000  FAIL
+Sheet 'Sheet1' range A1:D5: 8/20 cells match
+  Sheet1!A1: expected='Code' got=None
+  Sheet1!A2: expected=98715 got=None
+  Sheet1!A4: expected=None got='Code'
+  Sheet1!A5: expected=None got=98715
+  Sheet1!B1: expected='Name' got=None
+  Sheet1!B2: expected='Dave Marks' got='BR1 Southern SalesLedgerOutstandingTransactions ALL AUG21.csv'
+  Sheet1!B3: expected=None got=44449.47810185186
+  Sheet1!B4: expected=None got='Name'
+  Sheet1!B5: expected=None got='Dave Marks'
+  Sheet1!C1: expected='Address1' got=None
+  Sheet1!C4: expected=None got='Address1'
+  Sheet1!D1: expected=None got='Address2'

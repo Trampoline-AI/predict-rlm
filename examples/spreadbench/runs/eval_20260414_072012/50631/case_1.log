@@ -1,0 +1,466 @@
+task: 50631  case: 1
+instruction_type: Cell-Level Manipulation
+answer_position: H7:H38
+input:  /Users/gabriel/Workspace/trampoline-ai/predict-rlm.spreadbench-release/examples/spreadbench/data/testset/spreadsheet/50631/1_50631_init.xlsx
+answer: /Users/gabriel/Workspace/trampoline-ai/predict-rlm.spreadbench-release/examples/spreadbench/data/testset/spreadsheet/50631/1_50631_golden.xlsx
+============================================================
+2026-04-14 07:41:37,171 INFO RLM iteration 1/50
+Reasoning: We need to inspect the input workbook to understand its sheets, headers, and sample data. The instruction mentions recreating Sheet1 exactly, preserving formulas in columns B, D, F, applying fill color #FFFF00 where appropriate, hiding gridlines, using Calibri font, and fixing a WORKDAY formula in column H that references dates in B and F and holidays in J. First, load the workbook, list sheet names, get header row of Sheet1, and print first few rows and last few rows. Also inspect columns B, D, F, H, J for formulas and values.
+Code:
+```repl
+import openpyxl, os, json
+from openpyxl.utils import get_column_letter
+
+# Load workbook
+wb_path = '/sandbox/input/input_spreadsheet/1_50631_init.xlsx'
+wb = openpyxl.load_workbook(wb_path, data_only=False)
+
+print('Sheet names:', wb.sheetnames)
+
+ws = wb['Sheet1']
+# Determine max row and column
+max_row = ws.max_row
+max_col = ws.max_column
+print('Sheet1 dimensions: rows', max_row, 'cols', max_col)
+
+# Get header row (assume first row)
+headers = [ws.cell(row=1, column=c).value for c in range(1, max_col+1)]
+print('Headers:', headers)
+
+# Print first 5 data rows
+print('First 5 rows:')
+for r in range(2, min(2+5, max_row+1)):
+    row_vals = [ws.cell(row=r, column=c).value for c in range(1, max_col+1)]
+    print(r, row_vals)
+
+# Print last 5 data rows
+print('Last 5 rows:')
+for r in range(max(max_row-4, 2), max_row+1):
+    row_vals = [ws.cell(row=r, column=c).value for c in range(1, max_col+1)]
+    print(r, row_vals)
+
+# Inspect columns B, D, F, H, J for formulas in first few rows
+cols_to_check = {'B':2, 'D':4, 'F':6, 'H':8, 'J':10}
+for col_letter, col_idx in cols_to_check.items():
+    print(f'Column {col_letter} formulas (first 5 rows):')
+    for r in range(2, min(7, max_row+1)):
+        cell = ws.cell(row=r, column=col_idx)
+        if isinstance(cell.value, str) and cell.value.startswith('='):
+            print(r, cell.value)
+        else:
+            print(r, 'no formula')
+
+# Save workbook to output path for later modifications
+output_dir = '/sandbox/output/output_spreadsheet/'
+os.makedirs(output_dir, exist_ok=True)
+output_path = os.path.join(output_dir, '1_50631_init.xlsx')
+wb.save(output_path)
+print('Saved copy to', output_path)
+```
+2026-04-14 07:42:13,941 INFO RLM iteration 2/50
+Reasoning: We have inspected the input workbook. It contains a single sheet "Sheet1" with 38 rows and 10 columns. Columns B, D, F contain date‑sequence formulas (e.g., `=IF($B$3+ROWS($B$7:$B34)-1<=$F$3,$B$3+ROWS($B$7:$B34)-1,"")`). Column H contains a WORKDAY formula that currently lacks the holidays argument, causing a #VALUE! error. Column J holds the list of holiday dates (rows 5‑6 in the sample, but we will detect the full range).  
+
+The task is to recreate Sheet1 exactly, preserving all existing formulas in B, D, and F, apply a yellow fill (`#FFFF00`) where appropriate, hide gridlines, use Calibri font throughout, and fix the WORKDAY formula in column H to include the holidays from column J.
+
+**Plan**
+1. Load the workbook (read‑write) and get a reference to Sheet1.
+2. Determine the last row that contains a holiday in column J – this will be the holiday range for the WORKDAY function.
+3. Iterate over all rows that have a WORKDAY formula in column H (rows 7‑38 based on the sample) and replace the formula with one that includes the holiday range, e.g.:  
+   `=IF($B$3+ROWS($B$7:$B34)-1<=$F$3,WORKDAY($B$3+ROWS($B$7:$B34)-1,$J$5:$J$<last_holiday_row>),"")`
+   – Note: we keep the original `IF` wrapper and only modify the `WORKDAY` part.
+4. Apply a solid yellow fill (`#FFFF00`) to the same cells in column H that contain the WORKDAY formula (the “appropriate” fill).
+5. Set the worksheet view to hide gridlines (`ws.sheet_view.showGridLines = False`).
+6. Set the font of **all** cells in the sheet to Calibri (size 11, default).
+7. Save the modified workbook to the output directory with the same filename.
+8. Call `recalculate` on the saved file, then reload it (data_only=True) to verify that the target cells now contain values (no `None` or errors).
+9. Finally, submit the path of the output spreadsheet.
+
+**Implementation notes**
+- Use `openpyxl` for all manipulations.
+- Use `PatternFill` for the yellow background.
+- Use `Font` for Calibri.
+- Ensure we do **not** alter any existing formulas in columns B, D, or F.
+- Preserve the original sheet name.
+
+Now we will execute the plan.
+Code:
+```repl
+import openpyxl
+from openpyxl.styles import PatternFill, Font
+from openpyxl.utils import get_column_letter
+import os
+
+# Paths
+input_path = '/sandbox/input/input_spreadsheet/1_50631_init.xlsx'
+output_dir = '/sandbox/output/output_spreadsheet/'
+os.makedirs(output_dir, exist_ok=True)
+output_path = os.path.join(output_dir, '1_50631_init.xlsx')
+
+# Load workbook (keep formulas)
+wb = openpyxl.load_workbook(input_path, data_only=False)
+ws = wb['Sheet1']
+
+# 1. Determine holiday range in column J (index 10)
+holiday_col = 10
+last_holiday_row = 0
+for r in range(2, ws.max_row + 1):
+    val = ws.cell(row=r, column=holiday_col).value
+    if isinstance(val, (int, float, str, openpyxl.cell.cell.Cell)):
+        # any non‑None value counts as a holiday entry
+        last_holiday_row = r
+# If no holidays found, default to row 1 (empty range)
+if last_holiday_row < 2:
+    holiday_range = "$J$1:$J$1"
+else:
+    holiday_range = f"$J$5:${get_column_letter(holiday_col)}${last_holiday_row}"
+
+# 2. Update WORKDAY formulas in column H (index 8)
+workday_col = 8
+yellow_fill = PatternFill(start_color="FFFF00", end_color="FFFF00", fill_type="solid")
+for r in range(7, ws.max_row + 1):  # based on sample, data starts at row 7
+    cell = ws.cell(row=r, column=workday_col)
+    if isinstance(cell.value, str) and cell.value.startswith('='):
+        # Original pattern: =IF($B$3+ROWS($B$7:$B34)-1<=$F$3,WORKDAY($B$3+ROWS($B$7:$B34)-1,""))
+        # We replace the empty string argument with the holiday range.
+        # Extract the part before WORKDAY and after it.
+        # Simple approach: replace the last occurrence of 'WORKDAY(' and the closing ')'
+        import re
+        # Find the inner WORKDAY call
+        match = re.search(r'WORKDAY\(([^)]+)\)', cell.value)
+        if match:
+            inner = match.group(1)  # e.g., "$B$3+ROWS($B$7:$B34)-1"
+            # Build new WORKDAY with holidays
+            new_workday = f"WORKDAY({inner},{holiday_range})"
+            # Replace the old WORKDAY call with the new one
+            new_formula = cell.value[:match.start()] + new_workday + cell.value[match.end():]
+            cell.value = new_formula
+            # Apply yellow fill as "appropriate"
+            cell.fill = yellow_fill
+
+# 3. Hide gridlines
+ws.sheet_view.showGridLines = False
+
+# 4. Set Calibri font for all cells
+calibri_font = Font(name='Calibri', size=11)
+for row in ws.iter_rows(min_row=1, max_row=ws.max_row, min_col=1, max_col=ws.max_column):
+    for cell in row:
+        cell.font = calibri_font
+
+# Save modified workbook
+wb.save(output_path)
+
+# Recalculate formulas
+await recalculate(output_path)
+
+# Verify that column H cells now have values (data_only load)
+wb_check = openpyxl.load_workbook(output_path, data_only=True)
+ws_check = wb_check['Sheet1']
+print("Verification of column H after recalculation (first 5 data rows):")
+for r in range(7, min(12, ws_check.max_row + 1)):
+    val = ws_check.cell(row=r, column=workday_col).value
+    print(r, val)
+
+# End of processing
+```
+2026-04-14 07:43:05,242 INFO RLM iteration 3/50
+Reasoning: The previous attempt replaced the WORKDAY call but kept the empty second argument (`""`), which still causes a #VALUE! error. The correct WORKDAY syntax is `WORKDAY(start_date, days, [holidays])`. To return the workday for the start date without offset, we should use `days = 0` and supply the holiday range (e.g., `$J$5:$J$<last>`).  
+
+We will:
+1. Reload the original workbook (to avoid the previous broken changes).
+2. Determine the last row in column J that contains a holiday date.
+3. For each row in column H that has a WORKDAY formula, rebuild the formula as:
+   `=IF(<original condition>,WORKDAY(<inner start>,0,$J$5:$J$<last>), "")`
+   preserving the original IF condition and start‑date expression.
+4. Apply a solid yellow fill (`#FFFF00`) to those H cells.
+5. Hide gridlines and set Calibri font for all cells.
+6. Save, recalculate, and verify that column H now contains numeric dates (no #VALUE!).
+7. Submit the output spreadsheet path.
+Code:
+```repl
+import openpyxl
+from openpyxl.styles import PatternFill, Font
+from openpyxl.utils import get_column_letter
+import os, re
+
+# Paths
+input_path = '/sandbox/input/input_spreadsheet/1_50631_init.xlsx'
+output_dir = '/sandbox/output/output_spreadsheet/'
+os.makedirs(output_dir, exist_ok=True)
+output_path = os.path.join(output_dir, '1_50631_init.xlsx')
+
+# Load original workbook (keep formulas)
+wb = openpyxl.load_workbook(input_path, data_only=False)
+ws = wb['Sheet1']
+
+# -------------------------------------------------
+# 1. Determine holiday range in column J (index 10)
+holiday_col = 10
+last_holiday_row = 0
+for r in range(2, ws.max_row + 1):
+    val = ws.cell(row=r, column=holiday_col).value
+    if val is not None:
+        last_holiday_row = r
+# Holidays start at row 5 (as seen in sample); if none found, use empty range
+if last_holiday_row >= 5:
+    holiday_range = f"$J$5:${get_column_letter(holiday_col)}${last_holiday_row}"
+else:
+    holiday_range = "$J$5:$J$5"   # empty range placeholder
+
+# -------------------------------------------------
+# 2. Update WORKDAY formulas in column H (index 8)
+workday_col = 8
+yellow_fill = PatternFill(start_color="FFFF00", end_color="FFFF00", fill_type="solid")
+
+for r in range(7, ws.max_row + 1):   # data rows start around 7
+    cell = ws.cell(row=r, column=workday_col)
+    if isinstance(cell.value, str) and cell.value.startswith('='):
+        # Expected pattern: =IF(<cond>,WORKDAY(<inner>,""))
+        # Extract the IF condition and the inner start expression
+        m = re.match(r'^=IF\(([^,]+),\s*WORKDAY\(([^)]+)\)\s*,\s*""\s*\)', cell.value, re.IGNORECASE)
+        if m:
+            cond = m.group(1).strip()
+            inner = m.group(2).strip()
+            # Build corrected formula with days=0 and holiday range
+            new_formula = f'=IF({cond},WORKDAY({inner},0,{holiday_range}),"")'
+            cell.value = new_formula
+            cell.fill = yellow_fill
+        else:
+            # Fallback: try to replace the empty second argument directly
+            # Find the first WORKDAY call
+            wd_match = re.search(r'WORKDAY\(([^)]+)\)', cell.value, re.IGNORECASE)
+            if wd_match:
+                inner = wd_match.group(1).strip()
+                new_wd = f'WORKDAY({inner},0,{holiday_range})'
+                cell.value = cell.value[:wd_match.start()] + new_wd + cell.value[wd_match.end():]
+                cell.fill = yellow_fill
+
+# -------------------------------------------------
+# 3. Hide gridlines
+ws.sheet_view.showGridLines = False
+
+# -------------------------------------------------
+# 4. Set Calibri font for all cells
+calibri_font = Font(name='Calibri', size=11)
+for row in ws.iter_rows(min_row=1, max_row=ws.max_row,
+                        min_col=1, max_col=ws.max_column):
+    for cell in row:
+        cell.font = calibri_font
+
+# -------------------------------------------------
+# Save and recalculate
+wb.save(output_path)
+await recalculate(output_path)
+
+# -------------------------------------------------
+# Verify column H values after recalculation
+wb_check = openpyxl.load_workbook(output_path, data_only=True)
+ws_check = wb_check['Sheet1']
+print("Column H values after recalculation (first 5 data rows):")
+for r in range(7, min(12, ws_check.max_row + 1)):
+    val = ws_check.cell(row=r, column=workday_col).value
+    print(r, val)
+
+# -------------------------------------------------
+# End of processing
+```
+2026-04-14 07:43:27,481 INFO RLM iteration 4/50
+Reasoning: The previous attempt failed because the WORKDAY formulas still had an empty second argument (`""`), which results in a #VALUE! error. The correct syntax should be `WORKDAY(start_date, 0, holidays_range)`.  
+
+We will:
+1. Reload the original workbook to start from a clean state.
+2. Determine the last row in column J that contains a holiday date; holidays start at row 5, so the range will be `$J$5:$J$<last_holiday_row>`. If no holidays are found, we will use a dummy range `$J$5:$J$5`.
+3. For each row in column H that contains a WORKDAY formula, replace the pattern `WORKDAY(<inner>,"")` with `WORKDAY(<inner>,0,<holiday_range>)` while preserving the surrounding IF condition.
+4. Apply a solid yellow fill (`#FFFF00`) to those H cells.
+5. Hide gridlines and set the font of **all** cells to Calibri (size 11).
+6. Save the workbook, recalculate formulas, and verify that column H now contains proper dates (no #VALUE!).
+7. Submit the output spreadsheet path.
+Code:
+```repl
+import openpyxl
+from openpyxl.styles import PatternFill, Font
+from openpyxl.utils import get_column_letter
+import os, re
+
+# Paths
+input_path = '/sandbox/input/input_spreadsheet/1_50631_init.xlsx'
+output_dir = '/sandbox/output/output_spreadsheet/'
+os.makedirs(output_dir, exist_ok=True)
+output_path = os.path.join(output_dir, '1_50631_init.xlsx')
+
+# Load original workbook (keep formulas)
+wb = openpyxl.load_workbook(input_path, data_only=False)
+ws = wb['Sheet1']
+
+# -----------------------------------------------------------------
+# 1. Determine holiday range in column J (index 10)
+holiday_col = 10
+last_holiday_row = 0
+for r in range(2, ws.max_row + 1):
+    val = ws.cell(row=r, column=holiday_col).value
+    if val is not None:
+        last_holiday_row = r
+# Holidays start at row 5 (as observed). If none, use a dummy single‑cell range.
+if last_holiday_row >= 5:
+    holiday_range = f"$J$5:${get_column_letter(holiday_col)}${last_holiday_row}"
+else:
+    holiday_range = "$J$5:$J$5"
+
+# -----------------------------------------------------------------
+# 2. Update WORKDAY formulas in column H (index 8)
+workday_col = 8
+yellow_fill = PatternFill(start_color="FFFF00", end_color="FFFF00", fill_type="solid")
+
+# Data rows appear to start around row 7 (based on sample). Scan all rows from 2 to max_row.
+for r in range(2, ws.max_row + 1):
+    cell = ws.cell(row=r, column=workday_col)
+    if isinstance(cell.value, str) and cell.value.startswith('='):
+        # Look for the pattern WORKDAY(<inner>,"")
+        wd_match = re.search(r'WORKDAY\(([^,]+),\s*""\s*\)', cell.value, re.IGNORECASE)
+        if wd_match:
+            inner = wd_match.group(1).strip()
+            # Build corrected WORKDAY call with days=0 and holiday range
+            new_wd = f'WORKDAY({inner},0,{holiday_range})'
+            # Replace the old WORKDAY call
+            cell.value = cell.value[:wd_match.start()] + new_wd + cell.value[wd_match.end():]
+            # Apply yellow fill as requested
+            cell.fill = yellow_fill
+
+# -----------------------------------------------------------------
+# 3. Hide gridlines
+ws.sheet_view.showGridLines = False
+
+# -----------------------------------------------------------------
+# 4. Set Calibri font for all cells
+calibri_font = Font(name='Calibri', size=11)
+for row in ws.iter_rows(min_row=1, max_row=ws.max_row,
+                        min_col=1, max_col=ws.max_column):
+    for cell in row:
+        cell.font = calibri_font
+
+# -----------------------------------------------------------------
+# Save and recalculate
+wb.save(output_path)
+await recalculate(output_path)
+
+# -----------------------------------------------------------------
+# Verify column H values after recalculation (show first few rows)
+wb_check = openpyxl.load_workbook(output_path, data_only=True)
+ws_check = wb_check['Sheet1']
+print("Column H values after recalculation (first 5 data rows):")
+for r in range(2, min(7, ws_check.max_row + 1)):
+    val = ws_check.cell(row=r, column=workday_col).value
+    print(r, val)
+
+# -----------------------------------------------------------------
+# End of processing
+```
+2026-04-14 07:44:14,186 INFO RLM iteration 5/50
+Reasoning: The worksheet has been loaded and modified:
+- Determined the holiday range in column J (rows 5‑<last_holiday_row>).
+- Updated every WORKDAY formula in column H to use `WORKDAY(start,0,holiday_range)` and applied a yellow fill (`#FFFF00`).
+- Hid gridlines and set the font of all cells to Calibri 11.
+- Saved the workbook, ran `recalculate`, and re‑loaded it with `data_only=True` to inspect the computed values.
+
+The previous verification only printed rows 2‑6, which are empty. We now need to check the actual data rows (starting around row 7) to confirm that the WORKDAY formulas now return proper dates (no `#VALUE!`). After confirming, we will submit the output spreadsheet.
+Code:
+```repl
+import openpyxl, os, re
+from openpyxl.styles import PatternFill, Font
+from openpyxl.utils import get_column_letter
+
+# Paths
+input_path = '/sandbox/input/input_spreadsheet/1_50631_init.xlsx'
+output_dir = '/sandbox/output/output_spreadsheet/'
+os.makedirs(output_dir, exist_ok=True)
+output_path = os.path.join(output_dir, '1_50631_init.xlsx')
+
+# Load original workbook (preserve formulas)
+wb = openpyxl.load_workbook(input_path, data_only=False)
+ws = wb['Sheet1']
+
+# 1. Determine holiday range in column J (index 10)
+holiday_col = 10
+last_holiday_row = 0
+for r in range(2, ws.max_row + 1):
+    if ws.cell(row=r, column=holiday_col).value is not None:
+        last_holiday_row = r
+if last_holiday_row >= 5:
+    holiday_range = f"$J$5:${get_column_letter(holiday_col)}${last_holiday_row}"
+else:
+    holiday_range = "$J$5:$J$5"   # fallback empty range
+
+# 2. Update WORKDAY formulas in column H (index 8)
+workday_col = 8
+yellow_fill = PatternFill(start_color="FFFF00", end_color="FFFF00", fill_type="solid")
+for r in range(2, ws.max_row + 1):
+    cell = ws.cell(row=r, column=workday_col)
+    if isinstance(cell.value, str) and cell.value.startswith('='):
+        # Find WORKDAY(<inner>,"") pattern
+        wd_match = re.search(r'WORKDAY\(([^,]+),\s*""\s*\)', cell.value, re.IGNORECASE)
+        if wd_match:
+            inner = wd_match.group(1).strip()
+            new_wd = f'WORKDAY({inner},0,{holiday_range})'
+            cell.value = cell.value[:wd_match.start()] + new_wd + cell.value[wd_match.end():]
+            cell.fill = yellow_fill
+
+# 3. Hide gridlines
+ws.sheet_view.showGridLines = False
+
+# 4. Apply Calibri font to all cells
+calibri_font = Font(name='Calibri', size=11)
+for row in ws.iter_rows(min_row=1, max_row=ws.max_row,
+                        min_col=1, max_col=ws.max_column):
+    for cell in row:
+        cell.font = calibri_font
+
+# Save and recalculate
+wb.save(output_path)
+await recalculate(output_path)
+
+# Verify column H values after recalculation (show rows 7‑12)
+wb_check = openpyxl.load_workbook(output_path, data_only=True)
+ws_check = wb_check['Sheet1']
+print("Column H values after recalculation (rows 7‑12):")
+for r in range(7, min(13, ws_check.max_row + 1)):
+    print(r, ws_check.cell(row=r, column=workday_col).value)
+```
+2026-04-14 07:44:27,340 INFO RLM iteration 6/50
+Reasoning: The workbook has been processed:
+- Sheet1 recreated exactly with original formulas in B, D, F preserved.
+- WORKDAY formulas in column H corrected to include holidays from column J, using `WORKDAY(start,0,holiday_range)`.
+- Yellow fill (#FFFF00) applied to those H cells.
+- Gridlines hidden, Calibri font applied to all cells.
+- Saved to /sandbox/output/output_spreadsheet/1_50631_init.xlsx and recalculated.
+- Verification shows column H rows 7‑12 now contain proper date values (no #VALUE! errors).
+
+Now submit the output spreadsheet.
+Code:
+```repl
+SUBMIT(output_spreadsheet="/sandbox/output/output_spreadsheet/1_50631_init.xlsx")
+```
+
+============================================================
+recalc_source: baseline
+score:         0.0938  FAIL
+Sheet 'Sheet1' range H7:H38: 3/32 cells match
+  Sheet1!H10: expected=datetime.datetime(2021, 9, 6, 0, 0) got=datetime.datetime(2021, 9, 4, 0, 0)
+  Sheet1!H11: expected=datetime.datetime(2021, 9, 7, 0, 0) got=datetime.datetime(2021, 9, 5, 0, 0)
+  Sheet1!H12: expected=datetime.datetime(2021, 9, 8, 0, 0) got=datetime.datetime(2021, 9, 6, 0, 0)
+  Sheet1!H13: expected=datetime.datetime(2021, 9, 9, 0, 0) got=datetime.datetime(2021, 9, 7, 0, 0)
+  Sheet1!H14: expected=datetime.datetime(2021, 9, 10, 0, 0) got=datetime.datetime(2021, 9, 8, 0, 0)
+  Sheet1!H15: expected=datetime.datetime(2021, 9, 15, 0, 0) got=datetime.datetime(2021, 9, 9, 0, 0)
+  Sheet1!H16: expected=datetime.datetime(2021, 9, 16, 0, 0) got=datetime.datetime(2021, 9, 10, 0, 0)
+  Sheet1!H17: expected=datetime.datetime(2021, 9, 17, 0, 0) got=datetime.datetime(2021, 9, 11, 0, 0)
+  Sheet1!H18: expected=datetime.datetime(2021, 9, 20, 0, 0) got=datetime.datetime(2021, 9, 12, 0, 0)
+  Sheet1!H19: expected=datetime.datetime(2021, 9, 21, 0, 0) got=datetime.datetime(2021, 9, 13, 0, 0)
+  Sheet1!H20: expected=datetime.datetime(2021, 9, 22, 0, 0) got=datetime.datetime(2021, 9, 14, 0, 0)
+  Sheet1!H21: expected=datetime.datetime(2021, 9, 23, 0, 0) got=datetime.datetime(2021, 9, 15, 0, 0)
+  Sheet1!H22: expected=datetime.datetime(2021, 9, 24, 0, 0) got=datetime.datetime(2021, 9, 16, 0, 0)
+  Sheet1!H23: expected=datetime.datetime(2021, 9, 27, 0, 0) got=datetime.datetime(2021, 9, 17, 0, 0)
+  Sheet1!H24: expected=datetime.datetime(2021, 9, 28, 0, 0) got=datetime.datetime(2021, 9, 18, 0, 0)
+  Sheet1!H25: expected=datetime.datetime(2021, 9, 29, 0, 0) got=datetime.datetime(2021, 9, 19, 0, 0)
+  Sheet1!H26: expected=datetime.datetime(2021, 9, 30, 0, 0) got=datetime.datetime(2021, 9, 20, 0, 0)
+  Sheet1!H27: expected=datetime.datetime(2021, 10, 4, 0, 0) got=datetime.datetime(2021, 9, 21, 0, 0)
+  Sheet1!H28: expected=datetime.datetime(2021, 10, 5, 0, 0) got=datetime.datetime(2021, 9, 22, 0, 0)
+  Sheet1!H29: expected=datetime.datetime(2021, 10, 6, 0, 0) got=datetime.datetime(2021, 9, 23, 0, 0)
+  ... (9 more diffs)

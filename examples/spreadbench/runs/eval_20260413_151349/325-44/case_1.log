@@ -1,0 +1,221 @@
+task: 325-44  case: 1
+instruction_type: Sheet-Level Manipulation
+answer_position: 'Output'!A1:G10
+input:  /Users/gabriel/Workspace/trampoline-ai/predict-rlm.spreadbench-release/examples/spreadbench/data/testset/spreadsheet/325-44/1_325-44_init.xlsx
+answer: /Users/gabriel/Workspace/trampoline-ai/predict-rlm.spreadbench-release/examples/spreadbench/data/testset/spreadsheet/325-44/1_325-44_golden.xlsx
+============================================================
+2026-04-13 15:19:08,017 INFO RLM iteration 1/50
+Reasoning: We need to explore the input spreadsheet to understand its structure before performing any manipulation. We'll load the workbook with openpyxl, list the sheet names, and for each sheet print the number of rows and columns, plus a preview of the first few rows. This will help us see the "Input" and "Output" tabs referenced in the instruction.
+Code:
+```repl
+import openpyxl, pathlib, json, itertools, sys
+
+# Load the workbook (read_only for faster access)
+wb_path = pathlib.Path(input_spreadsheet)
+wb = openpyxl.load_workbook(wb_path, data_only=False)  # we need formulas if any
+
+print("Workbook loaded from:", wb_path)
+print("Sheet names:", wb.sheetnames)
+
+def preview_sheet(ws, max_rows=5):
+    # Gather header and first few data rows
+    rows = []
+    for r in ws.iter_rows(min_row=1, max_row=max_rows, values_only=True):
+        rows.append(r)
+    return rows
+
+for name in wb.sheetnames:
+    ws = wb[name]
+    print(f"\n--- Sheet: {name} ---")
+    print(f"Dimensions: max_row={ws.max_row}, max_column={ws.max_column}")
+    preview = preview_sheet(ws, max_rows=6)  # header + 5 data rows
+    for i, row in enumerate(preview):
+        print(f"Row {i+1}: {row}")
+```
+2026-04-13 15:19:46,696 INFO RLM iteration 2/50
+Reasoning: We inspected the workbook. It contains two sheets:
+
+- **Input** (4 rows, 4 columns): columns `wtype_id`, `name`, `status`, `filter`.  
+  The `filter` column holds logical expressions like  
+
+  `("orgId" = "LIM") AND ("careType" = "AMSTER") AND ("contextId" IN LIST 98);`
+
+- **Output** (10 rows, 7 columns): columns `wtype_id`, `name`, `status`, `orgId`, `careType`, `specialtyId`, `contextId`.  
+  Some rows are already populated, but we must **replace** the data in the *Output* tab with the result of splitting the `filter` column into the four target columns, keeping the *Input* tab unchanged.
+
+The instruction says:
+- Split the filter data into the specific columns.
+- Leave cells blank when a value is not defined.
+- Omit leading zeros (i.e., treat numeric values as integers).
+- Keep the *Input* sheet, update the *Output* sheet.
+
+**Plan**
+1. Load the workbook with `openpyxl`.
+2. Parse each data row in the *Input* sheet (skip the header).  
+   - Use a regular expression to capture key‑value pairs.
+   - For `=` clauses → single value.  
+   - For `IN LIST` clauses → split the comma‑separated list, convert each element to `int` (to drop leading zeros) when the key expects a numeric value (`specialtyId`, `contextId`).  
+   - Keep only the keys needed for the *Output* sheet: `orgId`, `careType`, `specialtyId`, `contextId`. Other keys (e.g., `loc`) are ignored.
+3. For each input row, generate the Cartesian product of the possible values for `specialtyId` and `contextId` (if a key has multiple values).  
+   - `orgId` and `careType` are always single‑value lists, so they are repeated for every combination.
+4. Build a list of output rows: `[wtype_id, name, status, orgId, careType, specialtyId, contextId]`.
+5. Clear the existing *Output* sheet (remove all rows after the header) and write the new header plus all generated rows.
+6. Save the workbook to the output directory (`/sandbox/output/output_spreadsheet/1_325-44_init.xlsx`).
+7. Verify by re‑loading the saved file with `data_only=True` and printing a few rows.
+
+**Implementation details**
+- Use `itertools.product` for the Cartesian product.
+- Use `openpyxl.utils.get_column_letter` only if needed for readability (not required here).
+- Ensure the output directory exists (`pathlib.Path(...).mkdir(parents=True, exist_ok=True)`).
+- After saving, reload with `data_only=True` and print the first few rows of the *Output* sheet for verification.
+
+Now we will execute the code.
+Code:
+```repl
+import pathlib, re, itertools, os
+import openpyxl
+
+# Paths
+input_path = pathlib.Path(input_spreadsheet)
+output_dir = pathlib.Path("/sandbox/output/output_spreadsheet")
+output_dir.mkdir(parents=True, exist_ok=True)
+output_path = output_dir / "1_325-44_init.xlsx"
+
+# Load workbook (keep formulas if any)
+wb = openpyxl.load_workbook(input_path, data_only=False)
+
+# Keep Input sheet unchanged
+input_ws = wb["Input"]
+output_ws = wb["Output"]
+
+# ----------------------------------------------------------------------
+# Helper to parse a filter string into a dict of key -> list of values
+# ----------------------------------------------------------------------
+def parse_filter(filter_str: str):
+    """
+    Returns a dict: key -> list of values (strings or ints).
+    Only extracts keys we need: orgId, careType, specialtyId, contextId.
+    """
+    # Remove surrounding parentheses/semicolon and extra spaces
+    filter_str = filter_str.strip()
+    # Remove trailing semicolon if present
+    if filter_str.endswith(";"):
+        filter_str = filter_str[:-1]
+
+    # Pattern for = "value"
+    eq_pat = re.compile(r'\(\s*"([^"]+)"\s*=\s*"([^"]+)"\s*\)')
+    # Pattern for IN LIST numbers (comma separated, may have spaces)
+    inlist_pat = re.compile(r'\(\s*"([^"]+)"\s*IN\s+LIST\s+([^)]*)\)')
+
+    result = {}
+
+    # Find all = clauses
+    for match in eq_pat.finditer(filter_str):
+        key, val = match.group(1), match.group(2)
+        result.setdefault(key, []).append(val)
+
+    # Find all IN LIST clauses
+    for match in inlist_pat.finditer(filter_str):
+        key, vals = match.group(1), match.group(2)
+        # Split by commas, strip spaces
+        val_list = [v.strip() for v in vals.split(",") if v.strip()]
+        result.setdefault(key, []).extend(val_list)
+
+    return result
+
+# ----------------------------------------------------------------------
+# Build output rows
+# ----------------------------------------------------------------------
+output_rows = []  # list of tuples matching Output columns
+
+# Header row (will be written later)
+header = ["wtype_id", "name", "status", "orgId", "careType", "specialtyId", "contextId"]
+
+# Iterate over Input rows (skip header)
+for row in input_ws.iter_rows(min_row=2, max_row=input_ws.max_row, values_only=True):
+    wtype_id, name, status, filter_val = row
+    # Skip completely empty rows
+    if wtype_id is None and name is None and status is None and filter_val is None:
+        continue
+
+    # Parse filter string; if None, treat as empty dict
+    filter_dict = parse_filter(filter_val) if isinstance(filter_val, str) else {}
+
+    # Extract needed keys, default to [None] if missing
+    org_ids = filter_dict.get("orgId", [None])
+    care_types = filter_dict.get("careType", [None])
+    specialty_ids_raw = filter_dict.get("specialtyId", [None])
+    context_ids_raw = filter_dict.get("contextId", [None])
+
+    # Convert numeric-looking values to int (dropping leading zeros)
+    def coerce_numeric(val):
+        if val is None:
+            return None
+        # Try int conversion; if fails, keep original string
+        try:
+            return int(val)
+        except ValueError:
+            return val
+
+    specialty_ids = [coerce_numeric(v) for v in specialty_ids_raw]
+    context_ids = [coerce_numeric(v) for v in context_ids_raw]
+
+    # Generate Cartesian product of specialtyId and contextId
+    for org, care, spec, ctx in itertools.product(org_ids, care_types, specialty_ids, context_ids):
+        output_rows.append((
+            wtype_id,
+            name,
+            status,
+            org,
+            care,
+            spec,
+            ctx
+        ))
+
+# ----------------------------------------------------------------------
+# Write to Output sheet
+# ----------------------------------------------------------------------
+# Clear existing rows (keep header row)
+output_ws.delete_rows(2, output_ws.max_row)  # delete everything after header
+
+# Write header (in case it was removed)
+for col_idx, col_name in enumerate(header, start=1):
+    output_ws.cell(row=1, column=col_idx, value=col_name)
+
+# Write data rows
+for r_idx, out_row in enumerate(output_rows, start=2):
+    for c_idx, value in enumerate(out_row, start=1):
+        output_ws.cell(row=r_idx, column=c_idx, value=value)
+
+# Save workbook to output path
+wb.save(output_path)
+
+# ----------------------------------------------------------------------
+# Verification: reload with data_only=True and print first few rows of Output
+# ----------------------------------------------------------------------
+verif_wb = openpyxl.load_workbook(output_path, data_only=True)
+verif_ws = verif_wb["Output"]
+print("Verification - first 10 rows of Output (including header):")
+for i, row in enumerate(verif_ws.iter_rows(min_row=1, max_row=10, values_only=True), start=1):
+    print(f"Row {i}: {row}")
+```
+2026-04-13 15:20:00,003 INFO RLM iteration 3/50
+Reasoning: The input workbook was inspected and the required transformation was implemented:
+
+- Parsed the `filter` column in the **Input** sheet to extract values for `orgId`, `careType`, `specialtyId`, and `contextId`.
+- Converted numeric strings to integers to drop leading zeros.
+- Generated all combinations (Cartesian product) of `specialtyId` and `contextId` for each input row.
+- Cleared the existing data in the **Output** sheet (keeping the header) and wrote the newly generated rows.
+- Saved the modified workbook to `/sandbox/output/output_spreadsheet/1_325-44_init.xlsx`.
+- Verified the first rows rows of the **Output** sheet, confirming the transformation matches the expected format.
+
+The workbook now contains the updated **Output** tab while preserving the **Input** tab.
+Code:
+```repl
+SUBMIT(output_spreadsheet=output_path)
+```
+
+============================================================
+recalc_source: baseline
+score:         1.0000  PASS
+All 70 cells match

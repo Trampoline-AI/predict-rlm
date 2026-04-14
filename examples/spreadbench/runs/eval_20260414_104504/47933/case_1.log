@@ -1,0 +1,118 @@
+task: 47933  case: 1
+instruction_type: Cell-Level Manipulation
+answer_position: 'master'!E2:E154
+input:  /Users/gabriel/Workspace/trampoline-ai/predict-rlm.spreadbench-release/examples/spreadbench/data/testset/spreadsheet/47933/1_47933_init.xlsx
+answer: /Users/gabriel/Workspace/trampoline-ai/predict-rlm.spreadbench-release/examples/spreadbench/data/testset/spreadsheet/47933/1_47933_golden.xlsx
+============================================================
+2026-04-14 10:58:35,024 INFO RLM iteration 1/50
+Reasoning: Need inspect workbook thoroughly first. Determine target cell/sheet and existing formulas. Then write correct formula into E2 likely and maybe fill down if data rows exist. Need save, recalc, verify.
+Code:
+```repl
+import os, json, shutil
+from openpyxl import load_workbook
+from openpyxl.utils import get_column_letter
+
+print("Instruction:", instruction)
+print("Input file:", input_spreadsheet)
+
+wb = load_workbook(input_spreadsheet)
+orig_sheetnames = wb.sheetnames[:]
+print("Original sheet names:", orig_sheetnames)
+
+for ws in wb.worksheets:
+    print(f"\n--- Sheet: {ws.title} ---")
+    print("max_row:", ws.max_row, "max_col:", ws.max_column)
+    headers = [ws.cell(1, c).value for c in range(1, ws.max_column + 1)]
+    print("Row1 values/headers:", headers)
+    if ws.max_row >= 2:
+        headers2 = [ws.cell(2, c).value for c in range(1, ws.max_column + 1)]
+        print("Row2 values:", headers2)
+    sample_rows = list(range(1, min(ws.max_row, 10) + 1))
+    if ws.max_row > 10:
+        sample_rows += list(range(max(1, ws.max_row - 4), ws.max_row + 1))
+    seen = set()
+    for r in sample_rows:
+        if r in seen:
+            continue
+        seen.add(r)
+        vals = [ws.cell(r, c).value for c in range(1, ws.max_column + 1)]
+        print(f"Row {r}:", vals)
+    # print specific E2 and nearby cells
+    for cell_ref in ["B2", "D2", "E2"]:
+        print(f"{ws.title}!{cell_ref} =", ws[cell_ref].value)
+```
+2026-04-14 10:59:14,403 INFO RLM iteration 2/50
+Reasoning: We found the exact target: sheet `master`, column E (`Sum`), with broken formulas already present from E2 through E154. The user specifically mentions E2, but per instructions we should apply to all relevant rows that currently use the same pattern. Need replace the broken formula in E2:E154 with the correct one: multiply rate in column D by 2 when hours in B are less than 37.5, otherwise by 1.5 when hours are 37.5 or more. Formula should be `=IF(B2<37.5,D2*2,D2*1.5)` and row-adjusted. Then save, recalculate, verify target cells and sheet names. Because B/C/D are formulas too, recalculation is required.
+Code:
+```repl
+import os, shutil
+from openpyxl import load_workbook
+
+infile = input_spreadsheet
+outdir = "/sandbox/output/output_spreadsheet"
+os.makedirs(outdir, exist_ok=True)
+outfile = os.path.join(outdir, os.path.basename(infile))
+shutil.copy(infile, outfile)
+
+wb = load_workbook(outfile)
+orig_sheetnames = wb.sheetnames[:]
+ws = wb["master"]
+
+# Inspect current target range before modification
+print("Before modification:")
+for r in range(2, 7):
+    print(r, ws[f"E{r}"].value)
+
+# Replace formulas in existing populated rows of master column E
+modified_rows = []
+for r in range(2, ws.max_row + 1):
+    # only write where the row has an employee number / active data
+    if ws[f"A{r}"].value is not None:
+        ws[f"E{r}"] = f'=IF(B{r}<37.5,D{r}*2,D{r}*1.5)'
+        modified_rows.append(r)
+
+wb.save(outfile)
+print("Modified rows in master!E:", modified_rows[:5], "...", modified_rows[-5:], "count=", len(modified_rows))
+
+# Recalculate
+result = await recalculate(outfile)
+print("Recalculate:", result)
+
+# Reload and restore original sheet names if needed
+wb_after = load_workbook(outfile)
+print("Sheet names after recalc:", wb_after.sheetnames)
+if wb_after.sheetnames != orig_sheetnames and len(wb_after.sheetnames) == len(orig_sheetnames):
+    for i, name in enumerate(orig_sheetnames):
+        wb_after.worksheets[i].title = name
+    wb_after.save(outfile)
+    print("Restored sheet names to:", orig_sheetnames)
+
+# Verify formulas
+wb_formula = load_workbook(outfile, data_only=False)
+wsf = wb_formula["master"]
+print("Formulas after write:")
+for r in [2,3,4,150,151,152,153,154]:
+    print(f"E{r} formula =", wsf[f"E{r}"].value)
+
+# Verify cached values after recalc
+wb_values = load_workbook(outfile, data_only=True)
+wsv = wb_values["master"]
+print("Verified values:")
+for r in [2,3,4,5,150,151,152,153,154]:
+    vals = {c: wsv[f"{c}{r}"].value for c in ["A","B","C","D","E"]}
+    print(r, vals)
+
+output_spreadsheet = outfile
+print("Output file ready:", output_spreadsheet)
+```
+2026-04-14 11:00:16,595 INFO RLM iteration 3/50
+Reasoning: The workbook has already been inspected thoroughly, the broken target cells were identified precisely as `master!E2:E154`, and they were replaced with the correct row-wise formula. Recalculation succeeded and verification showed plausible computed values in column E with sheet names preserved. The output file path is stored in `output_spreadsheet`. The next step is to submit that file path and nothing else.
+Code:
+```repl
+SUBMIT(output_spreadsheet=output_spreadsheet)
+```
+
+============================================================
+recalc_source: baseline
+score:         1.0000  PASS
+All 153 cells match

@@ -1,0 +1,103 @@
+task: 165-23  case: 1
+instruction_type: Sheet-Level Manipulation
+answer_position: 'Sheet1'!A2:N73
+input:  /Users/gabriel/Workspace/trampoline-ai/predict-rlm.spreadbench-release/examples/spreadbench/data/testset/spreadsheet/165-23/1_165-23_init.xlsx
+answer: /Users/gabriel/Workspace/trampoline-ai/predict-rlm.spreadbench-release/examples/spreadbench/data/testset/spreadsheet/165-23/1_165-23_golden.xlsx
+============================================================
+2026-04-13 14:23:01,771 INFO RLM iteration 1/50
+Reasoning: We need first inspect workbook structure and understand Sheet 1. The instruction says to delete all rows where column C is not the `#N/A` error value, preserving formatting and leaving row 1 blank. I should inspect sheet names, dimensions, and sample values in column C including whether cells are true Excel error cells. Then I can delete rows from bottom to top in Sheet 1 only, save to output, and verify.
+Code:
+```repl
+import os
+from openpyxl import load_workbook
+
+input_path = input_spreadsheet
+print("Input:", input_path)
+print("Instruction:", instruction[:500])
+
+wb = load_workbook(input_path)
+print("Sheets:", wb.sheetnames)
+
+for ws in wb.worksheets:
+    print(f"Sheet '{ws.title}': rows={ws.max_row}, cols={ws.max_column}")
+    # inspect first few rows/cols
+    for r in range(1, min(ws.max_row, 8) + 1):
+        vals = [ws.cell(r, c).value for c in range(1, min(ws.max_column, 5) + 1)]
+        types = [ws.cell(r, c).data_type for c in range(1, min(ws.max_column, 5) + 1)]
+        print(" row", r, "vals=", vals, "types=", types)
+    print("---")
+
+ws1 = wb[wb.sheetnames[0]]
+print("Sheet1 title:", ws1.title)
+print("Column C sample:")
+for r in range(1, min(ws1.max_row, 25) + 1):
+    cell = ws1.cell(r, 3)
+    print(r, repr(cell.value), cell.data_type)
+```
+2026-04-13 14:23:26,739 INFO RLM iteration 2/50
+Reasoning: We’ve inspected the workbook and confirmed the key condition: on `Sheet1`, the rows to keep are those where column C contains the actual Excel error `#N/A` (`cell.data_type == 'e'` and `cell.value == '#N/A'`). The workbook also includes a reference sheet named `Desired Sheet1 after delrow2`, which suggests the expected result is to leave only row 1 blank plus the `#N/A` rows.
+
+Next action:
+1. Load workbook normally with openpyxl.
+2. Delete rows from bottom to top on `Sheet1` only, starting at row 2, whenever column C is not the `#N/A` error.
+3. Save to the output directory with the same filename.
+4. Re-open and verify row count and remaining column C values against expectation.
+Code:
+```repl
+import os
+from openpyxl import load_workbook
+
+input_path = input_spreadsheet
+output_dir = "/sandbox/output/output_spreadsheet"
+os.makedirs(output_dir, exist_ok=True)
+output_path = os.path.join(output_dir, os.path.basename(input_path))
+
+# Load and modify
+wb2 = load_workbook(input_path)
+ws = wb2[wb2.sheetnames[0]]  # Sheet1
+
+deleted_rows = []
+for r in range(ws.max_row, 1, -1):  # keep row 1 blank
+    cell = ws.cell(r, 3)
+    if not (cell.data_type == 'e' and cell.value == '#N/A'):
+        ws.delete_rows(r, 1)
+        deleted_rows.append(r)
+
+wb2.save(output_path)
+
+# Verify output
+wb_check = load_workbook(output_path)
+ws_check = wb_check[wb_check.sheetnames[0]]
+remaining_c = [(r, ws_check.cell(r, 3).value, ws_check.cell(r, 3).data_type) for r in range(1, ws_check.max_row + 1)]
+
+print("Saved to:", output_path)
+print("Deleted count:", len(deleted_rows))
+print("Output Sheet1 rows:", ws_check.max_row, "cols:", ws_check.max_column)
+print("Remaining column C values/types:", remaining_c)
+
+# Compare to reference sheet values for confidence
+ref = wb_check["Desired Sheet1 after delrow2"]
+same_rows = ws_check.max_row == ref.max_row
+same_cols = ws_check.max_column == ref.max_column
+same_all = True
+for r in range(1, max(ws_check.max_row, ref.max_row) + 1):
+    for c in range(1, max(ws_check.max_column, ref.max_column) + 1):
+        if ws_check.cell(r, c).value != ref.cell(r, c).value:
+            same_all = False
+            print("First value mismatch at", r, c, ws_check.cell(r, c).value, ref.cell(r, c).value)
+            raise SystemExit
+print("Reference match:", same_rows, same_cols, same_all)
+
+output_spreadsheet = output_path
+```
+2026-04-13 14:23:28,883 INFO RLM iteration 3/50
+Reasoning: The workbook has been modified and verified successfully. `Sheet1` now retains row 1 blank and only the rows where column C is the actual `#N/A` error value. The saved output matches the provided reference sheet exactly. Next step is to submit the output file path.
+Code:
+```repl
+SUBMIT(output_spreadsheet=output_spreadsheet)
+```
+
+============================================================
+recalc_source: baseline
+score:         1.0000  PASS
+All 1008 cells match

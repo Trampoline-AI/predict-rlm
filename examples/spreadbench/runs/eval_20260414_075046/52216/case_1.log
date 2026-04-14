@@ -1,0 +1,477 @@
+task: 52216  case: 1
+instruction_type: Cell-Level Manipulation
+answer_position: 'INPUTS'!C15:G16
+input:  /Users/gabriel/Workspace/trampoline-ai/predict-rlm.spreadbench-release/examples/spreadbench/data/testset/spreadsheet/52216/1_52216_init.xlsx
+answer: /Users/gabriel/Workspace/trampoline-ai/predict-rlm.spreadbench-release/examples/spreadbench/data/testset/spreadsheet/52216/1_52216_golden.xlsx
+============================================================
+2026-04-14 08:05:07,317 INFO RLM iteration 1/50
+Reasoning: We need to explore the input spreadsheet to understand its structure before making any changes. The instruction mentions an "INPUTS" sheet and that values in C15:G15 are displaying correctly. We'll load the workbook, list all sheet names, row counts, and column headers for each sheet. Then we'll print the first few rows and the last few rows of the "INPUTS" sheet, and also print the values in cells C15:G15. This will give us the necessary context for the next steps.
+Code:
+```repl
+import openpyxl
+from openpyxl.utils import get_column_letter
+
+# Load the workbook
+wb_path = input_spreadsheet  # variable provided by the environment
+wb = openpyxl.load_workbook(wb_path, data_only=False)  # keep formulas
+
+# List sheet names and row/column info
+print("Sheets and dimensions:")
+for ws in wb.worksheets:
+    max_row = ws.max_row
+    max_col = ws.max_column
+    headers = [ws.cell(row=1, column=c).value for c in range(1, max_col+1)]
+    print(f"- {ws.title}: rows={max_row}, cols={max_col}, headers={headers}")
+
+# Focus on the INPUTS sheet (if it exists)
+if "INPUTS" in wb.sheetnames:
+    ws = wb["INPUTS"]
+    max_row = ws.max_row
+    max_col = ws.max_column
+    print("\n--- INPUTS sheet sample rows ---")
+    # Print first 5 rows (including header)
+    for r in range(1, min(6, max_row+1)):
+        row_vals = [ws.cell(row=r, column=c).value for c in range(1, max_col+1)]
+        print(f"Row {r}: {row_vals}")
+    # Print last 5 rows
+    start = max(2, max_row-4)  # start after header
+    for r in range(start, max_row+1):
+        row_vals = [ws.cell(row=r, column=c).value for c in range(1, max_col+1)]
+        print(f"Row {r}: {row_vals}")
+
+    # Print values in C15:G15
+    print("\nValues in C15:G15:")
+    vals = [ws.cell(row=15, column=c).value for c in range(3, 8)]  # C=3, G=7
+    print(vals)
+else:
+    print("ERROR: No sheet named 'INPUTS' found.")
+```
+2026-04-14 08:05:35,229 INFO RLM iteration 2/50
+Reasoning: We have inspected the workbook. The INPUTS sheet has formulas in C15:G15 that use a fixed lookup value INPUTS!A14 (the row label) and a fixed column header INPUTS!C3, D3, etc. The user wants the INDEX-MATCH to return values for subsequent rows, but because the lookup value is absolute (A14), copying the formula down will still reference the same row, producing the same result. The fix is to make the row lookup reference relative, e.g., use INPUTS!A15 for row 15, INPUTS!A16 for row 16, etc. We'll update the formulas in columns C through G for all rows that contain data (starting at row 15 down to the last row that has a non‑empty entry in column A). We'll preserve the column header MATCH (still referencing row 3) and keep the IFNA wrapper. After updating, we'll save the workbook to the output directory, recalculate, and verify a few sample cells to ensure they now reference the correct rows.
+Code:
+```repl
+import openpyxl
+from openpyxl.utils import get_column_letter
+import os
+
+# Paths
+input_path = input_spreadsheet
+output_dir = "/sandbox/output/output_spreadsheet/"
+output_path = os.path.join(output_dir, os.path.basename(input_path))
+
+# Load workbook (keep formulas)
+wb = openpyxl.load_workbook(input_path, data_only=False)
+ws = wb["INPUTS"]
+
+# Determine the last row with a label in column A (skip header rows)
+max_row = ws.max_row
+last_data_row = 1
+for r in range(2, max_row + 1):
+    val = ws.cell(row=r, column=1).value
+    if val is not None and str(val).strip() != "":
+        last_data_row = r
+
+print(f"Data rows in column A go up to row {last_data_row}")
+
+# Update formulas in columns C (3) to G (7) for rows starting at 15 up to last_data_row
+for row in range(15, last_data_row + 1):
+    # Build the relative row lookup reference (e.g., INPUTS!A15)
+    lookup_row_ref = f"INPUTS!A{row}"
+    for col_idx, header_col in zip(range(3, 8), ["C", "D", "E", "F", "G"]):
+        # Header row is always row 3, column header cell reference like INPUTS!C3
+        header_ref = f"INPUTS!{header_col}3"
+        # Build the new formula string (LibreOffice requires _xlfn.IFNA prefix)
+        formula = f"=_xlfn.IFNA(INDEX(Sheet2!C3:G20,MATCH({lookup_row_ref},Sheet2!A3:A20,0),MATCH({header_ref},Sheet2!C1:G1,0)),0)"
+        ws.cell(row=row, column=col_idx).value = formula
+
+# Save to output location
+os.makedirs(output_dir, exist_ok=True)
+wb.save(output_path)
+
+# Recalculate formulas
+await recalculate(output_path)
+
+# Reload with data_only to verify a few cells
+wb_check = openpyxl.load_workbook(output_path, data_only=True)
+ws_check = wb_check["INPUTS"]
+print("Sample recalculated values:")
+for r in range(15, min(15+5, last_data_row+1)):
+    vals = [ws_check.cell(row=r, column=c).value for c in range(3, 8)]
+    print(f"Row {r}: {vals}")
+```
+2026-04-14 08:06:41,662 INFO RLM iteration 3/50
+Reasoning: The previous update wrote relative MATCH references for rows 15‑23, but after recalculation all those cells returned 0. This suggests that the lookup does not find a match in Sheet2!A3:A20 for the values in INPUTS!A15:A23 (or the header lookup fails). To diagnose, we need to:
+
+1. Examine the contents of column A in the INPUTS sheet for rows 14‑23 (the lookup values used by MATCH).
+2. Examine the lookup column in Sheet2 (A3:A20) to see what values are available.
+3. Examine the header row in Sheet2 (C1:G1) that the column MATCH uses.
+4. Optionally, look at a few data cells in Sheet2!C3:G20 to confirm the expected numeric values.
+
+We'll print these ranges without modifying the workbook, then we can decide how to adjust the formulas (e.g., trimming spaces, fixing case, extending the range, or using a different lookup column).
+Code:
+```repl
+import openpyxl
+from openpyxl.utils import get_column_letter
+import os
+
+# Paths
+input_path = input_spreadsheet
+output_dir = "/sandbox/output/output_spreadsheet/"
+output_path = os.path.join(output_dir, os.path.basename(input_path))
+
+# Load workbook (keep formulas)
+wb = openpyxl.load_workbook(input_path, data_only=False)
+
+# INPUTS sheet: print column A values rows 14‑23
+ws_in = wb["INPUTS"]
+print("\nINPUTS!A14:A23 values:")
+for r in range(14, 24):
+    val = ws_in.cell(row=r, column=1).value
+    print(f"Row {r}: {repr(val)}")
+
+# Sheet2: print column A (lookup column) rows 3‑20
+ws_s2 = wb["Sheet2"]
+print("\nSheet2!A3:A20 values:")
+for r in range(3, 21):
+    val = ws_s2.cell(row=r, column=1).value
+    print(f"Row {r}: {repr(val)}")
+
+# Sheet2: print header row C1:G1
+print("\nSheet2!C1:G1 (header) values:")
+header_vals = [ws_s2.cell(row=1, column=c).value for c in range(3, 8)]
+print(header_vals)
+
+# Sheet2: print a few data rows (C3:G5) to see numeric values
+print("\nSample data rows Sheet2!C3:G5:")
+for r in range(3, 6):
+    row_vals = [ws_s2.cell(row=r, column=c).value for c in range(3, 8)]
+    print(f"Row {r}: {row_vals}")
+```
+2026-04-14 08:06:53,594 INFO RLM iteration 4/50
+Reasoning: The current formulas in INPUTS!C15:G15 use `MATCH(INPUTS!A14,Sheet2!A3:A20,0)`.  
+Column A in Sheet2 only contains the region identifiers “Regional” and “Metro”, while column A in INPUTS (rows 15‑23) contains expense categories such as “Advertising & Marketing”, “Electricity”, etc. Because these categories do not exist in Sheet2!A3:A20, the MATCH fails and IFNA returns 0, which is why all recalculated values are zero.
+
+To retrieve the correct values we need to match on the **category column** in Sheet2, not the region column. Looking at Sheet2, column B (B3:B20) holds the expense categories that correspond to the rows in INPUTS column A. Therefore we should change the row‑lookup part of the formula to:
+
+```
+MATCH(INPUTS!A{row}, Sheet2!B3:B20, 0)
+```
+
+The column‑lookup (the second MATCH) already correctly uses the header row (C1:G1) to select the correct month/period column, so that part stays unchanged.
+
+**Plan**
+1. Load the workbook.
+2. Determine the last data row in INPUTS column A (row 23).
+3. For every row from 15 through that last row, replace the formula in columns C‑G with a new formula that:
+   * Uses `Sheet2!B3:B20` for the row MATCH.
+   * Keeps the `_xlfn.IFNA` wrapper and the column MATCH on `INPUTS!C3` … `INPUTS!G3`.
+4. Save the workbook to the output directory.
+5. Recalculate formulas, reload with `data_only=True`, and verify a few rows (15‑19) now return non‑zero values.
+
+**Verification**
+After recalculation we will print the values in C15:G19 to confirm they are populated (they should reflect the numbers from Sheet2 for the matching category and month).
+Code:
+```repl
+import os
+import openpyxl
+from openpyxl.utils import get_column_letter
+
+# Paths
+input_path = input_spreadsheet
+output_dir = "/sandbox/output/output_spresheet/"
+output_path = os.path.join(output_dir, os.path.basename(input_path))
+
+# Load workbook (keep formulas)
+wb = openpyxl.load_workbook(input_path, data_only=False)
+
+# Worksheets
+ws_in = wb["INPUTS"]
+ws_s2 = wb["Sheet2"]
+
+# Find the last row with a non‑empty label in column A of INPUTS
+last_row = 1
+for r in range(2, ws_in.max_row + 1):
+    val = ws_in.cell(row=r, column=1).value
+    if val is not None and str(val).strip() != "":
+        last_row = r
+
+print(f"Last data row in INPUTS column A: {last_row}")
+
+# Update formulas in columns C (3) to G (7) for rows 15..last_row
+for row in range(15, last_row + 1):
+    # Row lookup reference now points to Sheet2 column B
+    row_lookup = f"INPUTS!A{row}"
+    for col_idx, header_letter in zip(range(3, 8), ["C", "D", "E", "F", "G"]):
+        header_ref = f"INPUTS!{header_letter}3"
+        # New formula with B3:B20 as the lookup column
+        formula = (
+            f"=_xlfn.IFNA("
+            f"INDEX(Sheet2!C3:G20,"
+            f"MATCH({row_lookup},Sheet2!B3:B20,0),"
+            f"MATCH({header_ref},Sheet2!C1:G1,0)),"
+            f"0)"
+        )
+        ws_in.cell(row=row, column=col_idx).value = formula
+
+# Ensure output directory exists and save
+os.makedirs(output_dir, exist_ok=True)
+wb.save(output_path)
+
+# Recalculate formulas
+await recalculate(output_path)
+
+# Reload with data_only to verify a few rows
+wb_check = openpyxl.load_workbook(output_path, data_only=True)
+ws_check = wb_check["INPUTS"]
+print("\nRecalculated values (C15:G19):")
+for r in range(15, min(20, last_row + 1)):
+    vals = [ws_check.cell(row=r, column=c).value for c in range(3, 8)]
+    print(f"Row {r}: {vals}")
+```
+2026-04-14 08:08:21,491 INFO RLM iteration 5/50
+Reasoning: The updated formulas now correctly retrieve values for the first three expense categories (Advertising & Marketing, Electricity, Insurance) because those categories exist in Sheet2 column B. However, rows 18 and 19 (Land Tax and Printing & Postage) still return 0, indicating that the MATCH on Sheet2!B3:B20 does not find those categories. We need to verify the actual contents of Sheet2 column B and see whether those category names are present, possibly with different spelling, extra spaces, or case differences. We'll print the full list of values in Sheet2!B3:B20 and also show the rows where column B matches each category from INPUTS column A (rows 15‑23). This will let us determine why the lookup fails and whether we need to adjust the lookup (e.g., trim spaces, use a different column, or handle missing categories).
+Code:
+```python
+```repl
+import openpyxl
+from openpyxl.utils import get_column_letter
+
+# Load the original workbook (keep formulas)
+wb = openpyxl.load_workbook(input_spreadsheet, data_only=False)
+ws_in = wb["INPUTS"]
+ws_s2 = wb["Sheet2"]
+
+# Print INPUTS column A values for rows 15‑23 (the lookup values)
+print("\nINPUTS column A (rows 15‑23):")
+for r in range(15, 24):
+    print(f"Row {r}: {repr(ws_in.cell(row=r, column=1).value)}")
+
+# Print Sheet2 column B values (rows 3‑20)
+print("\nSheet2 column B (rows 3‑20):")
+for r in range(3, 21):
+    print(f"Row {r}: {repr(ws_s2.cell(row=r, column=2).value)}")
+
+# For each category in INPUTS column A, find matching rows in Sheet2 column B
+print("\nMatching rows in Sheet2 column B for each category:")
+for r in range(15, 24):
+    cat = ws_in.cell(row=r, column=1).value
+    matches = []
+    for sr in range(3, 21):
+        val = ws_s2.cell(row=sr, column=2).value
+        if isinstance(val, str) and isinstance(cat, str) and val.strip() == cat.strip():
+            matches.append(sr)
+    print(f"Category '{cat}' matches Sheet2 rows: {matches}")
+```
+2026-04-14 08:08:45,282 INFO RLM iteration 6/50
+Reasoning: We need to diagnose why the MATCH on Sheet2!B3:B20 does not find some categories (e.g., "Land Tax", "Printing & Postage"). To do this we will:
+
+1. Load the workbook.
+2. Print the values in INPUTS column A for rows 15‑23 (the lookup values).
+3. Print all values in Sheet2 column B for rows 3‑20 (the lookup range).
+4. For each category from INPUTS, find rows in Sheet2 column B that match exactly after stripping whitespace.
+5. Print the matching row numbers (or an empty list) to see which categories are present and which are missing.
+
+This will reveal any mismatches due to spelling, extra spaces, or missing entries, allowing us to adjust the formulas accordingly.
+Code:
+```repl
+import openpyxl
+
+# Load the workbook (keep formulas)
+wb = openpyxl.load_workbook(input_spreadsheet, data_only=False)
+
+# Worksheets
+ws_in = wb["INPUTS"]
+ws_s2 = wb["Sheet2"]
+
+# 1. INPUTS column A rows 15‑23
+print("\nINPUTS column A (rows 15‑23):")
+for r in range(15, 24):
+    val = ws_in.cell(row=r, column=1).value
+    print(f"Row {r}: {repr(val)}")
+
+# 2. Sheet2 column B rows 3‑20
+print("\nSheet2 column B (rows 3‑20):")
+for r in range(3, 21):
+    val = ws_s2.cell(row=r, column=2).value
+    print(f"Row {r}: {repr(val)}")
+
+# 3. Matching rows in Sheet2 column B for each category
+print("\nMatching rows in Sheet2 column B for each category:")
+for r in range(15, 24):
+    cat = ws_in.cell(row=r, column=1).value
+    matches = []
+    if isinstance(cat, str):
+        cat_clean = cat.strip()
+        for sr in range(3, 21):
+            val = ws_s2.cell(row=sr, column=2).value
+            if isinstance(val, str) and val.strip() == cat_clean:
+                matches.append(sr)
+    print(f"Category {repr(cat)} matches Sheet2 rows: {matches}")
+```
+2026-04-14 08:08:59,516 INFO RLM iteration 7/50
+Reasoning: We have confirmed that the correct lookup column for the row MATCH is Sheet2!B3:B20, which contains the expense categories that match INPUTS column A. The formulas in INPUTS!C15:G23 have been updated to use this column. However, after recalculation, rows 18‑19 (Land Tax and Printing & Postage) still returned 0, indicating that the column MATCH (the second MATCH) may be failing for those rows. The column MATCH uses the header values from INPUTS!C3:G3 to match Sheet2!C1:G1. We need to verify that the header values in INPUTS!C3:G3 exactly match those in Sheet2!C1:G1 (including type and formatting). If there is a mismatch (e.g., text vs number, extra spaces), the MATCH will return #N/A and the IFNA wrapper will output 0. We'll inspect the header rows in both sheets, print their values, and then adjust the formula if necessary (e.g., wrap the header reference with VALUE() or ensure the header rows contain the same type). After confirming the header match, we'll recalculate and verify that all rows 15‑23 now return the expected non‑zero values.
+Code:
+```repl
+import openpyxl, os
+
+# Paths
+input_path = input_spreadsheet
+output_dir = "/sandbox/output/output_spreadsheet/"
+output_path = os.path.join(output_dir, os.path.basename(input_path))
+
+# Load workbook (keep formulas)
+wb = openpyxl.load_workbook(input_path, data_only=False)
+ws_in = wb["INPUTS"]
+ws_s2 = wb["Sheet2"]
+
+# Print header rows for inspection
+print("\nINPUTS header row C3:G3:")
+header_in = [ws_in.cell(row=3, column=c).value for c in range(3, 8)]
+print(header_in)
+
+print("\nSheet2 header row C1:G1:")
+header_s2 = [ws_s2.cell(row=1, column=c).value for c in range(3, 8)]
+print(header_s2)
+
+# If headers are numbers but stored as text in one sheet, we can coerce them using VALUE() in the formula.
+# We'll rebuild the formulas to use VALUE(INPUTS!C3) etc., which works in LibreOffice.
+
+# Determine last data row in INPUTS column A
+last_row = 1
+for r in range(2, ws_in.max_row + 1):
+    val = ws_in.cell(row=r, column=1).value
+    if val is not None and str(val).strip() != "":
+        last_row = r
+
+print(f"\nLast data row in INPUTS column A: {last_row}")
+
+# Update formulas in columns C‑G for rows 15..last_row
+for row in range(15, last_row + 1):
+    row_lookup = f"INPUTS!A{row}"
+    for col_idx, header_letter in zip(range(3, 8), ["C", "D", "E", "F", "G"]):
+        # Use VALUE() around the header reference to ensure numeric comparison
+        header_ref = f"VALUE(INPUTS!{header_letter}3)"
+        formula = (
+            f"=_xlfn.IFNA("
+            f"INDEX(Sheet2!C3:G20,"
+            f"MATCH({row_lookup},Sheet2!B3:B20,0),"
+            f"MATCH({header_ref},Sheet2!C1:G1,0)),"
+            f"0)"
+        )
+        ws_in.cell(row=row, column=col_idx).value = formula
+
+# Save and recalculate
+os.makedirs(output_dir, exist_ok=True)
+wb.save(output_path)
+await recalculate(output_path)
+
+# Reload with data_only to verify values for rows 15‑23
+wb_check = openpyxl.load_workbook(output_path, data_only=True)
+ws_check = wb_check["INPUTS"]
+print("\nRecalculated values (C15:G23):")
+for r in range(15, last_row + 1):
+    vals = [ws_check.cell(row=r, column=c).value for c in range(3, 8)]
+    print(f"Row {r}: {vals}")
+```
+2026-04-14 08:09:54,555 INFO RLM iteration 8/50
+Reasoning: We have updated the formulas in INPUTS!C15:G23 to use the correct row‑lookup column (Sheet2!B3:B20) and to coerce the header values with VALUE(). The first three rows (15‑17) now return the expected numbers, but rows 18‑23 still show 0. This suggests that the MATCH on the row‑lookup column is failing for those rows, even though the category names exist in Sheet2!B3:B20 (as confirmed earlier). Possible reasons:
+
+1. **Trailing/leading spaces or hidden characters** in the category names of either sheet that cause the exact string match to fail.
+2. **Case mismatch** – MATCH is case‑insensitive, so unlikely.
+3. **Cell type mismatch** – one side may be stored as a number or as a formula that evaluates to text, causing a mismatch.
+4. **Hidden characters** (e.g., non‑breaking spaces) that are not visible in the printed output.
+
+To diagnose, we will:
+- Print the raw byte representation (using `repr`) of the category cells in INPUTS column A for rows 15‑23.
+- Print the raw representation of the corresponding cells in Sheet2 column B for the rows that should match.
+- Perform a Python‑level stripped comparison after stripping whitespace to see if they truly match.
+- If they differ only by extra spaces, we can adjust the formula to trim the lookup value using `TRIM()` inside the MATCH.
+
+After confirming the mismatch, we will rewrite the formulas to use `MATCH(TRIM(INPUTS!A{row}), Sheet2!B3:B20, 0)` (wrapping the lookup value with TRIM). This will make the lookup robust against stray spaces. We will then save, recalculate, and verify that all rows 15‑23 now return non‑zero values.
+Code:
+```repl
+import os
+import openpyxl
+from openpyxl.utils import get_column_letter
+
+# Paths
+input_path = input_spreadsheet
+output_dir = "/sandbox/output/output_spreadsheet/"
+output_path = os.path.join(output_dir, os.path.basename(input_path))
+
+# Load workbook (keep formulas)
+wb = openpyxl.load_workbook(input_path, data_only=False)
+ws_in = wb["INPUTS"]
+ws_s2 = wb["Sheet2"]
+
+# ----------------------------------------------------------------------
+# Diagnostic: show raw values for categories in INPUTS (rows 15-23) and
+# corresponding rows in Sheet2 column B (rows 3-20)
+# ----------------------------------------------------------------------
+print("\n--- INPUTS column A (rows 15-23) raw values ---")
+for r in range(15, 24):
+    val = ws_in.cell(row=r, column=1).value
+    print(f"Row {r}: {repr(val)}")
+
+print("\n--- Sheet2 column B (rows 3-20) raw values ---")
+for r in range(3, 21):
+    val = ws_s2.cell(row=r, column=2).value
+    print(f"Row {r}: {repr(val)}")
+
+# ----------------------------------------------------------------------
+# Verify Python-level matching after stripping whitespace
+# ----------------------------------------------------------------------
+print("\n--- Python matching after strip() ---")
+for r in range(15, 24):
+    cat_in = ws_in.cell(row=r, column=1).value
+    matches = []
+    if isinstance(cat_in, str):
+        cat_clean = cat_in.strip()
+        for sr in range(3, 21):
+            cat_s2 = ws_s2.cell(row=sr, column=2).value
+            if isinstance(cat_s2, str) and cat_s2.strip() == cat_clean:
+                matches.append(sr)
+    print(f"Category {repr(cat_in)} matches Sheet2 rows: {matches}")
+
+# ----------------------------------------------------------------------
+# Update formulas to use TRIM on the lookup value (row MATCH)
+# ----------------------------------------------------------------------
+# Determine last data row in INPUTS column A
+last_row = 1
+for r in range(2, ws_in.max_row + 1):
+    val = ws_in.cell(row=r, column=1).value
+    if val is not None and str(val).strip() != "":
+        last_row = r
+
+print(f"\nLast data row in INPUTS column A: {last_row}")
+
+# Write new formulas for rows 15..last_row, columns C (3) to G (7)
+for row in range(15, last_row + 1):
+    # Use TRIM on the lookup value to ignore surrounding spaces
+    row_lookup = f"TRIM(INPUTS!A{row})"
+    for col_idx, header_letter in zip(range(3, 8), ["C", "D", "E", "F", "G"]):
+        header_ref = f"VALUE(INPUTS!{header_letter}3)"   # keep numeric header comparison
+        formula = (
+            f"=_xlfn.IFNA("
+            f"INDEX(Sheet2!C3:G20,"
+            f"MATCH({row_lookup},Sheet2!B3:B20,0),"
+            f"MATCH({header_ref},Sheet2!C1:G1,0)),"
+            f"0)"
+        )
+        ws_in.cell(row=row, column=col_idx).value = formula
+
+# Save to output location
+os.makedirs(output_dir, exist_ok=True)
+wb.save(output_path)
+
+# Recalculate formulas
+await recalculate(output_path)
+
+# Reload with data_only to verify values for rows 15‑23
+wb_check = openpyxl.load_workbook(output_path, data_only=True)
+ws_check = wb_check["INPUTS"]
+print("\n--- Recalculated values after adding TRIM (C15:G23) ---")
+for r in range(15, min(24, last_row + 1)):
+    vals = [ws_check.cell(row=r, column=c).value for c in range(3, 8)]
+    print(f"Row {r}: {vals}")
+```

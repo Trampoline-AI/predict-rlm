@@ -1,0 +1,561 @@
+task: 59224  case: 1
+instruction_type: Cell-Level Manipulation
+answer_position: E4:E14
+input:  /Users/gabriel/Workspace/trampoline-ai/predict-rlm.spreadbench-release/examples/spreadbench/data/testset/spreadsheet/59224/1_59224_init.xlsx
+answer: /Users/gabriel/Workspace/trampoline-ai/predict-rlm.spreadbench-release/examples/spreadbench/data/testset/spreadsheet/59224/1_59224_golden.xlsx
+============================================================
+2026-04-14 10:39:17,254 INFO RLM iteration 1/50
+Reasoning: First I need to inspect the workbook structure and the exact cells involved before making changes. The instruction mentions B2, columns C:D containing date ranges, and cells E4:E8 with formulas / outputs, so I should confirm the sheet name(s), headers, sample rows, and current formulas/values in the target range. After that I can determine whether to modify the existing formulas in column E or fill another target area.
+Code:
+```repl
+from openpyxl import load_workbook
+from openpyxl.utils import get_column_letter
+import os, json, math
+
+print("Input file:", input_spreadsheet)
+print("Instruction:", instruction)
+
+# Load workbook twice: once with formulas, once with cached values
+wb = load_workbook(input_spreadsheet)
+wb_values = load_workbook(input_spreadsheet, data_only=True)
+
+original_sheet_names = wb.sheetnames
+print("Sheet names:", original_sheet_names)
+
+def row_values(ws, r, max_cols=None):
+    max_cols = max_cols or ws.max_column
+    return [ws.cell(r, c).value for c in range(1, max_cols + 1)]
+
+for sname in wb.sheetnames:
+    ws = wb[sname]
+    ws_vals = wb_values[sname]
+    print("\n=== SHEET:", sname, "===")
+    print("Dimensions: rows =", ws.max_row, "cols =", ws.max_column)
+    
+    # Print first several rows to identify headers/layout
+    preview_rows = min(ws.max_row, 10)
+    print("First rows:")
+    for r in range(1, preview_rows + 1):
+        print(f"Row {r}:", row_values(ws, r, ws.max_column))
+    
+    # Print last 5 rows
+    start_last = max(1, ws.max_row - 4)
+    print("Last rows:")
+    for r in range(start_last, ws.max_row + 1):
+        print(f"Row {r}:", row_values(ws, r, ws.max_column))
+    
+    # Candidate header rows: first 3 rows
+    for r in range(1, min(3, ws.max_row) + 1):
+        print(f"Header candidate row {r}:", row_values(ws, r, ws.max_column))
+    
+    # Specific cells/ranges mentioned in instruction
+    if ws.max_row >= 8 and ws.max_column >= 5:
+        print("B2 formula/value:", ws["B2"].value, "| cached:", ws_vals["B2"].value)
+        for cell_ref in ["C4","C5","C6","C7","C8","D4","D5","D6","D7","D8","E4","E5","E6","E7","E8"]:
+            print(cell_ref, "formula/value:", ws[cell_ref].value, "| cached:", ws_vals[cell_ref].value)
+
+# Save references for next iteration
+inspection = {
+    "sheetnames": wb.sheetnames,
+    "original_sheet_names": original_sheet_names,
+}
+print("\nStored inspection keys:", inspection.keys())
+```
+2026-04-14 10:40:02,290 INFO RLM iteration 2/50
+Reasoning: I’ve confirmed the workbook has one sheet, the target output column is existing column E under header “Initial Date,” and the current formulas are in E4:E14. The likely desired behavior is: if B2 falls inside any one date range in C:D, that matching row and every row above it should show “Select Period”; rows below should show “Do Not Select.” To avoid false positives when B2 is outside all listed ranges, I should first test whether any row matches at all, then for each row mark it selected when B2 is earlier than that row’s end date in column D. I’ll update E4:E14 with a dynamic formula, save, recalculate, reload, restore sheet names if needed, and verify formulas plus cached results.
+Code:
+```repl
+from openpyxl import load_workbook
+from openpyxl.utils import get_column_letter
+import os, shutil
+
+infile = input_spreadsheet
+filename = os.path.basename(infile)
+outdir = "/sandbox/output/output_spreadsheet"
+outfile = os.path.join(outdir, filename)
+
+# Reload source workbook with formulas
+wb = load_workbook(infile)
+original_sheet_names = wb.sheetnames[:]
+ws = wb[original_sheet_names[0]]
+
+print("Working sheet:", ws.title)
+print("Target header row 3:", [ws.cell(3, c).value for c in range(1, ws.max_column + 1)])
+print("Pre-change E4:E14 formulas/values:")
+for r in range(4, 15):
+    print(r, "C", ws[f"C{r}"].value, "D", ws[f"D{r}"].value, "E formula", ws[f"E{r}"].value)
+
+# Apply dynamic formulas to the existing target cells E4:E14
+# Logic:
+# 1) If B2 doesn't fall strictly inside any listed C:D range, return Do Not Select.
+# 2) Otherwise, rows whose end date D(row) is after B2 are the matching row and all rows above it.
+for r in range(4, 15):
+    ws[f"E{r}"] = (
+        f'=IF(COUNTIFS($C$4:$C$14,"<"&$B$2,$D$4:$D$14,">"&$B$2)=0,'
+        f'"Do Not Select",'
+        f'IF($B$2<D{r},"Select Period","Do Not Select"))'
+    )
+
+os.makedirs(outdir, exist_ok=True)
+wb.save(outfile)
+print("Saved to:", outfile)
+
+# Recalculate
+recalc_result = await recalculate(outfile)
+print("Recalculate result:", recalc_result)
+
+# After recalc, restore original sheet names if needed
+wb_after = load_workbook(outfile)
+if wb_after.sheetnames != original_sheet_names:
+    print("Sheet names changed after recalc:", wb_after.sheetnames, "-> restoring", original_sheet_names)
+    # rename by position
+    for i, desired in enumerate(original_sheet_names):
+        wb_after.worksheets[i].title = desired
+    wb_after.save(outfile)
+else:
+    print("Sheet names preserved:", wb_after.sheetnames)
+
+# Verify formulas
+wb_verify_formulas = load_workbook(outfile)
+wsf = wb_verify_formulas[original_sheet_names[0]]
+print("\nPost-change formulas in E4:E14:")
+for r in range(4, 15):
+    print(f"E{r}:", wsf[f"E{r}"].value)
+
+# Verify cached values
+wb_verify_values = load_workbook(outfile, data_only=True)
+wsv = wb_verify_values[original_sheet_names[0]]
+print("\nCached values after recalc:")
+print("B2:", wsv["B2"].value)
+for r in range(4, 15):
+    print(f"E{r}:", wsv[f"E{r}"].value)
+
+# Keep path for submission
+final_output_spreadsheet = outfile
+print("\nPrepared output:", final_output_spreadsheet)
+```
+2026-04-14 10:41:10,496 INFO RLM iteration 3/50
+Reasoning: The current output has correct displayed results, but verification showed the formulas in E4:E14 were converted into plain text values after recalculation. Since the user explicitly wants the setup to respond when B2 changes, I should restore actual formulas while preserving cached results. I’ll patch the workbook XML so E4:E14 contain formulas plus cached string values, then verify both `data_only=False` and `data_only=True` views. If that works, the file will be ready to submit.
+Code:
+```repl
+import os, zipfile, tempfile, shutil
+import xml.etree.ElementTree as ET
+from openpyxl import load_workbook
+
+outfile = final_output_spreadsheet
+sheet_name = "Sheet1"
+
+# Intended formulas
+formula_map = {
+    f"E{r}": (
+        f'=IF(COUNTIFS($C$4:$C$14,"<"&$B$2,$D$4:$D$14,">"&$B$2)=0,'
+        f'"Do Not Select",'
+        f'IF($B$2<D{r},"Select Period","Do Not Select"))'
+    )
+    for r in range(4, 15)
+}
+
+# Read current cached values from the recalculated file
+wb_cached = load_workbook(outfile, data_only=True)
+ws_cached = wb_cached[sheet_name]
+cached_map = {cell_ref: ws_cached[cell_ref].value for cell_ref in formula_map}
+print("Cached values before XML patch:")
+for k, v in cached_map.items():
+    print(k, v)
+
+# Determine worksheet XML path from workbook metadata
+NS = {
+    "main": "http://schemas.openxmlformats.org/spreadsheetml/2006/main",
+    "rel": "http://schemas.openxmlformats.org/package/2006/relationships",
+    "rmain": "http://schemas.openxmlformats.org/officeDocument/2006/relationships",
+}
+ET.register_namespace("", NS["main"])
+ET.register_namespace("r", NS["rmain"])
+
+with tempfile.TemporaryDirectory() as tmpdir:
+    with zipfile.ZipFile(outfile, "r") as zf:
+        zf.extractall(tmpdir)
+
+    workbook_xml = os.path.join(tmpdir, "xl", "workbook.xml")
+    rels_xml = os.path.join(tmpdir, "xl", "_rels", "workbook.xml.rels")
+
+    wb_tree = ET.parse(workbook_xml)
+    wb_root = wb_tree.getroot()
+    rels_tree = ET.parse(rels_xml)
+    rels_root = rels_tree.getroot()
+
+    # Find r:id for the requested sheet name
+    sheet_rid = None
+    for sh in wb_root.find("main:sheets", NS):
+        if sh.attrib.get("name") == sheet_name:
+            sheet_rid = sh.attrib.get(f"{{{NS['rmain']}}}id")
+            break
+    print("sheet_rid:", sheet_rid)
+
+    target_rel = None
+    for rel in rels_root:
+        if rel.attrib.get("Id") == sheet_rid:
+            target_rel = rel.attrib.get("Target")
+            break
+
+    if not target_rel:
+        raise RuntimeError(f"Could not find XML target for sheet {sheet_name}")
+
+    sheet_xml_path = os.path.normpath(os.path.join(tmpdir, "xl", target_rel))
+    print("Worksheet XML path:", sheet_xml_path)
+
+    sheet_tree = ET.parse(sheet_xml_path)
+    sheet_root = sheet_tree.getroot()
+    sheetdata = sheet_root.find("main:sheetData", NS)
+
+    # Helper: find/create row and cell
+    def get_or_create_row(row_num):
+        for row in sheetdata.findall("main:row", NS):
+            if int(row.attrib["r"]) == row_num:
+                return row
+        # create new row in order
+        new_row = ET.Element(f"{{{NS['main']}}}row", {"r": str(row_num)})
+        inserted = False
+        rows = sheetdata.findall("main:row", NS)
+        for idx, row in enumerate(rows):
+            if int(row.attrib["r"]) > row_num:
+                sheetdata.insert(idx, new_row)
+                inserted = True
+                break
+        if not inserted:
+            sheetdata.append(new_row)
+        return new_row
+
+    def get_or_create_cell(cell_ref):
+        import re
+        m = re.match(r"([A-Z]+)(\d+)$", cell_ref)
+        col_letters, row_num = m.group(1), int(m.group(2))
+        row = get_or_create_row(row_num)
+        for c in row.findall("main:c", NS):
+            if c.attrib.get("r") == cell_ref:
+                return c
+        new_cell = ET.Element(f"{{{NS['main']}}}c", {"r": cell_ref})
+        row.append(new_cell)
+        return new_cell
+
+    # Patch each target formula cell with formula + cached string result
+    for cell_ref, formula in formula_map.items():
+        c = get_or_create_cell(cell_ref)
+        # preserve style if present
+        preserved_attrs = dict(c.attrib)
+        preserved_attrs["r"] = cell_ref
+        preserved_attrs["t"] = "str"
+        c.attrib.clear()
+        c.attrib.update(preserved_attrs)
+
+        for child in list(c):
+            c.remove(child)
+
+        f_el = ET.SubElement(c, f"{{{NS['main']}}}f")
+        f_el.text = formula[1:] if formula.startswith("=") else formula
+        v_el = ET.SubElement(c, f"{{{NS['main']}}}v")
+        v_el.text = "" if cached_map[cell_ref] is None else str(cached_map[cell_ref]).strip()
+
+    sheet_tree.write(sheet_xml_path, encoding="utf-8", xml_declaration=True)
+
+    # Repack workbook
+    patched_out = outfile
+    with zipfile.ZipFile(patched_out, "w", zipfile.ZIP_DEFLATED) as zf:
+        for root, dirs, files in os.walk(tmpdir):
+            for file in files:
+                full = os.path.join(root, file)
+                arc = os.path.relpath(full, tmpdir)
+                zf.write(full, arc)
+
+print("XML patch complete.")
+
+# Verify formulas are present
+wb_formula_view = load_workbook(outfile, data_only=False)
+wsf = wb_formula_view[sheet_name]
+print("\nFormula view E4:E14:")
+for r in range(4, 15):
+    print(f"E{r}:", wsf[f"E{r}"].value)
+
+# Verify cached values still present
+wb_value_view = load_workbook(outfile, data_only=True)
+wsv = wb_value_view[sheet_name]
+print("\nData-only view E4:E14:")
+for r in range(4, 15):
+    print(f"E{r}:", wsv[f"E{r}"].value)
+
+# Extra exact-target verification
+print("\nTarget cells verification:")
+print("B2:", wsv["B2"].value)
+for r in range(4, 15):
+    print(
+        f"Row {r}: C={wsv[f'C{r}'].value}, D={wsv[f'D{r}'].value}, "
+        f"E_formula={wsf[f'E{r}'].value}, E_value={wsv[f'E{r}'].value}"
+    )
+
+final_output_spreadsheet = outfile
+print("\nReady for submission:", final_output_spreadsheet)
+```
+2026-04-14 10:41:26,774 INFO RLM iteration 4/50
+Reasoning: The output file already exists from step 2, but the XML patch step failed with a FileNotFoundError. I need to inspect the saved workbook path, confirm it exists, and inspect the internal XLSX zip structure—especially `xl/workbook.xml.rels` and the sheet target path—before attempting another patch. If the file is present, I can patch the worksheet XML more carefully and then verify both formula view and cached value view.
+Code:
+```repl
+import os, zipfile, tempfile, xml.etree.ElementTree as ET
+from openpyxl import load_workbook
+
+# Recover/confirm output path
+outfile = globals().get("final_output_spreadsheet", "/sandbox/output/output_spreadsheet/" + os.path.basename(input_spreadsheet))
+print("outfile:", outfile)
+print("exists:", os.path.exists(outfile), "size:", os.path.getsize(outfile) if os.path.exists(outfile) else None)
+
+# Inspect workbook normally first
+if os.path.exists(outfile):
+    wb_chk = load_workbook(outfile, data_only=False)
+    print("sheetnames:", wb_chk.sheetnames)
+    ws_chk = wb_chk[wb_chk.sheetnames[0]]
+    print("E4:E14 formula-view currently:")
+    for r in range(4, 15):
+        print(r, repr(ws_chk[f"E{r}"].value))
+
+# Inspect xlsx internal structure
+with zipfile.ZipFile(outfile, "r") as zf:
+    names = zf.namelist()
+    print("\nFirst 30 zip members:")
+    for n in names[:30]:
+        print(n)
+    print("\nHas workbook xml:", "xl/workbook.xml" in names)
+    print("Has rels xml:", "xl/_rels/workbook.xml.rels" in names)
+    print("Worksheet files:", [n for n in names if n.startswith("xl/worksheets/")])
+
+    wb_xml = zf.read("xl/workbook.xml")
+    rels_xml = zf.read("xl/_rels/workbook.xml.rels")
+    print("\nworkbook.xml snippet:\n", wb_xml.decode("utf-8")[:1200])
+    print("\nworkbook.xml.rels snippet:\n", rels_xml.decode("utf-8")[:1200])
+
+    # Parse mapping from sheet name -> target
+    NS_MAIN = {"main": "http://schemas.openxmlformats.org/spreadsheetml/2006/main"}
+    NS_REL_DOC = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+    NS_PKG_REL = "http://schemas.openxmlformats.org/package/2006/relationships"
+
+    wb_root = ET.fromstring(wb_xml)
+    rels_root = ET.fromstring(rels_xml)
+
+    sheet_map = {}
+    for sh in wb_root.find("main:sheets", NS_MAIN):
+        rid = sh.attrib.get(f"{{{NS_REL_DOC}}}id")
+        sheet_map[sh.attrib.get("name")] = rid
+    rel_map = {}
+    for rel in rels_root:
+        rel_map[rel.attrib.get("Id")] = rel.attrib.get("Target")
+    print("\nSheet -> rid:", sheet_map)
+    print("rid -> target:", rel_map)
+
+    first_sheet = wb_chk.sheetnames[0]
+    rid = sheet_map[first_sheet]
+    target = rel_map[rid]
+    print("Chosen sheet:", first_sheet, "rid:", rid, "target:", target)
+
+    # Important: workbook rel targets are relative to xl/, not xl/_rels/
+    normalized = os.path.normpath("xl/" + target.lstrip("/"))
+    print("Normalized worksheet member path:", normalized)
+    print("Exists in zip:", normalized in names)
+
+    if normalized in names:
+        sheet_xml = zf.read(normalized).decode("utf-8")
+        print("\nWorksheet XML snippet:\n", sheet_xml[:2000])
+```
+2026-04-14 10:41:55,463 INFO RLM iteration 5/50
+Reasoning: The output file exists and the earlier patch failed because the worksheet relationship target is absolute (`/xl/worksheets/sheet1.xml`), so joining it with `xl/` incorrectly produced `xl/xl/...`. I should now patch the correct XML member directly, restoring formulas in E4:E14 while keeping the cached string results already computed. Then I need to verify both views:
+- `data_only=False` should show formulas in E4:E14
+- `data_only=True` should still show the evaluated text values
+
+If that succeeds, the workbook will be ready and I can submit in the next iteration.
+Code:
+```repl
+import os, zipfile, tempfile, xml.etree.ElementTree as ET, re
+from openpyxl import load_workbook
+
+outfile = globals().get("final_output_spreadsheet", "/sandbox/output/output_spreadsheet/" + os.path.basename(input_spreadsheet))
+print("Patching file:", outfile, "exists:", os.path.exists(outfile))
+
+sheet_name = "Sheet1"
+
+# Restore the intended formulas
+formula_map = {
+    f"E{r}": (
+        f'=IF(COUNTIFS($C$4:$C$14,"<"&$B$2,$D$4:$D$14,">"&$B$2)=0,'
+        f'"Do Not Select",'
+        f'IF($B$2<D{r},"Select Period","Do Not Select"))'
+    )
+    for r in range(4, 15)
+}
+
+# Read current cached results from the already recalculated workbook
+wb_cached = load_workbook(outfile, data_only=True)
+ws_cached = wb_cached[sheet_name]
+cached_map = {cell_ref: ws_cached[cell_ref].value for cell_ref in formula_map}
+print("Current cached values:")
+for k in sorted(cached_map):
+    print(k, cached_map[k])
+
+NS_MAIN = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+NS_DOCREL = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+NS_PKGREL = "http://schemas.openxmlformats.org/package/2006/relationships"
+NS = {"main": NS_MAIN, "r": NS_DOCREL, "pr": NS_PKGREL}
+
+ET.register_namespace("", NS_MAIN)
+ET.register_namespace("r", NS_DOCREL)
+
+with tempfile.TemporaryDirectory() as tmpdir:
+    with zipfile.ZipFile(outfile, "r") as zf:
+        zf.extractall(tmpdir)
+        wb_xml = zf.read("xl/workbook.xml")
+        rels_xml = zf.read("xl/_rels/workbook.xml.rels")
+
+    wb_root = ET.fromstring(wb_xml)
+    rels_root = ET.fromstring(rels_xml)
+
+    # Map sheet name -> relationship id
+    rid = None
+    for sh in wb_root.find("main:sheets", {"main": NS_MAIN}):
+        if sh.attrib.get("name") == sheet_name:
+            rid = sh.attrib.get(f"{{{NS_DOCREL}}}id")
+            break
+    print("Sheet rid:", rid)
+
+    target = None
+    for rel in rels_root:
+        if rel.attrib.get("Id") == rid:
+            target = rel.attrib.get("Target")
+            break
+    print("Relationship target:", target)
+
+    # Resolve absolute vs relative package path
+    if target.startswith("/"):
+        member_path = target.lstrip("/")
+    else:
+        member_path = os.path.normpath(os.path.join("xl", target))
+    xml_path = os.path.join(tmpdir, *member_path.split("/"))
+    print("Resolved member path:", member_path)
+    print("Resolved filesystem path exists:", os.path.exists(xml_path))
+
+    sheet_tree = ET.parse(xml_path)
+    sheet_root = sheet_tree.getroot()
+    sheet_data = sheet_root.find("main:sheetData", {"main": NS_MAIN})
+
+    def cell_parts(cell_ref):
+        m = re.fullmatch(r"([A-Z]+)(\d+)", cell_ref)
+        return m.group(1), int(m.group(2))
+
+    def col_num(col_letters):
+        n = 0
+        for ch in col_letters:
+            n = n * 26 + (ord(ch) - 64)
+        return n
+
+    def get_or_create_row(row_num):
+        rows = sheet_data.findall(f"{{{NS_MAIN}}}row")
+        for row in rows:
+            if int(row.attrib["r"]) == row_num:
+                return row
+        new_row = ET.Element(f"{{{NS_MAIN}}}row", {"r": str(row_num)})
+        inserted = False
+        for idx, row in enumerate(rows):
+            if int(row.attrib["r"]) > row_num:
+                sheet_data.insert(idx, new_row)
+                inserted = True
+                break
+        if not inserted:
+            sheet_data.append(new_row)
+        return new_row
+
+    def get_or_create_cell(cell_ref):
+        col_letters, row_num = cell_parts(cell_ref)
+        target_col = col_num(col_letters)
+        row_el = get_or_create_row(row_num)
+        cells = row_el.findall(f"{{{NS_MAIN}}}c")
+        for c in cells:
+            if c.attrib.get("r") == cell_ref:
+                return c
+        new_c = ET.Element(f"{{{NS_MAIN}}}c", {"r": cell_ref})
+        inserted = False
+        for idx, c in enumerate(cells):
+            existing_ref = c.attrib.get("r")
+            existing_col = col_num(cell_parts(existing_ref)[0])
+            if existing_col > target_col:
+                row_el.insert(idx, new_c)
+                inserted = True
+                break
+        if not inserted:
+            row_el.append(new_c)
+        return new_c
+
+    for cell_ref, formula in formula_map.items():
+        c = get_or_create_cell(cell_ref)
+
+        # preserve style/index attributes but make it a formula cell with cached string
+        attrs = dict(c.attrib)
+        attrs["r"] = cell_ref
+        attrs["t"] = "str"
+        c.attrib.clear()
+        c.attrib.update(attrs)
+
+        for child in list(c):
+            c.remove(child)
+
+        f_el = ET.SubElement(c, f"{{{NS_MAIN}}}f")
+        f_el.text = formula[1:] if formula.startswith("=") else formula
+
+        v_el = ET.SubElement(c, f"{{{NS_MAIN}}}v")
+        cached = cached_map[cell_ref]
+        v_el.text = "" if cached is None else str(cached).strip()
+
+    sheet_tree.write(xml_path, encoding="utf-8", xml_declaration=True)
+
+    # Repack xlsx
+    with zipfile.ZipFile(outfile, "w", zipfile.ZIP_DEFLATED) as zf:
+        for root, dirs, files in os.walk(tmpdir):
+            for fn in files:
+                full = os.path.join(root, fn)
+                arc = os.path.relpath(full, tmpdir).replace(os.sep, "/")
+                zf.write(full, arc)
+
+print("Patch written.")
+
+# Verify formula view
+wb_formula = load_workbook(outfile, data_only=False)
+wsf = wb_formula[sheet_name]
+print("\nFormula view E4:E14:")
+for r in range(4, 15):
+    print(f"E{r}:", wsf[f"E{r}"].value)
+
+# Verify cached value view
+wb_values = load_workbook(outfile, data_only=True)
+wsv = wb_values[sheet_name]
+print("\nData-only view E4:E14:")
+for r in range(4, 15):
+    print(f"E{r}:", wsv[f"E{r}"].value)
+
+# Exact target verification
+print("\nExact target verification:")
+print("Sheet names:", wb_formula.sheetnames)
+print("B2:", wsv["B2"].value)
+for r in range(4, 15):
+    print(
+        f"Row {r}: C={wsv[f'C{r}'].value}, D={wsv[f'D{r}'].value}, "
+        f"E_formula={wsf[f'E{r}'].value}, E_value={wsv[f'E{r}'].value}"
+    )
+
+final_output_spreadsheet = outfile
+print("\nReady to submit next turn:", final_output_spreadsheet)
+```
+2026-04-14 10:41:58,868 INFO RLM iteration 6/50
+Reasoning: The workbook has been inspected, modified, saved to the required output directory, recalculated, repaired so the target cells E4:E14 retain dynamic formulas, and verified in both formula and data-only views. The output file is ready, so I should now submit the saved spreadsheet path with no extra logic.
+Code:
+```repl
+SUBMIT(output_spreadsheet=final_output_spreadsheet)
+```
+
+============================================================
+recalc_source: baseline
+score:         1.0000  PASS
+All 11 cells match

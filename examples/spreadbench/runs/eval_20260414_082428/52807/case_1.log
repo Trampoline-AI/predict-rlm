@@ -1,0 +1,237 @@
+task: 52807  case: 1
+instruction_type: Cell-Level Manipulation
+answer_position: 'Summary'!E6:P9
+input:  /Users/gabriel/Workspace/trampoline-ai/predict-rlm.spreadbench-release/examples/spreadbench/data/testset/spreadsheet/52807/1_52807_init.xlsx
+answer: /Users/gabriel/Workspace/trampoline-ai/predict-rlm.spreadbench-release/examples/spreadbench/data/testset/spreadsheet/52807/1_52807_golden.xlsx
+============================================================
+2026-04-14 08:40:00,916 INFO RLM iteration 1/50
+Reasoning: First I need to inspect the workbook thoroughly before making changes: print the full instruction, list all sheets, dimensions, headers, and sample rows; inspect the `Summary` target area and any existing formulas in E6:P9 plus D3. Then I can infer the exact formula pattern and update only the intended cells. After that I’ll save, recalculate, verify the target cells, and submit.
+Code:
+```repl
+import os, json, math, statistics
+from openpyxl import load_workbook
+from openpyxl.utils import get_column_letter
+
+print("Instruction:")
+print(instruction)
+
+input_path = input_spreadsheet
+print("Input path:", input_path)
+
+wb = load_workbook(input_path)
+orig_sheet_names = wb.sheetnames
+print("Original sheet names:", orig_sheet_names)
+
+def sample_sheet(ws, n_head=8, n_tail=5):
+    max_row = ws.max_row
+    max_col = ws.max_column
+    print(f"\n--- Sheet: {ws.title} | rows={max_row}, cols={max_col} ---")
+    headers = [ws.cell(1, c).value for c in range(1, max_col+1)]
+    print("Row 1 headers/values:", headers)
+    if max_row >= 2:
+        row2 = [ws.cell(2, c).value for c in range(1, max_col+1)]
+        print("Row 2 values:", row2)
+    head_rows = list(range(1, min(max_row, n_head)+1))
+    tail_start = max(1, max_row - n_tail + 1)
+    tail_rows = list(range(tail_start, max_row+1))
+    printed = set()
+    print("Head sample:")
+    for r in head_rows:
+        printed.add(r)
+        vals = [ws.cell(r, c).value for c in range(1, max_col+1)]
+        print(f"R{r}: {vals}")
+    print("Tail sample:")
+    for r in tail_rows:
+        if r in printed:
+            continue
+        vals = [ws.cell(r, c).value for c in range(1, max_col+1)]
+        print(f"R{r}: {vals}")
+
+for ws in wb.worksheets:
+    sample_sheet(ws)
+
+# Inspect Summary relevant cells/ranges
+if "Summary" in wb.sheetnames:
+    ws = wb["Summary"]
+    print("\nDetailed Summary inspection:")
+    for coord in ["D3"]:
+        print(coord, "=", ws[coord].value)
+    for r in range(1, 12):
+        vals = [ws.cell(r, c).value for c in range(1, 17)]
+        print(f"Summary R{r} A:P -> {vals}")
+    print("Target region E6:P9 formulas/values:")
+    for r in range(6, 10):
+        row_out = []
+        for c in range(5, 17):  # E:P
+            cell = ws.cell(r, c)
+            row_out.append(f"{get_column_letter(c)}{r}={cell.value}")
+        print(" | ".join(row_out))
+
+# Also inspect Data sheet more carefully
+if "Data" in wb.sheetnames:
+    wsd = wb["Data"]
+    print("\nDetailed Data inspection rows 1:15:")
+    for r in range(1, min(15, wsd.max_row)+1):
+        vals = [wsd.cell(r, c).value for c in range(1, wsd.max_column+1)]
+        print(f"Data R{r}: {vals}")
+```
+2026-04-14 08:40:25,360 INFO RLM iteration 2/50
+Reasoning: I’ve identified the workbook structure and the exact target range: `Summary!H6:P9` are blank forecast cells, `Summary!E6:G9` already contain the current `SUMIFS` actuals formulas, `Summary!D3` is the completed-month count (`3`), and `Summary!Q6:Q9` contains totals summing `E:P`.
+
+The requested behavior is best implemented directly in `H6:P9` with a combined formula:
+- try the period-specific `SUMIFS` for that row/account and that month header;
+- if it returns a total, use it;
+- otherwise use the forecast allocation `SUM($Erow:$Grow)/(12-$D$3)`.
+
+Since `SUMIFS` returns `0` when no match exists, checking `<>0` is appropriate here. I’ll write those formulas to all rows 6:9 and columns H:P, save to the output folder with the same filename, recalculate, restore sheet names if needed, then verify the target cells and totals.
+Code:
+```repl
+import os
+from openpyxl import load_workbook
+from openpyxl.utils import get_column_letter
+
+input_path = input_spreadsheet
+filename = os.path.basename(input_path)
+output_path = os.path.join("/sandbox/output/output_spreadsheet", filename)
+
+# Load workbook normally
+wb = load_workbook(input_path)
+original_sheet_names = wb.sheetnames[:]
+ws = wb["Summary"]
+
+print("Pre-write inspection of target area H6:P9:")
+for r in range(6, 10):
+    vals = [ws.cell(r, c).value for c in range(8, 17)]
+    print(f"Row {r} H:P before:", vals)
+
+print("Existing total formulas Q6:Q9:")
+for r in range(6, 10):
+    print(f"Q{r} =", ws[f"Q{r}"].value)
+
+# Write combined formulas into H6:P9
+for r in range(6, 10):
+    for c in range(8, 17):  # H:P
+        col = get_column_letter(c)
+        formula = (
+            f'=IF(SUMIFS(Data!$C$2:$C$13,Data!$A$2:$A$13,Summary!$C{r},'
+            f'Data!$D$2:$D$13,Summary!{col}$5)<>0,'
+            f'SUMIFS(Data!$C$2:$C$13,Data!$A$2:$A$13,Summary!$C{r},'
+            f'Data!$D$2:$D$13,Summary!{col}$5),'
+            f'SUM($E{r}:$G{r})/(12-$D$3))'
+        )
+        ws.cell(r, c).value = formula
+
+print("Written formulas H6:P9:")
+for r in range(6, 10):
+    row_formulas = [ws.cell(r, c).value for c in range(8, 17)]
+    print(f"Row {r} H:P formulas:", row_formulas)
+
+# Save
+wb.save(output_path)
+print("Saved to:", output_path)
+
+# Recalculate
+recalc_result = await recalculate(output_path)
+print("Recalculate result:", recalc_result)
+
+# Reload after recalculation; restore sheet names if LO changed them
+wb_post = load_workbook(output_path)
+print("Sheet names after recalc:", wb_post.sheetnames)
+if wb_post.sheetnames != original_sheet_names:
+    # Rename by position to original names
+    for i, expected in enumerate(original_sheet_names):
+        if i < len(wb_post.worksheets):
+            wb_post.worksheets[i].title = expected
+    wb_post.save(output_path)
+    print("Restored sheet names to:", original_sheet_names)
+
+# Verify formulas are present
+wb_formula = load_workbook(output_path, data_only=False)
+wsf = wb_formula["Summary"]
+print("Verification of stored formulas H6:P9:")
+for r in range(6, 10):
+    print(f"Row {r}:", [wsf.cell(r, c).value for c in range(8, 17)])
+
+# Verify calculated values
+wb_values = load_workbook(output_path, data_only=True)
+wsv = wb_values["Summary"]
+
+print("Verification of calculated values D3, E6:G9, H6:P9, Q6:Q9:")
+print("D3 =", wsv["D3"].value)
+for r in range(6, 10):
+    actuals = [wsv.cell(r, c).value for c in range(5, 8)]
+    forecast = [wsv.cell(r, c).value for c in range(8, 17)]
+    total = wsv[f"Q{r}"].value
+    print(f"Row {r} actuals E:G -> {actuals}")
+    print(f"Row {r} forecast H:P -> {forecast}")
+    print(f"Row {r} total Q -> {total}")
+
+# Basic sanity checks
+issues = []
+for r in range(6, 10):
+    for c in range(8, 17):
+        val = wsv.cell(r, c).value
+        if val is None or val == "":
+            issues.append(f"{get_column_letter(c)}{r} blank")
+for r in range(6, 10):
+    if wsv[f"Q{r}"].value is None:
+        issues.append(f"Q{r} blank")
+
+print("Issues found:", issues if issues else "None")
+```
+2026-04-14 08:41:37,418 INFO RLM iteration 3/50
+Reasoning: I’ve already written the formulas and saved/recalculated, but the prior output was truncated before showing the crucial post-recalc values. I need one concise verification pass: reload the output workbook in both formula mode and `data_only=True`, print the exact `Summary!H6:P9` formulas and evaluated values plus `Q6:Q9`, and confirm the sheet names are still `Data` and `Summary`. If everything looks correct and nonblank, I can submit the output file path next.
+Code:
+```repl
+from openpyxl import load_workbook
+import os
+
+output_path = os.path.join("/sandbox/output/output_spreadsheet", os.path.basename(input_spreadsheet))
+
+# Reload for concise verification
+wbf = load_workbook(output_path, data_only=False)
+wbv = load_workbook(output_path, data_only=True)
+
+print("Formula workbook sheets:", wbf.sheetnames)
+print("Value workbook sheets:", wbv.sheetnames)
+
+wsf = wbf["Summary"]
+wsv = wbv["Summary"]
+
+print("D3:", wsv["D3"].value)
+
+for r in range(6, 10):
+    formulas = [wsf.cell(r, c).value for c in range(8, 17)]  # H:P
+    values = [wsv.cell(r, c).value for c in range(8, 17)]
+    actuals = [wsv.cell(r, c).value for c in range(5, 8)]    # E:G
+    total = wsv[f"Q{r}"].value
+    print(f"R{r} actuals E:G = {actuals}")
+    print(f"R{r} H:P formulas first/last = {formulas[0]} | {formulas[-1]}")
+    print(f"R{r} H:P values = {values}")
+    print(f"R{r} Q total = {total}")
+
+issues = []
+if wbf.sheetnames != ["Data", "Summary"]:
+    issues.append(f"Unexpected sheet names: {wbf.sheetnames}")
+for r in range(6, 10):
+    for c in range(8, 17):
+        v = wsv.cell(r, c).value
+        if v in (None, ""):
+            issues.append(f"Blank {r},{c}")
+    if wsv[f"Q{r}"].value in (None, ""):
+        issues.append(f"Blank Q{r}")
+
+print("Issues:", issues if issues else "None")
+print("Output path:", output_path)
+```
+2026-04-14 08:41:39,841 INFO RLM iteration 4/50
+Reasoning: The workbook has been inspected, the target range `Summary!H6:P9` was populated, recalculated, and verified. Sheet names are correct, target cells are nonblank, and totals in `Q6:Q9` look plausible. The output file is ready to submit.
+Code:
+```repl
+SUBMIT(output_spreadsheet="/sandbox/output/output_spreadsheet/1_52807_init.xlsx")
+```
+
+============================================================
+recalc_source: baseline
+score:         1.0000  PASS
+All 48 cells match

@@ -1,0 +1,179 @@
+task: 192-22  case: 1
+instruction_type: Sheet-Level Manipulation
+answer_position: 'Sheet1'!F2:F71
+input:  /Users/gabriel/Workspace/trampoline-ai/predict-rlm.spreadbench-release/examples/spreadbench/data/testset/spreadsheet/192-22/1_192-22_init.xlsx
+answer: /Users/gabriel/Workspace/trampoline-ai/predict-rlm.spreadbench-release/examples/spreadbench/data/testset/spreadsheet/192-22/1_192-22_golden.xlsx
+============================================================
+2026-04-14 10:51:34,663 INFO RLM iteration 1/50
+Reasoning: Need inspect workbook thoroughly first: sheet names, dimensions, headers, sample rows, target columns D/F, any existing formulas/values in F. Then implement on correct sheet, save, recalc, verify.
+Code:
+```repl
+import os, shutil, json, re
+from openpyxl import load_workbook
+from openpyxl.utils import get_column_letter
+
+print("Instruction:", instruction)
+
+wb = load_workbook(input_spreadsheet)
+print("Original sheet names:", wb.sheetnames)
+
+for ws in wb.worksheets:
+    print(f"\n--- Sheet: {ws.title} ---")
+    print("max_row:", ws.max_row, "max_col:", ws.max_column)
+    headers = [ws.cell(1, c).value for c in range(1, ws.max_column + 1)]
+    print("Row 1 headers/values:", headers)
+    # sample first 10 rows
+    first_n = min(ws.max_row, 10)
+    print("First rows:")
+    for r in range(1, first_n + 1):
+        vals = [ws.cell(r, c).value for c in range(1, min(ws.max_column, 8) + 1)]
+        print(r, vals)
+    # last 5 rows
+    print("Last rows:")
+    start = max(1, ws.max_row - 4)
+    for r in range(start, ws.max_row + 1):
+        vals = [ws.cell(r, c).value for c in range(1, min(ws.max_column, 8) + 1)]
+        print(r, vals)
+
+# Inspect Sheet1 specifically and target columns D/F
+ws = wb["Sheet1"] if "Sheet1" in wb.sheetnames else wb[wb.sheetnames[0]]
+print("\nUsing target sheet:", ws.title)
+
+for cell_ref in ["D1","F1","D2","F2","D3","F3","D4","F4","D5","F5","D6","F6","D7","F7","D8","F8","D9","F9","D10","F10"]:
+    print(cell_ref, "=", ws[cell_ref].value)
+
+print("\nScanning populated rows in D and current F values/formulas:")
+populated = []
+for r in range(1, ws.max_row + 1):
+    d = ws.cell(r, 4).value
+    f = ws.cell(r, 6).value
+    if d not in (None, ""):
+        populated.append((r, d, f))
+print("Total populated D rows:", len(populated))
+for item in populated[:10]:
+    print("FIRST", item)
+for item in populated[-5:]:
+    print("LAST", item)
+```
+2026-04-14 10:52:48,610 INFO RLM iteration 2/50
+Reasoning: I’ve identified the workbook layout and verified the exact target area: Sheet1, scanning populated cells in column D (“MAPPED”) and writing results into column F (“EXPECTED RESULT”). There are already example answers in F for rows 3–8, which confirm the intended pattern: rows containing phrases like “Core Activation”, “Core Design”, “Mobile Terminology”, “Mobile Design”, and “Testing Offshore” should be marked “Billing PO”. I should now inspect all rows in D to determine which rows match the requested keywords, compare with existing F values to avoid unnecessary overwrites, then write/update only the relevant F cells for data rows (not header). After saving, recalculate, restore sheet names if needed, reload, and verify the target range.
+Code:
+```repl
+import os, shutil, re
+from openpyxl import load_workbook
+
+# Re-open clean workbook for modification
+wb = load_workbook(input_spreadsheet)
+orig_sheetnames = wb.sheetnames[:]
+ws = wb["Sheet1"]
+
+keywords = [
+    "Core Activation",
+    "Core Design",
+    "Mobile Terminology",
+    "Mobile Design",
+    "Mobile Integration",
+    "Testing Layer",
+    "Testing Offshore",
+    "Carrier",
+    "Barrier",
+]
+keywords_lower = [k.lower() for k in keywords]
+
+def matches_keyword(val):
+    if val is None:
+        return False
+    s = str(val).lower()
+    return any(k in s for k in keywords_lower)
+
+# Print full matching analysis before writing
+analysis = []
+for r in range(2, ws.max_row + 1):  # skip header row
+    d = ws.cell(r, 4).value
+    f = ws.cell(r, 6).value
+    if d not in (None, ""):
+        m = matches_keyword(d)
+        analysis.append((r, d, f, m))
+
+matches = [x for x in analysis if x[3]]
+nonmatches = [x for x in analysis if not x[3]]
+
+print("Total data rows with populated D:", len(analysis))
+print("Matched rows count:", len(matches))
+print("Matched rows:")
+for row in matches:
+    print(row)
+print("Sample non-matches first 10:")
+for row in nonmatches[:10]:
+    print(row)
+print("Sample non-matches last 5:")
+for row in nonmatches[-5:]:
+    print(row)
+
+# Apply updates to column F only where needed
+changed = []
+for r, d, f, m in analysis:
+    target = "Billing PO" if m else None
+    current = ws.cell(r, 6).value
+    if m:
+        if current != "Billing PO":
+            ws.cell(r, 6).value = "Billing PO"
+            changed.append((r, current, "Billing PO"))
+    else:
+        # leave blank if no match
+        if current not in (None, ""):
+            ws.cell(r, 6).value = None
+            changed.append((r, current, None))
+
+print("Changed rows:", changed)
+
+# Save output
+out_dir = "/sandbox/output/output_spreadsheet"
+os.makedirs(out_dir, exist_ok=True)
+out_path = os.path.join(out_dir, os.path.basename(input_spreadsheet))
+wb.save(out_path)
+print("Saved to:", out_path)
+
+# Recalculate
+recalc_result = await recalculate(out_path)
+print("Recalculate result:", recalc_result)
+
+# Restore sheet names if recalculate changed them
+wb_check = load_workbook(out_path)
+if wb_check.sheetnames != orig_sheetnames:
+    print("Sheet names changed after recalc:", wb_check.sheetnames, "-> restoring", orig_sheetnames)
+    for i, orig_name in enumerate(orig_sheetnames):
+        if i < len(wb_check.worksheets):
+            wb_check.worksheets[i].title = orig_name
+    wb_check.save(out_path)
+else:
+    print("Sheet names preserved.")
+
+# Verify output using data_only
+wb_verify = load_workbook(out_path, data_only=True)
+print("Verified sheet names:", wb_verify.sheetnames)
+wsv = wb_verify["Sheet1"]
+
+print("Verification of target rows in D/F:")
+for r in range(2, wsv.max_row + 1):
+    d = wsv.cell(r, 4).value
+    f = wsv.cell(r, 6).value
+    if d not in (None, ""):
+        if matches_keyword(d):
+            print("MATCH", r, repr(d), "->", repr(f))
+        elif r <= 12 or r >= wsv.max_row - 4:
+            print("NONMATCH", r, repr(d), "->", repr(f))
+
+output_spreadsheet = out_path
+```
+2026-04-14 10:54:10,315 INFO RLM iteration 3/50
+Reasoning: Need submit output path.
+Code:
+```repl
+SUBMIT(output_spreadsheet=output_spreadsheet)
+```
+
+============================================================
+recalc_source: baseline
+score:         1.0000  PASS
+All 70 cells match

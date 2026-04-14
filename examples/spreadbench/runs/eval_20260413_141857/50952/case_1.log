@@ -1,0 +1,120 @@
+task: 50952  case: 1
+instruction_type: Cell-Level Manipulation
+answer_position: G2:G5
+input:  /Users/gabriel/Workspace/trampoline-ai/predict-rlm.spreadbench-release/examples/spreadbench/data/testset/spreadsheet/50952/1_50952_init.xlsx
+answer: /Users/gabriel/Workspace/trampoline-ai/predict-rlm.spreadbench-release/examples/spreadbench/data/testset/spreadsheet/50952/1_50952_golden.xlsx
+============================================================
+2026-04-13 14:34:05,379 INFO RLM iteration 1/50
+Reasoning: First I need to inspect the workbook structure and read the full instruction so I can implement it literally. I’ll load the workbook with openpyxl, print sheet names, dimensions, headers, sample rows, and the full instruction text. Then I can determine what formula or values should be written into column G and whether there is an example pattern already present.
+Code:
+```repl
+from openpyxl import load_workbook
+import os, json, textwrap
+
+print("Input file:", input_spreadsheet)
+print("Instruction:\n", instruction)
+
+wb = load_workbook(input_spreadsheet)
+print("Sheet names:", wb.sheetnames)
+
+for ws in wb.worksheets:
+    print("\n--- Sheet:", ws.title, "---")
+    print("max_row:", ws.max_row, "max_column:", ws.max_column)
+    # Print first 10 rows x up to 10 cols
+    for r in range(1, min(ws.max_row, 10) + 1):
+        vals = [ws.cell(r, c).value for c in range(1, min(ws.max_column, 10) + 1)]
+        print(r, vals)
+```
+2026-04-13 14:34:42,472 INFO RLM iteration 2/50
+Reasoning: I inspected the workbook: there is one sheet with a small example table. Column A contains IDs, column B contains comments, columns E and F contain the two search parameters, and column G (“Found ID”) is the target output.
+
+The most literal implementation is to fill column G with a formula that searches column B for rows containing both parameter strings anywhere in the comment text, then returns the corresponding ID from column A. Because separators vary and the parameters can appear anywhere, `SEARCH` is appropriate. I’ll write a robust `INDEX`/`MATCH` formula for each applicable row in G, save the workbook to the output directory with the same filename, recalculate it, and verify the resulting values.
+Code:
+```repl
+from openpyxl import load_workbook
+from pathlib import Path
+import os
+
+input_path = Path(input_spreadsheet)
+output_dir = Path("/sandbox/output/output_spreadsheet")
+output_dir.mkdir(parents=True, exist_ok=True)
+output_path = output_dir / input_path.name
+
+wb = load_workbook(input_path)
+ws = wb[wb.sheetnames[0]]
+
+# Determine bounds of the lookup table in columns A:B
+start_row = 2
+end_row = ws.max_row
+
+# Write formulas into column G for rows having both parameters in E and F
+for r in range(start_row, end_row + 1):
+    p1 = ws[f"E{r}"].value
+    p2 = ws[f"F{r}"].value
+    if p1 not in (None, "") and p2 not in (None, ""):
+        formula = (
+            f'=IFERROR('
+            f'INDEX($A$2:$A${end_row},'
+            f'MATCH(1,INDEX((ISNUMBER(SEARCH(E{r},$B$2:$B${end_row})))*(ISNUMBER(SEARCH(F{r},$B$2:$B${end_row})),0),0)),'
+            f'"")'
+        )
+        # Corrected formula with properly placed INDEX wrapper
+        formula = (
+            f'=IFERROR('
+            f'INDEX($A$2:$A${end_row},'
+            f'MATCH(1,INDEX((ISNUMBER(SEARCH(E{r},$B$2:$B${end_row})))*(ISNUMBER(SEARCH(F{r},$B$2:$B${end_row})),0),0)),'
+            f'""'
+            f')'
+        )
+        # Build clean final formula explicitly
+        formula = (
+            f'=IFERROR(INDEX($A$2:$A${end_row},'
+            f'MATCH(1,INDEX((ISNUMBER(SEARCH(E{r},$B$2:$B${end_row})))*'
+            f'(ISNUMBER(SEARCH(F{r},$B$2:$B${end_row})),0),0)),"")'
+        )
+        # Fix parenthesis issue by replacing with the intended standard non-CSE pattern
+        formula = (
+            f'=IFERROR(INDEX($A$2:$A${end_row},'
+            f'MATCH(1,INDEX((ISNUMBER(SEARCH(E{r},$B$2:$B${end_row})))*'
+            f'(ISNUMBER(SEARCH(F{r},$B$2:$B${end_row})),0),0)),"")'
+        )
+        # Final reliable formula:
+        formula = (
+            f'=IFERROR(INDEX($A$2:$A${end_row},'
+            f'MATCH(1,INDEX((ISNUMBER(SEARCH(E{r},$B$2:$B${end_row})))*'
+            f'(ISNUMBER(SEARCH(F{r},$B$2:$B${end_row})),0),0)),"")'
+        )
+        ws[f"G{r}"] = formula
+    else:
+        ws[f"G{r}"] = None
+
+wb.save(output_path)
+
+# Re-open and correct formulas with a safer construction after save-time syntax review
+wb = load_workbook(output_path)
+ws = wb[wb.sheetnames[0]]
+for r in range(start_row, end_row + 1):
+    p1 = ws[f"E{r}"].value
+    p2 = ws[f"F{r}"].value
+    if p1 not in (None, "") and p2 not in (None, ""):
+        ws[f"G{r}"] = (
+            f'=IFERROR(INDEX($A$2:$A${end_row},MATCH(1,INDEX('
+            f'(ISNUMBER(SEARCH(E{r},$B$2:$B${end_row})))*'
+            f'(ISNUMBER(SEARCH(F{r},$B$2:$B${end_row}))),0),0)),"")'
+        )
+wb.save(output_path)
+
+recalc_result = await recalculate(str(output_path))
+print("Recalc:", recalc_result)
+
+# Verify cached results
+wbv = load_workbook(output_path, data_only=True)
+wsv = wbv[wbv.sheetnames[0]]
+verification = []
+for r in range(2, wsv.max_row + 1):
+    verification.append((r, wsv[f"E{r}"].value, wsv[f"F{r}"].value, wsv[f"G{r}"].value))
+print("Verification rows:", verification)
+
+output_spreadsheet = str(output_path)
+print("Saved to:", output_spreadsheet)
+```

@@ -1,0 +1,127 @@
+task: 52233  case: 1
+instruction_type: Cell-Level Manipulation
+answer_position: B7:B10
+input:  /Users/gabriel/Workspace/trampoline-ai/predict-rlm.spreadbench-release/examples/spreadbench/data/testset/spreadsheet/52233/1_52233_init.xlsx
+answer: /Users/gabriel/Workspace/trampoline-ai/predict-rlm.spreadbench-release/examples/spreadbench/data/testset/spreadsheet/52233/1_52233_golden.xlsx
+============================================================
+2026-04-14 11:09:05,349 INFO RLM iteration 1/50
+Reasoning: Need inspect workbook thoroughly first: sheets, dimensions, headers, sample rows, and find target cells/formulas related to given formula. Then determine where to write modified formula.
+Code:
+```repl
+import os, json
+from openpyxl import load_workbook
+from openpyxl.utils import get_column_letter
+
+path = input_spreadsheet
+wb = load_workbook(path)
+print("Workbook sheets:", wb.sheetnames)
+
+for ws in wb.worksheets:
+    print(f"\n--- Sheet: {ws.title} ---")
+    print("max_row:", ws.max_row, "max_col:", ws.max_column)
+    headers = [ws.cell(1,c).value for c in range(1, ws.max_column+1)]
+    print("Row1 headers/values:", headers)
+    if ws.max_row >= 2:
+        headers2 = [ws.cell(2,c).value for c in range(1, ws.max_column+1)]
+        print("Row2 values:", headers2)
+    # first 10 rows
+    first_n = min(ws.max_row, 10)
+    print("First rows:")
+    for r in range(1, first_n+1):
+        vals = [ws.cell(r,c).value for c in range(1, ws.max_column+1)]
+        print(r, vals)
+    # last 5 rows if distinct
+    start_last = max(1, ws.max_row-4)
+    print("Last rows:")
+    for r in range(start_last, ws.max_row+1):
+        vals = [ws.cell(r,c).value for c in range(1, ws.max_column+1)]
+        print(r, vals)
+
+    # search formulas / cells with A7,B2:Z2 or INDEX/MATCH or SUM(INDEX
+    hits = []
+    for row in ws.iter_rows():
+        for cell in row:
+            v = cell.value
+            if isinstance(v, str) and v.startswith("="):
+                s = v.upper()
+                if any(k in s for k in ["INDEX(", "MATCH(", "SUM(INDEX", "$B$2:$Z$2", "B3:B5", "A7"]):
+                    hits.append((cell.coordinate, v))
+    print("Relevant formula hits:", hits[:20], "count", len(hits))
+
+    # print specific referenced cells if present
+    for coord in ["A7","B2","C2","B3","B4","B5","C3","C4","C5"]:
+        if ws.max_row >= int(''.join(filter(str.isdigit, coord))) and ws.max_column >= ord(''.join(filter(str.isalpha, coord)).upper())-64:
+            try:
+                print(coord, "=", ws[coord].value)
+            except:
+                pass
+```
+2026-04-14 11:09:26,843 INFO RLM iteration 2/50
+Reasoning: We found the exact target area: Sheet1 cells B7:B10 currently contain formulas. The user wants a modified formula such that when dragged vertically, the column reference changes from B-range to C-range etc., while the row range remains fixed at 3:5. That means the appropriate modified formula should likely use `INDEX($B$3:$Z$5,0,MATCH(A7,$B$2:$Z$2,0))` wrapped in SUM, because across rows 7:10 the lookup value changes (A7/A8/...) but the data block rows stay 3:5 and MATCH picks the correct company column. Existing formulas in B8:B10 incorrectly shift rows downward. I should verify expected outputs from data, write the corrected formulas into the same target cells B7:B10, save, recalc, verify cached values, and ensure sheet names preserved.
+Code:
+```repl
+import os, shutil
+from openpyxl import load_workbook
+
+infile = input_spreadsheet
+filename = os.path.basename(infile)
+outdir = "/sandbox/output/output_spreadsheet"
+os.makedirs(outdir, exist_ok=True)
+outfile = os.path.join(outdir, filename)
+
+# Load workbook and inspect target formulas again
+wb = load_workbook(infile)
+orig_sheetnames = wb.sheetnames[:]
+ws = wb["Sheet1"]
+
+print("Before modification:")
+for r in range(7, 11):
+    print(f"A{r}={ws[f'A{r}'].value}, B{r}={ws[f'B{r}'].value}")
+
+# Use corrected formula with fixed row block and variable matched column
+for r in range(7, 11):
+    ws[f"B{r}"] = f'=SUM(INDEX($B$3:$Z$5,0,MATCH(A{r},$B$2:$Z$2,0)))'
+
+print("\nAfter modification (formula strings):")
+for r in range(7, 11):
+    print(f"B{r}={ws[f'B{r}'].value}")
+
+wb.save(outfile)
+
+# recalculate
+recalc_result = await recalculate(outfile)
+print("\nRecalculate result:", recalc_result)
+
+# restore sheet names if changed
+wb2 = load_workbook(outfile)
+if wb2.sheetnames != orig_sheetnames:
+    print("Sheet names changed after recalc:", wb2.sheetnames, "-> restoring", orig_sheetnames)
+    # rename by position
+    for i, name in enumerate(orig_sheetnames):
+        wb2.worksheets[i].title = name
+    wb2.save(outfile)
+
+# Verify with data_only
+ver = load_workbook(outfile, data_only=True)
+vws = ver[orig_sheetnames[0]]
+print("\nVerified cached values in target range:")
+for r in range(7, 11):
+    print(f"A{r}={vws[f'A{r}'].value}, B{r}={vws[f'B{r}'].value}")
+
+output_spreadsheet = outfile
+```
+2026-04-14 11:09:53,358 INFO RLM iteration 3/50
+Reasoning: The workbook has already been inspected and modified successfully. The exact target cells were B7:B10 on Sheet1, and the corrected formula was written there. Recalculation succeeded and cached values verified as nonblank. The output file path is stored in `output_spreadsheet`. The next step is to submit that file path and nothing else.
+Code:
+```repl
+SUBMIT(output_spreadsheet=output_spreadsheet)
+```
+
+============================================================
+recalc_source: baseline
+score:         0.0000  FAIL
+Sheet 'Sheet1' range B7:B10: 0/4 cells match
+  Sheet1!B7: expected=1000 got=500
+  Sheet1!B8: expected=700 got=150
+  Sheet1!B9: expected=1400 got=600
+  Sheet1!B10: expected=1550 got=200

@@ -1,0 +1,137 @@
+task: 4714  case: 1
+instruction_type: Cell-Level Manipulation
+answer_position: E2:E25
+input:  /Users/gabriel/Workspace/trampoline-ai/predict-rlm.spreadbench-release/examples/spreadbench/data/testset/spreadsheet/4714/1_4714_init.xlsx
+answer: /Users/gabriel/Workspace/trampoline-ai/predict-rlm.spreadbench-release/examples/spreadbench/data/testset/spreadsheet/4714/1_4714_golden.xlsx
+============================================================
+2026-04-13 15:32:25,028 INFO RLM iteration 1/50
+Reasoning: First, I need to explore the input spreadsheet to understand its layout: what sheets exist, column headers, and a few rows of data. This will let me see which columns contain employee names, months, and values for the moving average. I'll load the workbook with openpyxl, print sheet names, and then print the first few rows of the first sheet (including column letters). This information will guide the subsequent processing steps.
+Code:
+```repl
+import openpyxl, os, json
+
+# Load the workbook (read only for quick inspection)
+wb_path = '/sandbox/input/input_spreadsheet/1_4714_init.xlsx'
+wb = openpyxl.load_workbook(wb_path, data_only=True)
+print('Sheets:', wb.sheetnames)
+
+# Use the first sheet (assuming data is there)
+ws = wb[wb.sheetnames[0]]
+
+# Print header row (first row)
+headers = [ws.cell(row=1, column=c).value for c in range(1, ws.max_column+1)]
+print('Headers:', headers)
+
+# Print first 5 data rows
+for r in range(2, min(7, ws.max_row+1)):
+    row_vals = [ws.cell(row=r, column=c).value for c in range(1, ws.max_column+1)]
+    print(f'Row {r}:', row_vals)
+```
+2026-04-13 15:33:31,373 INFO RLM iteration 2/50
+Reasoning: We inspected the input workbook. It contains a single sheet with columns:
+1. Emp Code (A)
+2. Month (YYYYMM) (B)
+3. Month (datetime) (C)
+4. Hours (D)
+5. Moving Average Amount (E) – currently contains some pre‑filled values or6. Moving Average (four months exceed 48) (F) – status text.
+
+The task is to compute a 4‑month moving average of **Hours** for each employee (column A) and write the result in column E. If the average is an integer we must write it as a whole number (e.g., `50` not `50.0`). Column F must indicate whether the average exceeds 48 (e.g., `"Exceeds 48"` or `"Less than 48"`). When fewer than 4 months of data exist for the employee we leave the cells as `"n/a"` and `"n/a - less that 4 weeks"` respectively.
+
+Plan:
+1. Load the workbook with openpyxl (read/write).
+2. Build a mapping `emp -> list of (row_index, month_date, hours)` sorted by month.
+3. For each employee, slide a window of up to 4 consecutive rows and compute the average.
+4. Write the average to column E, using an `int` when the value is whole.
+5. Write the status to column F based on the average > 48.
+6. Save the modified workbook to `/sandbox/output/output_spreadsheet/1_4714_init.xlsx`.
+7. Reload the saved file (data_only) and print a few rows to verify the results.
+
+The code below follows this plan.
+Code:
+```repl
+import openpyxl
+import os
+from pathlib import Path
+
+# Paths
+input_path = Path("/sandbox/input/input_spreadsheet/1_4714_init.xlsx")
+output_dir = Path("/sandbox/output/output_spreadsheet")
+output_dir.mkdir(parents=True, exist_ok=True)
+output_path = output_dir / "1_4714_init.xlsx"
+
+# Load workbook (read/write)
+wb = openpyxl.load_workbook(input_path)   # keep formulas (we will overwrite)
+ws = wb[wb.sheetnames[0]]
+
+# Column indices (1‑based)
+COL_EMP = 1   # A
+COL_MONTH_STR = 2   # B
+COL_MONTH_DT = 3    # C
+COL_HOURS = 4   # D
+COL_MOVAVG = 5   # E
+COL_STATUS = 6   # F
+
+# Gather rows per employee, sorted by month datetime
+emp_rows = {}
+for r in range(2, ws.max_row + 1):
+    emp = ws.cell(row=r, column=COL_EMP).value
+    month_dt = ws.cell(row=r, column=COL_MONTH_DT).value
+    hours = ws.cell(row=r, column=COL_HOURS).value
+    if emp is None:
+        continue
+    emp_rows.setdefault(emp, []).append((r, month_dt, hours))
+
+# Ensure sorting by month
+for emp in emp_rows:
+    emp_rows[emp].sort(key=lambda x: x[1])   # sort by month_dt
+
+# Compute moving averages
+for emp, rows in emp_rows.items():
+    # rows is list of (row_idx, month_dt, hours) sorted
+    for i, (row_idx, month_dt, hours) in enumerate(rows):
+        # Determine window: current row and up to 3 previous rows
+        if i < 3:   # fewer than 4 months available
+            ws.cell(row=row_idx, column=COL_MOVAVG).value = "n/a"
+            ws.cell(row=row_idx, column=COL_STATUS).value = "n/a - less that 4 weeks"
+            continue
+
+        # Take the last 4 rows (i-3 .. i)
+        window = rows[i-3:i+1]
+        total = sum(item[2] for item in window if isinstance(item[2], (int, float)))
+        avg = total / 4.0
+
+        # Write average, whole number if no fractional part
+        if abs(avg - int(avg)) < 1e-9:
+            avg_to_write = int(avg)
+        else:
+            avg_to_write = round(avg, 2)   # keep two decimals for readability
+        ws.cell(row=row_idx, column=COL_MOVAVG).value = avg_to_write
+
+        # Write status
+        status = "Exceeds 48" if avg > 48 else "Less than 48"
+        ws.cell(row=row_idx, column=COL_STATUS).value = status
+
+# Save the workbook
+wb.save(output_path)
+
+# ----------------------------------------------------------------------
+# Verification: reload with data_only and print a few rows
+wb_check = openpyxl.load_workbook(output_path, data_only=True)
+ws_check = wb_check[wb_check.sheetnames[0]]
+
+print("Verification (first 10 rows after processing):")
+for r in range(2, min(12, ws_check.max_row + 1)):
+    vals = [ws_check.cell(row=r, column=c).value for c in range(1, 7)]
+    print(f"Row {r}: {vals}")
+```
+2026-04-13 15:34:02,542 INFO RLM iteration 3/50
+Reasoning: The spreadsheet has been processed: a 4‑month moving average of Hours (column D) is calculated per employee and written to column E, formatted as an integer when the average is whole. Column F indicates whether the average exceeds 48 ("Exceeds 48") or not ("Less than 48"). Rows with fewer than 4 months retain the original "n/a" and "n/a - less that 4 weeks" placeholders. The modified workbook has been saved to /sandbox/output/output_spreadsheet/1_4714_init.xlsx and verified.
+Code:
+```repl
+SUBMIT(output_spreadsheet="/sandbox/output/output_spreadsheet/1_4714_init.xlsx")
+```
+
+============================================================
+recalc_source: baseline
+score:         1.0000  PASS
+All 24 cells match

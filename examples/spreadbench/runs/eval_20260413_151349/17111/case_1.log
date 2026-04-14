@@ -1,0 +1,144 @@
+task: 17111  case: 1
+instruction_type: Cell-Level Manipulation
+answer_position: 'Summary'!B2:C6
+input:  /Users/gabriel/Workspace/trampoline-ai/predict-rlm.spreadbench-release/examples/spreadbench/data/testset/spreadsheet/17111/1_17111_init.xlsx
+answer: /Users/gabriel/Workspace/trampoline-ai/predict-rlm.spreadbench-release/examples/spreadbench/data/testset/spreadsheet/17111/1_17111_golden.xlsx
+============================================================
+2026-04-13 15:35:43,502 INFO RLM iteration 1/50
+Reasoning: We need to understand the structure of the input spreadsheet before applying any formulas. We'll load the workbook with openpyxl, list the sheet names, and for each sheet print the number of rows and columns, and show the header row and a few sample rows. This will give us the column names (likely including Person, Type, Amount, Status) and allow us to design the correct SUMIF/IF formulas later.
+Code:
+```repl
+import openpyxl, pathlib, json, sys
+
+# Load the workbook
+wb_path = pathlib.Path("/sandbox/input/input_spreadsheet/1_17111_init.xlsx")
+wb = openpyxl.load_workbook(wb_path, data_only=False)  # keep formulas if any
+
+print(f"Workbook loaded from: {wb_path}")
+print(f"Sheets: {wb.sheetnames}")
+
+# Inspect each sheet
+for sheet_name in wb.sheetnames:
+    ws = wb[sheet_name]
+    max_row = ws.max_row
+    max_col = ws.max_column
+    print(f"\n--- Sheet: {sheet_name} ---")
+    print(f"Rows: {max_row}, Columns: {max_col}")
+
+    # Get header row values
+    headers = [ws.cell(row=1, column=c).value for c in range(1, max_col + 1)]
+    print(f"Headers: {headers}")
+
+    # Show first 5 data rows (or up to max_row)
+    sample_rows = min(5, max_row - 1)
+    for r in range(2, 2 + sample_rows):
+        row_vals = [ws.cell(row=r, column=c).value for c in range(1, max_col + 1)]
+        print(f"Row {r}: {row_vals}")
+```
+2026-04-13 15:37:24,244 INFO RLM iteration 2/50
+Reasoning: We inspected the workbook and found two sheets:
+
+- **Sheet1** contains the raw data with columns: Status, Name, Type, Amt.
+- **Summary** is intended to aggregate amounts per Name and Type (HD, SD). Its current formulas use `SUMIFS` but do **not** filter by Status, so they sum all rows regardless of whether the status is “Completed”, “Not Completed”, or something else.
+
+The instruction requires:
+1. Sum the amount for a given Name and Type **only** when the Status is “Completed”, “Not Completed”, or both.
+2. If a different status appears, it must be excluded.
+3. The Summary sheet already has a “Status” column (column F) that can specify which status to filter on (e.g., “Completed”, “Not Completed”, or be empty to include both).
+
+**Plan**
+- Loop over each data row in the `Summary` sheet (starting at row 2).
+- Read the status value from column F.
+- Build a formula for the HD column (B) and SD column (C):
+  - If the status cell is empty/`None`, use a plain `SUMIFS` that filters only by Name and Type.
+  - Otherwise, add an extra criteria range for Status using the value from column F.
+- Write the new formula strings back into the cells.
+- Save the workbook to the output directory with the same filename.
+- Call `await recalculate(output_path)` to cache formula results, then reload with `data_only=True` to verify that the key cells contain values (not `None`).
+
+**Implementation Details**
+- Use `openpyxl` for workbook manipulation.
+- Use absolute column references (`$`) to keep formulas stable when copied.
+- The status filter will reference `Summary!$F2` (or the appropriate row) so the formula stays dynamic.
+- After saving, we’ll recalculate and print a quick verification of a few result cells.
+Code:
+```repl
+import pathlib, openpyxl, asyncio
+
+# Paths
+input_path = pathlib.Path("/sandbox/input/input_spreadsheet/1_17111_init.xlsx")
+output_dir = pathlib.Path("/sandbox/output/output_spreadsheet/")
+output_dir.mkdir(parents=True, exist_ok=True)
+output_path = output_dir / "1_17111_init.xlsx"
+
+# Load workbook (keep formulas)
+wb = openpyxl.load_workbook(input_path, data_only=False)
+summary_ws = wb["Summary"]
+data_ws = wb["Sheet1"]
+
+# Determine column indices (1‑based)
+col_name = 1      # A
+col_hd = 2        # B
+col_sd = 3        # C
+col_status = 6    # F (Status column in Summary)
+
+# Helper to build formula strings
+def build_sumif_formula(row, type_letter):
+    """
+    Returns a formula string for the given row and type (HD or SD).
+    If the status cell is empty, the formula does not filter by status.
+    """
+    # References
+    amt_range = "Sheet1!$D:$D"
+    name_range = "Sheet1!$B:$B"
+    type_range = "Sheet1!$C:$C"
+    status_range = "Sheet1!$A:$A"  # Status column in Sheet1 (first column)
+
+    # Cells in Summary to reference
+    name_cell = f"Summary!${openpyxl.utils.get_column_letter(col_name)}${row}"
+    status_cell = f"Summary!${openpyxl.utils.get_column_letter(col_status)}${row}"
+
+    # Base SUMIFS without status
+    base = f"SUMIFS({amt_range}, {name_range}, {name_cell}, {type_range}, \"{type_letter}\")"
+
+    # If status cell is empty, just use base; otherwise add status criteria
+    # We'll embed an IF that checks the status cell length
+    # IF( ISBLANK(StatusCell), base, SUMIFS(..., status_range, StatusCell) )
+    # Use ISBLANK for LibreOffice compatibility
+    formula = (
+        f"=IF(ISBLANK({status_cell}), {base}, "
+        f"SUMIFS({amt_range}, {name_range}, {name_cell}, {type_range}, \"{type_letter}\", {status_range}, {status_cell}))"
+    )
+    return formula
+
+# Update formulas for each data row in Summary
+for row in range(2, summary_ws.max_row + 1):
+    # HD column (B)
+    hd_formula = build_sumif_formula(row, "HD")
+    summary_ws.cell(row=row, column=col_hd).value = hd_formula
+
+    # SD column (C)
+    sd_formula = build_sumif_formula(row, "SD")
+    summary_ws.cell(row=row, column=col_sd).value = sd_formula
+
+# Save to output location
+wb.save(output_path)
+
+# Recalculate formulas to cache values (LibreOffice fallback)
+# The recalculate function is provided by the sandbox environment.
+# We need to await it.
+await recalculate(str(output_path))
+
+# Load the workbook with data_only=True to verify a few cells
+wb_check = openpyxl.load_workbook(output_path, data_only=True)
+summary_check = wb_check["Summary"]
+print("Verification of first few result cells (cached values):")
+for row in range(2, min(6, summary_check.max_row + 1)):
+    name = summary_check.cell(row=row, column=col_name).value
+    hd_val = summary_check.cell(row=row, column=col_hd).value
+    sd_val = summary_check.cell(row=row, column=col_sd).value
+    status = summary_check.cell(row=row, column=col_status).value
+    print(f"Row {row}: Name={name}, Status={status}, HD={hd_val}, SD={sd_val}")
+
+# End of script – the output workbook is ready at `output_path`.
+```

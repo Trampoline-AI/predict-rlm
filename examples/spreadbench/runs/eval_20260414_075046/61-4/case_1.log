@@ -1,0 +1,673 @@
+task: 61-4  case: 1
+instruction_type: Sheet-Level Manipulation
+answer_position: 'output'!A2:G15
+input:  /Users/gabriel/Workspace/trampoline-ai/predict-rlm.spreadbench-release/examples/spreadbench/data/testset/spreadsheet/61-4/1_61-4_init.xlsx
+answer: /Users/gabriel/Workspace/trampoline-ai/predict-rlm.spreadbench-release/examples/spreadbench/data/testset/spreadsheet/61-4/1_61-4_golden.xlsx
+============================================================
+2026-04-14 07:53:42,382 INFO RLM iteration 1/50
+Reasoning: We need to explore the input spreadsheet to understand its structure before performing any manipulation. The instruction mentions identifying consecutive negative values in a column for specific stock names, then summarizing opening, closing, high, low, and volume data per group. To do this we must:
+
+1. Load the workbook from the given path.
+2. List all sheet names.
+3. For each sheet, determine the header row (usually row 1) and print column headers.
+4. Print the first few rows (e.g., rows 2‑6) and the last few rows (e.g., last 5 rows) to see data patterns.
+5. Identify columns that likely correspond to stock name, date, opening price, closing price, high, low, volume, and any column that may contain negative values (perhaps "change" or similar).
+6. Print a sample of values in those columns to confirm.
+
+We will output this information using `print` statements. No modifications will be made yet; this is purely exploratory.
+Code:
+```repl
+import openpyxl
+from openpyxl.utils import get_column_letter
+
+# Load the workbook (read-only is fine for inspection)
+wb_path = "/sandbox/input/input_spreadsheet/1_61-4_init.xlsx"
+wb = openpyxl.load_workbook(wb_path, data_only=False)  # keep formulas
+
+# List sheet names
+print("Sheet names:", wb.sheetnames)
+
+# Function to print header and sample rows for a sheet
+def inspect_sheet(ws):
+    max_row = ws.max_row
+    max_col = ws.max_column
+    print(f"\n--- Sheet: {ws.title} ---")
+    print(f"Dimensions: rows={max_row}, cols={max_col}")
+
+    # Assume first row is header
+    headers = [ws.cell(row=1, column=c).value for c in range(1, max_col+1)]
+    print("Headers:", headers)
+
+    # Print first 5 data rows (rows 2-6)
+    print("\nFirst 5 data rows:")
+    for r in range(2, min(7, max_row+1)):
+        row_vals = [ws.cell(row=r, column=c).value for c in range(1, max_col+1)]
+        print(f"Row {r}:", row_vals)
+
+    # Print last 5 data rows
+    print("\nLast 5 data rows:")
+    start = max(2, max_row-4)
+    for r in range(start, max_row+1):
+        row_vals = [ws.cell(row=r, column=c).value for c in range(1, max_col+1)]
+        print(f"Row {r}:", row_vals)
+
+# Inspect each sheet
+for sheet_name in wb.sheetnames:
+    ws = wb[sheet_name]
+    inspect_sheet(ws)
+```
+2026-04-14 07:54:18,336 INFO RLM iteration 2/50
+Reasoning: We have inspected the workbook. It contains two sheets: 'input' and 'output'. The 'input' sheet has duplicated columns: left side (cols 1‑8) includes DATE, Stock Name, OPENP*, HIGH, LOW, CLOSEP*, VOLUME, Change. Right side (cols 11‑17) includes the same fields (except Change). The 'output' sheet matches the right‑side layout (DATE, Stock Name, OPENP*, HIGH, LOW, CLOSEP*, VOLUME). The task is to identify consecutive negative values in the 'Change' column for each stock, then summarise the corresponding right‑side data for each such run: first opening price, last closing price, max high, min low, sum of volume. The summary rows should be written to the 'output' sheet, replacing any existing data rows (keeping the header). We'll:
+1. Load the workbook.
+2. Determine the column indices for the relevant fields.
+3. Iterate through the rows of the input sheet, grouping by Stock Name and detecting runs of consecutive negative Change values.
+4. For each run, compute the required summary using the right‑side columns.
+5. Clear existing rows in the output sheet (except the header) and write the new summary rows.
+6. Save the workbook to the output directory, recalculate formulas, and verify the written rows.
+The following code implements these steps.
+Code:
+```repl
+import openpyxl
+from openpyxl.utils import get_column_letter
+import os
+
+# Paths
+input_path = "/sandbox/input/input_spreadsheet/1_61-4_init.xlsx"
+output_dir = "/sandbox/output/output_spreadsheet/"
+output_path = os.path.join(output_dir, "1_61-4_init.xlsx")
+
+# Load workbook (keep formulas)
+wb = openpyxl.load_workbook(input_path, data_only=False)
+input_ws = wb["input"]
+output_ws = wb["output"]
+
+# Column indices (1‑based)
+# Left side (source of Change)
+COL_DATE_L = 1
+COL_STOCK_L = 2
+COL_OPEN_L = 3
+COL_HIGH_L = 4
+COL_LOW_L = 5
+COL_CLOSE_L = 6
+COL_VOLUME_L = 7
+COL_CHANGE = 8
+
+# Right side (data to summarise)
+COL_DATE_R = 11
+COL_STOCK_R = 12
+COL_OPEN_R = 13
+COL_HIGH_R = 14
+COL_LOW_R = 15
+COL_CLOSE_R = 16
+COL_VOLUME_R = 17
+
+# Helper to get cell value safely
+
+def cell_val(ws, row, col):
+    return ws.cell(row=row, column=col).value
+
+# Build runs per stock
+runs = []  # each entry: dict with stock, rows (list of row numbers), summary placeholders
+
+current_stock = None
+current_run_rows = []
+for r in range(2, input_ws.max_row + 1):
+    stock = cell_val(input_ws, r, COL_STOCK_L)
+    change = cell_val(input_ws, r, COL_CHANGE)
+    # If stock changes, flush any ongoing run
+    if stock != current_stock:
+        if current_run_rows:
+            runs.append({"stock": current_stock, "rows": current_run_rows})
+            current_run_rows = []
+        current_stock = stock
+    # Determine if this row is part of a negative run
+    if isinstance(change, (int, float)) and change < 0:
+        current_run_rows.append(r)
+    else:
+        # End of a negative run
+        if current_run_rows:
+            runs.append({"stock": current_stock, "rows": current_run_rows})
+            current_run_rows = []
+# Flush final run if any
+if current_run_rows:
+    runs.append({"stock": current_stock, "rows": current_run_rows})
+
+# Compute summary for each run using right‑side columns
+summaries = []
+for run in runs:
+    rows = run["rows"]
+    if not rows:
+        continue
+    # Extract values from right side
+    dates = [cell_val(input_ws, r, COL_DATE_R) for r in rows]
+    opens = [cell_val(input_ws, r, COL_OPEN_R) for r in rows]
+    closes = [cell_val(input_ws, r, COL_CLOSE_R) for r in rows]
+    highs = [cell_val(input_ws, r, COL_HIGH_R) for r in rows]
+    lows = [cell_val(input_ws, r, COL_LOW_R) for r in rows]
+    volumes = [cell_val(input_ws, r, COL_VOLUME_R) for r in rows]
+    # Summarise
+    summary = {
+        "stock": run["stock"],
+        "date": dates[0],  # first date of the run (as it appears in sheet)
+        "open": opens[0],
+        "high": max(highs) if highs else None,
+        "low": min(lows) if lows else None,
+        "close": closes[-1],
+        "volume": sum(v for v in volumes if isinstance(v, (int, float)))
+    }
+    summaries.append(summary)
+
+# Write to output sheet – clear existing data rows (keep header row 1)
+# Delete rows beyond header
+if output_ws.max_row > 1:
+    output_ws.delete_rows(2, output_ws.max_row - 1)
+
+# Write summaries starting at row 2
+out_row = 2
+for s in summaries:
+    output_ws.cell(row=out_row, column=1, value=s["date"])
+    output_ws.cell(row=out_row, column=2, value=s["stock"])
+    output_ws.cell(row=out_row, column=3, value=s["open"])
+    output_ws.cell(row=out_row, column=4, value=s["high"])
+    output_ws.cell(row=out_row, column=5, value=s["low"])
+    output_ws.cell(row=out_row, column=6, value=s["close"])
+    output_ws.cell(row=out_row, column=7, value=s["volume"])
+    out_row += 1
+
+# Ensure output directory exists
+os.makedirs(output_dir, exist_ok=True)
+
+# Save workbook
+wb.save(output_path)
+
+# Recalculate formulas (if any) and verify
+await recalculate(output_path)
+# Reload with data_only to see cached values
+wb_check = openpyxl.load_workbook(output_path, data_only=True)
+check_ws = wb_check["output"]
+print("--- Verified output rows ---")
+for r in range(2, check_ws.max_row + 1):
+    vals = [check_ws.cell(row=r, column=c).value for c in range(1, 8)]
+    print(f"Row {r}:", vals)
+```
+2026-04-14 07:54:32,340 INFO RLM iteration 3/50
+Reasoning: The previous code crashed because `max(highs)` and `min(lows)` were called on lists that may contain `None` values (empty cells). Python cannot compare `None` with numbers, causing a `TypeError`. We need to filter out non‑numeric entries before computing max/min. We'll also guard against empty lists after filtering. The rest of the logic (detecting runs of consecutive negative `Change` values per stock, summarizing right‑side columns, and writing to the `output` sheet) remains unchanged. After fixing the filtering, we'll rewrite the output sheet, save, recalculate, and verify the written rows.
+Code:
+```repl
+import openpyxl
+from openpyxl.utils import get_column_letter
+import os
+
+# Paths
+input_path = "/sandbox/input/input_spreadsheet/1_61-4_init.xlsx"
+output_dir = "/sandbox/output/output_spreadsheet/"
+output_path = os.path.join(output_dir, "1_61-4_init.xlsx")
+
+# Load workbook (keep formulas)
+wb = openpyxl.load_workbook(input_path, data_only=False)
+input_ws = wb["input"]
+output_ws = wb["output"]
+
+# Column indices (1‑based)
+# Left side (source of Change)
+COL_DATE_L = 1
+COL_STOCK_L = 2
+COL_OPEN_L = 3
+COL_HIGH_L = 4
+COL_LOW_L = 5
+COL_CLOSE_L = 6
+COL_VOLUME_L = 7
+COL_CHANGE = 8
+
+# Right side (data to summarise)
+COL_DATE_R = 11
+COL_STOCK_R = 12
+COL_OPEN_R = 13
+COL_HIGH_R = 14
+COL_LOW_R = 15
+COL_CLOSE_R = 16
+COL_VOLUME_R = 17
+
+def cell_val(ws, row, col):
+    return ws.cell(row=row, column=col).value
+
+# ----------------------------------------------------------------------
+# 1. Detect runs of consecutive negative Change values per stock
+# ----------------------------------------------------------------------
+runs = []  # list of dicts: {"stock": str, "rows": [row numbers]}
+current_stock = None
+current_run_rows = []
+
+for r in range(2, input_ws.max_row + 1):
+    stock = cell_val(input_ws, r, COL_STOCK_L)
+    change = cell_val(input_ws, r, COL_CHANGE)
+
+    # Stock change → flush any ongoing run
+    if stock != current_stock:
+        if current_run_rows:
+            runs.append({"stock": current_stock, "rows": current_run_rows})
+            current_run_rows = []
+        current_stock = stock
+
+    # Determine if this row is part of a negative run
+    if isinstance(change, (int, float)) and change < 0:
+        current_run_rows.append(r)
+    else:
+        # End of a negative run
+        if current_run_rows:
+            runs.append({"stock": current_stock, "rows": current_run_rows})
+            current_run_rows = []
+
+# Flush final run if any
+if current_run_rows:
+    runs.append({"stock": current_stock, "rows": current_run_rows})
+
+# ----------------------------------------------------------------------
+# 2. Summarise each run using the right‑side columns
+# ----------------------------------------------------------------------
+summaries = []
+
+for run in runs:
+    rows = run["rows"]
+    if not rows:
+        continue
+
+    # Extract right‑side values
+    dates   = [cell_val(input_ws, r, COL_DATE_R)   for r in rows]
+    opens   = [cell_val(input_ws, r, COL_OPEN_R)   for r in rows]
+    closes  = [cell_val(input_ws, r, COL_CLOSE_R)  for r in rows]
+    highs   = [cell_val(input_ws, r, COL_HIGH_R)   for r in rows]
+    lows    = [cell_val(input_ws, r, COL_LOW_R)    for r in rows]
+    volumes = [cell_val(input_ws, r, COL_VOLUME_R) for r in rows]
+
+    # Filter out non‑numeric entries for max/min calculations
+    numeric_highs = [h for h in highs if isinstance(h, (int, float))]
+    numeric_lows  = [l for l in lows  if isinstance(l, (int, float))]
+    numeric_vols = [v for v in volumes if isinstance(v, (int, float))]
+
+    summary = {
+        "stock": run["stock"],
+        "date": dates[0] if dates else None,          # first date of the run
+        "open": opens[0] if opens else None,          # opening price from first row
+        "high": max(numeric_highs) if numeric_highs else None,
+        "low":  min(numeric_lows)  if numeric_lows  else None,
+        "close": closes[-1] if closes else None,      # closing price from last row
+        "volume": sum(numeric_vols)
+    }
+    summaries.append(summary)
+
+# ----------------------------------------------------------------------
+# 3. Write summaries to the output sheet (clear old data first)
+# ----------------------------------------------------------------------
+# Delete all rows after the header (row 1)
+if output_ws.max_row > 1:
+    output_ws.delete_rows(2, output_ws.max_row - 1)
+
+out_row = 2
+for s in summaries:
+    output_ws.cell(row=out_row, column=1, value=s["date"])
+    output_ws.cell(row=out_row, column=2, value=s["stock"])
+    output_ws.cell(row=out_row, column=3, value=s["open"])
+    output_ws.cell(row=out_row, column=4, value=s["high"])
+    output_ws.cell(row=out_row, column=5, value=s["low"])
+    output_ws.cell(row=out_row, column=6, value=s["close"])
+    output_ws.cell(row=out_row, column=7, value=s["volume"])
+    out_row += 1
+
+# ----------------------------------------------------------------------
+# 4. Save, recalculate, and verify
+# ----------------------------------------------------------------------
+os.makedirs(output_dir, exist_ok=True)
+wb.save(output_path)
+
+# Recalculate formulas (if any)
+await recalculate(output_path)
+
+# Reload with cached values to verify
+wb_check = openpyxl.load_workbook(output_path, data_only=True)
+check_ws = wb_check["output"]
+print("--- Verified output rows (data only) ---")
+for r in range(2, check_ws.max_row + 1):
+    vals = [check_ws.cell(row=r, column=c).value for c in range(1, 8)]
+    print(f"Row {r}:", vals)
+```
+2026-04-14 07:55:18,661 INFO RLM iteration 4/50
+Reasoning: We need to debug why the “CLOSEP*” column in the output rows is being written as `None`. The logic for extracting the right‑side “CLOSEP*” values (column 16) should work, but the printed results show `None` for all runs. To investigate, we will:
+
+1. Print the column letters for the right‑side columns to confirm indices.
+2. For each detected run, print the row numbers and the raw values extracted from the right‑side “CLOSEP*” column.
+3. Verify that `cell_val` returns the expected numeric values.
+4. After confirming the correct values, rewrite the output sheet (clearing previous data) and write the summaries again.
+5. Re‑calculate and verify the final output.
+
+This will let us see whether the issue is with column indexing, data extraction, or something else, and then produce the correct summarized sheet.
+Code:
+```repl
+import openpyxl
+from openpyxl.utils import column_index_from_string, get_column_letter
+import os
+
+# Paths
+input_path = "/sandbox/input/input_spreadsheet/1_61-4_init.xlsx"
+output_dir = "/sandbox/output/output_spreadsheet/"
+output_path = os.path.join(output_dir, "1_61-4_init.xlsx")
+
+# Load workbook (keep formulas)
+wb = openpyxl.load_workbook(input_path, data_only=False)
+input_ws = wb["input"]
+output_ws = wb["output"]
+
+# Column indices (1‑based)
+COL_DATE_L = 1
+COL_STOCK_L = 2
+COL_CHANGE = 8
+
+# Right‑side columns (the data we need to summarise)
+COL_DATE_R = 11
+COL_STOCK_R = 12
+COL_OPEN_R = 13
+COL_HIGH_R = 14
+COL_LOW_R = 15
+COL_CLOSE_R = 16
+COL_VOLUME_R = 17
+
+def cell_val(ws, row, col):
+    return ws.cell(row=row, column=col).value
+
+# ----------------------------------------------------------------------
+# 1. Detect runs of consecutive negative Change values per stock
+# ----------------------------------------------------------------------
+runs = []
+current_stock = None
+current_run_rows = []
+
+for r in range(2, input_ws.max_row + 1):
+    stock = cell_val(input_ws, r, COL_STOCK_L)
+    change = cell_val(input_ws, r, COL_CHANGE)
+
+    if stock != current_stock:
+        if current_run_rows:
+            runs.append({"stock": current_stock, "rows": current_run_rows})
+            current_run_rows = []
+        current_stock = stock
+
+    if isinstance(change, (int, float)) and change < 0:
+        current_run_rows.append(r)
+    else:
+        if current_run_rows:
+            runs.append({"stock": current_stock, "rows": current_run_rows})
+            current_run_rows = []
+
+if current_run_rows:
+    runs.append({"stock": current_stock, "rows": current_run_rows})
+
+print("Detected runs:")
+for run in runs:
+    print(f"Stock {run['stock']}: rows {run['rows']}")
+
+# ----------------------------------------------------------------------
+# 2. Debug extraction of right‑side values for each run
+# ----------------------------------------------------------------------
+print("\n--- Debug extraction of right‑side values ---")
+for run in runs:
+    rows = run["rows"]
+    if not rows:
+        continue
+    closes = [cell_val(input_ws, r, COL_CLOSE_R) for r in rows]
+    highs  = [cell_val(input_ws, r, COL_HIGH_R) for r in rows]
+    lows   = [cell_val(input_ws, r, COL_LOW_R) for r in rows]
+    opens  = [cell_val(input_ws, r, COL_OPEN_R) for r in rows]
+    volumes= [cell_val(input_ws, r, COL_VOLUME_R) for r in rows]
+    dates  = [cell_val(input_ws, r, COL_DATE_R) for r in rows]
+
+    print(f"\nStock {run['stock']} rows {rows}")
+    for i, r in enumerate(rows):
+        print(f"  Row {r}: CLOSE={closes[i]}, HIGH={highs[i]}, LOW={lows[i]}, OPEN={opens[i]}, VOLUME={volumes[i]}, DATE={dates[i]}")
+
+# ----------------------------------------------------------------------
+# 3. Summarise each run (filtering non‑numeric values)
+# ----------------------------------------------------------------------
+summaries = []
+for run in runs:
+    rows = run["rows"]
+    if not rows:
+        continue
+
+    dates   = [cell_val(input_ws, r, COL_DATE_R)   for r in rows]
+    opens   = [cell_val(input_ws, r, COL_OPEN_R)   for r in rows]
+    closes  = [cell_val(input_ws, r, COL_CLOSE_R)  for r in rows]
+    highs   = [cell_val(input_ws, r, COL_HIGH_R)   for r in rows]
+    lows    = [cell_val(input_ws, r, COL_LOW_R)    for r in rows]
+    volumes = [cell_val(input_ws, r, COL_VOLUME_R) for r in rows]
+
+    numeric_highs = [h for h in highs if isinstance(h, (int, float))]
+    numeric_lows  = [l for l in lows  if isinstance(l, (int, float))]
+    numeric_vols = [v for v in volumes if isinstance(v, (int, float))]
+
+    summary = {
+        "stock": run["stock"],
+        "date": dates[0] if dates else None,
+        "open": opens[0] if opens else None,
+        "high": max(numeric_highs) if numeric_highs else None,
+        "low":  min(numeric_lows)  if numeric_lows  else None,
+        "close": closes[-1] if closes else None,
+        "volume": sum(numeric_vols)
+    }
+    summaries.append(summary)
+
+print("\n--- Summaries to be written ---")
+for s in summaries:
+    print(s)
+
+# ----------------------------------------------------------------------
+# 4. Write summaries to the output sheet (clear old data first)
+# ----------------------------------------------------------------------
+# Delete all rows after the header (row 1)
+if output_ws.max_row > 1:
+    output_ws.delete_rows(2, output_ws.max_row - 1)
+
+out_row = 2
+for s in summaries:
+    output_ws.cell(row=out_row, column=1, value=s["date"])
+    output_ws.cell(row=out_row, column=2, value=s["stock"])
+    output_ws.cell(row=out_row, column=3, value=s["open"])
+    output_ws.cell(row=out_row, column=4, value=s["high"])
+    output_ws.cell(row=out_row, column=5, value=s["low"])
+    output_ws.cell(row=out_row, column=6, value=s["close"])
+    output_ws.cell(row=out_row, column=7, value=s["volume"])
+    out_row += 1
+
+# Ensure output directory exists and save
+os.makedirs(output_dir, exist_ok=True)
+wb.save(output_path)
+
+# Recalculate formulas (if any) and verify
+await recalculate(output_path)
+
+# Reload with data_only to see cached values
+wb_check = openpyxl.load_workbook(output_path, data_only=True)
+check_ws = wb_check["output"]
+print("\n--- Verified output rows (data only) ---")
+for r in range(2, check_ws.max_row + 1):
+    vals = [check_ws.cell(row=r, column=c).value for c in range(1, 8)]
+    print(f"Row {r}:", vals)
+```
+2026-04-14 07:56:21,467 INFO RLM iteration 5/50
+Reasoning: The previous attempt used the right‑side columns (11‑17) for the summary, but many of those cells are empty, resulting in `None` for the closing price. The left‑side columns (1‑8) contain the complete data for every row (date, stock, open, high, low, close, volume, change). The desired summary (first open, last close, max high, min low, sum volume) can be correctly derived from the left‑side columns.  
+
+Plan:
+1. Load the workbook.
+2. Detect runs of consecutive negative `Change` values per stock (using column 8).
+3. For each run, compute:
+   - `date` = first row’s DATE (col 1)
+   - `stock` = stock name (col 2)
+   - `open` = first row’s OPEN (col 3)
+   - `high` = max of HIGH (col 4) across the run
+   - `low`  = min of LOW  (col 5) across the run
+   - `close` = last row’s CLOSE (col 6)
+   - `volume` = sum of VOLUME (col 7) across the run
+4. Clear all rows after the header in the `output` sheet.
+5. Write the summaries into columns 1‑7 of `output`.
+6. Save to the output directory, recalculate formulas, reload with `data_only=True`, and print the final rows for verification.
+
+This will produce correct closing prices and other aggregated values.
+Code:
+```repl
+import openpyxl
+import os
+
+# Paths
+input_path = "/sandbox/input/input_spreadsheet/1_61-4_init.xlsx"
+output_dir = "/sandbox/output/output_spreadsheet/"
+output_path = os.path.join(output_dir, "1_61-4_init.xlsx")
+
+# Load workbook (keep formulas)
+wb = openpyxl.load_workbook(input_path, data_only=False)
+input_ws = wb["input"]
+output_ws = wb["output"]
+
+# Column indices (1‑based) for the left‑side data (complete rows)
+COL_DATE   = 1   # DATE
+COL_STOCK  = 2   # Stock Name
+COL_OPEN   = 3   # OPENP*
+COL_HIGH   = 4   # HIGH
+COL_LOW    = 5   # LOW
+COL_CLOSE  = 6   # CLOSEP*
+COL_VOLUME = 7   # VOLUME
+COL_CHANGE = 8   # Change (used to detect negative runs)
+
+def cell_val(ws, row, col):
+    return ws.cell(row=row, column=col).value
+
+# ----------------------------------------------------------------------
+# 1. Detect runs of consecutive negative Change values per stock
+# ----------------------------------------------------------------------
+runs = []                     # list of dicts: {"stock": str, "rows": [row numbers]}
+current_stock = None
+current_run = []
+
+for r in range(2, input_ws.max_row + 1):
+    stock = cell_val(input_ws, r, COL_STOCK)
+    change = cell_val(input_ws, r, COL_CHANGE)
+
+    # Stock changed → flush any ongoing run
+    if stock != current_stock:
+        if current_run:
+            runs.append({"stock": current_stock, "rows": current_run})
+            current_run = []
+        current_stock = stock
+
+    # Negative change?
+    if isinstance(change, (int, float)) and change < 0:
+        current_run.append(r)
+    else:
+        if current_run:
+            runs.append({"stock": current_stock, "rows": current_run})
+            current_run = []
+
+# Flush final run
+if current_run:
+    runs.append({"stock": current_stock, "rows": current_run})
+
+# ----------------------------------------------------------------------
+# 2. Summarise each run using the left‑side columns
+# ----------------------------------------------------------------------
+summaries = []
+
+for run in runs:
+    rows = run["rows"]
+    if not rows:
+        continue
+
+    # Gather values from left‑side columns
+    dates   = [cell_val(input_ws, r, COL_DATE)   for r in rows]
+    opens   = [cell_val(input_ws, r, COL_OPEN)   for r in rows]
+    closes  = [cell_val(input_ws, r, COL_CLOSE)  for r in rows]
+    highs   = [cell_val(input_ws, r, COL_HIGH)   for r in rows]
+    lows    = [cell_val(input_ws, r, COL_LOW)    for r in rows]
+    volumes = [cell_val(input_ws, r, COL_VOLUME) for r in rows]
+
+    # Filter numeric values for max/min and sum
+    numeric_highs = [h for h in highs if isinstance(h, (int, float))]
+    numeric_lows  = [l for l in lows  if isinstance(l, (int, float))]
+    numeric_vols  = [v for v in volumes if isinstance(v, (int, float))]
+
+    summary = {
+        "stock": run["stock"],
+        "date": dates[0] if dates else None,               # first date
+        "open": opens[0] if opens else None,               # opening price from first row
+        "high": max(numeric_highs) if numeric_highs else None,
+        "low":  min(numeric_lows)  if numeric_lows  else None,
+        "close": closes[-1] if closes else None,           # closing price from last row
+        "volume": sum(numeric_vols)
+    }
+    summaries.append(summary)
+
+# ----------------------------------------------------------------------
+# 3. Write summaries to the output sheet (clear old data first)
+# ----------------------------------------------------------------------
+# Delete all rows after the header (row 1) if any
+if output_ws.max_row > 1:
+    output_ws.delete_rows(2, output_ws.max_row - 1)
+
+out_row = 2
+for s in summaries:
+    output_ws.cell(row=out_row, column=1, value=s["date"])
+    output_ws.cell(row=out_row, column=2, value=s["stock"])
+    output_ws.cell(row=out_row, column=3, value=s["open"])
+    output_ws.cell(row=out_row, column=4, value=s["high"])
+    output_ws.cell(row=out_row, column=5, value=s["low"])
+    output_ws.cell(row=out_row, column=6, value=s["close"])
+    output_ws.cell(row=out_row, column=7, value=s["volume"])
+    out_row += 1
+
+# ----------------------------------------------------------------------
+# 4. Save, recalculate, and verify
+# ----------------------------------------------------------------------
+os.makedirs(output_dir, exist_ok=True)
+wb.save(output_path)
+
+# Recalculate formulas (if any)
+await recalculate(output_path)
+
+# Reload with cached values to verify
+wb_check = openpyxl.load_workbook(output_path, data_only=True)
+check_ws = wb_check["output"]
+print("--- Verified output rows (data only) ---")
+for r in range(2, check_ws.max_row + 1):
+    vals = [check_ws.cell(row=r, column=c).value for c in range(1, 8)]
+    print(f"Row {r}:", vals)
+```
+2026-04-14 07:56:36,224 INFO RLM iteration 6/50
+Reasoning: The workbook has been processed: consecutive negative Change runs per stock were detected, and for each run the first date, first opening price, last closing price, maximum high, minimum low, and summed volume (using the complete left‑side columns) were calculated. The existing rows in the `output` sheet were cleared, the summaries were written to columns 1‑7, the file was saved to the output directory, formulas were recalculated, and the final data was verified. The resulting output spreadsheet is ready at the expected location.
+Code:
+```repl
+# Submit the final output file
+SUBMIT(output_spreadsheet=output_path)
+```
+
+============================================================
+recalc_source: baseline
+score:         0.2857  FAIL
+Sheet 'output' range A2:G15: 28/98 cells match
+  output!A3: expected=datetime.datetime(2023, 9, 12, 0, 0) got=datetime.datetime(2023, 9, 11, 0, 0)
+  output!A4: expected=datetime.datetime(2023, 9, 11, 0, 0) got=datetime.datetime(2023, 9, 4, 0, 0)
+  output!A5: expected=datetime.datetime(2023, 9, 5, 0, 0) got=datetime.datetime(2023, 9, 14, 0, 0)
+  output!A6: expected=datetime.datetime(2023, 9, 4, 0, 0) got=datetime.datetime(2023, 9, 11, 0, 0)
+  output!A7: expected=datetime.datetime(2023, 9, 3, 0, 0) got=None
+  output!A8: expected=datetime.datetime(2023, 9, 17, 0, 0) got=None
+  output!A9: expected=datetime.datetime(2023, 9, 14, 0, 0) got=None
+  output!A10: expected=datetime.datetime(2023, 9, 12, 0, 0) got=None
+  output!A11: expected=datetime.datetime(2023, 9, 11, 0, 0) got=None
+  output!A12: expected=datetime.datetime(2023, 9, 3, 0, 0) got=None
+  output!B5: expected='AAMRANET ' got='ADVENT '
+  output!B6: expected='AAMRANET ' got='ADVENT '
+  output!B7: expected='AAMRANET ' got=None
+  output!B8: expected='ADVENT ' got=None
+  output!B9: expected='ADVENT ' got=None
+  output!B10: expected='ADVENT ' got=None
+  output!B11: expected='ADVENT ' got=None
+  output!B12: expected='ADVENT ' got=None
+  output!C2: expected=59.6 got=58
+  output!C3: expected=0 got=60
+  ... (50 more diffs)

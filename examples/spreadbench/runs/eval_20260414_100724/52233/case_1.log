@@ -1,0 +1,172 @@
+task: 52233  case: 1
+instruction_type: Cell-Level Manipulation
+answer_position: B7:B10
+input:  /Users/gabriel/Workspace/trampoline-ai/predict-rlm.spreadbench-release/examples/spreadbench/data/testset/spreadsheet/52233/1_52233_init.xlsx
+answer: /Users/gabriel/Workspace/trampoline-ai/predict-rlm.spreadbench-release/examples/spreadbench/data/testset/spreadsheet/52233/1_52233_golden.xlsx
+============================================================
+2026-04-14 10:32:35,851 INFO RLM iteration 1/50
+Reasoning: I need first inspect the workbook structure and locate the existing formula mentioned in the instruction. I should list sheets, dimensions, headers, and sample rows, then search for cells containing formulas related to `SUM`, `INDEX`, or `MATCH`, especially the exact formula pattern `=SUM(INDEX(B3:B5,0,MATCH(A7,$B$2:$Z$2,0)))` or nearby cells. After identifying the target column/range, I can modify the formula appropriately and verify it. For now, exploration only.
+Code:
+```repl
+from openpyxl import load_workbook
+from openpyxl.utils import get_column_letter
+import os, json, math
+
+path = input_spreadsheet
+wb = load_workbook(path)
+print("Workbook loaded:", path)
+print("Sheet names:", wb.sheetnames)
+
+def sheet_summary(ws):
+    print("\n=== SHEET:", ws.title, "===")
+    print("max_row:", ws.max_row, "max_column:", ws.max_column)
+    # Find first non-empty rows and headers
+    for r in range(1, min(ws.max_row, 5) + 1):
+        vals = [ws.cell(r, c).value for c in range(1, min(ws.max_column, 12) + 1)]
+        print(f"Row {r} first cols:", vals)
+    headers = [ws.cell(1, c).value for c in range(1, ws.max_column + 1)]
+    print("Header row 1:", headers[:20])
+    if ws.max_row >= 2:
+        headers2 = [ws.cell(2, c).value for c in range(1, ws.max_column + 1)]
+        print("Row 2:", headers2[:20])
+    # first 10 rows
+    print("First rows sample:")
+    for r in range(1, min(ws.max_row, 10) + 1):
+        vals = [ws.cell(r, c).value for c in range(1, min(ws.max_column, 12) + 1)]
+        print(f"  R{r}:", vals)
+    # last 5 rows
+    print("Last rows sample:")
+    start = max(1, ws.max_row - 4)
+    for r in range(start, ws.max_row + 1):
+        vals = [ws.cell(r, c).value for c in range(1, min(ws.max_column, 12) + 1)]
+        print(f"  R{r}:", vals)
+
+for ws in wb.worksheets:
+    sheet_summary(ws)
+
+# Search formulas and relevant cells
+print("\n=== Searching for formulas / relevant patterns ===")
+matches = []
+for ws in wb.worksheets:
+    for row in ws.iter_rows():
+        for cell in row:
+            v = cell.value
+            if isinstance(v, str) and v.startswith("="):
+                if any(k in v.upper() for k in ["INDEX", "MATCH", "SUM"]):
+                    matches.append((ws.title, cell.coordinate, v))
+print("Relevant formula cells found:", len(matches))
+for item in matches[:100]:
+    print(item)
+
+# Search for exact text in instruction pattern area
+target_like = []
+for ws in wb.worksheets:
+    for row in ws.iter_rows():
+        for cell in row:
+            v = cell.value
+            if v == '=SUM(INDEX(B3:B5,0,MATCH(A7,$B$2:$Z$2,0)))':
+                target_like.append((ws.title, cell.coordinate, v))
+print("Exact formula matches:", target_like)
+
+# Print a broader neighborhood around formula cells
+for ws_name, coord, formula in matches[:20]:
+    ws = wb[ws_name]
+    row = ws[coord].row
+    col = ws[coord].column
+    print(f"\nNeighborhood around {ws_name}!{coord} -> {formula}")
+    for r in range(max(1, row-2), min(ws.max_row, row+2)+1):
+        vals = []
+        for c in range(max(1, col-3), min(ws.max_column, col+3)+1):
+            vals.append(f"{get_column_letter(c)}{r}={ws.cell(r,c).value}")
+        print(" | ".join(vals))
+```
+2026-04-14 10:33:19,924 INFO RLM iteration 2/50
+Reasoning: I inspected the workbook and found the exact target cells: `Sheet1!B7:B10`. Those cells currently contain dragged formulas where the indexed range shifts downward (`B3:B5`, `B4:B6`, etc.), which is the problem the instruction describes.
+
+To make the formula work when filled downward while keeping the data rows fixed, the indexed data range should be locked to the full data block and let `MATCH(A7,...)` determine which company column to sum. The correct pattern is:
+
+`=SUM(INDEX($B$3:$E$5,0,MATCH(A7,$B$2:$E$2,0)))`
+
+Then fill it down through `B10`, so `A7` becomes `A8`, `A9`, `A10`, but the summed rows stay `3:5`.
+
+Next action: write that corrected formula into `B7:B10`, save to the output folder, recalculate, reload, and verify the resulting values.
+Code:
+```repl
+from openpyxl import load_workbook
+import os
+
+infile = input_spreadsheet
+filename = os.path.basename(infile)
+outdir = "/sandbox/output/output_spreadsheet"
+outfile = os.path.join(outdir, filename)
+
+# Load workbook
+wb = load_workbook(infile)
+orig_sheetnames = wb.sheetnames[:]
+ws = wb["Sheet1"]
+
+# Print current target area before modification
+print("Before modification:")
+for r in range(7, 11):
+    print(f"A{r}={ws[f'A{r}'].value!r}, B{r}={ws[f'B{r}'].value!r}")
+
+# Correct formula pattern: fixed data rows, dynamic lookup row
+for r in range(7, 11):
+    ws[f"B{r}"] = f"=SUM(INDEX($B$3:$E$5,0,MATCH(A{r},$B$2:$E$2,0)))"
+
+# Print formulas after modification
+print("\nAfter modification (formulas written):")
+for r in range(7, 11):
+    print(f"B{r} formula -> {ws[f'B{r}'].value}")
+
+# Save
+os.makedirs(outdir, exist_ok=True)
+wb.save(outfile)
+print("\nSaved to:", outfile)
+
+# Recalculate
+recalc_result = await recalculate(outfile)
+print("Recalculate result:", recalc_result)
+
+# Reload and restore sheet names if recalc changed them
+wb_check = load_workbook(outfile)
+if wb_check.sheetnames != orig_sheetnames:
+    print("Sheet names changed after recalc:", wb_check.sheetnames, "restoring to", orig_sheetnames)
+    for i, expected in enumerate(orig_sheetnames):
+        if i < len(wb_check.worksheets):
+            wb_check.worksheets[i].title = expected
+    wb_check.save(outfile)
+else:
+    print("Sheet names preserved:", wb_check.sheetnames)
+
+# Verify formulas
+wb_formula = load_workbook(outfile, data_only=False)
+ws_formula = wb_formula["Sheet1"]
+print("\nVerification - formulas in B7:B10:")
+for r in range(7, 11):
+    print(f"B{r}: {ws_formula[f'B{r}'].value}")
+
+# Verify calculated values
+wb_values = load_workbook(outfile, data_only=True)
+ws_values = wb_values["Sheet1"]
+print("\nVerification - calculated values in B7:B10:")
+for r in range(7, 11):
+    print(f"A{r}={ws_values[f'A{r}'].value!r}, B{r}={ws_values[f'B{r}'].value!r}")
+
+output_spreadsheet = outfile
+```
+2026-04-14 10:33:30,307 INFO RLM iteration 3/50
+Reasoning: I identified the exact target range as `Sheet1!B7:B10`, confirmed the original dragged formulas were incorrectly shifting the source row range downward, replaced them with the corrected fixed-range formula pattern, saved the workbook, recalculated it, and verified the resulting values in the target cells. The output file is ready to submit.
+Code:
+```repl
+SUBMIT(output_spreadsheet=output_spreadsheet)
+```
+
+============================================================
+recalc_source: baseline
+score:         0.0000  FAIL
+Sheet 'Sheet1' range B7:B10: 0/4 cells match
+  Sheet1!B7: expected=1000 got=500
+  Sheet1!B8: expected=700 got=150
+  Sheet1!B9: expected=1400 got=600
+  Sheet1!B10: expected=1550 got=200

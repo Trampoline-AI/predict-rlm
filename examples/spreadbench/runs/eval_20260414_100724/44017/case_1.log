@@ -1,0 +1,551 @@
+task: 44017  case: 1
+instruction_type: Cell-Level Manipulation
+answer_position: AD14:AO42
+input:  /Users/gabriel/Workspace/trampoline-ai/predict-rlm.spreadbench-release/examples/spreadbench/data/testset/spreadsheet/44017/1_44017_init.xlsx
+answer: /Users/gabriel/Workspace/trampoline-ai/predict-rlm.spreadbench-release/examples/spreadbench/data/testset/spreadsheet/44017/1_44017_golden.xlsx
+============================================================
+2026-04-14 10:36:45,771 INFO RLM iteration 1/50
+Reasoning: First I need to inspect the workbook thoroughly before changing anything. The instruction mentions formulas in columns AD:AO starting at row 14, so I should verify the sheet layout, headers, sample rows, and current values/formulas in that target range. I'll load the workbook with openpyxl, print the full instruction, list all sheet names with row/column counts, show headers, first 10 and last 5 rows for each sheet, and specifically inspect columns around AD:AO plus row 14 onward to identify the exact target cells and any existing formulas/example answers.
+Code:
+```repl
+from openpyxl import load_workbook
+from openpyxl.utils import get_column_letter, column_index_from_string
+import os, json, math
+
+print("INSTRUCTION:\n", instruction)
+
+path = input_spreadsheet
+wb = load_workbook(path)
+print("\nWorkbook loaded:", path)
+print("Sheet names:", wb.sheetnames)
+
+def row_values(ws, r, start=1, end=None):
+    if end is None:
+        end = ws.max_column
+    return [ws.cell(r, c).value for c in range(start, end+1)]
+
+for ws in wb.worksheets:
+    print("\n" + "="*100)
+    print(f"Sheet: {ws.title}")
+    print(f"Dimensions: max_row={ws.max_row}, max_column={ws.max_column}")
+    
+    # Print first few rows to determine header structure
+    for r in range(1, min(ws.max_row, 6) + 1):
+        vals = row_values(ws, r, 1, min(ws.max_column, 45))
+        print(f"Row {r}:", vals)
+    
+    # Heuristic header candidates
+    for hr in [1,2,3,4,5,6,10,12,13,14]:
+        if hr <= ws.max_row:
+            vals = row_values(ws, hr, 1, min(ws.max_column, 45))
+            nonempty = sum(v is not None and v != "" for v in vals)
+            print(f"Header candidate row {hr} nonempty={nonempty}: {vals}")
+    
+    # First 10 rows and last 5 rows, truncated to first 45 cols
+    print("\nFirst 10 rows (first 45 columns):")
+    for r in range(1, min(ws.max_row, 10) + 1):
+        print(f"R{r}:", row_values(ws, r, 1, min(ws.max_column, 45)))
+    
+    print("\nLast 5 rows (first 45 columns):")
+    for r in range(max(1, ws.max_row - 4), ws.max_row + 1):
+        print(f"R{r}:", row_values(ws, r, 1, min(ws.max_column, 45)))
+    
+    # Specific inspection around target columns AD:AO
+    start_c = column_index_from_string("AA")
+    end_c = column_index_from_string("AO")
+    if ws.max_column >= start_c:
+        print(f"\nColumns AA:AO headers/values for rows 1:16 on sheet {ws.title}:")
+        for r in range(1, min(ws.max_row, 16) + 1):
+            vals = row_values(ws, r, start_c, min(end_c, ws.max_column))
+            labels = [f"{get_column_letter(c)}{r}={ws.cell(r,c).value}" for c in range(start_c, min(end_c, ws.max_column)+1)]
+            print(" | ".join(labels))
+    
+    # Inspect target cells/formulas row 14 onward for a sample
+    if ws.max_row >= 14 and ws.max_column >= column_index_from_string("AD"):
+        print(f"\nTarget range sample AD:AO rows 14:{min(ws.max_row,22)} on {ws.title}:")
+        for r in range(14, min(ws.max_row, 22) + 1):
+            out = []
+            for c in range(column_index_from_string("AD"), min(column_index_from_string("AO"), ws.max_column) + 1):
+                v = ws.cell(r,c).value
+                out.append(f"{get_column_letter(c)}{r}={v!r}")
+            print(" ; ".join(out))
+```
+2026-04-14 10:37:17,718 INFO RLM iteration 2/50
+Reasoning: The previous output confirmed there is one sheet, `Data`, and the instruction targets columns AD:AO starting at row 14. Because the earlier printout was truncated, I still need the exact layout around the target area and the source columns used in the formulas: J (frequency), L (effective date), M:P (up to 4 increase percentages), W (base rate), and row 9 month dates for AD:AO. I also need to inspect whether AD:AO already contains formulas, placeholder values, or yellow fill, and whether any nearby columns contain example formulas I can mimic.
+
+Next I’ll do a focused inspection:
+1. Print row 9–14 across key columns A:AO with column letters.
+2. Print rows 14–42 for just the relevant source and target columns.
+3. Print existing formulas/values and fill colors in AD:AO.
+4. Check if neighboring “new rates” columns before AD contain existing formulas/examples.
+
+Once I understand the exact pattern, I can write formulas into the correct cells, save, recalculate, and verify.
+Code:
+```repl
+from openpyxl import load_workbook
+from openpyxl.utils import get_column_letter, column_index_from_string
+
+path = input_spreadsheet
+wb = load_workbook(path)
+ws = wb["Data"]
+
+def fmt(v):
+    if v is None:
+        return ""
+    return str(v)
+
+def fill_info(cell):
+    f = cell.fill
+    if f and f.fill_type:
+        return (f.fill_type, f.fgColor.rgb, f.start_color.rgb, f.end_color.rgb)
+    return None
+
+# 1) Print row 9-14 with column letters for A:AO
+start_c, end_c = 1, column_index_from_string("AO")
+print("=== ROWS 9:14, COLUMNS A:AO ===")
+header_line = [f"{get_column_letter(c)}" for c in range(start_c, end_c+1)]
+print("COLS:", " | ".join(header_line))
+for r in range(9, 15):
+    vals = [fmt(ws.cell(r, c).value) for c in range(start_c, end_c+1)]
+    print(f"R{r}:", " | ".join(vals))
+
+# 2) Print targeted source+target columns for all data rows
+relevant_cols = ["A","B","C","D","E","F","G","H","I","J","K","L","M","N","O","P","Q","R","S","T","U","V","W","X","Y","Z","AA","AB","AC","AD","AE","AF","AG","AH","AI","AJ","AK","AL","AM","AN","AO"]
+rel_idx = [column_index_from_string(c) for c in relevant_cols]
+
+print("\n=== DATA ROWS 14:42, RELEVANT COLUMNS ===")
+print("Cols:", relevant_cols)
+for r in range(14, ws.max_row + 1):
+    vals = [ws.cell(r, c).value for c in rel_idx]
+    # only show rows that have any data in key source region A:W or target AD:AO
+    if any(v not in (None, "") for v in vals):
+        print(f"R{r}:", vals)
+
+# 3) Existing formulas/values/fills in AD:AO
+print("\n=== EXISTING TARGET CELLS AD:AO ROWS 14:42 ===")
+for r in range(14, ws.max_row + 1):
+    parts = []
+    has_any = False
+    for c in range(column_index_from_string("AD"), column_index_from_string("AO")+1):
+        cell = ws.cell(r, c)
+        v = cell.value
+        fi = fill_info(cell)
+        if v not in (None, "") or fi is not None:
+            has_any = True
+        parts.append(f"{get_column_letter(c)}{r}={v!r}, fill={fi}")
+    if has_any or r <= 20:
+        print(" | ".join(parts))
+
+# 4) Inspect nearby example formulas in old/new rate area Q:AO
+print("\n=== FORMULA SCAN Q:AO ROWS 14:42 ===")
+for r in range(14, ws.max_row + 1):
+    found = []
+    for c in range(column_index_from_string("Q"), column_index_from_string("AO")+1):
+        v = ws.cell(r, c).value
+        if isinstance(v, str) and v.startswith("="):
+            found.append(f"{get_column_letter(c)}{r}={v}")
+    if found:
+        print(f"R{r} formulas:", found)
+
+# 5) Print row 9 dates specifically for Q:AO
+print("\n=== ROW 9 DATE/HEADER MAP Q:AO ===")
+for c in range(column_index_from_string("Q"), column_index_from_string("AO")+1):
+    print(f"{get_column_letter(c)}9 = {ws.cell(9,c).value!r}")
+
+# 6) Print merged cells if any around relevant region
+print("\n=== MERGED RANGES INTERSECTING A:AO ===")
+for mr in ws.merged_cells.ranges:
+    print(mr)
+```
+2026-04-14 10:39:05,590 INFO RLM iteration 3/50
+Reasoning: I’ve confirmed the workbook structure and the relevant source columns, but I still need a few exact details before writing formulas safely:
+
+1. Inspect the frequency lookup table in I6:J8.
+2. Inspect the target month dates in AD:AO more precisely, especially the odd blank at AD9.
+3. Inspect existing formulas and fills in AD:AO for a small focused set of rows so I can preserve or replace correctly.
+4. Check whether row 9 cached values are valid after loading with `data_only=True`.
+5. Then write a robust formula pattern for all populated data rows 14:42, clear yellow fills in the completed target cells, save, recalculate, reload, and verify.
+
+The likely formula logic is:
+- blank if target month date < effective date
+- otherwise start from base rate in W
+- apply 1st increase immediately at effective date
+- apply 2nd/3rd/4th increases when the target month is at least J / 2J / 3J months after the effective date
+- ignore blank increase % cells
+
+I’ll verify the date row and frequency mapping first, then implement.
+Code:
+```repl
+from openpyxl import load_workbook
+from openpyxl.utils import get_column_letter, column_index_from_string
+from copy import copy
+import os
+
+path = input_spreadsheet
+wb = load_workbook(path)
+ws = wb["Data"]
+
+# Also inspect cached/calculated values
+wb_vals = load_workbook(path, data_only=True)
+ws_vals = wb_vals["Data"]
+
+def cell_desc(ws_obj, addr):
+    c = ws_obj[addr]
+    return {
+        "addr": addr,
+        "value": c.value,
+        "fill_type": c.fill.fill_type,
+        "fg": c.fill.fgColor.rgb,
+        "start": c.fill.start_color.rgb,
+        "end": c.fill.end_color.rgb,
+        "numfmt": c.number_format,
+    }
+
+print("=== Frequency lookup table I6:J8 ===")
+for r in range(6, 9):
+    print(r, [ws.cell(r, c).value for c in range(column_index_from_string("I"), column_index_from_string("J")+1)])
+
+print("\n=== Month/date row around AB:AO (formulas workbook) ===")
+for c in range(column_index_from_string("AB"), column_index_from_string("AO")+1):
+    print(f"{get_column_letter(c)}9 -> {ws.cell(9,c).value!r}")
+
+print("\n=== Month/date row around AB:AO (data_only cached values) ===")
+for c in range(column_index_from_string("AB"), column_index_from_string("AO")+1):
+    print(f"{get_column_letter(c)}9 -> {ws_vals.cell(9,c).value!r}")
+
+print("\n=== Merged ranges (all) ===")
+print([str(rng) for rng in ws.merged_cells.ranges])
+
+print("\n=== Target area AD:AO focused rows 14:20 with fills/formulas ===")
+for r in range(14, 21):
+    items = []
+    for c in range(column_index_from_string("AD"), column_index_from_string("AO")+1):
+        cell = ws.cell(r, c)
+        items.append(
+            f"{get_column_letter(c)}{r}={cell.value!r}, fill={cell.fill.fill_type}/{cell.fill.fgColor.rgb}"
+        )
+    print(" | ".join(items))
+
+print("\n=== Source columns I:P and W for rows 14:22 ===")
+for r in range(14, 23):
+    vals = {col: ws[f"{col}{r}"].value for col in ["I","J","K","L","M","N","O","P","W"]}
+    print(r, vals)
+
+# Build formulas and save
+out_dir = "/sandbox/output/output_spreadsheet"
+os.makedirs(out_dir, exist_ok=True)
+out_path = os.path.join(out_dir, os.path.basename(input_spreadsheet))
+
+# Re-open fresh for writing
+wbw = load_workbook(path)
+wsw = wbw["Data"]
+
+# Preserve original sheet names for post-recalc verification
+original_sheetnames = wbw.sheetnames[:]
+
+# Determine actual data rows: rows with meaningful content in source region
+target_rows = []
+for r in range(14, wsw.max_row + 1):
+    if any(wsw[f"{col}{r}"].value not in (None, "") for col in ["I","J","L","W"]):
+        target_rows.append(r)
+
+print("\nRows selected for output:", target_rows)
+
+# Formula template:
+# If target date blank or effective date blank => ""
+# If target date < effective date => ""
+# Else W * (1+M if M exists) * (1+N if N exists and target date >= EDATE(L,J)) * ...
+# Use IF blanks for missing percentages. Use numeric J from lookup/formula column J.
+for r in target_rows:
+    for c in range(column_index_from_string("AD"), column_index_from_string("AO") + 1):
+        col_letter = get_column_letter(c)
+        formula = (
+            f'=IF(OR({col_letter}$9="", $L{r}=""),"",'
+            f'IF({col_letter}$9<$L{r},"",'
+            f'$W{r}'
+            f'*IF($M{r}="";1;1+$M{r})'
+            f'*IF(AND($N{r}<>"",{col_letter}$9>=EDATE($L{r},$J{r}));1+$N{r};1)'
+            f'*IF(AND($O{r}<>"",{col_letter}$9>=EDATE($L{r},2*$J{r}));1+$O{r};1)'
+            f'*IF(AND($P{r}<>"",{col_letter}$9>=EDATE($L{r},3*$J{r}));1+$P{r};1)'
+            f'))'
+        )
+        # Use comma separators for Excel/LibreOffice xlsx formulas, not semicolons
+        formula = formula.replace(";", ",")
+        cell = wsw.cell(r, c)
+        cell.value = formula
+        # Remove fill in completed target cells
+        cell.fill = copy(wsw["Q14"].fill)
+        cell.fill.fill_type = None
+
+# Save before recalc
+wbw.save(out_path)
+print("\nSaved initial output to:", out_path)
+
+# Recalculate
+recalc_result = await recalculate(out_path)
+print("Recalculate result:", recalc_result)
+
+# Reload and restore sheet names if changed
+wb_after = load_workbook(out_path)
+print("Sheet names after recalc:", wb_after.sheetnames)
+if wb_after.sheetnames != original_sheetnames:
+    print("Renaming sheets back to original names...")
+    for i, name in enumerate(original_sheetnames):
+        wb_after.worksheets[i].title = name
+    wb_after.save(out_path)
+
+# Verify with data_only
+wb_verify = load_workbook(out_path, data_only=True)
+wsv = wb_verify["Data"]
+
+print("\n=== Verification: AD:AO rows 14:20 (data_only) ===")
+for r in range(14, 21):
+    vals = [wsv.cell(r, c).value for c in range(column_index_from_string("AD"), column_index_from_string("AO")+1)]
+    print(f"R{r}:", vals)
+
+print("\n=== Verification: written formulas AD:AO rows 14:16 ===")
+wb_formula_check = load_workbook(out_path)
+wsf = wb_formula_check["Data"]
+for r in range(14, 17):
+    vals = [wsf.cell(r, c).value for c in range(column_index_from_string("AD"), column_index_from_string("AO")+1)]
+    print(f"R{r}:", vals)
+
+output_spreadsheet = out_path
+```
+2026-04-14 10:39:54,934 INFO RLM iteration 4/50
+Reasoning: The prior attempt failed only because I tried to mutate an immutable style object while clearing the yellow fill. I already have enough layout detail to proceed: the target is `Data!AD:AO` from row 14 onward, using row 9 month dates, base rate in `W`, effective date in `L`, frequency months in `J`, and sequential increase percentages in `M:P`.
+
+Next action:
+1. Re-open the workbook fresh.
+2. Write formulas into `AD:AO` for all relevant rows starting at 14.
+3. Clear fill safely by assigning a new `PatternFill(fill_type=None)`.
+4. Save, recalculate, reload, verify row 9 dates plus sample results/formulas/fills.
+5. Store the output path for submission if verification looks good.
+Code:
+```repl
+from openpyxl import load_workbook
+from openpyxl.utils import get_column_letter, column_index_from_string
+from openpyxl.styles import PatternFill
+import os
+
+in_path = input_spreadsheet
+out_dir = "/sandbox/output/output_spreadsheet"
+os.makedirs(out_dir, exist_ok=True)
+out_path = os.path.join(out_dir, os.path.basename(in_path))
+
+# Fresh load for writing
+wb = load_workbook(in_path)
+ws = wb["Data"]
+original_sheetnames = wb.sheetnames[:]
+
+ad_col = column_index_from_string("AD")
+ao_col = column_index_from_string("AO")
+
+# Determine rows to populate: any row with meaningful data in the main source area
+target_rows = []
+for r in range(14, ws.max_row + 1):
+    if any(ws[f"{col}{r}"].value not in (None, "") for col in ["I", "J", "L", "M", "N", "O", "P", "W"]):
+        target_rows.append(r)
+
+print("Target rows:", target_rows)
+
+# Write formulas into AD:AO
+for r in target_rows:
+    for c in range(ad_col, ao_col + 1):
+        col = get_column_letter(c)
+        # Use DATE instead of EDATE for better compatibility
+        formula = (
+            f'=IF(OR({col}$9="",$L{r}="",NOT(ISNUMBER($J{r}))),"",'
+            f'IF({col}$9<$L{r},"",'
+            f'$W{r}'
+            f'*IF($M{r}="",1,1+$M{r})'
+            f'*IF(AND($N{r}<>"",{col}$9>=DATE(YEAR($L{r}),MONTH($L{r})+$J{r},1)),1+$N{r},1)'
+            f'*IF(AND($O{r}<>"",{col}$9>=DATE(YEAR($L{r}),MONTH($L{r})+2*$J{r},1)),1+$O{r},1)'
+            f'*IF(AND($P{r}<>"",{col}$9>=DATE(YEAR($L{r}),MONTH($L{r})+3*$J{r},1)),1+$P{r},1)'
+            f'))'
+        )
+        cell = ws.cell(r, c)
+        cell.value = formula
+        cell.fill = PatternFill(fill_type=None)  # remove yellow fill
+        cell.number_format = ws[f"W{r}"].number_format
+
+wb.save(out_path)
+print("Saved:", out_path)
+
+# Recalculate
+recalc_result = await recalculate(out_path)
+print("Recalculate:", recalc_result)
+
+# Restore sheet names if recalc changed them
+wb_after = load_workbook(out_path)
+if wb_after.sheetnames != original_sheetnames:
+    print("Sheet names changed:", wb_after.sheetnames, "->", original_sheetnames)
+    for i, name in enumerate(original_sheetnames):
+        wb_after.worksheets[i].title = name
+    wb_after.save(out_path)
+else:
+    print("Sheet names preserved:", wb_after.sheetnames)
+
+# Verify cached values
+wbv = load_workbook(out_path, data_only=True)
+wsv = wbv["Data"]
+
+print("\nRow 9 dates AD:AO (data_only):")
+for c in range(ad_col, ao_col + 1):
+    print(get_column_letter(c), wsv.cell(9, c).value)
+
+print("\nSample verified values AD:AO rows 14:18:")
+for r in range(14, 19):
+    vals = [wsv.cell(r, c).value for c in range(ad_col, ao_col + 1)]
+    print(f"R{r}:", vals)
+
+# Verify formulas + fill in normal workbook
+wbf = load_workbook(out_path)
+wsf = wbf["Data"]
+
+print("\nSample formulas AD:AO rows 14:16:")
+for r in range(14, 17):
+    vals = [wsf.cell(r, c).value for c in range(ad_col, ao_col + 1)]
+    print(f"R{r}:", vals)
+
+print("\nSample fills AD:AF rows 14:16:")
+for r in range(14, 17):
+    info = []
+    for c in range(ad_col, ad_col + 3):
+        cell = wsf.cell(r, c)
+        info.append((f"{get_column_letter(c)}{r}", cell.fill.fill_type, cell.fill.fgColor.rgb))
+    print(info)
+
+output_spreadsheet = out_path
+print("\nPrepared output:", output_spreadsheet)
+```
+2026-04-14 10:40:36,220 INFO RLM iteration 5/50
+Reasoning: I’ve already written and recalculated the formulas, but before submitting I should do one final verification pass across all target cells, not just sample rows. I want to confirm:
+1. `AD:AO` has formulas for all relevant rows.
+2. Recalculated values are present where the month date is on/after the effective date and prerequisites exist.
+3. No target cells contain errors.
+4. No yellow fill remains in the completed cells.
+5. The saved output path is correct and ready to submit next turn.
+
+I’ll run a compact full-range audit and print only issues plus a few representative rows. Then, if everything checks out, I can submit in the following turn.
+Code:
+```repl
+from openpyxl import load_workbook
+from openpyxl.utils import column_index_from_string, get_column_letter
+
+out_path = "/sandbox/output/output_spreadsheet/1_44017_init.xlsx"
+
+wb_formula = load_workbook(out_path)
+wsf = wb_formula["Data"]
+
+wb_values = load_workbook(out_path, data_only=True)
+wsv = wb_values["Data"]
+
+ad_col = column_index_from_string("AD")
+ao_col = column_index_from_string("AO")
+
+issues = {
+    "missing_formula": [],
+    "missing_value_when_expected": [],
+    "error_like_value": [],
+    "yellow_fill": [],
+}
+
+def is_yellow(cell):
+    fills = [
+        getattr(cell.fill.fgColor, "rgb", None),
+        getattr(cell.fill.start_color, "rgb", None),
+        getattr(cell.fill.end_color, "rgb", None),
+    ]
+    fills = [x.upper() for x in fills if isinstance(x, str)]
+    return any(x in {"FFFFFF00", "FFFF00"} for x in fills)
+
+for r in range(14, wsf.max_row + 1):
+    L = wsf[f"L{r}"].value
+    W = wsf[f"W{r}"].value
+    Jv = wsv[f"J{r}"].value  # cached numeric freq if available
+    # Only audit rows that look like actual customer rows
+    row_is_relevant = any(wsf[f"{col}{r}"].value not in (None, "") for col in ["I","J","L","M","N","O","P","W"])
+    if not row_is_relevant:
+        continue
+
+    for c in range(ad_col, ao_col + 1):
+        col = get_column_letter(c)
+        formula_cell = wsf.cell(r, c)
+        value_cell = wsv.cell(r, c)
+        month_date = wsv.cell(9, c).value
+
+        if not (isinstance(formula_cell.value, str) and formula_cell.value.startswith("=")):
+            issues["missing_formula"].append(f"{col}{r}")
+
+        if is_yellow(formula_cell):
+            issues["yellow_fill"].append(f"{col}{r}")
+
+        val = value_cell.value
+        if isinstance(val, str) and val.startswith("#"):
+            issues["error_like_value"].append(f"{col}{r}={val}")
+
+        expected = (
+            month_date is not None and
+            L is not None and
+            W is not None and
+            isinstance(Jv, (int, float)) and
+            month_date >= L
+        )
+        if expected and val is None:
+            issues["missing_value_when_expected"].append(f"{col}{r}")
+
+print("Output file:", out_path)
+print("Sheet names (formula wb):", wb_formula.sheetnames)
+print("Sheet names (value wb):", wb_values.sheetnames)
+
+print("\nIssue counts:")
+for k, v in issues.items():
+    print(k, len(v))
+
+for k, v in issues.items():
+    if v:
+        print(f"\n{k} examples:", v[:20])
+
+print("\nRepresentative rows 19:23 with source data and AD:AO values")
+for r in range(19, 24):
+    src = {col: wsf[f"{col}{r}"].value for col in ["I","J","K","L","M","N","O","P","W"]}
+    vals = [wsv.cell(r, c).value for c in range(ad_col, ao_col + 1)]
+    print(f"Row {r} source:", src)
+    print(f"Row {r} AD:AO:", vals)
+
+output_spreadsheet = out_path
+print("\nReady to submit:", output_spreadsheet)
+```
+2026-04-14 10:40:39,981 INFO RLM iteration 6/50
+Reasoning: The workbook has been fully inspected, updated, recalculated, and verified. The target cells `Data!AD:AO` from row 14 onward now contain formulas, no yellow fill remains, recalculated values are present where expected, there are no formula/value errors, and the output file exists at the required path. The next step is to submit the completed spreadsheet path only.
+Code:
+```repl
+SUBMIT(output_spreadsheet=output_spreadsheet)
+```
+
+============================================================
+recalc_source: baseline
+score:         0.1437  FAIL
+Sheet 'Data' range AD14:AO42: 50/348 cells match
+  Data!AD14: expected=55198.076538341 got=39540.3985811875
+  Data!AD15: expected=18039.3808965942 got=48827.2969481432
+  Data!AD16: expected=0 got=None
+  Data!AD17: expected=105525.012 got=None
+  Data!AD18: expected=97766.5308934943 got=114229.595724334
+  Data!AD19: expected=58561.347363 got=69511.05396
+  Data!AD20: expected=261746.696110892 got=253465.813653291
+  Data!AD21: expected=43493.4924205668 got=16555.1249100402
+  Data!AD22: expected=0 got=None
+  Data!AD23: expected=389314.274953568 got=379577.246996389
+  Data!AD24: expected=32799.151791329 got=31593.6
+  Data!AD25: expected=419468.760223224 got=None
+  Data!AD26: expected=352999.125921802 got=241315.2
+  Data!AD27: expected=66812.3559951927 got=39492
+  Data!AD28: expected=110744.10809453 got=95191.557990875
+  Data!AD29: expected=355521.942318716 got=396183.744
+  Data!AD30: expected=0 got=None
+  Data!AD31: expected=550989.820480304 got=417592.2849956
+  Data!AD32: expected=9778.78741607677 got=21468.4767876533
+  Data!AD34: expected=784696.761423741 got=650056.938340536
+  ... (278 more diffs)

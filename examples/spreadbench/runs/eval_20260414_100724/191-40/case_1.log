@@ -1,0 +1,535 @@
+task: 191-40  case: 1
+instruction_type: Sheet-Level Manipulation
+answer_position: 'Sheet1'!A1:H85
+input:  /Users/gabriel/Workspace/trampoline-ai/predict-rlm.spreadbench-release/examples/spreadbench/data/testset/spreadsheet/191-40/1_191-40_init.xlsx
+answer: /Users/gabriel/Workspace/trampoline-ai/predict-rlm.spreadbench-release/examples/spreadbench/data/testset/spreadsheet/191-40/1_191-40_golden.xlsx
+============================================================
+2026-04-14 10:12:14,491 INFO RLM iteration 1/50
+Reasoning: First I need to inspect the workbook structure before making changes. I should:
+1. Load the spreadsheet with openpyxl.
+2. Print the instruction in full for precise requirements.
+3. List all sheet names, sizes, and key row samples.
+4. Focus on Sheet1: inspect headers, first/last rows, and especially columns D–F to see current formulas and whether formulas should be preserved/moved/rebuilt.
+5. Detect the blank-row-separated blocks and print their row ranges plus sample values in columns A–F, so I can confirm exactly which rows need sorting.
+
+Only after that should I implement the block-wise descending sort by column D.
+Code:
+```repl
+from openpyxl import load_workbook
+from openpyxl.utils import get_column_letter
+import os, json, math
+
+print("Instruction:")
+print(instruction)
+
+wb = load_workbook(input_spreadsheet)
+print("\nWorkbook loaded:", input_spreadsheet)
+print("Sheet names:", wb.sheetnames)
+
+def row_values(ws, r, max_cols=None):
+    mc = max_cols or ws.max_column
+    return [ws.cell(r, c).value for c in range(1, mc+1)]
+
+for ws in wb.worksheets:
+    print(f"\n--- Sheet: {ws.title} ---")
+    print("max_row:", ws.max_row, "max_column:", ws.max_column)
+    headers = row_values(ws, 1, ws.max_column)
+    print("Row 1 values:", headers)
+    
+    sample_first = list(range(1, min(ws.max_row, 10)+1))
+    sample_last = list(range(max(1, ws.max_row-4), ws.max_row+1))
+    print("First rows:")
+    for r in sample_first:
+        print(r, row_values(ws, r, min(ws.max_column, 8)))
+    print("Last rows:")
+    for r in sample_last:
+        print(r, row_values(ws, r, min(ws.max_column, 8)))
+
+# Focus on Sheet1
+ws = wb["Sheet1"]
+print("\nFocused inspection: Sheet1")
+print("Dimensions:", ws.max_row, ws.max_column)
+
+# Print columns letters and headers
+col_info = [(get_column_letter(c), ws.cell(1, c).value) for c in range(1, ws.max_column+1)]
+print("Column letters + row1 values:")
+print(col_info)
+
+# Print rows with A:F for all non-empty-ish region, but summarized
+print("\nRows 1..min(20,max_row), columns A:F:")
+for r in range(1, min(20, ws.max_row)+1):
+    print(r, [ws.cell(r, c).value for c in range(1, 7)])
+
+if ws.max_row > 20:
+    print("\nLast 10 rows, columns A:F:")
+    for r in range(max(1, ws.max_row-9), ws.max_row+1):
+        print(r, [ws.cell(r, c).value for c in range(1, 7)])
+
+# Inspect formulas in D:F
+print("\nInspect formulas/values in D:F for first 20 rows:")
+for r in range(1, min(20, ws.max_row)+1):
+    vals = [ws.cell(r, c).value for c in range(4, 7)]
+    print(r, vals)
+
+# Detect blocks separated by fully blank rows (A:max_column all blank)
+def is_blank_row(ws, r):
+    return all(ws.cell(r, c).value in (None, "") for c in range(1, ws.max_column+1))
+
+blocks = []
+in_block = False
+start = None
+for r in range(1, ws.max_row + 1):
+    blank = is_blank_row(ws, r)
+    if not blank and not in_block:
+        start = r
+        in_block = True
+    elif blank and in_block:
+        blocks.append((start, r-1))
+        in_block = False
+if in_block:
+    blocks.append((start, ws.max_row))
+
+print("\nDetected non-blank blocks:")
+for i, (s, e) in enumerate(blocks, 1):
+    print(f"Block {i}: rows {s}-{e}, size={e-s+1}")
+    # show up to first 3 and last 2 rows of A:F
+    rows_to_show = list(range(s, min(e, s+2)+1))
+    if e - s + 1 > 5:
+        rows_to_show += list(range(max(s+3, e-1), e+1))
+    rows_to_show = sorted(set(rows_to_show))
+    for r in rows_to_show:
+        print(" ", r, [ws.cell(r, c).value for c in range(1, 7)])
+
+# Identify candidate numeric data rows by checking D values
+print("\nColumn D values/types by row for first 30 rows:")
+for r in range(1, min(30, ws.max_row)+1):
+    v = ws.cell(r, 4).value
+    print(r, repr(v), type(v).__name__)
+```
+2026-04-14 10:12:53,220 INFO RLM iteration 2/50
+Reasoning: I’ve confirmed the workbook is a single-sheet file with data on `Sheet1`, and columns D/F currently appear as formulas like `=B1+C1` and `=D1+E1`. Before modifying anything, I still need a few exact details that were truncated:
+1. The true used row extent and all detected block ranges.
+2. Whether any D–F cells are text-stored formulas rather than real formulas.
+3. The current styles/number formats/alignment in D–F so I can preserve and enforce them correctly.
+4. A data-only view of column D to confirm sorting should be based on evaluated numeric values.
+
+Next I’ll print concise summaries for all blocks, inspect formula/data types and cached numeric values, and inspect styles on representative rows. Then I can perform the in-place block sort safely while preserving one blank row between blocks and restoring formulas/styles.
+Code:
+```repl
+from openpyxl import load_workbook
+from openpyxl.styles import PatternFill
+from copy import copy
+import os, json, math
+
+# Reload normal + data_only for formula/cached-value inspection
+wb = load_workbook(input_spreadsheet)
+wbd = load_workbook(input_spreadsheet, data_only=True)
+ws = wb["Sheet1"]
+wsd = wbd["Sheet1"]
+
+def row_vals(ws, r, c1=1, c2=8):
+    return [ws.cell(r, c).value for c in range(c1, c2+1)]
+
+def is_blank_row(ws, r, upto=None):
+    upto = upto or ws.max_column
+    return all(ws.cell(r, c).value in (None, "") for c in range(1, upto+1))
+
+# true last non-empty row
+last_nonempty = 0
+for r in range(ws.max_row, 0, -1):
+    if not is_blank_row(ws, r):
+        last_nonempty = r
+        break
+print("True last non-empty row:", last_nonempty)
+
+# Detect contiguous nonblank blocks in used region
+blocks = []
+in_block = False
+start = None
+for r in range(1, last_nonempty + 1):
+    blank = is_blank_row(ws, r)
+    if not blank and not in_block:
+        start = r
+        in_block = True
+    elif blank and in_block:
+        blocks.append((start, r-1))
+        in_block = False
+if in_block:
+    blocks.append((start, last_nonempty))
+
+print("Detected blocks:", len(blocks))
+for i, (s,e) in enumerate(blocks, 1):
+    print(f"Block {i}: rows {s}-{e}, size={e-s+1}, first={row_vals(ws,s,1,8)}, last={row_vals(ws,e,1,8)}")
+
+# Inspect D:F value/data_type and cached data-only values for representative rows
+sample_rows = []
+for s,e in blocks[:5]:
+    sample_rows.extend([s, min(s+1,e), e])
+sample_rows = sorted(set(r for r in sample_rows if r <= last_nonempty))
+print("\nRepresentative D:F inspection:")
+for r in sample_rows:
+    vals = [ws.cell(r,c).value for c in range(4,7)]
+    dtypes = [ws.cell(r,c).data_type for c in range(4,7)]
+    cached = [wsd.cell(r,c).value for c in range(4,7)]
+    print(f"Row {r}: vals={vals}, dtypes={dtypes}, cached={cached}")
+
+# Check for text-stored formulas or non-formula entries in D and F within blocks
+issues = []
+for s,e in blocks:
+    for r in range(s,e+1):
+        for c in [4,6]:
+            cell = ws.cell(r,c)
+            v = cell.value
+            if v is None:
+                issues.append((r,c,"blank"))
+            elif cell.data_type != 'f':
+                issues.append((r,c,cell.data_type,v))
+print("\nNon-formula issues in D/F count:", len(issues))
+print("First 20 issues:", issues[:20])
+
+# Style / number format / font / alignment inspection for D:E:F on representative rows
+print("\nStyle inspection D:E:F:")
+for r in sample_rows[:10]:
+    row_info = {}
+    for c in [4,5,6]:
+        cell = ws.cell(r,c)
+        row_info[c] = {
+            "coord": cell.coordinate,
+            "value": cell.value,
+            "numfmt": cell.number_format,
+            "bold": cell.font.bold,
+            "align_h": cell.alignment.horizontal,
+            "align_v": cell.alignment.vertical,
+            "style_id": cell.style_id,
+        }
+    print(f"Row {r}: {row_info}")
+
+# Show a few later rows to ensure formula pattern is consistent
+print("\nLater rows samples A:H around each block boundary:")
+for i, (s,e) in enumerate(blocks, 1):
+    rows = [s, min(s+1,e), e]
+    print(f"Block {i}")
+    for r in sorted(set(rows)):
+        print(r, row_vals(ws, r, 1, 8))
+
+# If many blocks, print just their ranges summary compactly
+print("\nCompact block ranges:", blocks)
+```
+2026-04-14 10:15:08,585 INFO RLM iteration 3/50
+Reasoning: I’ve inspected the workbook enough to implement safely:
+
+- Only `Sheet1` exists.
+- Real used range is rows 1–85, arranged as 9 nonblank blocks separated by blank rows.
+- Columns D and F are already real formulas (`data_type='f'`), and their cached values are numeric.
+- The task’s exact target is the existing data blocks on `Sheet1`; sorting should reorder rows within each block by evaluated column D descending, while preserving one blank row between blocks.
+- I also need to preserve formatting/structure, keep formulas live and row-correct after sorting, enforce automatic calculation, and make D:E:F bold, center-aligned, with the requested numeric display.
+
+Plan:
+1. Snapshot each block row (values + styles + row dimension metadata).
+2. Sort rows within each block by numeric D cached value descending.
+3. Rewrite the sheet sequentially with exactly one blank row between blocks.
+4. Translate formulas when moving rows so D/F still reference their own row.
+5. Reapply D:E:F style requirements.
+6. Save, recalculate, reload, verify sorted order/formulas/styles/sheet name.
+Code:
+```repl
+from openpyxl import load_workbook
+from openpyxl.formula.translate import Translator
+from openpyxl.styles import Font, Alignment
+from copy import copy
+import os, math
+
+infile = input_spreadsheet
+outdir = "/sandbox/output/output_spreadsheet"
+os.makedirs(outdir, exist_ok=True)
+outfile = os.path.join(outdir, os.path.basename(infile))
+
+wb = load_workbook(infile)
+wbd = load_workbook(infile, data_only=True)
+orig_sheetnames = wb.sheetnames[:]
+ws = wb["Sheet1"]
+wsd = wbd["Sheet1"]
+
+def is_blank_row(ws, r, max_col=None):
+    max_col = max_col or ws.max_column
+    return all(ws.cell(r, c).value in (None, "") for c in range(1, max_col + 1))
+
+def last_nonempty_row(ws):
+    for r in range(ws.max_row, 0, -1):
+        if not is_blank_row(ws, r):
+            return r
+    return 0
+
+def detect_blocks(ws, last_row):
+    blocks = []
+    start = None
+    in_block = False
+    for r in range(1, last_row + 1):
+        blank = is_blank_row(ws, r)
+        if not blank and not in_block:
+            start = r
+            in_block = True
+        elif blank and in_block:
+            blocks.append((start, r - 1))
+            in_block = False
+    if in_block:
+        blocks.append((start, last_row))
+    return blocks
+
+def to_num(v):
+    if isinstance(v, (int, float)) and not isinstance(v, bool):
+        return float(v)
+    try:
+        if v is None or v == "":
+            return None
+        return float(v)
+    except Exception:
+        return None
+
+def row_sort_key(r):
+    dv = to_num(wsd.cell(r, 4).value)
+    if dv is not None:
+        return dv
+    # fallback from B + C if cache missing
+    bv = to_num(ws.cell(r, 2).value)
+    cv = to_num(ws.cell(r, 3).value)
+    if bv is not None and cv is not None:
+        return bv + cv
+    return None
+
+def snapshot_row(ws, r, max_col):
+    row = []
+    for c in range(1, max_col + 1):
+        cell = ws.cell(r, c)
+        row.append({
+            "value": cell.value,
+            "style": copy(cell._style),
+            "number_format": cell.number_format,
+            "font": copy(cell.font),
+            "fill": copy(cell.fill),
+            "border": copy(cell.border),
+            "alignment": copy(cell.alignment),
+            "protection": copy(cell.protection),
+            "hyperlink": copy(cell.hyperlink) if cell.hyperlink else None,
+            "comment": copy(cell.comment) if cell.comment else None,
+            "data_type": cell.data_type,
+            "source_coord": cell.coordinate,
+        })
+    rd = ws.row_dimensions[r]
+    row_meta = {
+        "height": rd.height,
+        "hidden": rd.hidden,
+        "outlineLevel": rd.outlineLevel,
+        "collapsed": rd.collapsed,
+    }
+    return {"orig_row": r, "cells": row, "row_meta": row_meta, "sort_key": row_sort_key(r)}
+
+last_row = last_nonempty_row(ws)
+blocks = detect_blocks(ws, last_row)
+max_col = ws.max_column
+
+print("Original blocks:", blocks)
+
+# Snapshot and sort each block by evaluated D descending; nonnumeric rows, if any, go last preserving order
+sorted_blocks = []
+for (s, e) in blocks:
+    snaps = [snapshot_row(ws, r, max_col) for r in range(s, e + 1)]
+    snaps_sorted = sorted(
+        snaps,
+        key=lambda x: (x["sort_key"] is None, -(x["sort_key"] if x["sort_key"] is not None else 0), x["orig_row"])
+    )
+    sorted_blocks.append(snaps_sorted)
+
+# Clear used region values/comments/hyperlinks before rewrite
+for r in range(1, last_row + 1):
+    for c in range(1, max_col + 1):
+        cell = ws.cell(r, c)
+        cell.value = None
+        cell.comment = None
+        cell._hyperlink = None
+
+# Determine a blank-row style template from existing separator rows if available
+blank_template_row = None
+for r in range(1, last_row + 1):
+    if is_blank_row(load_workbook(infile)["Sheet1"], r):  # small file, okay here for template detection
+        blank_template_row = r
+        break
+# reload template workbook just once
+tmpl_wb = load_workbook(infile)
+tmpl_ws = tmpl_wb["Sheet1"]
+
+# Rewrite sequentially with exactly one blank row between blocks
+target_row = 1
+new_blocks = []
+
+for bi, block in enumerate(sorted_blocks, start=1):
+    start_row = target_row
+    for snap in block:
+        # apply row dimensions
+        meta = snap["row_meta"]
+        ws.row_dimensions[target_row].height = meta["height"]
+        ws.row_dimensions[target_row].hidden = meta["hidden"]
+        ws.row_dimensions[target_row].outlineLevel = meta["outlineLevel"]
+        ws.row_dimensions[target_row].collapsed = meta["collapsed"]
+
+        for c, cell_snap in enumerate(snap["cells"], start=1):
+            dest = ws.cell(target_row, c)
+            src_val = cell_snap["value"]
+
+            # translate formulas to new row so they keep row-correct references
+            if isinstance(src_val, str) and src_val.startswith("="):
+                try:
+                    new_val = Translator(src_val, origin=cell_snap["source_coord"]).translate_formula(dest.coordinate)
+                except Exception:
+                    new_val = src_val
+            else:
+                new_val = src_val
+
+            dest.value = new_val
+            dest._style = copy(cell_snap["style"])
+            dest.number_format = cell_snap["number_format"]
+            dest.font = copy(cell_snap["font"])
+            dest.fill = copy(cell_snap["fill"])
+            dest.border = copy(cell_snap["border"])
+            dest.alignment = copy(cell_snap["alignment"])
+            dest.protection = copy(cell_snap["protection"])
+            if cell_snap["hyperlink"]:
+                dest._hyperlink = copy(cell_snap["hyperlink"])
+            if cell_snap["comment"]:
+                dest.comment = copy(cell_snap["comment"])
+        target_row += 1
+
+    end_row = target_row - 1
+    new_blocks.append((start_row, end_row))
+
+    # exactly one blank row between blocks
+    if bi < len(sorted_blocks):
+        if blank_template_row:
+            ws.row_dimensions[target_row].height = tmpl_ws.row_dimensions[blank_template_row].height
+            ws.row_dimensions[target_row].hidden = tmpl_ws.row_dimensions[blank_template_row].hidden
+            ws.row_dimensions[target_row].outlineLevel = tmpl_ws.row_dimensions[blank_template_row].outlineLevel
+            ws.row_dimensions[target_row].collapsed = tmpl_ws.row_dimensions[blank_template_row].collapsed
+            # copy blank row styles from template row
+            for c in range(1, max_col + 1):
+                src = tmpl_ws.cell(blank_template_row, c)
+                dest = ws.cell(target_row, c)
+                dest._style = copy(src._style)
+                dest.number_format = src.number_format
+                dest.font = copy(src.font)
+                dest.fill = copy(src.fill)
+                dest.border = copy(src.border)
+                dest.alignment = copy(src.alignment)
+                dest.protection = copy(src.protection)
+                dest.value = None
+                dest.comment = None
+                dest._hyperlink = None
+        target_row += 1
+
+needed_last_row = target_row - 1
+
+# Clear any leftover rows in prior used range below new data
+for r in range(needed_last_row + 1, last_row + 1):
+    for c in range(1, max_col + 1):
+        cell = ws.cell(r, c)
+        cell.value = None
+        cell.comment = None
+        cell._hyperlink = None
+
+# Enforce automatic calculation
+try:
+    wb.calculation.calcMode = "auto"
+    wb.calculation.fullCalcOnLoad = True
+    wb.calculation.forceFullCalc = True
+except Exception as e:
+    print("Calc mode set warning:", e)
+
+# Recheck D:E:F formatting on data rows
+for s, e in new_blocks:
+    for r in range(s, e + 1):
+        for c in [4, 5, 6]:
+            cell = ws.cell(r, c)
+            cell.font = copy(cell.font)
+            cell.font = cell.font.copy(bold=True) if hasattr(cell.font, "copy") else Font(
+                name=cell.font.name, sz=cell.font.sz, b=True, i=cell.font.i, color=cell.font.color,
+                underline=cell.font.underline, strike=cell.font.strike, charset=cell.font.charset,
+                outline=cell.font.outline, shadow=cell.font.shadow, condense=cell.font.condense,
+                extend=cell.font.extend, family=cell.font.family, scheme=cell.font.scheme,
+                vertAlign=cell.font.vertAlign
+            )
+            cell.alignment = copy(cell.alignment)
+            cell.alignment = cell.alignment.copy(horizontal="center") if hasattr(cell.alignment, "copy") else Alignment(
+                horizontal="center", vertical=cell.alignment.vertical, textRotation=cell.alignment.textRotation,
+                wrapText=cell.alignment.wrapText, shrinkToFit=cell.alignment.shrinkToFit, indent=cell.alignment.indent
+            )
+            cell.number_format = "0.#"
+
+wb.save(outfile)
+print("Saved to:", outfile)
+
+# Recalculate
+recalc_result = await recalculate(outfile)
+print("Recalc:", recalc_result)
+
+# Restore original sheet names if LibreOffice changed them
+post_wb = load_workbook(outfile)
+if post_wb.sheetnames != orig_sheetnames and len(post_wb.sheetnames) == len(orig_sheetnames):
+    for idx, name in enumerate(orig_sheetnames):
+        post_wb.worksheets[idx].title = name
+    post_wb.save(outfile)
+    print("Restored sheet names:", post_wb.sheetnames)
+
+# Verification
+vbf = load_workbook(outfile)
+vbd = load_workbook(outfile, data_only=True)
+vws = vbf["Sheet1"]
+vwsd = vbd["Sheet1"]
+
+def verify_blocks(ws, last_row):
+    return detect_blocks(ws, last_row)
+
+v_last = last_nonempty_row(vws)
+v_blocks = verify_blocks(vws, v_last)
+print("Verified blocks:", v_blocks)
+
+# verify sort order in each block
+sort_checks = []
+for s, e in v_blocks:
+    vals = [to_num(vwsd.cell(r, 4).value) for r in range(s, e + 1)]
+    ok = all(vals[i] is not None and vals[i+1] is not None and vals[i] >= vals[i+1] for i in range(len(vals)-1))
+    sort_checks.append((s, e, ok, vals[:3], vals[-3:]))
+print("Sort checks:", sort_checks)
+
+# verify formulas/styles in first row of each block
+style_checks = []
+for s, e in v_blocks:
+    d = vws[f"D{s}"]
+    ecell = vws[f"E{s}"]
+    f = vws[f"F{s}"]
+    style_checks.append({
+        "row": s,
+        "D_formula": d.value,
+        "F_formula": f.value,
+        "D_cached": vwsd[f"D{s}"].value,
+        "F_cached": vwsd[f"F{s}"].value,
+        "D_bold": d.font.bold,
+        "E_bold": ecell.font.bold,
+        "F_bold": f.font.bold,
+        "D_align": d.alignment.horizontal,
+        "E_align": ecell.alignment.horizontal,
+        "F_align": f.alignment.horizontal,
+        "D_fmt": d.number_format,
+        "E_fmt": ecell.number_format,
+        "F_fmt": f.number_format,
+    })
+print("Style/formula checks:", style_checks[:5])
+
+# print sample rows from each block
+for idx, (s, e) in enumerate(v_blocks, start=1):
+    rows_to_show = [s, min(s+1, e), e]
+    rows_to_show = sorted(set(rows_to_show))
+    print(f"Block {idx} sample:")
+    for r in rows_to_show:
+        print(r, [vws.cell(r, c).value for c in range(1, 8)], "cachedD=", vwsd.cell(r, 4).value)
+
+output_spreadsheet = outfile
+```

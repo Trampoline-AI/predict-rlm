@@ -1,0 +1,123 @@
+task: 51431  case: 1
+instruction_type: Cell-Level Manipulation
+answer_position: B2
+input:  /Users/gabriel/Workspace/trampoline-ai/predict-rlm.spreadbench-release/examples/spreadbench/data/testset/spreadsheet/51431/1_51431_init.xlsx
+answer: /Users/gabriel/Workspace/trampoline-ai/predict-rlm.spreadbench-release/examples/spreadbench/data/testset/spreadsheet/51431/1_51431_golden.xlsx
+============================================================
+2026-04-14 08:39:37,306 INFO RLM iteration 1/50
+Reasoning: We need first inspect the workbook thoroughly before making changes: list sheets, dimensions, headers, sample first/last rows, and identify the exact target cells. The instruction specifically mentions A2 and B2, so we should print current values there and inspect surrounding cells to see if there are example formulas or designated output columns. After understanding the layout, we can write the appropriate Excel formula into B2 (and likely similar rows if the sheet contains more data), save, recalculate, verify, and then submit.
+Code:
+```repl
+import os, json, math, statistics, textwrap
+from openpyxl import load_workbook
+from openpyxl.utils import get_column_letter, column_index_from_string
+
+input_path = input_spreadsheet
+print("Input path:", input_path)
+print("Instruction:", instruction)
+
+wb = load_workbook(input_path)
+print("Sheet names:", wb.sheetnames)
+
+def row_values(ws, r, max_cols=None):
+    mc = max_cols or ws.max_column
+    return [ws.cell(r, c).value for c in range(1, mc+1)]
+
+for s in wb.sheetnames:
+    ws = wb[s]
+    print(f"\n--- Sheet: {s} ---")
+    print("max_row:", ws.max_row, "max_col:", ws.max_column)
+    headers = row_values(ws, 1, ws.max_column)
+    print("Header row 1:", headers)
+    if ws.max_row >= 2:
+        print("Row 2:", row_values(ws, 2, ws.max_column))
+    # first 10 rows
+    first_n = min(ws.max_row, 10)
+    print(f"First {first_n} rows:")
+    for r in range(1, first_n+1):
+        print(r, row_values(ws, r, ws.max_column))
+    # last 5 rows
+    start_last = max(1, ws.max_row - 4)
+    print("Last rows:")
+    for r in range(start_last, ws.max_row+1):
+        print(r, row_values(ws, r, ws.max_column))
+
+    # print A2/B2 and nearby range if exists
+    print("A2:", ws["A2"].value, "B2:", ws["B2"].value)
+    for r in range(1, min(ws.max_row, 5)+1):
+        vals = [ws.cell(r, c).value for c in range(1, min(ws.max_column, 4)+1)]
+        print(f"Nearby r{r} A:D:", vals)
+```
+2026-04-14 08:40:00,842 INFO RLM iteration 2/50
+Reasoning: We inspected the workbook and confirmed:
+- One sheet: `Sheet1`
+- Headers: `A1 = "Names:"`, `B1 = "Primary Provider"`
+- Data: `A2 = "Nizghi, Righat; Maher, Tammy; Ayer, Janet"`
+- Target output cell is clearly `B2`, currently blank.
+
+The instruction asks for a formula to extract the first full name listed in `A2`, where names are separated by semicolons. The correct result for the sample should therefore be the text before the first semicolon, trimmed of spaces:
+- Expected from A2: `Nizghi, Righat`
+
+Since the workbook only has row 2, we should place the formula in `B2`. A LibreOffice-compatible formula is:
+`=TRIM(LEFT(A2,FIND(";",A2&";")-1))`
+This safely returns everything before the first semicolon; appending `&";"` ensures it still works even if a semicolon is absent.
+
+Next: write the formula, save to the required output path, recalculate, reload, verify `B2`, and ensure sheet names remain unchanged.
+Code:
+```repl
+import os
+from openpyxl import load_workbook
+
+input_path = input_spreadsheet
+filename = os.path.basename(input_path)
+output_path = os.path.join("/sandbox/output/output_spreadsheet", filename)
+
+# Load workbook and write formula
+wb = load_workbook(input_path)
+original_sheetnames = wb.sheetnames[:]
+ws = wb["Sheet1"]
+
+print("Before write - B2:", ws["B2"].value)
+formula = '=TRIM(LEFT(A2,FIND(";",A2&";")-1))'
+ws["B2"] = formula
+print("Written formula to B2:", ws["B2"].value)
+
+wb.save(output_path)
+print("Saved to:", output_path)
+
+# Recalculate
+recalc_result = await recalculate(output_path)
+print("Recalculate result:", recalc_result)
+
+# Reload and restore sheet names if recalculate changed them
+wb_check = load_workbook(output_path)
+print("Sheet names after recalc:", wb_check.sheetnames)
+if wb_check.sheetnames != original_sheetnames and len(wb_check.sheetnames) == len(original_sheetnames):
+    for i, desired in enumerate(original_sheetnames):
+        wb_check.worksheets[i].title = desired
+    wb_check.save(output_path)
+    print("Restored sheet names to:", original_sheetnames)
+
+# Verify formulas and cached values
+wb_formula = load_workbook(output_path, data_only=False)
+ws_formula = wb_formula[original_sheetnames[0]]
+print("Verified formula in B2:", ws_formula["B2"].value)
+
+wb_values = load_workbook(output_path, data_only=True)
+ws_values = wb_values[original_sheetnames[0]]
+print("Verified A2:", ws_values["A2"].value)
+print("Verified B2 cached value:", ws_values["B2"].value)
+
+output_spreadsheet = output_path
+```
+2026-04-14 08:40:25,324 INFO RLM iteration 3/50
+Reasoning: The workbook has been inspected, modified, saved, recalculated, and verified successfully. `B2` now contains the expected extracted first full name from `A2`, and the output file is ready. The next step is to submit the saved spreadsheet path only.
+Code:
+```repl
+SUBMIT(output_spreadsheet=output_spreadsheet)
+```
+
+============================================================
+recalc_source: baseline
+score:         1.0000  PASS
+All 1 cells match

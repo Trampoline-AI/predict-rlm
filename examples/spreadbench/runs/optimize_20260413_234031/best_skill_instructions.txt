@@ -1,0 +1,113 @@
+Use openpyxl and pandas to manipulate .xlsx spreadsheet files.
+
+Output files are evaluated with **LibreOffice Calc**. This constrains which formulas work.
+
+# Formulas vs Python
+
+Use Excel formulas for per-cell calculations (sums, lookups, conditionals). Use Python to filter, sort, deduplicate, or populate sheets — write values row by row with openpyxl.
+
+```python
+# Per-cell formulas (good — stay live in LibreOffice)
+ws["F25"] = "=SUM(F3:F24)"
+ws["G10"] = "=IF(G8>0, G6/G8, 0)"
+ws["B10"] = "=VLOOKUP(TRIM(A10), Sheet2!A:C, 3, FALSE)"
+
+# Filtering/sorting (do in Python, write values directly)
+for r in range(2, src.max_row + 1):
+    if src.cell(r, 4).value > threshold:
+        for c in range(1, src.max_column + 1):
+            dest.cell(out_row, c).value = src.cell(r, c).value
+        out_row += 1
+```
+
+Prefer Python-computed literal values over complex multi-step formulas for small, static datasets — unless the instruction explicitly asks for formulas.
+
+# Identifying the Correct Target Cells
+
+Before writing ANY data, determine exactly which cells need modification:
+- **Read column headers and existing layout** to find the correct target column. If the task says "column H" but the actual header for results is in column D, write to column D. Trust headers and existing layout over letter references in the user instruction when they conflict.
+- **Check if target cells already contain correct values.** Read each target cell before overwriting. If a cell already has a non-None value that looks plausible, do NOT overwrite it. Only fill cells that are empty/None or contain errors.
+- **When the task says "fix" or "modify" a formula, write to the SAME cells** that currently contain the broken formulas — do NOT create a new column beside them.
+- **For report generation**, double-check column positions by counting from the start column. Off-by-one column errors cause total mismatches. Print your header row after writing to verify alignment.
+
+# Handling ArrayFormula Objects
+
+When openpyxl loads a cell and shows `<openpyxl.worksheet.formula.ArrayFormula object>`, the cell contains a CSE (Ctrl+Shift+Enter) array formula. These often fail to re-evaluate after re-saving with openpyxl.
+
+**Best practice**: Access the formula text via `cell.value.text`. Then decide:
+1. If the formula is simple, replace it with a non-array equivalent (e.g., SUMPRODUCT instead of SUM with array conditions).
+2. If the formula is complex or references external workbooks, compute the result in Python and write the literal value.
+3. Check type with `isinstance(cell.value, openpyxl.worksheet.formula.ArrayFormula)`.
+4. When the task asks to fix cells that contain ArrayFormula objects, you MUST write to those same cells — do not add a new column.
+
+# Formulas Referencing External Workbooks
+
+Formulas like `='[1]Sheet1'!A1` or `=VLOOKUP(A1,[1]Sort!$B:$C,2,FALSE)` reference external workbooks that are NOT available in the sandbox. These formulas will evaluate to `None` or `#REF!` after recalculation.
+
+**Always compute such values in Python** by reading the available data and performing the lookup/calculation programmatically. Write literal values to the cells instead of formulas.
+
+# LibreOffice Formula Compatibility
+
+## Forbidden (spill/dynamic-array — results not persisted)
+`FILTER`, `SORT`, `UNIQUE`, `SORTBY`, `SEQUENCE`, `RANDARRAY`
+
+Write every cell individually. If a formula should fill a range, loop and write to each cell.
+
+## Forbidden (Excel 365-only — evaluate to `#NAME?`)
+`LET`, `LAMBDA`, `MAP`, `REDUCE`, `SCAN`, `MAKEARRAY`, `BYROW`, `BYCOL`,
+`TEXTSPLIT`, `TEXTBEFORE`, `TEXTAFTER`, `CHOOSECOLS`, `CHOOSEROWS`,
+`TAKE`, `DROP`, `EXPAND`, `WRAPCOLS`, `WRAPROWS`, `TOCOL`, `TOROW`,
+`VSTACK`, `HSTACK`
+
+## Require `_xlfn.` prefix in LibreOffice
+`IFNA`, `IFS`, `SWITCH`, `TEXTJOIN`, `AGGREGATE`, `MAXIFS`, `MINIFS`, `CONCAT`
+Write as `=_xlfn.IFNA(...)` etc.
+
+## Safe single-cell functions
+`SUM`, `SUMIF`, `SUMIFS`, `SUMPRODUCT`, `AVERAGE`, `AVERAGEIF`, `MIN`, `MAX`,
+`ROUND`, `ABS`, `IF`, `IFS`, `AND`, `OR`, `NOT`, `IFERROR`,
+`VLOOKUP`, `HLOOKUP`, `XLOOKUP`, `INDEX`, `MATCH`, `OFFSET`, `INDIRECT`,
+`COUNT`, `COUNTA`, `COUNTIF`, `COUNTIFS`, `COUNTBLANK`,
+`LEFT`, `RIGHT`, `MID`, `LEN`, `TRIM`, `TEXT`, `VALUE`, `FIND`, `SUBSTITUTE`,
+`DATE`, `YEAR`, `MONTH`, `DAY`, `TODAY`, `ROW`, `COLUMN`, `LARGE`, `SMALL`, `RANK`
+
+# Respecting Existing Files
+
+Treat the layout, fonts, colors, naming conventions, and data ordering of provided workbooks as authoritative. Mimic existing patterns. Before writing any value, read nearby cells to learn the convention (casing, abbreviations, placeholders) and match it exactly.
+
+Never create explanation sheets, VBA code sheets, or "Answer" sheets. Implement the transformation directly.
+
+# Verifying Formulas
+
+After saving a workbook with formulas, call `recalculate(output_path)` and
+then reload with `data_only=True` to confirm key target cells are not `None`.
+
+If target cells are `None` or `0` after recalculation but should have real values:
+1. Check if the formula references external workbooks — if so, compute in Python and write literals.
+2. Check if the formula uses array syntax that LibreOffice doesn't support — switch to SUMPRODUCT or Python.
+3. Check if you overwrote a cell that already had a correct value — revert and only modify truly empty/broken cells.
+4. As a fallback, compute the values in Python and write literals instead of formulas.
+
+`#NAME?` errors mean you used an unsupported function — replace with Python logic or a compatible formula.
+
+# Common Pitfalls
+
+- **Circular refs**: never write a formula that references its own cell. Read the value into Python first, then write back as a literal.
+- **Division by zero**: guard divisors with `IFERROR` or check in Python.
+- **`{=FORMULA}` braces**: never write literal curly braces — openpyxl treats them as text, not array formula markers.
+- **Merged cells**: only the top-left cell has a value; others are `None`. Unmerge before restructuring.
+- **`data_only=True`**: use when reading computed values from formula cells. Never save a workbook opened this way (replaces formulas with cached values).
+- **Full-column refs**: prefer bounded ranges matching actual data extent. `$A:$A` hangs the sandbox formula verifier.
+- **`ws.delete_rows()` / `ws.insert_rows()`**: O(n²) in WASM — hangs on large sheets. Read rows into a list, transform in Python, write back.
+- **SUMIF with array math**: `SUMIF` does not support computed arrays as sum_range. Use `SUMPRODUCT` instead.
+- **SUM on text-formatted numbers**: returns 0. Coerce with `VALUE()` inside `SUMPRODUCT`, or compute in Python.
+- **Overwriting existing data**: Before writing to any cell, check if it already contains a valid value. Only write to cells that are None, empty, or contain errors. Never blindly overwrite a range — inspect first and preserve cells that already have correct data.
+- **Wrong target column**: Always verify the target column by reading headers and the existing layout. Count columns carefully. If a result header already exists, write under it.
+- **Existing #NAME? or error values**: When source cells contain errors like #NAME?, wrap your formulas referencing them in IFERROR, or compute values in Python to avoid error propagation.
+
+# openpyxl Essentials
+
+- 1-indexed: `cell(row=1, column=1)` is `A1`.
+- Formulas are stored as text — openpyxl does not evaluate them.
+- `read_only=True` / `write_only=True` for large files.
+- ArrayFormula objects: access the formula string via `cell.value.text`. Check type with `isinstance(cell.value, openpyxl.worksheet.formula.ArrayFormula)`.

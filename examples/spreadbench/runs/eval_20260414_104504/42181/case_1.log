@@ -1,0 +1,145 @@
+task: 42181  case: 1
+instruction_type: Cell-Level Manipulation
+answer_position: B13
+input:  /Users/gabriel/Workspace/trampoline-ai/predict-rlm.spreadbench-release/examples/spreadbench/data/testset/spreadsheet/42181/1_42181_init.xlsx
+answer: /Users/gabriel/Workspace/trampoline-ai/predict-rlm.spreadbench-release/examples/spreadbench/data/testset/spreadsheet/42181/1_42181_golden.xlsx
+============================================================
+2026-04-14 11:07:00,164 INFO RLM iteration 1/50
+Reasoning: Need inspect workbook thoroughly first per instructions, identify target formula cell(s), current formulas, sample rows esp columns A,B,I and A13. Then modify existing formula cells, likely around A13/B13? Need explore sheet names, dimensions, headers/sample rows/formulas.
+Code:
+```repl
+import os, json, re, shutil
+from openpyxl import load_workbook
+from openpyxl.utils import get_column_letter
+
+print("Instruction:", instruction)
+
+path = input_spreadsheet
+wb = load_workbook(path)
+print("Sheets:", wb.sheetnames)
+
+for ws in wb.worksheets:
+    print(f"\n--- Sheet: {ws.title} ---")
+    print("max_row:", ws.max_row, "max_col:", ws.max_column)
+    headers = [ws.cell(1, c).value for c in range(1, ws.max_column + 1)]
+    print("Row1 headers/values:", headers)
+    if ws.max_row >= 2:
+        headers2 = [ws.cell(2, c).value for c in range(1, ws.max_column + 1)]
+        print("Row2 values:", headers2)
+    # first 10 rows
+    first_n = min(ws.max_row, 10)
+    print("First rows:")
+    for r in range(1, first_n + 1):
+        vals = [ws.cell(r, c).value for c in range(1, ws.max_column + 1)]
+        print(r, vals)
+    # last 5 rows
+    start_last = max(1, ws.max_row - 4)
+    print("Last rows:")
+    for r in range(start_last, ws.max_row + 1):
+        vals = [ws.cell(r, c).value for c in range(1, ws.max_column + 1)]
+        print(r, vals)
+
+    # print key cells / columns if available
+    for coord in ["A13", "B13", "I13", "J13", "K13", "L13", "M13"]:
+        if ws.max_column >= 1 and ws.max_row >= 13:
+            print(f"{coord} =", ws[coord].value)
+
+    # print formulas in used range around rows 10-20, cols A-M
+    print("Formulas around rows 10-20, cols A-M:")
+    for r in range(10, min(ws.max_row, 20) + 1):
+        row_items = []
+        for c in range(1, min(ws.max_column, 13) + 1):
+            v = ws.cell(r, c).value
+            if isinstance(v, str) and v.startswith("="):
+                row_items.append(f"{get_column_letter(c)}{r}={v}")
+        if row_items:
+            print(" | ".join(row_items))
+
+    # explicit sample of cols A, B, I for rows with data
+    if ws.max_column >= 9:
+        print("Sample A/B/I rows 1-15:")
+        for r in range(1, min(ws.max_row, 15) + 1):
+            print(r, ws.cell(r,1).value, ws.cell(r,2).value, ws.cell(r,9).value)
+```
+2026-04-14 11:07:25,393 INFO RLM iteration 2/50
+Reasoning: Need inspect row 14 array formula and relevant nearby cells, derive expected pattern. Need probably update B13 only? Maybe also B14 array formula remains. Need print formulas/values around row13-14, including C2 maybe. Then implement likely SUMPRODUCT formula in B13 to include A13 text and exclude any digits in I4:I10. Best with wildcard digits countifs impossible in one SUMIF. Use SUMPRODUCT with SEARCH on A13 and digit absence checks. Since LibreOffice may handle SUMPRODUCT with ISERROR(SEARCH(...)). Need verify.
+Code:
+```repl
+from openpyxl import load_workbook
+from openpyxl.utils import get_column_letter
+import os, shutil
+
+wb = load_workbook(input_spreadsheet)
+ws = wb[wb.sheetnames[0]]
+
+print("Inspect key cells and nearby rows:")
+for coord in ["C2", "A13", "B13", "A14", "B14"]:
+    cell = ws[coord]
+    v = cell.value
+    if hasattr(v, "text"):
+        print(coord, "ArrayFormula text:", v.text)
+    else:
+        print(coord, "=", v)
+
+print("\nRows 11-16, cols A:I")
+for r in range(11, 17):
+    vals = []
+    for c in range(1, 10):
+        v = ws.cell(r, c).value
+        if hasattr(v, "text"):
+            v = f"ArrayFormula:{v.text}"
+        vals.append(v)
+    print(r, vals)
+
+print("\nSource rows 4:10 cols A,B,I")
+for r in range(4, 11):
+    print(r, {"A": ws[f"A{r}"].value, "B": ws[f"B{r}"].value, "I": ws[f"I{r}"].value})
+
+# Apply formula to B13: sum B where I contains text in A13 but contains no digits
+# Use SUMPRODUCT for LibreOffice compatibility.
+digit_checks = "*".join([f'ISERROR(SEARCH("{d}",$I$4:$I$10))' for d in range(10)])
+formula_b13 = f'=SUMPRODUCT(--ISNUMBER(SEARCH(A13,$I$4:$I$10)),--ISTEXT($I$4:$I$10),--({digit_checks}),$B$4:$B$10)'
+print("\nNew B13 formula:", formula_b13)
+
+ws["B13"] = formula_b13
+
+out_dir = "/sandbox/output/output_spreadsheet"
+os.makedirs(out_dir, exist_ok=True)
+out_path = os.path.join(out_dir, os.path.basename(input_spreadsheet))
+wb.save(out_path)
+print("Saved to", out_path)
+
+# recalc
+res = await recalculate(out_path)
+print("Recalc:", res)
+
+# restore sheet names if changed
+orig_names = wb.sheetnames
+wb2 = load_workbook(out_path)
+if wb2.sheetnames != orig_names:
+    for i, name in enumerate(orig_names):
+        wb2.worksheets[i].title = name
+    wb2.save(out_path)
+    print("Restored sheet names:", wb2.sheetnames)
+
+# verify
+wbv = load_workbook(out_path, data_only=False)
+wsv = wbv[orig_names[0]]
+print("Verified formula B13:", wsv["B13"].value)
+
+wbv2 = load_workbook(out_path, data_only=True)
+wsv2 = wbv2[orig_names[0]]
+print("Cached value B13:", wsv2["B13"].value)
+print("A13:", wsv2["A13"].value, "A14:", wsv2["A14"].value, "B14:", wsv["B14"].value if hasattr(wsv["B14"].value, "text") else wsv["B14"].value)
+```
+2026-04-14 11:08:16,562 INFO RLM iteration 3/50
+Reasoning: We’ve already inspected the workbook, identified the exact target cell (B13), studied the neighboring example formula in B14, applied a compatible replacement formula, saved, recalculated, and verified that B13 now evaluates to 4, which matches the intended logic (sum B for rows where I contains “Note” and has no digits: rows 4 and 7 => 2 + 2 = 4). The output file is ready. Next step is to submit the saved spreadsheet path only.
+Code:
+```repl
+SUBMIT(output_spreadsheet="/sandbox/output/output_spreadsheet/1_42181_init.xlsx")
+```
+
+============================================================
+recalc_source: baseline
+score:         1.0000  PASS
+All 1 cells match

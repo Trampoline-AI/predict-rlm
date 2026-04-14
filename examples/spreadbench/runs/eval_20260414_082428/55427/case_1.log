@@ -1,0 +1,768 @@
+task: 55427  case: 1
+instruction_type: Cell-Level Manipulation
+answer_position: Compiled and located schools da'!B2:B1461
+input:  /Users/gabriel/Workspace/trampoline-ai/predict-rlm.spreadbench-release/examples/spreadbench/data/testset/spreadsheet/55427/1_55427_init.xlsx
+answer: /Users/gabriel/Workspace/trampoline-ai/predict-rlm.spreadbench-release/examples/spreadbench/data/testset/spreadsheet/55427/1_55427_golden.xlsx
+============================================================
+2026-04-14 08:49:37,718 INFO RLM iteration 1/50
+Reasoning: I need to inspect the workbook before making changes: list sheets, dimensions, headers, sample rows from top and bottom, and look for formulas/target columns referenced in the instruction (especially column L and any existing INDEX/MATCH formulas, plus sheets like "URN lookup"). Then I can determine exactly where outputs belong and what needs fixing.
+Code:
+```repl
+import os, json, textwrap, math, statistics
+from openpyxl import load_workbook
+from openpyxl.utils import get_column_letter
+
+print("Input:", input_spreadsheet)
+print("Instruction:", instruction)
+
+wb = load_workbook(input_spreadsheet)
+orig_sheet_names = wb.sheetnames
+print("Sheet names:", orig_sheet_names)
+
+def sheet_summary(ws):
+    print(f"\n=== SHEET: {ws.title} ===")
+    print("max_row:", ws.max_row, "max_col:", ws.max_column)
+    headers = [ws.cell(1, c).value for c in range(1, ws.max_column+1)]
+    print("Row 1 headers/values:", headers)
+    if ws.max_row >= 2:
+        headers2 = [ws.cell(2, c).value for c in range(1, ws.max_column+1)]
+        print("Row 2 values:", headers2)
+    # Print first 10 rows
+    top_n = min(ws.max_row, 10)
+    print(f"First {top_n} rows:")
+    for r in range(1, top_n+1):
+        vals = [ws.cell(r, c).value for c in range(1, ws.max_column+1)]
+        print(r, vals)
+    # Print last 5 rows
+    start = max(1, ws.max_row - 4)
+    print(f"Last rows {start} to {ws.max_row}:")
+    for r in range(start, ws.max_row+1):
+        vals = [ws.cell(r, c).value for c in range(1, ws.max_column+1)]
+        print(r, vals)
+
+for ws in wb.worksheets:
+    sheet_summary(ws)
+
+# Search workbook for formulas and references to INDEX/MATCH, column L, lookup sheets
+formula_hits = []
+for ws in wb.worksheets:
+    for row in ws.iter_rows():
+        for cell in row:
+            if isinstance(cell.value, str) and cell.value.startswith("="):
+                f = cell.value
+                if any(key in f.upper() for key in ["INDEX(", "MATCH(", "URN LOOKUP", "L2", "K$2", "D$2"]):
+                    formula_hits.append((ws.title, cell.coordinate, f))
+print("\nRelevant formulas found:", len(formula_hits))
+for hit in formula_hits[:50]:
+    print(hit)
+
+# Print columns A:N for all rows that have data in those ranges for likely target sheet(s)
+for ws in wb.worksheets:
+    if ws.max_column >= 12:
+        print(f"\nFocused view A:N for sheet {ws.title}")
+        top_n = min(ws.max_row, 8)
+        for r in range(1, top_n+1):
+            vals = [ws.cell(r, c).value for c in range(1, min(14, ws.max_column)+1)]
+            print(r, vals)
+        start = max(1, ws.max_row-4)
+        for r in range(start, ws.max_row+1):
+            vals = [ws.cell(r, c).value for c in range(1, min(14, ws.max_column)+1)]
+            print(r, vals)
+```
+2026-04-14 08:50:26,435 INFO RLM iteration 2/50
+Reasoning: I’ve identified the likely target sheet and cells: sheet `Compiled and located schools da`, especially columns A:C, with existing formulas in column B (`DFES check`) that match `L` (Postcode) against sheet `URN lookup`. I still need to inspect the lookup sheet structure carefully, verify what columns D and K actually contain, compare a few successful/failed matches, and determine whether the intended output should be written into column B, column C, and/or column A. Then I can fix the workbook by writing correct formulas or values and verify after recalculation.
+Code:
+```repl
+from openpyxl import load_workbook
+from openpyxl.utils import get_column_letter
+
+wb = load_workbook(input_spreadsheet)
+ws = wb["Compiled and located schools da"]
+lookup = wb["URN lookup"]
+ks4 = wb["KS4 data"]
+
+def row_vals(sheet, r, start=1, end=None):
+    end = end or sheet.max_column
+    return [sheet.cell(r, c).value for c in range(start, end+1)]
+
+print("Compiled headers with letters:")
+for c in range(1, ws.max_column+1):
+    print(c, get_column_letter(c), ws.cell(1,c).value)
+
+print("\nURN lookup headers with letters:")
+for c in range(1, lookup.max_column+1):
+    print(c, get_column_letter(c), lookup.cell(1,c).value)
+
+print("\nKS4 data headers with letters:")
+for c in range(1, ks4.max_column+1):
+    print(c, get_column_letter(c), ks4.cell(1,c).value)
+
+print("\nFirst 10 rows of URN lookup (A:K or full width):")
+for r in range(1, min(11, lookup.max_row+1)):
+    print(r, row_vals(lookup, r, 1, lookup.max_column))
+
+print("\nLast 5 rows of URN lookup:")
+for r in range(max(1, lookup.max_row-4), lookup.max_row+1):
+    print(r, row_vals(lookup, r, 1, lookup.max_column))
+
+print("\nFirst 10 rows of KS4 data:")
+for r in range(1, min(11, ks4.max_row+1)):
+    print(r, row_vals(ks4, r, 1, min(ks4.max_column, 20)))
+
+print("\nLast 5 rows of KS4 data:")
+for r in range(max(1, ks4.max_row-4), ks4.max_row+1):
+    print(r, row_vals(ks4, r, 1, min(ks4.max_column, 20)))
+
+# Inspect current formulas/values in A:C and postcode L for first 20 data rows
+print("\nCompiled rows 2:20 focused A:C, E, L")
+for r in range(2, 21):
+    print(r, {
+        "A_URN": ws[f"A{r}"].value,
+        "B_DFEScheck": ws[f"B{r}"].value,
+        "C_DfENumber": ws[f"C{r}"].value,
+        "E_Name": ws[f"E{r}"].value,
+        "L_Postcode": ws[f"L{r}"].value,
+    })
+
+# Build normalized postcode -> lookup rows map to understand matching
+def norm(x):
+    if x is None:
+        return None
+    s = str(x).strip().upper()
+    s = " ".join(s.split())
+    return s
+
+lookup_matches = {}
+for r in range(2, lookup.max_row+1):
+    key = norm(lookup[f"K{r}"].value)
+    lookup_matches.setdefault(key, []).append(r)
+
+print("\nSample postcode matches for compiled rows 2:20:")
+for r in range(2, 21):
+    key = norm(ws[f"L{r}"].value)
+    rows = lookup_matches.get(key, [])
+    preview = []
+    for rr in rows[:3]:
+        preview.append({
+            "lookup_row": rr,
+            "A": lookup[f"A{rr}"].value,
+            "B": lookup[f"B{rr}"].value,
+            "C": lookup[f"C{rr}"].value,
+            "D": lookup[f"D{rr}"].value,
+            "K": lookup[f"K{rr}"].value,
+        })
+    print(r, ws[f"E{r}"].value, key, "match_count=", len(rows), preview)
+
+# Count exact postcode matches across compiled sheet
+compiled_data_rows = 0
+exact_match_rows = 0
+multi_match_rows = 0
+for r in range(2, ws.max_row+1):
+    if any(ws.cell(r,c).value is not None for c in range(1, ws.max_column+1)):
+        compiled_data_rows += 1
+        key = norm(ws[f"L{r}"].value)
+        n = len(lookup_matches.get(key, []))
+        if n >= 1:
+            exact_match_rows += 1
+        if n > 1:
+            multi_match_rows += 1
+print("\nCompiled nonblank rows:", compiled_data_rows)
+print("Rows with postcode match in URN lookup:", exact_match_rows)
+print("Rows with multiple postcode matches:", multi_match_rows)
+
+# Show a few rows where C has value and compare to lookup D match
+examples = []
+for r in range(2, ws.max_row+1):
+    if ws[f"C{r}"].value is not None and ws[f"L{r}"].value is not None:
+        key = norm(ws[f"L{r}"].value)
+        rows = lookup_matches.get(key, [])
+        examples.append((r, ws[f"E{r}"].value, ws[f"C{r}"].value, key, rows[:5]))
+    if len(examples) >= 15:
+        break
+print("\nExamples where compiled column C already has value:")
+for item in examples:
+    print(item)
+    for rr in item[4][:2]:
+        print("   lookup", rr, row_vals(lookup, rr, 1, min(lookup.max_column, 11)))
+```
+2026-04-14 08:50:59,589 INFO RLM iteration 3/50
+Reasoning: I need the full instruction text and more targeted inspection to verify the intended outputs. The workbook strongly suggests:
+- column B (`DFES check`) currently contains a broken formula using postcode from column L;
+- the failure is likely due to leading/trailing spaces in `Postcode`, and possibly duplicate postcodes;
+- column A (`URN`) is blank and appears to be the natural place to bring in URN from `URN lookup`;
+- columns AC:AJ match the `KS4 data` headers and likely should be populated by URN.
+
+Before modifying, I should confirm:
+1. the exact wording of the instruction,
+2. whether column B formulas are the only existing formulas,
+3. whether postcodes need `TRIM`,
+4. whether KS4 metrics align exactly to AC:AJ,
+5. how many rows can be matched by trimmed postcode and by URN.
+
+Then I can implement the merge directly in the existing sheet, likely using formulas where appropriate for the lookup/merge columns, save, recalculate, and verify the target cells.
+Code:
+```repl
+from openpyxl import load_workbook
+from openpyxl.utils import get_column_letter
+import os, shutil
+
+print("FULL INSTRUCTION:\n")
+print(instruction)
+
+wb = load_workbook(input_spreadsheet)
+ws = wb["Compiled and located schools da"]
+lookup = wb["URN lookup"]
+ks4 = wb["KS4 data"]
+
+def norm(s):
+    if s is None:
+        return None
+    return " ".join(str(s).strip().upper().split())
+
+print("\n--- Existing formulas in compiled sheet (first 20 hits) ---")
+hits = []
+for row in ws.iter_rows():
+    for cell in row:
+        if isinstance(cell.value, str) and cell.value.startswith("="):
+            hits.append((cell.coordinate, cell.value))
+print("Formula count:", len(hits))
+for x in hits[:20]:
+    print(x)
+
+print("\n--- Check raw vs trimmed postcode matching for first 20 rows ---")
+lookup_raw_keys = {}
+lookup_trim_keys = {}
+for r in range(2, lookup.max_row + 1):
+    raw = lookup[f"K{r}"].value
+    lookup_raw_keys.setdefault(raw, []).append(r)
+    lookup_trim_keys.setdefault(norm(raw), []).append(r)
+
+for r in range(2, 21):
+    raw_pc = ws[f"L{r}"].value
+    print(
+        r,
+        "Name=", ws[f"E{r}"].value,
+        "| raw postcode repr=", repr(raw_pc),
+        "| raw matches=", len(lookup_raw_keys.get(raw_pc, [])),
+        "| trimmed matches=", len(lookup_trim_keys.get(norm(raw_pc), [])),
+    )
+
+print("\n--- Count matchability across all compiled rows ---")
+raw_match = trim_match = no_trim_but_trim_yes = multi_trim = 0
+nonblank_pc = 0
+for r in range(2, ws.max_row + 1):
+    pc = ws[f"L{r}"].value
+    if pc not in (None, ""):
+        nonblank_pc += 1
+        n_raw = len(lookup_raw_keys.get(pc, []))
+        n_trim = len(lookup_trim_keys.get(norm(pc), []))
+        if n_raw > 0:
+            raw_match += 1
+        if n_trim > 0:
+            trim_match += 1
+        if n_raw == 0 and n_trim > 0:
+            no_trim_but_trim_yes += 1
+        if n_trim > 1:
+            multi_trim += 1
+print("nonblank postcode rows:", nonblank_pc)
+print("raw exact matches:", raw_match)
+print("trimmed matches:", trim_match)
+print("would be fixed by TRIM:", no_trim_but_trim_yes)
+print("trimmed multiple matches:", multi_trim)
+
+print("\n--- Rows where C already has DfE Number and compare to lookup ESTAB by trimmed postcode ---")
+shown = 0
+for r in range(2, ws.max_row + 1):
+    cval = ws[f"C{r}"].value
+    if cval is not None:
+        rows = lookup_trim_keys.get(norm(ws[f"L{r}"].value), [])
+        info = [(rr, lookup[f"A{rr}"].value, lookup[f"D{rr}"].value, lookup[f"F{rr}"].value, lookup[f"K{rr}"].value) for rr in rows[:3]]
+        print(r, ws[f"E{r}"].value, "C=", cval, "lookup candidates=", info)
+        shown += 1
+        if shown >= 12:
+            break
+
+print("\n--- Compare compiled AC:AJ headers to KS4 data headers ---")
+compiled_headers = {get_column_letter(c): ws.cell(1, c).value for c in range(1, ws.max_column+1)}
+for col in range(29, 37):  # AC:AJ
+    print(get_column_letter(col), compiled_headers[get_column_letter(col)])
+print("KS4 E:L headers:", [ks4.cell(1, c).value for c in range(5, 13)])
+
+print("\n--- Sample KS4 rows 2:10 ---")
+for r in range(2, min(11, ks4.max_row+1)):
+    print(r, [ks4.cell(r, c).value for c in range(1, 13)])
+
+# Build URN set intersections
+compiled_urn_vals = [ws[f"A{r}"].value for r in range(2, ws.max_row + 1) if ws[f"A{r}"].value not in (None, "")]
+ks4_urns = {ks4[f"C{r}"].value for r in range(2, ks4.max_row + 1) if ks4[f"C{r}"].value not in (None, "")}
+print("\nCompiled existing URNs count:", len(compiled_urn_vals))
+print("Distinct KS4 URNs:", len(ks4_urns))
+
+# inspect designated target area AC:AJ first few rows and bottom few rows
+print("\n--- Current compiled target area A:C and AC:AJ, first 10 rows ---")
+for r in range(1, 11):
+    vals = [ws.cell(r, c).value for c in [1,2,3,29,30,31,32,33,34,35,36]]
+    print(r, vals)
+
+print("\n--- Current compiled target area A:C and AC:AJ, last 5 rows ---")
+for r in range(ws.max_row-4, ws.max_row+1):
+    vals = [ws.cell(r, c).value for c in [1,2,3,29,30,31,32,33,34,35,36]]
+    print(r, vals)
+```
+2026-04-14 08:52:29,111 INFO RLM iteration 4/50
+Reasoning: I’ve confirmed the main failure in the existing formula: many postcodes in the compiled sheet have leading spaces, so `MATCH(L2, 'URN lookup'!K:K, 0)` often fails unless `TRIM` is used. I also need to decide how to actually write the output in the existing workbook.
+
+The most defensible workbook changes are:
+1. Fix the existing lookup logic in the intended target column `B` (`DFES check`) using a trimmed postcode lookup.
+2. Populate column `A` (`URN`) from the same matched `URN lookup` row.
+3. Preserve existing `C` (`DfE Number`) values, but fill blanks from the matched lookup `ESTAB` where possible.
+4. Merge the available additional data from `KS4 data` into the existing matching columns `AC:AJ` using URN, because those headers align exactly and are clearly designated output columns.
+
+Before writing, I should inspect ambiguous postcode matches and name-based disambiguation quality so I can avoid writing wrong URNs/DFES values for duplicate postcodes. Then I can apply the merge, save, recalculate, and verify target cells/ranges.
+Code:
+```repl
+import re, os, shutil, json, math
+from collections import defaultdict, Counter
+from openpyxl import load_workbook
+from openpyxl.utils import get_column_letter
+
+wb = load_workbook(input_spreadsheet)
+ws = wb["Compiled and located schools da"]
+lookup = wb["URN lookup"]
+ks4 = wb["KS4 data"]
+
+def norm_text(s):
+    if s is None:
+        return ""
+    s = str(s).strip().upper()
+    s = " ".join(s.split())
+    return s
+
+def norm_name(s):
+    s = norm_text(s)
+    s = s.replace("&", " AND ")
+    s = re.sub(r"[^A-Z0-9 ]+", " ", s)
+    s = " ".join(s.split())
+    # light standardization only; avoid overcollapsing
+    repl = {
+        "COFE": "CHURCH OF ENGLAND",
+        " C OF E ": " CHURCH OF ENGLAND ",
+        " CE ": " CHURCH OF ENGLAND ",
+    }
+    s = f" {s} "
+    for k, v in repl.items():
+        s = s.replace(k, v)
+    s = " ".join(s.split())
+    return s
+
+# Build lookup indices
+lookup_by_postcode = defaultdict(list)
+lookup_by_name = defaultdict(list)
+lookup_rows = {}
+
+for r in range(2, lookup.max_row + 1):
+    rec = {
+        "row": r,
+        "URN": lookup[f"A{r}"].value,
+        "LANAME": lookup[f"B{r}"].value,
+        "LA": lookup[f"C{r}"].value,
+        "ESTAB": lookup[f"D{r}"].value,
+        "LAESTAB": lookup[f"E{r}"].value,
+        "SCHNAME": lookup[f"F{r}"].value,
+        "POSTCODE": lookup[f"K{r}"].value,
+    }
+    lookup_rows[r] = rec
+    lookup_by_postcode[norm_text(rec["POSTCODE"])].append(rec)
+    lookup_by_name[norm_name(rec["SCHNAME"])].append(rec)
+
+def choose_candidate(comp_name, candidates):
+    """Return best candidate or None."""
+    if not candidates:
+        return None
+    if len(candidates) == 1:
+        return candidates[0]
+    cn = norm_name(comp_name)
+
+    # exact normalized name
+    exact = [c for c in candidates if norm_name(c["SCHNAME"]) == cn]
+    if len(exact) == 1:
+        return exact[0]
+
+    # contains match either direction
+    contains = [
+        c for c in candidates
+        if cn and (cn in norm_name(c["SCHNAME"]) or norm_name(c["SCHNAME"]) in cn)
+    ]
+    if len(contains) == 1:
+        return contains[0]
+
+    # token overlap score
+    ctoks = set(cn.split())
+    scored = []
+    for c in candidates:
+        ntoks = set(norm_name(c["SCHNAME"]).split())
+        inter = len(ctoks & ntoks)
+        union = len(ctoks | ntoks) or 1
+        score = inter / union
+        scored.append((score, inter, c))
+    scored.sort(key=lambda x: (x[0], x[1]), reverse=True)
+    if len(scored) >= 2 and scored[0][0] > scored[1][0] and scored[0][0] >= 0.5:
+        return scored[0][2]
+    if len(scored) == 1 and scored[0][0] >= 0.5:
+        return scored[0][2]
+    return None
+
+# Inspect ambiguous postcode cases
+ambiguous_examples = []
+for pc, cands in lookup_by_postcode.items():
+    if pc and len(cands) > 1:
+        ambiguous_examples.append((pc, len(cands), [(c["row"], c["URN"], c["ESTAB"], c["SCHNAME"]) for c in cands[:5]]))
+print("Ambiguous postcode count:", len(ambiguous_examples))
+print("Sample ambiguous postcodes:")
+for item in ambiguous_examples[:10]:
+    print(item)
+
+# Test matching quality against existing DfE Number in column C
+tested = matched_correct = matched_wrong = unresolved = 0
+sample_checks = []
+for r in range(2, ws.max_row + 1):
+    existing_c = ws[f"C{r}"].value
+    pc = norm_text(ws[f"L{r}"].value)
+    nm = ws[f"E{r}"].value
+    cands = lookup_by_postcode.get(pc, [])
+    chosen = choose_candidate(nm, cands)
+    if existing_c not in (None, ""):
+        tested += 1
+        if chosen is None:
+            unresolved += 1
+        else:
+            if str(chosen["ESTAB"]) == str(existing_c):
+                matched_correct += 1
+            else:
+                matched_wrong += 1
+                if len(sample_checks) < 15:
+                    sample_checks.append((r, nm, existing_c, pc, [(c["ESTAB"], c["SCHNAME"]) for c in cands], chosen["ESTAB"], chosen["SCHNAME"]))
+print("\nValidation against existing column C DfE values:")
+print("tested:", tested, "correct:", matched_correct, "wrong:", matched_wrong, "unresolved:", unresolved)
+print("Sample wrong matches:")
+for s in sample_checks[:10]:
+    print(s)
+
+# Fallback: if postcode match unresolved, try exact name lookup globally
+def best_lookup(comp_name, postcode):
+    cands = lookup_by_postcode.get(norm_text(postcode), [])
+    chosen = choose_candidate(comp_name, cands)
+    method = None
+    if chosen is not None:
+        method = "postcode" if len(cands) == 1 else "postcode+name"
+        return chosen, method
+    name_cands = lookup_by_name.get(norm_name(comp_name), [])
+    if len(name_cands) == 1:
+        return name_cands[0], "name"
+    return None, None
+
+# Re-test full matcher
+tested2 = matched_correct2 = matched_wrong2 = unresolved2 = 0
+for r in range(2, ws.max_row + 1):
+    existing_c = ws[f"C{r}"].value
+    if existing_c in (None, ""):
+        continue
+    tested2 += 1
+    chosen, method = best_lookup(ws[f"E{r}"].value, ws[f"L{r}"].value)
+    if chosen is None:
+        unresolved2 += 1
+    elif str(chosen["ESTAB"]) == str(existing_c):
+        matched_correct2 += 1
+    else:
+        matched_wrong2 += 1
+print("\nValidation with fallback name matcher:")
+print("tested:", tested2, "correct:", matched_correct2, "wrong:", matched_wrong2, "unresolved:", unresolved2)
+```
+2026-04-14 08:53:21,134 INFO RLM iteration 5/50
+Reasoning: I’ve gathered enough evidence to implement the fix directly in the workbook.
+
+Key findings:
+- The existing formula in `Compiled and located schools da!B2:B13` fails mainly because many postcodes in column `L` have leading spaces. `TRIM()` would help.
+- But postcode alone is not always safe: there are duplicate postcodes, and some postcode-only matches point to the wrong school.
+- The existing layout strongly indicates the intended targets are:
+  - `A` = `URN`
+  - `B` = `DFES check`
+  - `C` = `DfE Number`
+  - `AC:AJ` = KS4 metrics matching `KS4 data!E:L`
+- For reliable results, the best approach is:
+  1. Match rows from `Compiled and located schools da` to `URN lookup` using normalized postcode plus disambiguation by existing `C` value where available, otherwise by school name.
+  2. Write literal values into `A` and `B`, and fill blank `C` values only when the match is confident.
+  3. Merge KS4 data into `AC:AJ` by URN.
+- I also need to save, recalculate, reload, verify target cells/ranges, and restore sheet names if recalculation changes them.
+
+Next I’ll perform the update, save to the required output path, recalculate, and print verification summaries and sample target cells.
+Code:
+```repl
+import os, re, shutil
+from collections import defaultdict, Counter
+from openpyxl import load_workbook
+
+infile = input_spreadsheet
+filename = os.path.basename(infile)
+outdir = "/sandbox/output/output_spreadsheet"
+os.makedirs(outdir, exist_ok=True)
+outfile = os.path.join(outdir, filename)
+
+wb = load_workbook(infile)
+orig_sheet_names = wb.sheetnames[:]
+ws = wb["Compiled and located schools da"]
+lookup = wb["URN lookup"]
+ks4 = wb["KS4 data"]
+
+def norm_text(s):
+    if s is None:
+        return ""
+    return " ".join(str(s).strip().upper().split())
+
+def norm_name(s):
+    s = norm_text(s)
+    s = s.replace("&", " AND ")
+    s = re.sub(r"[^A-Z0-9 ]+", " ", s)
+    s = f" {s} "
+    replacements = [
+        (" C OF E ", " CHURCH OF ENGLAND "),
+        (" COFE ", " CHURCH OF ENGLAND "),
+        (" CE ", " CHURCH OF ENGLAND "),
+        (" RC ", " ROMAN CATHOLIC "),
+        (" ST ", " SAINT "),
+    ]
+    for a, b in replacements:
+        s = s.replace(a, b)
+    s = " ".join(s.split())
+    return s
+
+# Build lookup records
+lookup_by_postcode = defaultdict(list)
+lookup_by_name = defaultdict(list)
+for r in range(2, lookup.max_row + 1):
+    rec = {
+        "row": r,
+        "URN": lookup[f"A{r}"].value,
+        "ESTAB": lookup[f"D{r}"].value,
+        "SCHNAME": lookup[f"F{r}"].value,
+        "POSTCODE": lookup[f"K{r}"].value,
+    }
+    lookup_by_postcode[norm_text(rec["POSTCODE"])].append(rec)
+    lookup_by_name[norm_name(rec["SCHNAME"])].append(rec)
+
+def choose_candidate(comp_name, candidates, existing_estab=None):
+    if not candidates:
+        return None, "no_postcode_match"
+    if existing_estab not in (None, ""):
+        same_estab = [c for c in candidates if str(c["ESTAB"]) == str(existing_estab)]
+        if len(same_estab) == 1:
+            return same_estab[0], "postcode+existing_dfe"
+    if len(candidates) == 1:
+        return candidates[0], "postcode_unique"
+
+    cn = norm_name(comp_name)
+    exact = [c for c in candidates if norm_name(c["SCHNAME"]) == cn]
+    if len(exact) == 1:
+        return exact[0], "postcode+exact_name"
+
+    contains = [
+        c for c in candidates
+        if cn and (cn in norm_name(c["SCHNAME"]) or norm_name(c["SCHNAME"]) in cn)
+    ]
+    if len(contains) == 1:
+        return contains[0], "postcode+contains_name"
+
+    ctoks = set(cn.split())
+    scored = []
+    for c in candidates:
+        ntoks = set(norm_name(c["SCHNAME"]).split())
+        inter = len(ctoks & ntoks)
+        union = len(ctoks | ntoks) or 1
+        score = inter / union
+        scored.append((score, inter, c))
+    scored.sort(key=lambda x: (x[0], x[1]), reverse=True)
+    if len(scored) >= 2:
+        if scored[0][0] >= 0.6 and scored[0][0] > scored[1][0]:
+            return scored[0][2], "postcode+best_name_score"
+    elif len(scored) == 1 and scored[0][0] >= 0.6:
+        return scored[0][2], "postcode+best_name_score"
+
+    # global exact name fallback if unique
+    name_cands = lookup_by_name.get(cn, [])
+    if len(name_cands) == 1:
+        return name_cands[0], "name_unique"
+
+    return None, "ambiguous"
+
+# Build KS4 URN map
+ks4_by_urn = {}
+for r in range(2, ks4.max_row + 1):
+    urn = ks4[f"C{r}"].value
+    if urn not in (None, ""):
+        ks4_by_urn[str(urn)] = [ks4.cell(r, c).value for c in range(5, 13)]  # E:L
+
+# Print target columns before modification for sample rows
+print("Pre-write sample target area:")
+for r in list(range(2, 10)) + list(range(ws.max_row - 4, ws.max_row + 1)):
+    if 2 <= r <= ws.max_row:
+        print(r, {
+            "A": ws[f"A{r}"].value,
+            "B": ws[f"B{r}"].value,
+            "C": ws[f"C{r}"].value,
+            "E": ws[f"E{r}"].value,
+            "L": ws[f"L{r}"].value,
+            "AC_AJ": [ws.cell(r, c).value for c in range(29, 37)]
+        })
+
+# Apply updates
+match_method_counts = Counter()
+filled_A = filled_B = filled_C = filled_ks4_rows = 0
+left_unmatched = 0
+
+for r in range(2, ws.max_row + 1):
+    row_has_data = any(ws.cell(r, c).value not in (None, "") for c in range(4, 19))
+    if not row_has_data:
+        continue
+
+    comp_name = ws[f"E{r}"].value
+    postcode = ws[f"L{r}"].value
+    existing_c = ws[f"C{r}"].value
+
+    candidate, method = choose_candidate(comp_name, lookup_by_postcode.get(norm_text(postcode), []), existing_c)
+    match_method_counts[method] += 1
+
+    if candidate is None:
+        left_unmatched += 1
+        continue
+
+    # A = URN
+    if ws[f"A{r}"].value in (None, ""):
+        ws[f"A{r}"] = candidate["URN"]
+        filled_A += 1
+    elif str(ws[f"A{r}"].value) != str(candidate["URN"]):
+        ws[f"A{r}"] = candidate["URN"]
+        filled_A += 1
+
+    # B = DFES check (ESTAB) -- replace broken formula with actual matched value
+    if ws[f"B{r}"].value != candidate["ESTAB"]:
+        ws[f"B{r}"] = candidate["ESTAB"]
+        filled_B += 1
+
+    # C = DfE Number -- preserve existing values, fill blanks only
+    if ws[f"C{r}"].value in (None, "") and candidate["ESTAB"] not in (None, ""):
+        ws[f"C{r}"] = candidate["ESTAB"]
+        filled_C += 1
+
+# Merge KS4 data into AC:AJ using URN in col A
+for r in range(2, ws.max_row + 1):
+    urn = ws[f"A{r}"].value
+    if urn in (None, ""):
+        continue
+    metrics = ks4_by_urn.get(str(urn))
+    if not metrics:
+        continue
+    wrote_any = False
+    for offset, value in enumerate(metrics, start=29):  # AC=29 ... AJ=36
+        if value not in (None, ""):
+            ws.cell(r, offset).value = value
+            wrote_any = True
+    if wrote_any:
+        filled_ks4_rows += 1
+
+# Save
+wb.save(outfile)
+print("\nWrite summary:")
+print("filled_A:", filled_A)
+print("filled_B:", filled_B)
+print("filled_C:", filled_C)
+print("filled_ks4_rows:", filled_ks4_rows)
+print("left_unmatched:", left_unmatched)
+print("match methods:", dict(match_method_counts))
+
+# Recalculate
+recalc_result = await recalculate(outfile)
+print("\nRecalculate:", recalc_result)
+
+# Restore original sheet names if needed
+wb2 = load_workbook(outfile)
+if wb2.sheetnames != orig_sheet_names:
+    print("Sheet names changed after recalculation:", wb2.sheetnames)
+    for i, old_name in enumerate(orig_sheet_names):
+        if i < len(wb2.worksheets):
+            wb2.worksheets[i].title = old_name
+    wb2.save(outfile)
+    print("Sheet names restored to:", orig_sheet_names)
+else:
+    print("Sheet names preserved.")
+
+# Verification reload
+verify_wb = load_workbook(outfile, data_only=True)
+vws = verify_wb["Compiled and located schools da"]
+
+print("\nVerified sample target area after recalc (data_only=True):")
+sample_rows = list(range(2, 15)) + [100, 250, 500, 750, 1000, 1250, ws.max_row]
+for r in sample_rows:
+    if 2 <= r <= vws.max_row:
+        print(r, {
+            "A_URN": vws[f"A{r}"].value,
+            "B_DFEScheck": vws[f"B{r}"].value,
+            "C_DfENumber": vws[f"C{r}"].value,
+            "E_Name": vws[f"E{r}"].value,
+            "L_Postcode": vws[f"L{r}"].value,
+            "AC_AJ": [vws.cell(r, c).value for c in range(29, 37)]
+        })
+
+# Verification counts
+nonblank_A = nonblank_B = nonblank_C = 0
+nonblank_ks4 = 0
+for r in range(2, vws.max_row + 1):
+    if vws[f"A{r}"].value not in (None, ""):
+        nonblank_A += 1
+    if vws[f"B{r}"].value not in (None, ""):
+        nonblank_B += 1
+    if vws[f"C{r}"].value not in (None, ""):
+        nonblank_C += 1
+    if any(vws.cell(r, c).value not in (None, "") for c in range(29, 37)):
+        nonblank_ks4 += 1
+
+print("\nVerification counts:")
+print("Nonblank A (URN):", nonblank_A)
+print("Nonblank B (DFES check):", nonblank_B)
+print("Nonblank C (DfE Number):", nonblank_C)
+print("Rows with any KS4 data in AC:AJ:", nonblank_ks4)
+print("Final sheet names:", verify_wb.sheetnames)
+
+output_spreadsheet = outfile
+```
+2026-04-14 08:53:53,738 INFO RLM iteration 6/50
+Reasoning: The workbook has been inspected, modified, saved to the required output directory, recalculated, reloaded, and verified. The output file path is stored in `output_spreadsheet`. This turn should only submit the result.
+Code:
+```repl
+SUBMIT(output_spreadsheet=output_spreadsheet)
+```
+
+============================================================
+recalc_source: baseline
+score:         0.8774  FAIL
+Sheet 'Compiled and located schools da' range B2:B1461: 1281/1460 cells match
+  Compiled and located schools da!B3: expected='#N/A' got=None
+  Compiled and located schools da!B9: expected='#N/A' got=None
+  Compiled and located schools da!B10: expected='#N/A' got=None
+  Compiled and located schools da!B13: expected='#N/A' got=None
+  Compiled and located schools da!B16: expected=2200 got=None
+  Compiled and located schools da!B24: expected='#N/A' got=None
+  Compiled and located schools da!B25: expected='#N/A' got=None
+  Compiled and located schools da!B48: expected='#N/A' got=None
+  Compiled and located schools da!B49: expected='#N/A' got=None
+  Compiled and located schools da!B52: expected='#N/A' got=None
+  Compiled and located schools da!B64: expected=2705 got=2022
+  Compiled and located schools da!B70: expected='#N/A' got=None
+  Compiled and located schools da!B71: expected='#N/A' got=None
+  Compiled and located schools da!B72: expected='#N/A' got=None
+  Compiled and located schools da!B89: expected=2413 got=2414
+  Compiled and located schools da!B98: expected='#N/A' got=None
+  Compiled and located schools da!B107: expected=3405 got=2021
+  Compiled and located schools da!B116: expected='#N/A' got=None
+  Compiled and located schools da!B117: expected='#N/A' got=None
+  Compiled and located schools da!B118: expected='#N/A' got=None
+  ... (159 more diffs)

@@ -1,0 +1,591 @@
+task: 31202  case: 1
+instruction_type: Cell-Level Manipulation
+answer_position: J2:J47
+input:  /Users/gabriel/Workspace/trampoline-ai/predict-rlm.spreadbench-release/examples/spreadbench/data/testset/spreadsheet/31202/1_31202_init.xlsx
+answer: /Users/gabriel/Workspace/trampoline-ai/predict-rlm.spreadbench-release/examples/spreadbench/data/testset/spreadsheet/31202/1_31202_golden.xlsx
+============================================================
+2026-04-14 10:18:14,302 INFO RLM iteration 1/50
+Reasoning: I should first inspect the workbook structure carefully before changing anything: list sheet names, dimensions, headers, and sample rows from the top and bottom. Since the instruction mentions a payroll table with a "debt" column and weekly deductions/additions per worker, I also need to identify the exact sheet and columns involved, and check whether the debt cells already contain formulas or example answers. After that, I can determine the correct target cells and implement the update logic.
+Code:
+```repl
+import os, json, math, statistics
+from collections import defaultdict
+from openpyxl import load_workbook
+from openpyxl.utils import get_column_letter
+
+input_path = input_spreadsheet
+wb = load_workbook(input_path)
+print("Workbook:", input_path)
+print("Sheet names:", wb.sheetnames)
+
+def display(v):
+    if v is None:
+        return None
+    s = str(v)
+    return s if len(s) <= 40 else s[:37] + "..."
+
+sheet_summaries = {}
+
+for ws in wb.worksheets:
+    max_row, max_col = ws.max_row, ws.max_column
+    
+    # find non-empty rows / cols more accurately
+    nonempty_rows = []
+    for r in range(1, max_row + 1):
+        vals = [ws.cell(r, c).value for c in range(1, max_col + 1)]
+        if any(v not in (None, "") for v in vals):
+            nonempty_rows.append(r)
+    first_nonempty = nonempty_rows[0] if nonempty_rows else None
+    last_nonempty = nonempty_rows[-1] if nonempty_rows else None
+    
+    # candidate header rows: first 3 non-empty rows
+    candidate_headers = {}
+    for r in (nonempty_rows[:3] if nonempty_rows else []):
+        candidate_headers[r] = [display(ws.cell(r, c).value) for c in range(1, max_col + 1)]
+    
+    print(f"\n--- Sheet: {ws.title} ---")
+    print("max_row/max_col:", max_row, max_col)
+    print("first_nonempty_row:", first_nonempty, "last_nonempty_row:", last_nonempty)
+    print("Candidate header rows:")
+    for r, vals in candidate_headers.items():
+        print(f" Row {r}: {vals}")
+    
+    # print first 8 non-empty rows and last 5 non-empty rows
+    sample_rows = []
+    if nonempty_rows:
+        sample_idx = nonempty_rows[:8]
+        tail_idx = nonempty_rows[-5:]
+        combined = []
+        seen = set()
+        for r in sample_idx + tail_idx:
+            if r not in seen:
+                combined.append(r)
+                seen.add(r)
+        print("Sample rows:")
+        for r in combined:
+            vals = [display(ws.cell(r, c).value) for c in range(1, max_col + 1)]
+            print(f" Row {r}: {vals}")
+            sample_rows.append((r, vals))
+    
+    # detect columns whose header mentions relevant terms in first 5 rows
+    keywords = ["debt", "deduct", "addition", "add", "worker", "employee", "week", "name"]
+    hits = []
+    for r in range(1, min(5, max_row) + 1):
+        for c in range(1, max_col + 1):
+            v = ws.cell(r, c).value
+            if isinstance(v, str):
+                low = v.strip().lower()
+                if any(k in low for k in keywords):
+                    hits.append((r, c, v))
+    if hits:
+        print("Relevant header-like hits:")
+        for r, c, v in hits:
+            print(f"  {get_column_letter(c)}{r} = {v}")
+    
+    sheet_summaries[ws.title] = {
+        "max_row": max_row,
+        "max_col": max_col,
+        "nonempty_rows": nonempty_rows,
+        "candidate_headers": candidate_headers,
+        "samples": sample_rows,
+        "hits": hits,
+    }
+
+# More targeted inspection of any sheet containing relevant hits
+for ws in wb.worksheets:
+    hits = sheet_summaries[ws.title]["hits"]
+    if not hits:
+        continue
+    print(f"\n### Targeted inspection for sheet: {ws.title}")
+    # use the first row that contains the most text headers among first 5 rows as probable header
+    best_row = None
+    best_score = -1
+    for r in range(1, min(5, ws.max_row) + 1):
+        vals = [ws.cell(r, c).value for c in range(1, ws.max_column + 1)]
+        score = sum(isinstance(v, str) and v.strip() != "" for v in vals)
+        if score > best_score:
+            best_score = score
+            best_row = r
+    print("Probable header row:", best_row)
+    headers = [ws.cell(best_row, c).value for c in range(1, ws.max_column + 1)]
+    for c, h in enumerate(headers, start=1):
+        if h not in (None, ""):
+            print(f"  Col {get_column_letter(c)} ({c}): {h}")
+    
+    # inspect first 15 rows under header
+    start = best_row + 1
+    end = min(ws.max_row, start + 14)
+    print(f"Rows {start}-{end}:")
+    for r in range(start, end + 1):
+        vals = [display(ws.cell(r, c).value) for c in range(1, ws.max_column + 1)]
+        print(f"  Row {r}: {vals}")
+    
+    # print any formulas in used range for first 30 rows
+    formula_cells = []
+    for r in range(1, min(ws.max_row, 30) + 1):
+        for c in range(1, ws.max_column + 1):
+            v = ws.cell(r, c).value
+            if isinstance(v, str) and v.startswith("="):
+                formula_cells.append((r, c, v))
+    print("Formulas in first 30 rows:", len(formula_cells))
+    for r, c, v in formula_cells[:20]:
+        print(f"  {get_column_letter(c)}{r}: {v}")
+```
+2026-04-14 10:18:41,706 INFO RLM iteration 2/50
+Reasoning: I’ve identified the workbook and the likely target sheet/column (`NOMINA`, `DEBT` in column J), but I still need to verify the exact intended pattern before writing anything. The instruction suggests a rolling per-worker debt: each row should look up the same worker’s previous week debt, then add deductions or subtract additions. To confirm that, I need to inspect:
+
+1. The actual formulas or values currently in column J (`DEBT`) for all populated rows.
+2. Whether there are example formulas in earlier rows that show the intended logic.
+3. The weekly row ordering per worker, including dates/weeks and deduction/addition values.
+4. Workbook table definitions, since the visible formulas use structured references (`tblNomina`, `tblEmpleados`).
+
+After that I can implement the correct formula down the exact target cells in column J, save, recalculate, and verify.
+Code:
+```repl
+from openpyxl import load_workbook
+from openpyxl.utils import get_column_letter
+from collections import defaultdict
+import os, shutil
+
+# Reload workbook fresh
+wb = load_workbook(input_spreadsheet)
+ws = wb["NOMINA"]
+
+print("Sheet:", ws.title)
+print("Dimensions:", ws.max_row, ws.max_column)
+
+# Print table info if present
+print("\nTables found:")
+if hasattr(ws, "tables") and ws.tables:
+    for name, tbl in ws.tables.items():
+        print(" ", name, "->", tbl.ref)
+else:
+    print(" No tables")
+
+# Header row and relevant columns
+headers = [ws.cell(1, c).value for c in range(1, ws.max_column + 1)]
+print("\nRow 1 headers:")
+for c, h in enumerate(headers, start=1):
+    print(f" {get_column_letter(c)}{1}: {h}")
+
+relevant_cols = {}
+for c, h in enumerate(headers, start=1):
+    if isinstance(h, str) and h.strip().upper() in {"DATE", "MONTH", "WEEK", "WORKER", "DEDUCTIONS", "ADDITIONS", "TOTAL", "DEBT"}:
+        relevant_cols[h.strip().upper()] = c
+print("\nRelevant columns:", {k: f"{get_column_letter(v)}({v})" for k, v in relevant_cols.items()})
+
+# Print exact DEBT column values/formulas for all payroll rows
+print("\nPayroll rows overview (A:J):")
+for r in range(2, ws.max_row + 1):
+    vals = [ws.cell(r, c).value for c in range(1, 11)]
+    if any(v not in (None, "") for v in vals[:10]):
+        print(f"Row {r}: ", vals)
+
+print("\nExact DEBT column content:")
+for r in range(2, ws.max_row + 1):
+    worker = ws.cell(r, relevant_cols["WORKER"]).value
+    datev = ws.cell(r, relevant_cols["DATE"]).value
+    weekv = ws.cell(r, relevant_cols["WEEK"]).value
+    ded = ws.cell(r, relevant_cols["DEDUCTIONS"]).value
+    add = ws.cell(r, relevant_cols["ADDITIONS"]).value
+    debt = ws.cell(r, relevant_cols["DEBT"]).value
+    if worker not in (None, ""):
+        print(f"Row {r}: worker={worker!r}, date={datev!r}, week={weekv!r}, deductions={ded!r}, additions={add!r}, debt={debt!r}")
+
+# Group by worker to inspect sequence through time
+print("\nPer-worker sequences (date, row, deductions, additions, debt) for first several workers:")
+by_worker = defaultdict(list)
+for r in range(2, ws.max_row + 1):
+    worker = ws["D"+str(r)].value
+    datev = ws["A"+str(r)].value
+    ded = ws["G"+str(r)].value
+    add = ws["H"+str(r)].value
+    debt = ws["J"+str(r)].value
+    if worker:
+        by_worker[worker].append((datev, r, ded, add, debt))
+
+for i, (worker, items) in enumerate(by_worker.items()):
+    print("\nWORKER:", worker)
+    for item in items:
+        print(" ", item)
+    if i >= 7:
+        break
+
+# Print any formulas in J column, plus neighboring cells
+print("\nDetailed J column formulas/values with neighbors:")
+for r in range(2, ws.max_row + 1):
+    j = ws.cell(r, 10).value
+    if ws.cell(r, 4).value:
+        row_vals = {col: ws.cell(r, col).value for col in range(1, 11)}
+        print(f"Row {r}: A={row_vals[1]!r}, C={row_vals[3]!r}, D={row_vals[4]!r}, G={row_vals[7]!r}, H={row_vals[8]!r}, I={row_vals[9]!r}, J={row_vals[10]!r}")
+
+# Also inspect data_only version to see cached results
+wb_vals = load_workbook(input_spreadsheet, data_only=True)
+ws_vals = wb_vals["NOMINA"]
+print("\nData-only cached values in J column:")
+for r in range(2, ws_vals.max_row + 1):
+    if ws_vals.cell(r, 4).value:
+        print(f"Row {r}: worker={ws_vals.cell(r,4).value!r}, debt_cached={ws_vals.cell(r,10).value!r}")
+```
+2026-04-14 10:19:29,895 INFO RLM iteration 3/50
+Reasoning: The previous inspection failed only because I assumed each table entry had a `.ref` attribute; in this workbook `ws.tables` may map names directly to ref strings. I still need the exact current pattern in column J (`DEBT`) before editing anything.
+
+Next action:
+1. Reload the workbook and inspect `ws.tables` safely.
+2. Print headers and the exact contents/formulas of rows 2–48 for columns A:J.
+3. Specifically inspect column J formulas/values and the corresponding row data (`DATE`, `WEEK`, `WORKER`, `DEDUCTIONS`, `ADDITIONS`).
+4. Print the data-only cached values too, to see which rows are blank/broken.
+5. If possible, inspect the table ref and any example formulas around J2:J10 and J40:J48 to infer the intended formula pattern.
+
+Once I confirm the target rows and existing formula behavior, I can write the correct formula into the `DEBT` cells, save, recalculate, and verify.
+Code:
+```repl
+from openpyxl import load_workbook
+from openpyxl.utils import get_column_letter
+
+wb = load_workbook(input_spreadsheet)
+ws = wb["NOMINA"]
+
+print("Sheet names:", wb.sheetnames)
+print("NOMINA dimensions:", ws.max_row, ws.max_column)
+
+# Safe table inspection
+print("\nTables object type:", type(ws.tables))
+print("Tables raw repr:", repr(ws.tables))
+try:
+    print("Table names:", list(ws.tables.keys()))
+except Exception as e:
+    print("Could not list table keys:", e)
+
+for name in list(ws.tables.keys()):
+    obj = ws.tables[name]
+    print(f"Table {name!r}: type={type(obj)}, repr={repr(obj)}")
+    ref = getattr(obj, "ref", obj)
+    print("  ref:", ref)
+
+# Headers
+headers = [ws.cell(1, c).value for c in range(1, ws.max_column + 1)]
+print("\nHeaders row 1:")
+for c, h in enumerate(headers, start=1):
+    print(f"{get_column_letter(c)}1 -> {h!r}")
+
+# Relevant columns
+wanted = ["DATE", "MONTH", "WEEK", "WORKER", "DAILY WAGE", "DAYS WORKED", "DEDUCTIONS", "ADDITIONS", "TOTAL", "DEBT"]
+colmap = {}
+for c, h in enumerate(headers, start=1):
+    if isinstance(h, str) and h.strip().upper() in wanted:
+        colmap[h.strip().upper()] = c
+print("\nRelevant columns:", {k: f"{get_column_letter(v)}({v})" for k, v in colmap.items()})
+
+# Print first 10 and last 10 payroll rows for A:J exactly
+def row_vals(r, c1=1, c2=10):
+    return [ws.cell(r, c).value for c in range(c1, c2 + 1)]
+
+nonempty_payroll_rows = []
+for r in range(2, ws.max_row + 1):
+    if any(ws.cell(r, c).value not in (None, "") for c in range(1, 11)):
+        nonempty_payroll_rows.append(r)
+
+print("\nPayroll nonempty rows count (A:J):", len(nonempty_payroll_rows))
+sample_rows = nonempty_payroll_rows[:10] + [r for r in nonempty_payroll_rows[-10:] if r not in nonempty_payroll_rows[:10]]
+for r in sample_rows:
+    print(f"Row {r} A:J -> {row_vals(r)}")
+
+# Exact J formulas/values for every payroll row
+print("\nExact debt column inspection:")
+for r in nonempty_payroll_rows:
+    A = ws.cell(r, colmap["DATE"]).value
+    C = ws.cell(r, colmap["WEEK"]).value
+    D = ws.cell(r, colmap["WORKER"]).value
+    G = ws.cell(r, colmap["DEDUCTIONS"]).value
+    H = ws.cell(r, colmap["ADDITIONS"]).value
+    J = ws.cell(r, colmap["DEBT"]).value
+    print(f"Row {r}: DATE={A!r}, WEEK={C!r}, WORKER={D!r}, DED={G!r}, ADD={H!r}, DEBT={J!r}")
+
+# Show formulas in first 15 and last 10 payroll rows for A:J
+print("\nFormula cells in A:J (first 15 payroll rows and last 10 payroll rows):")
+focus_rows = nonempty_payroll_rows[:15] + [r for r in nonempty_payroll_rows[-10:] if r not in nonempty_payroll_rows[:15]]
+for r in focus_rows:
+    formulas = []
+    for c in range(1, 11):
+        v = ws.cell(r, c).value
+        if isinstance(v, str) and v.startswith("="):
+            formulas.append(f"{get_column_letter(c)}{r}={v}")
+    print(f"Row {r}: {formulas}")
+
+# data_only cached results
+wbv = load_workbook(input_spreadsheet, data_only=True)
+wsv = wbv["NOMINA"]
+print("\nData-only cached debt values:")
+for r in sample_rows:
+    print(f"Row {r}: worker={wsv.cell(r, colmap['WORKER']).value!r}, debt_cached={wsv.cell(r, colmap['DEBT']).value!r}")
+
+# Extra focused area around debt/output target
+print("\nFocused target area D:G:H:J for all payroll rows:")
+for r in nonempty_payroll_rows:
+    print(
+        r,
+        {
+            "D_WORKER": ws.cell(r, 4).value,
+            "G_DEDUCTIONS": ws.cell(r, 7).value,
+            "H_ADDITIONS": ws.cell(r, 8).value,
+            "J_DEBT": ws.cell(r, 10).value,
+        },
+    )
+```
+2026-04-14 10:20:11,330 INFO RLM iteration 4/50
+Reasoning: I’ve confirmed the target is the existing `DEBT` column in `NOMINA` column J, and that the payroll data sits in table `tblNomina` (`A1:J48`). Before writing anything, I still need the exact current debt logic/pattern and whether there are already formulas in J that need replacing. Because the previous output was truncated, I’ll now print only the specific details I need:
+
+1. The table definition for the `DEBT` column, especially any calculated-column formula.
+2. Exact formulas/values in `J2:J48`.
+3. A compact per-worker sequence for repeated workers to infer the intended rolling logic.
+4. The totals row and whether row 48 is a totals row.
+5. Existing cached values in J to see what’s broken.
+
+Once that’s clear, I can either write a compatible formula or compute static values if the structured-reference formula is incompatible with LibreOffice.
+Code:
+```repl
+from openpyxl import load_workbook
+from openpyxl.utils import get_column_letter
+from collections import defaultdict
+
+wb = load_workbook(input_spreadsheet)
+ws = wb["NOMINA"]
+tbl = ws.tables["tblNomina"]
+
+print("Table ref:", tbl.ref)
+print("Totals row count:", tbl.totalsRowCount)
+
+# Print table columns compactly, especially DEBT
+print("\nTable columns:")
+for tc in tbl.tableColumns:
+    calc = None
+    if getattr(tc, "calculatedColumnFormula", None) is not None:
+        calc = tc.calculatedColumnFormula.attr_text
+    print(f"{tc.id}: {tc.name} | calc={calc!r} | totals={getattr(tc,'totalsRowFunction',None)!r} | label={getattr(tc,'totalsRowLabel',None)!r}")
+
+# Exact J column formulas/values
+print("\nJ column exact contents:")
+for r in range(1, ws.max_row + 1):
+    v = ws.cell(r, 10).value
+    if r <= 12 or r >= 40:
+        print(f"J{r}: {v!r}")
+
+# Compact payroll rows around top/bottom with relevant cols only
+print("\nRelevant rows top:")
+for r in range(2, 13):
+    print(r, {
+        "A_DATE": ws.cell(r,1).value,
+        "C_WEEK": ws.cell(r,3).value,
+        "D_WORKER": ws.cell(r,4).value,
+        "G_DED": ws.cell(r,7).value,
+        "H_ADD": ws.cell(r,8).value,
+        "J_DEBT": ws.cell(r,10).value,
+    })
+
+print("\nRelevant rows bottom:")
+for r in range(40, 49):
+    print(r, {
+        "A_DATE": ws.cell(r,1).value,
+        "C_WEEK": ws.cell(r,3).value,
+        "D_WORKER": ws.cell(r,4).value,
+        "G_DED": ws.cell(r,7).value,
+        "H_ADD": ws.cell(r,8).value,
+        "J_DEBT": ws.cell(r,10).value,
+    })
+
+# Per-worker sequences for workers with >1 rows only
+by_worker = defaultdict(list)
+for r in range(2, 48):  # exclude totals row if present
+    worker = ws.cell(r,4).value
+    if worker:
+        by_worker[worker].append((r, ws.cell(r,1).value, ws.cell(r,7).value, ws.cell(r,8).value, ws.cell(r,10).value))
+
+repeat_workers = [(w, seq) for w, seq in by_worker.items() if len(seq) > 1]
+print("\nRepeat workers count:", len(repeat_workers))
+for w, seq in repeat_workers[:5]:
+    print("\nWORKER:", w)
+    for item in seq:
+        print(item)
+
+# Cached values in data_only workbook
+wbv = load_workbook(input_spreadsheet, data_only=True)
+wsv = wbv["NOMINA"]
+print("\nCached J values top:")
+for r in range(2, 13):
+    print(r, wsv.cell(r,4).value, wsv.cell(r,10).value)
+
+print("\nCached J values bottom:")
+for r in range(40, 49):
+    print(r, wsv.cell(r,4).value, wsv.cell(r,10).value)
+```
+2026-04-14 10:21:26,820 INFO RLM iteration 5/50
+Reasoning: I’ve now identified the exact target: sheet `NOMINA`, column `J` (`DEBT`), data rows `2:47`, with row `48` as the totals row and not a data row. The current `DEBT` cells are literal `0` values in earlier rows and blank in later rows, with no existing formula pattern to preserve.
+
+Given the instruction, the correct rolling logic is per worker:
+- current debt = cumulative deductions for that worker up to this row
+- minus cumulative additions for that worker up to this row
+
+A robust row formula for that is:
+`=SUMIFS($G$2:G{r},$D$2:D{r},D{r})-SUMIFS($H$2:H{r},$D$2:D{r},D{r})`
+
+This matches “find previous debt for the same worker and add/subtract the new week’s amount,” without needing a complicated previous-row lookup. I’ll:
+1. Print rows with nonzero deductions/additions and Python-computed expected debts.
+2. Write formulas into `J2:J47`.
+3. Save to the output path.
+4. Recalculate.
+5. Restore sheet names if LibreOffice changed them.
+6. Reload with `data_only=True` and verify the target cells.
+Code:
+```repl
+import os, shutil
+from collections import defaultdict
+from openpyxl import load_workbook
+from openpyxl.utils import get_column_letter
+
+input_path = input_spreadsheet
+output_dir = "/sandbox/output/output_spreadsheet"
+os.makedirs(output_dir, exist_ok=True)
+output_path = os.path.join(output_dir, os.path.basename(input_path))
+
+# Load and inspect
+wb = load_workbook(input_path)
+original_sheetnames = wb.sheetnames[:]
+ws = wb["NOMINA"]
+
+print("Original sheet names:", original_sheetnames)
+print("Target sheet:", ws.title)
+print("Target column J header:", ws["J1"].value)
+print("Table ref:", ws.tables["tblNomina"].ref)
+print("Totals row appears to be row:", ws.max_row)
+
+# Confirm target rows and current J values briefly
+target_rows = []
+for r in range(2, ws.max_row):
+    if ws.cell(r, 4).value not in (None, ""):  # worker present
+        target_rows.append(r)
+
+print("Target rows count:", len(target_rows), "first/last:", target_rows[0], target_rows[-1])
+print("Current J preview before writing:")
+for r in target_rows[:5] + target_rows[-5:]:
+    print(f"  J{r} currently -> {ws.cell(r,10).value!r}")
+
+# Inspect rows with nonzero deductions/additions and compute expected rolling debts in Python
+running = defaultdict(float)
+expected = {}
+interesting = []
+for r in target_rows:
+    worker = ws.cell(r, 4).value
+    ded = ws.cell(r, 7).value or 0
+    add = ws.cell(r, 8).value or 0
+    try:
+        ded = float(ded)
+    except:
+        ded = 0.0
+    try:
+        add = float(add)
+    except:
+        add = 0.0
+    running[worker] += ded - add
+    expected[r] = running[worker]
+    if ded != 0 or add != 0:
+        interesting.append((r, worker, ded, add, expected[r]))
+
+print("\nRows with nonzero deductions/additions:")
+for item in interesting[:20]:
+    print(" ", item)
+if not interesting:
+    print("  None found")
+
+print("\nPython expected debt preview:")
+for r in target_rows[:8] + target_rows[-8:]:
+    print(
+        f"  Row {r}: worker={ws.cell(r,4).value!r}, "
+        f"ded={ws.cell(r,7).value!r}, add={ws.cell(r,8).value!r}, "
+        f"expected_debt={expected[r]}"
+    )
+
+# Write formulas into existing DEBT column J for all payroll data rows only
+for r in target_rows:
+    formula = f'=SUMIFS($G$2:G{r},$D$2:D{r},D{r})-SUMIFS($H$2:H{r},$D$2:D{r},D{r})'
+    ws.cell(r, 10).value = formula
+
+# Keep totals row untouched
+print("\nWritten formulas preview:")
+for r in target_rows[:5] + target_rows[-5:]:
+    print(f"  J{r} -> {ws.cell(r,10).value}")
+
+# Save
+wb.save(output_path)
+print("\nSaved to:", output_path)
+
+# Recalculate
+recalc_result = await recalculate(output_path)
+print("Recalculate result:", recalc_result)
+
+# Restore original sheet names if LibreOffice changed them
+wb_after = load_workbook(output_path)
+if wb_after.sheetnames != original_sheetnames:
+    print("Sheet names changed after recalc:", wb_after.sheetnames)
+    if len(wb_after.sheetnames) == len(original_sheetnames):
+        for ws_obj, original_name in zip(wb_after.worksheets, original_sheetnames):
+            ws_obj.title = original_name
+        wb_after.save(output_path)
+        print("Restored sheet names to:", original_sheetnames)
+else:
+    print("Sheet names unchanged after recalc.")
+
+# Verify with data_only
+wb_verify = load_workbook(output_path, data_only=True)
+print("Verified sheet names:", wb_verify.sheetnames)
+wsv = wb_verify["NOMINA"]
+
+print("\nVerification of target cells J2:J47:")
+bad = []
+for r in target_rows:
+    val = wsv.cell(r, 10).value
+    if val in (None, ""):
+        bad.append(r)
+
+# Print every target row as requested, compactly
+for r in target_rows:
+    print(
+        f"Row {r}: worker={ws.cell(r,4).value!r}, "
+        f"G={ws.cell(r,7).value!r}, H={ws.cell(r,8).value!r}, "
+        f"J_formula={ws.cell(r,10).value!r}, J_value={wsv.cell(r,10).value!r}"
+    )
+
+print("\nBlank/None target rows after recalc:", bad)
+
+# Additional sanity check against Python expected values
+mismatches = []
+for r in target_rows:
+    actual = wsv.cell(r, 10).value
+    exp = expected[r]
+    if actual is None:
+        mismatches.append((r, exp, actual))
+    else:
+        try:
+            if abs(float(actual) - float(exp)) > 1e-9:
+                mismatches.append((r, exp, actual))
+        except:
+            mismatches.append((r, exp, actual))
+
+print("Mismatch count vs Python expectation:", len(mismatches))
+print("Mismatch preview:", mismatches[:10])
+
+final_output_path = output_path
+```
+2026-04-14 10:21:53,474 INFO RLM iteration 6/50
+Reasoning: The `DEBT` column in `NOMINA!J2:J47` has been updated with rolling per-worker formulas, saved, recalculated successfully, and verified with nonblank evaluated values matching the Python expectation. The output file is ready to submit.
+Code:
+```repl
+SUBMIT(output_spreadsheet=final_output_path)
+```
+
+============================================================
+recalc_source: baseline
+score:         0.9565  FAIL
+Sheet 'NOMINA' range J2:J47: 44/46 cells match
+  NOMINA!J35: expected=1500 got=-1500
+  NOMINA!J45: expected=1000 got=-1000

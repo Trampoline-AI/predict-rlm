@@ -1,0 +1,193 @@
+task: 49300  case: 1
+instruction_type: Cell-Level Manipulation
+answer_position:  'Sheet1'!C2:C3
+input:  /Users/gabriel/Workspace/trampoline-ai/predict-rlm.spreadbench-release/examples/spreadbench/data/testset/spreadsheet/49300/1_49300_init.xlsx
+answer: /Users/gabriel/Workspace/trampoline-ai/predict-rlm.spreadbench-release/examples/spreadbench/data/testset/spreadsheet/49300/1_49300_golden.xlsx
+============================================================
+2026-04-14 10:22:18,130 INFO RLM iteration 1/50
+Reasoning: First I need to inspect the workbook carefully before changing anything. The instruction mentions `Data` and `Sheet1`, a two-criteria `INDEX/MATCH` lookup, and writing results into column C of `Sheet1`. I should verify the exact sheet names, data ranges, headers, sample rows, and whether column C already has example formulas or answers. Then I can infer the intended corrected formula pattern or decide whether to compute values directly in Python if array formula compatibility is risky.
+Code:
+```repl
+from openpyxl import load_workbook
+from openpyxl.utils import get_column_letter
+
+print("Instruction full text:")
+print(instruction)
+print("-" * 80)
+
+wb = load_workbook(input_spreadsheet)
+print("Workbook sheets:", wb.sheetnames)
+
+def nonempty_row_count(ws):
+    cnt = 0
+    for row in ws.iter_rows():
+        if any(cell.value not in (None, "") for cell in row):
+            cnt += 1
+    return cnt
+
+def row_values(ws, r, max_cols=None):
+    max_cols = max_cols or ws.max_column
+    return [ws.cell(r, c).value for c in range(1, max_cols + 1)]
+
+for ws in wb.worksheets:
+    print("=" * 80)
+    print(f"Sheet: {ws.title}")
+    print(f"max_row={ws.max_row}, max_column={ws.max_column}, nonempty_rows={nonempty_row_count(ws)}")
+    headers = row_values(ws, 1, ws.max_column)
+    print("Row 1 values / headers:", headers)
+    if ws.max_row >= 2:
+        print("Row 2 values:", row_values(ws, 2, ws.max_column))
+    # first 10 rows
+    print("First rows:")
+    for r in range(1, min(ws.max_row, 10) + 1):
+        print(f"Row {r}: {row_values(ws, r, ws.max_column)}")
+    # last 5 rows
+    start_last = max(1, ws.max_row - 4)
+    print("Last rows:")
+    for r in range(start_last, ws.max_row + 1):
+        print(f"Row {r}: {row_values(ws, r, ws.max_column)}")
+
+# Inspect mentioned relevant ranges/cells
+if "Sheet1" in wb.sheetnames:
+    ws1 = wb["Sheet1"]
+    print("=" * 80)
+    print("Inspecting Sheet1 columns A:C")
+    for r in range(1, ws1.max_row + 1):
+        vals = [ws1.cell(r, c).value for c in range(1, min(3, ws1.max_column) + 1)]
+        print(f"Sheet1 row {r} A:C -> {vals}")
+        if r >= 15:
+            break
+    print("Existing values/formulas in Sheet1 column C:")
+    for r in range(1, ws1.max_row + 1):
+        v = ws1.cell(r, 3).value
+        if v is not None:
+            print(f"C{r} = {v!r}")
+
+if "Data" in wb.sheetnames:
+    wsd = wb["Data"]
+    print("=" * 80)
+    print("Inspecting Data top-left area A1:AZ10")
+    max_c = min(wsd.max_column, 52)
+    for r in range(1, min(wsd.max_row, 10) + 1):
+        print(f"Data row {r}: {[wsd.cell(r, c).value for c in range(1, max_c + 1)]}")
+
+    # Print exact referenced ranges from user formula
+    print("Referenced lookup headers / criteria ranges:")
+    print("Data!B3:B4 =", [wsd[f"B{r}"].value for r in range(3, min(4, wsd.max_row) + 1)])
+    if wsd.max_column >= 51:
+        print("Data!C2:AY2 =", [wsd.cell(2, c).value for c in range(3, min(51, wsd.max_column) + 1)])
+    else:
+        print("Data row 2 from C onward =", [wsd.cell(2, c).value for c in range(3, wsd.max_column + 1)])
+    for r in range(3, min(6, wsd.max_row) + 1):
+        print(f"Data row {r} from B onward:", [wsd.cell(r, c).value for c in range(2, min(wsd.max_column, 15) + 1)])
+```
+2026-04-14 10:22:55,427 INFO RLM iteration 2/50
+Reasoning: I’ve now confirmed the workbook structure and the exact target area:
+
+- Sheets: `Sheet1`, `Data`
+- Target output column: `Sheet1!C:C` under header `Salary`
+- Existing broken example formula is in `Sheet1!C2`
+- The lookup table is clearly:
+  - row criteria in `Data!B3:B4`
+  - column criteria in `Data!C2:AY2`
+  - values in `Data!C3:AY4`
+
+The user’s formula is failing because `INDEX` over a 2D range needs both a row number and a column number. The correct pattern is:
+`=INDEX(Data!$C$3:$AY$4, MATCH(A2, Data!$B$3:$B$4, 0), MATCH(B2, Data!$C$2:$AY$2, 0))`
+
+Next I should:
+1. Re-open / prepare the workbook for editing.
+2. Print the exact target cells before modification.
+3. Write the corrected formula into all relevant `Sheet1` rows in column C (rows with values in columns A and B).
+4. Save to the output folder with the same filename.
+5. Recalculate.
+6. Reload and verify that `C2:C...` contains numeric results and that sheet names remain `['Sheet1', 'Data']`.
+Code:
+```repl
+from openpyxl import load_workbook
+from openpyxl.utils import column_index_from_string
+import os
+
+input_path = input_spreadsheet
+output_dir = "/sandbox/output/output_spreadsheet"
+output_path = os.path.join(output_dir, os.path.basename(input_path))
+
+wb = load_workbook(input_path)
+orig_sheetnames = wb.sheetnames[:]
+ws1 = wb["Sheet1"]
+wsd = wb["Data"]
+
+print("Original sheet names:", orig_sheetnames)
+print("Target column C index:", column_index_from_string("C"))
+print("Before modification, Sheet1 A:C rows:")
+for r in range(1, ws1.max_row + 1):
+    print(r, [ws1.cell(r, c).value for c in range(1, 4)])
+
+# Write corrected formulas into existing output column C for all relevant rows
+written = []
+for r in range(2, ws1.max_row + 1):
+    a = ws1.cell(r, 1).value
+    b = ws1.cell(r, 2).value
+    c = ws1.cell(r, 3).value
+    if a not in (None, "") and b not in (None, ""):
+        formula = f'=INDEX(Data!$C$3:$AY$4,MATCH(A{r},Data!$B$3:$B$4,0),MATCH(B{r},Data!$C$2:$AY$2,0))'
+        print(f"Row {r}: A={a!r}, B={b!r}, existing C={c!r} -> new formula {formula}")
+        ws1.cell(r, 3).value = formula
+        written.append((r, formula))
+
+wb.save(output_path)
+print("Saved to:", output_path)
+
+# Recalculate formulas
+recalc_result = await recalculate(output_path)
+print("Recalculate result:", recalc_result)
+
+# Reload after recalc, ensure sheet names preserved
+wb_post = load_workbook(output_path)
+print("Sheet names after recalc/reload:", wb_post.sheetnames)
+if wb_post.sheetnames != orig_sheetnames:
+    print("Sheet names changed; restoring original names.")
+    for ws, orig_name in zip(wb_post.worksheets, orig_sheetnames):
+        ws.title = orig_name
+    wb_post.save(output_path)
+    wb_post = load_workbook(output_path)
+    print("Sheet names after restore:", wb_post.sheetnames)
+
+# Verify formulas still present in normal load
+ws1_post = wb_post["Sheet1"]
+print("Formulas in target cells after save:")
+for r in range(2, ws1_post.max_row + 1):
+    print(f"C{r} formula:", ws1_post.cell(r, 3).value)
+
+# Verify computed numeric results using data_only=True
+wb_vals = load_workbook(output_path, data_only=True)
+print("Sheet names in data_only reload:", wb_vals.sheetnames)
+ws1_vals = wb_vals["Sheet1"]
+
+print("Verified target cells (A:C):")
+for r in range(1, ws1_vals.max_row + 1):
+    vals = [ws1_vals.cell(r, c).value for c in range(1, 4)]
+    types = [type(v).__name__ if v is not None else None for v in vals]
+    print(f"Row {r}: values={vals}, types={types}")
+
+# Sanity-check expected numeric outputs from the source table
+print("Sanity check against source table:")
+for r in range(2, ws1.max_row + 1):
+    a = ws1_vals.cell(r, 1).value
+    b = ws1_vals.cell(r, 2).value
+    c = ws1_vals.cell(r, 3).value
+    print(f"Sheet1 row {r}: Job Title={a}, Months={b}, Salary={c}, numeric={isinstance(c, (int, float))}")
+
+final_output_spreadsheet = output_path
+```
+2026-04-14 10:23:19,359 INFO RLM iteration 3/50
+Reasoning: The workbook has been inspected, modified, saved, recalculated, and verified. The exact target cells `Sheet1!C2:C3` now contain numeric outputs `35` and `37`, and the sheet names remain unchanged. The output file path is stored in `final_output_spreadsheet`. I should now submit that file path and nothing else.
+Code:
+```repl
+SUBMIT(output_spreadsheet=final_output_spreadsheet)
+```
+
+============================================================
+recalc_source: baseline
+score:         1.0000  PASS
+All 2 cells match

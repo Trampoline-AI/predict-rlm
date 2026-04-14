@@ -1,0 +1,96 @@
+task: 43657  case: 1
+instruction_type: Cell-Level Manipulation
+answer_position: K2:K8
+input:  /Users/gabriel/Workspace/trampoline-ai/predict-rlm.spreadbench-release/examples/spreadbench/data/testset/spreadsheet/43657/1_43657_init.xlsx
+answer: /Users/gabriel/Workspace/trampoline-ai/predict-rlm.spreadbench-release/examples/spreadbench/data/testset/spreadsheet/43657/1_43657_golden.xlsx
+============================================================
+2026-04-13 15:48:17,636 INFO RLM iteration 1/50
+Reasoning: We need to examine the input spreadsheet to understand where the list of names is located and where the cells that may be highlighted in green are. The instruction mentions a formula `SUMPRODUCT(--ISNUMBER(SEARCH(L2,C3:G3)))`, which suggests that the name to search is in column L (row 2) and the range to search is C3:G3 (a row of data). The task is to write a formula to the left of the list of names that counts how many times that name appears (and is highlighted in green). Since Excel formulas cannot directly detect fill color, we assume that the green highlighting is applied only to cells that contain the name, so counting occurrences of the name in the target range suffices.
+
+Our plan:
+1. Load the workbook from the given path.
+2. Identify the sheet that contains the data (usually the first sheet).
+3. Print the sheet name, dimensions, and a few rows to locate the column with names (likely column L) and the data range (columns C‑G).
+4. Based on that, we will insert a new column to the left of the names column and write a formula like `=SUMPRODUCT(--ISNUMBER(SEARCH(L2, C2:G2)))` (adjusting row numbers as needed) for each row of names.
+5. Save the modified workbook to the output directory with the same filename.
+6. Verify that the formula was written correctly.
+
+We will start by loading and inspecting the workbook.
+Code:
+```repl
+import openpyxl
+from pathlib import Path
+
+# Load the workbook
+input_path = Path("/sandbox/input/input_spreadsheet/1_43657_init.xlsx")
+wb = openpyxl.load_workbook(input_path, data_only=False)  # keep formulas
+ws = wb.active  # assume first sheet
+
+# Print basic info
+print("Sheet name:", ws.title)
+print("Dimensions: rows =", ws.max_row, "cols =", ws.max_column)
+
+# Show first few rows (up to row 5) with column letters
+for r in range(1, min(6, ws.max_row + 1)):
+    row_vals = [ws.cell(row=r, column=c).value for c in range(1, ws.max_column + 1)]
+    print(f"Row {r}:", row_vals)
+```
+2026-04-13 15:48:45,658 INFO RLM iteration 2/50
+Reasoning: We inspected the workbook and identified that the list of names resides in column L (12th column). The instruction asks for a formula placed to the left of this list (i.e., column K) that counts how many times each name appears highlighted in green. Since Excel formulas cannot detect fill color, we assume the green‑highlighted cells are the ones that contain the name, so counting occurrences of the name in the target range is sufficient.
+
+The provided example formula `SUMPRODUCT(--ISNUMBER(SEARCH(L2,C3:G3)))` searches the name in L2 within the next row (row 3) columns C‑G. Therefore, for each name in row i we need a formula that searches that name in the row below (i+1) across columns C‑G:
+
+```
+=SUMPRODUCT(--ISNUMBER(SEARCH(Li, C(i+1):G(i+1))))
+```
+
+Implementation steps:
+1. Load the input workbook.
+2. Insert a new column before column L (so the new column becomes K).
+3. For each row that contains a name (starting at row 2 up to the last used row), write the formula above into column K.
+4. Save the modified workbook to the output folder with the same filename.
+5. Optionally recalculate formulas to cache values.
+
+We'll now execute these steps.
+Code:
+```repl
+import openpyxl
+from pathlib import Path
+
+# Paths
+input_path = Path("/sandbox/input/input_spreadsheet/1_43657_init.xlsx")
+output_dir = Path("/sandbox/output/output_spreadsheet/")
+output_dir.mkdir(parents=True, exist_ok=True)
+output_path = output_dir / "1_43657_init.xlsx"
+
+# Load workbook (keep formulas)
+wb = openpyxl.load_workbook(input_path, data_only=False)
+ws = wb.active  # assume first sheet
+
+# Insert a new column before column L (12th column) => new column K
+ws.insert_cols(12)  # shifts original column L to M, new column K is empty
+
+# Determine the last row with data (use max_row)
+last_row = ws.max_row
+
+# Write formula into column K for each row that has a name in column L (now column M after insertion)
+for row in range(2, last_row + 1):
+    # Name cell is now column M (13th column) after insertion
+    name_cell = ws.cell(row=row, column=13)  # column M
+    # Only write formula if there is a name (non‑empty)
+    if name_cell.value is not None:
+        # Build the formula string using the original column L reference (now column L is 12)
+        # The formula should reference the name in column L (12) and the range C:G of the next row.
+        formula = f"=SUMPRODUCT(--ISNUMBER(SEARCH(L{row}, C{row+1}:G{row+1})))"
+        ws.cell(row=row, column=11, value=formula)  # column K (11)
+
+# Save the workbook
+wb.save(output_path)
+
+# Recalculate formulas to cache values (optional but recommended)
+try:
+    result = await recalculate(str(output_path))
+    print("Recalculate result:", result)
+except Exception as e:
+    print("Recalculate failed:", e)
+```
