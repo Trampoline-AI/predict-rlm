@@ -4,8 +4,9 @@ Resolves stale formula values inside a workbook by running it through a
 two-stage pipeline:
 
 1. **Python `formulas` library** — computes every formula in memory
-   using a pure-Python dependency graph. Fast, no subprocess, and
-   handles a surprisingly wide range of Excel functions including
+   using a pure-Python dependency graph. Executed in an isolated child
+   process with a hard timeout so pathological graphs cannot wedge the
+   host run, and handles a surprisingly wide range of Excel functions including
    `TEXTJOIN` and other modern built-ins.
 2. **LibreOffice headless** — ``soffice --headless --convert-to xlsx``
    as a fallback for formulas the Python library can't evaluate.
@@ -30,6 +31,7 @@ Typical usage::
 from __future__ import annotations
 
 import logging
+import multiprocessing as mp
 import os
 import re
 import shutil
@@ -95,6 +97,9 @@ _ERROR_TOKENS = frozenset(
 #   "'[workbook.xlsx]SHEETNAME'!A1"
 # The sheet name is always upper-cased by the library.
 _CELL_KEY_RE = re.compile(r"'?\[.*?\](.+?)'?!([A-Z]+\d+)$")
+
+_FORMULAS_TIMEOUT_SECONDS = 30.0
+_FORMULAS_TERMINATE_GRACE_SECONDS = 2.0
 
 Source = Literal["baseline", "formulas", "libreoffice"]
 
@@ -259,15 +264,54 @@ def _count_resolved(path: Path, targets: list[tuple[str, str]]) -> int:
     return resolved
 
 
-def _recalc_with_formulas(src: Path, dst: Path) -> None:
-    """Run the Python `formulas` library on *src* and write the result to *dst*.
+def _run_formulas_worker(src: str, dst: str, send_conn: Any) -> None:
+    try:
+        _recalc_with_formulas_inprocess(Path(src), Path(dst))
+        send_conn.send((True, ""))
+    except Exception as e:
+        send_conn.send((False, f"{type(e).__name__}: {e}"))
+    finally:
+        send_conn.close()
 
-    Non-formula cells, sheet names, and styling are preserved by loading
-    *src* with openpyxl and only replacing formula cells whose value the
-    library successfully computed. Formulas the library couldn't handle
-    are left untouched so the LibreOffice fallback still has something
-    to work on.
-    """
+
+def _recalc_with_formulas(src: Path, dst: Path) -> None:
+    """Run formulas in a child process with a hard timeout."""
+    if _formulas_lib is None:
+        raise RuntimeError("formulas library not installed")
+
+    context = mp.get_context("spawn")
+    recv_conn, send_conn = context.Pipe(duplex=False)
+    worker = context.Process(
+        target=_run_formulas_worker,
+        args=(str(src), str(dst), send_conn),
+    )
+    worker.start()
+    send_conn.close()
+
+    worker.join(_FORMULAS_TIMEOUT_SECONDS)
+    if worker.is_alive():
+        worker.terminate()
+        worker.join(_FORMULAS_TERMINATE_GRACE_SECONDS)
+        if worker.is_alive():
+            worker.kill()
+            worker.join()
+        recv_conn.close()
+        raise RuntimeError(f"timed out after {_FORMULAS_TIMEOUT_SECONDS:.1f}s")
+
+    ok = False
+    message = f"worker exited without result (exitcode={worker.exitcode})"
+    if recv_conn.poll():
+        ok, message = recv_conn.recv()
+    recv_conn.close()
+
+    if not ok:
+        raise RuntimeError(message)
+    if not dst.is_file():
+        raise RuntimeError("worker produced no output workbook")
+
+
+def _recalc_with_formulas_inprocess(src: Path, dst: Path) -> None:
+    """Run formulas in-process and write results to *dst*."""
     if _formulas_lib is None:
         raise RuntimeError("formulas library not installed")
 
