@@ -11,9 +11,30 @@ for common providers so misconfiguration fails fast.
 
 from __future__ import annotations
 
+import logging
 import os
 
 import litellm
+
+_LITELLM_LOGGER_NAMES = ("LiteLLM", "LiteLLM Router", "LiteLLM Proxy")
+
+
+def configure_litellm_logging() -> None:
+    """Suppress noisy LiteLLM background-worker logs.
+
+    DSPy imports LiteLLM and can reset logger levels after this module
+    is imported, so call this both at import time and when building LM
+    configs.
+    """
+    try:
+        litellm.turn_off_message_logging = True
+    except Exception:
+        pass
+    for logger_name in _LITELLM_LOGGER_NAMES:
+        logging.getLogger(logger_name).setLevel(logging.CRITICAL)
+
+
+configure_litellm_logging()
 
 SUB_LM: str = "openai/gpt-5.1"
 
@@ -85,6 +106,7 @@ def get_lm_config(lm: str, reasoning_effort: str | None = None) -> dict:
     Raises:
         RuntimeError: if an API key env var required by ``lm`` is missing.
     """
+    configure_litellm_logging()
     validate_lm_env(lm)
 
     cfg: dict = {"model": lm, "num_retries": 5}
