@@ -27,7 +27,7 @@ from spreadsheet_rlm.signature import ManipulateSpreadsheet
 from spreadsheet_rlm.skills import libreoffice_spreadsheet_skill
 from tqdm import tqdm
 
-from predict_rlm import File, PredictRLM
+from predict_rlm import File, PredictRLM, Skill
 
 from .dataset import SpreadsheetTask, load_dataset
 from .lm_config import SUB_LM, compute_lm_cost, get_lm_config, get_sub_lm_config
@@ -35,7 +35,10 @@ from .scoring import score_workbooks
 
 nest_asyncio.apply()
 
-GEPA_COMPONENT = "signature_docstring"
+GEPA_COMPONENT_SIGNATURE = "signature_docstring"
+GEPA_COMPONENT_SKILL = "skill_instructions"
+# Backwards-compat alias used by older code that only knew about sig.
+GEPA_COMPONENT = GEPA_COMPONENT_SIGNATURE
 
 RLM_LOGGER_NAME = "dspy.predict.rlm"
 
@@ -93,6 +96,12 @@ class EvalConfig:
     reasoning_effort: str | None = "low"
     dataset: str = "testset"
     run_dir: str | None = None
+    # When `run_dir` is set, by default both evolved components (signature
+    # docstring + skill instructions) are loaded from the GEPA state and
+    # applied. Pass ``only="signature"`` or ``only="skill"`` to apply just
+    # one and use the seed value for the other — useful for A/B'ing each
+    # component's individual contribution.
+    only: str | None = None
     limit: int | None = None
     concurrency: int = 30
     max_iterations: int = 50
@@ -183,8 +192,10 @@ class TaskResult:
 @dataclass
 class EvalReport:
     config: EvalConfig
-    prompt_source: str
-    prompt_length: int
+    signature_source: str
+    signature_length: int
+    skill_source: str
+    skill_length: int
     total_tasks: int
     soft_restriction_avg: float
     hard_restriction_avg: float
@@ -205,13 +216,16 @@ class EvalReport:
                 "reasoning_effort": self.config.reasoning_effort,
                 "dataset": self.config.dataset,
                 "run_dir": self.config.run_dir,
+                "only": self.config.only,
                 "limit": self.config.limit,
                 "concurrency": self.config.concurrency,
                 "max_iterations": self.config.max_iterations,
                 "task_timeout": self.config.task_timeout,
             },
-            "prompt_source": self.prompt_source,
-            "prompt_length": self.prompt_length,
+            "signature_source": self.signature_source,
+            "signature_length": self.signature_length,
+            "skill_source": self.skill_source,
+            "skill_length": self.skill_length,
             "total_tasks": self.total_tasks,
             "soft_restriction_avg": self.soft_restriction_avg,
             "hard_restriction_avg": self.hard_restriction_avg,
@@ -246,6 +260,39 @@ def make_dynamic_signature(docstring: str) -> type[dspy.Signature]:
     return ManipulateSpreadsheet.with_instructions(docstring)
 
 
+def make_dynamic_skill(instructions: str) -> Skill:
+    """Return a copy of the LO spreadsheet skill with custom instructions.
+
+    Preserves ``name``, ``packages``, ``modules``, and ``tools`` (including
+    the ``recalculate`` host-side tool registered by ``skills.py``). Uses
+    pydantic ``model_copy`` so the new Skill is structurally identical to
+    the seed except for the ``instructions`` field.
+    """
+    return libreoffice_spreadsheet_skill.model_copy(
+        update={"instructions": instructions}
+    )
+
+
+def extract_best_candidate(run_dir: str | Path) -> dict[str, str]:
+    """Pull the best-by-mean candidate (full dict) from a GEPA ``run_dir``.
+
+    Returns the full ``{component_name: component_text}`` dict. For
+    multi-component runs this includes both ``signature_docstring`` and
+    ``skill_instructions``; for single-component (legacy) runs only
+    ``signature_docstring`` is present.
+    """
+    state_path = Path(run_dir) / "gepa_state.bin"
+    with state_path.open("rb") as f:
+        state = pickle.load(f)
+    subs = state["prog_candidate_val_subscores"]
+    cands = state["program_candidates"]
+    best_idx = max(
+        range(len(cands)),
+        key=lambda i: (sum(subs[i].values()) / len(subs[i])) if subs[i] else 0.0,
+    )
+    return cands[best_idx]
+
+
 def extract_best_prompt(run_dir: str | Path) -> tuple[str, int, float]:
     """Pull the best-by-mean candidate prompt from a GEPA ``run_dir``.
 
@@ -272,6 +319,7 @@ async def _run_case(
     input_path: str,
     answer_path: str | None,
     sig_cls: type[dspy.Signature],
+    skill: Skill,
     lm: dspy.LM,
     sub_lm: dspy.LM,
     sem: asyncio.Semaphore,
@@ -302,7 +350,7 @@ async def _run_case(
                 sig_cls,
                 lm=lm,
                 sub_lm=sub_lm,
-                skills=[libreoffice_spreadsheet_skill],
+                skills=[skill],
                 max_iterations=config.max_iterations,
                 verbose=config.log_dir is not None,
                 debug=False,
@@ -376,6 +424,7 @@ async def _run_case(
 async def _run_tasks_async(
     tasks: list[SpreadsheetTask],
     sig_cls: type[dspy.Signature],
+    skill: Skill,
     lm: dspy.LM,
     sub_lm: dspy.LM,
     config: EvalConfig,
@@ -388,7 +437,7 @@ async def _run_tasks_async(
         case_coros = [
             _run_case(
                 task, idx, input_path, answer_path,
-                sig_cls, lm, sub_lm, sem, tmp_dir, config,
+                sig_cls, skill, lm, sub_lm, sem, tmp_dir, config,
             )
             for idx, input_path, answer_path in task.test_cases
         ]
@@ -409,28 +458,73 @@ async def _run_tasks_async(
     return list(results)
 
 
+def _resolve_components(
+    config: EvalConfig,
+) -> tuple[str, str, str, str]:
+    """Resolve (sig_text, sig_source, skill_text, skill_source) for an eval run.
+
+    Default: load both components from ``config.run_dir`` if set, fall
+    back to seed for either component that the run_dir doesn't contain
+    (so single-component / legacy runs still work).
+
+    ``config.only`` overrides this:
+    * ``"signature"`` → load sig from run_dir, use seed skill
+    * ``"skill"``     → use seed sig, load skill from run_dir
+    * ``None``        → load both (default)
+
+    Raises:
+        ValueError: if ``only`` is set but ``run_dir`` is not, or if
+            ``only`` is an unrecognised value.
+    """
+    seed_sig = ManipulateSpreadsheet.__doc__ or ""
+    seed_skill = libreoffice_spreadsheet_skill.instructions
+
+    if config.only is not None and config.only not in ("signature", "skill"):
+        raise ValueError(
+            f"--only must be 'signature' or 'skill', got {config.only!r}"
+        )
+    if config.only is not None and not config.run_dir:
+        raise ValueError("--only requires --run_dir")
+
+    if not config.run_dir:
+        return seed_sig, "seed", seed_skill, "seed"
+
+    candidate = extract_best_candidate(config.run_dir)
+    run_basename = Path(config.run_dir).name
+
+    sig_text = seed_sig
+    sig_source = "seed"
+    if config.only != "skill" and GEPA_COMPONENT_SIGNATURE in candidate:
+        sig_text = candidate[GEPA_COMPONENT_SIGNATURE]
+        sig_source = f"{run_basename}#sig"
+
+    skill_text = seed_skill
+    skill_source = "seed"
+    if config.only != "signature" and GEPA_COMPONENT_SKILL in candidate:
+        skill_text = candidate[GEPA_COMPONENT_SKILL]
+        skill_source = f"{run_basename}#skill"
+
+    return sig_text, sig_source, skill_text, skill_source
+
+
 def run_evaluation(config: EvalConfig) -> EvalReport:
     """Run the eval loop described by *config* and return a report.
 
-    Resolves the prompt (seed docstring by default, GEPA best when
-    ``config.run_dir`` is set), builds the main/sub LMs, loads the
+    Resolves both components (signature docstring + skill instructions)
+    from ``config.run_dir`` when set, builds the main/sub LMs, loads the
     dataset, runs every task's cases concurrently, recalculates each
     produced output through the formulas+LO pipeline, and scores
-    against ground truth.
+    against ground truth. ``config.only`` selectively applies just one
+    of the two evolved components.
     """
-    if config.run_dir:
-        prompt, best_idx, best_mean = extract_best_prompt(config.run_dir)
-        prompt_source = f"{Path(config.run_dir).name}#cand{best_idx}"
-        print(
-            f"Loaded GEPA best prompt: {prompt_source} "
-            f"(val_mean={best_mean:.4f}, {len(prompt)} chars)"
-        )
-    else:
-        prompt = ManipulateSpreadsheet.__doc__ or ""
-        prompt_source = "seed"
-        print(f"Using seed prompt ({len(prompt)} chars)")
+    sig_text, sig_source, skill_text, skill_source = _resolve_components(config)
+    print(
+        f"Signature: {sig_source} ({len(sig_text)} chars)\n"
+        f"Skill:     {skill_source} ({len(skill_text)} chars)"
+    )
 
-    sig_cls = make_dynamic_signature(prompt)
+    sig_cls = make_dynamic_signature(sig_text)
+    skill = make_dynamic_skill(skill_text)
 
     lm_cfg = get_lm_config(config.lm, config.reasoning_effort)
     sub_lm_cfg = get_sub_lm_config(config.sub_lm)
@@ -463,7 +557,7 @@ def run_evaluation(config: EvalConfig) -> EvalReport:
     t0 = time.time()
     loop = asyncio.get_event_loop()
     results = loop.run_until_complete(
-        _run_tasks_async(tasks, sig_cls, lm, sub_lm, config)
+        _run_tasks_async(tasks, sig_cls, skill, lm, sub_lm, config)
     )
     elapsed = time.time() - t0
 
@@ -479,8 +573,10 @@ def run_evaluation(config: EvalConfig) -> EvalReport:
 
     return EvalReport(
         config=config,
-        prompt_source=prompt_source,
-        prompt_length=len(prompt),
+        signature_source=sig_source,
+        signature_length=len(sig_text),
+        skill_source=skill_source,
+        skill_length=len(skill_text),
         total_tasks=total,
         soft_restriction_avg=soft_avg,
         hard_restriction_avg=hard_avg,
