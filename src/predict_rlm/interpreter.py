@@ -21,6 +21,7 @@ import logging
 import os
 import re
 import select
+import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -34,6 +35,7 @@ if TYPE_CHECKING:
 
 
 logger = logging.getLogger(__name__)
+
 
 # JSON-RPC 2.0 helpers (local to avoid coupling to dspy internals)
 JSONRPC_APP_ERRORS = {
@@ -825,6 +827,8 @@ class JspiInterpreter(PythonInterpreter):
 
     async def _execute_tool_async(self, tool_name: str, call_args: dict) -> dict:
         """Execute a tool asynchronously and return the response dict."""
+        from .trace import ToolCall, ms_since, record_tool_call
+
         if self._debug:
             import sys
 
@@ -832,13 +836,16 @@ class JspiInterpreter(PythonInterpreter):
             print(
                 f"\n\033[33m── Tool: {tool_name}({kwargs_preview}) ──\033[0m", file=sys.stderr
             )
+
+        call_start = time.perf_counter()
+        args = call_args.get("args", [])
+        kwargs = call_args.get("kwargs", {})
+
         try:
             if tool_name not in self.tools:
                 raise CodeInterpreterError(f"Unknown tool: {tool_name}")
 
             tool_fn = self.tools[tool_name]
-            args = call_args.get("args", [])
-            kwargs = call_args.get("kwargs", {})
 
             # Pass pydantic_schemas through to predict tool if present
             pydantic_schemas = call_args.get("pydantic_schemas")
@@ -849,22 +856,38 @@ class JspiInterpreter(PythonInterpreter):
             if asyncio.iscoroutinefunction(tool_fn):
                 result = await tool_fn(*args, **kwargs)
             else:
-                # Run sync function in per-interpreter thread pool (not the
-                # shared default pool) to prevent starvation when many
-                # interpreters run concurrently.
-                # loop.run_in_executor only accepts positional args, so wrap
-                # the call in functools.partial to bind **kwargs.
                 loop = asyncio.get_running_loop()
                 result = await loop.run_in_executor(
                     self._executor, functools.partial(tool_fn, *args, **kwargs)
                 )
 
             is_json = isinstance(result, (list, dict))
-            return {
+            response = {
                 "value": json.dumps(result) if is_json else str(result or ""),
                 "type": "json" if is_json else "string",
             }
+
+            # Record non-predict tool calls (predict records itself with richer detail)
+            if tool_name != "predict":
+                record_tool_call(ToolCall(
+                    name=tool_name,
+                    args=args,
+                    kwargs={k: v for k, v in kwargs.items() if k != "pydantic_schemas"},
+                    result=result,
+                    duration_ms=ms_since(call_start),
+                ))
+
+            return response
         except Exception as e:
+            if tool_name != "predict":
+                record_tool_call(ToolCall(
+                    name=tool_name,
+                    args=args,
+                    kwargs={k: v for k, v in kwargs.items() if k != "pydantic_schemas"},
+                    result=None,
+                    error=str(e),
+                    duration_ms=ms_since(call_start),
+                ))
             return {"error": str(e)}
 
     def _write_stdin(self, data: str) -> None:
