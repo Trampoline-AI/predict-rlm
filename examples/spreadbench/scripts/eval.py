@@ -48,7 +48,8 @@ def _parse_args() -> argparse.Namespace:
         "--reasoning_effort",
         default="low",
         help="reasoning effort for the main LM (e.g. low, medium, high). "
-        "Pass the empty string to omit it.",
+        "Pass '' or 'none' to omit it (required on Claude 4.6 to disable "
+        "extended thinking — any non-empty value maps to adaptive thinking).",
     )
     p.add_argument("--sub_lm", default=SUB_LM, help="sub LM for predict() calls")
     p.add_argument(
@@ -73,6 +74,13 @@ def _parse_args() -> argparse.Namespace:
         "individual contribution). Default: apply both.",
     )
     p.add_argument("--limit", type=int, default=None, help="cap tasks for smoke tests")
+    p.add_argument(
+        "--task_ids",
+        default=None,
+        help="comma-separated task IDs to run (subset of the dataset). "
+        "Prefix with '@' to read from a file with one ID per line, "
+        "e.g. --task_ids @failing_ids.txt",
+    )
     p.add_argument("--concurrency", type=int, default=30)
     p.add_argument("--max_iterations", type=int, default=50)
     p.add_argument("--task_timeout", type=int, default=300)
@@ -118,6 +126,17 @@ def _resolve_log_dir(
     return output_path.with_suffix("")
 
 
+def _parse_task_ids(raw: str | None) -> tuple[str, ...] | None:
+    if not raw:
+        return None
+    if raw.startswith("@"):
+        text = Path(raw[1:]).read_text()
+    else:
+        text = raw
+    ids = [s.strip() for s in text.replace("\n", ",").split(",")]
+    return tuple(s for s in ids if s) or None
+
+
 def main() -> int:
     args = _parse_args()
 
@@ -125,14 +144,19 @@ def main() -> int:
     output_path.parent.mkdir(parents=True, exist_ok=True)
     log_dir = _resolve_log_dir(args.log_dir, output_path, args.no_logs)
 
+    effort = args.reasoning_effort
+    if effort and effort.strip().lower() == "none":
+        effort = None
+
     config = EvalConfig(
         lm=args.lm,
         sub_lm=args.sub_lm,
-        reasoning_effort=args.reasoning_effort or None,
+        reasoning_effort=effort or None,
         dataset=args.dataset,
         run_dir=args.run_dir,
         only=args.only,
         limit=args.limit,
+        task_ids=_parse_task_ids(args.task_ids),
         concurrency=args.concurrency,
         max_iterations=args.max_iterations,
         task_timeout=args.task_timeout,
@@ -151,11 +175,8 @@ def main() -> int:
     print("=" * 60)
     print(f"Signature:      {report.signature_source} ({report.signature_length} chars)")
     print(f"Skill:          {report.skill_source} ({report.skill_length} chars)")
-    print(f"Model:          {config.lm}" + (
-        f" (reasoning_effort={config.reasoning_effort})"
-        if config.reasoning_effort
-        else ""
-    ))
+    _effort = config.reasoning_effort if config.reasoning_effort else "none"
+    print(f"Model:          {config.lm}  (reasoning_effort={_effort})")
     print(f"Dataset:        {config.dataset}")
     print(f"Tasks:          {report.total_tasks}")
     print(f"Duration:       {mins}m {secs}s")

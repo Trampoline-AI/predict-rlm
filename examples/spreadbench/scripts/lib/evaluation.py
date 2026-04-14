@@ -103,6 +103,7 @@ class EvalConfig:
     # component's individual contribution.
     only: str | None = None
     limit: int | None = None
+    task_ids: tuple[str, ...] | None = None
     concurrency: int = 30
     max_iterations: int = 50
     task_timeout: int = 300
@@ -531,15 +532,20 @@ def run_evaluation(config: EvalConfig) -> EvalReport:
     lm = dspy.LM(**lm_cfg, cache=config.cache)
     sub_lm = dspy.LM(**sub_lm_cfg, cache=config.cache)
 
-    effort_tag = (
-        f" (reasoning_effort={config.reasoning_effort})"
-        if config.reasoning_effort
-        else ""
-    )
-    print(f"Main LM: {config.lm}{effort_tag}")
+    effort = config.reasoning_effort if config.reasoning_effort else "none"
+    print(f"Main LM: {config.lm}  (reasoning_effort={effort})")
     print(f"Sub LM:  {config.sub_lm}")
 
     tasks = load_dataset(config.dataset, max_cases_per_task=0)
+    if config.task_ids:
+        wanted = set(config.task_ids)
+        tasks = [t for t in tasks if t.task_id in wanted]
+        missing = wanted - {t.task_id for t in tasks}
+        if missing:
+            raise ValueError(
+                f"task_ids not found in dataset {config.dataset!r}: "
+                f"{sorted(missing)}"
+            )
     if config.limit:
         tasks = tasks[: config.limit]
     print(f"Dataset: {config.dataset} ({len(tasks)} tasks)")
