@@ -251,6 +251,23 @@ def test_recalculate_reports_errors_when_both_pipelines_fail(
     assert xlsx.read_bytes() == before
 
 
+def test_recalculate_times_out_formulas_and_falls_back(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    fixture = Path(__file__).parent / "fixtures" / "hang_huge_range_34365.xlsx"
+    xlsx = tmp_path / "hang.xlsx"
+    shutil.copy2(fixture, xlsx)
+
+    monkeypatch.setattr(recalc_mod, "_FORMULAS_TIMEOUT_SECONDS", 1.0)
+    monkeypatch.setattr(recalc_mod, "_find_libreoffice", lambda: None)
+
+    result = recalculate(xlsx)
+
+    assert result.source == "baseline"
+    assert any("timed out after 1.0s" in e for e in result.errors)
+    assert any(e.startswith("libreoffice:") for e in result.errors)
+
+
 @pytest.mark.integration
 def test_recalculate_uses_libreoffice_when_formulas_is_incomplete(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
