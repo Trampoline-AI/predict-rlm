@@ -14,6 +14,7 @@ from predict_rlm.trace import (
     TokenUsage,
     ToolCall,
     _RawPredictCall,
+    _sanitize_for_trace,
     drain_predict_calls,
     drain_tool_calls,
     init_predict_call_collector,
@@ -156,6 +157,57 @@ class TestRunTrace:
                 iterations=1, max_iterations=5, duration_ms=100,
             )
             assert trace.status == status
+
+    def test_to_exportable_json_returns_string(self):
+        trace = RunTrace(
+            status="completed", model="openai/gpt-5",
+            iterations=1, max_iterations=5, duration_ms=100,
+        )
+        result = trace.to_exportable_json()
+        assert isinstance(result, str)
+        import json
+        data = json.loads(result)
+        assert data["status"] == "completed"
+
+    def test_to_exportable_json_sanitizes_base64(self):
+        b64 = "A" * 40000
+        trace = RunTrace(
+            status="completed", model="openai/gpt-5",
+            iterations=1, max_iterations=5, duration_ms=100,
+            steps=[
+                IterationStep(
+                    iteration=1, reasoning="", code="",
+                    output="", untruncated_output="", duration_ms=100,
+                    predict_calls=[
+                        PredictCallGroup(
+                            signature="page: dspy.Image -> answer",
+                            model="openai/gpt-4o",
+                            calls=[PredictCallDetail(
+                                duration_ms=50,
+                                input={"page": f"data:image/png;base64,{b64}"},
+                                output={"answer": "hello"},
+                            )],
+                        )
+                    ],
+                )
+            ],
+        )
+        result = trace.to_exportable_json()
+        assert "AAAA" not in result
+        assert "<IMAGE_BASE_64_ENCODED(40000)>" in result
+        # model_dump still has the full data
+        full = trace.model_dump()
+        assert b64 in full["steps"][0]["predict_calls"][0]["calls"][0]["input"]["page"]
+
+    def test_to_exportable_json_writes_file(self, tmp_path):
+        trace = RunTrace(
+            status="completed", model="openai/gpt-5",
+            iterations=1, max_iterations=5, duration_ms=100,
+        )
+        out = tmp_path / "trace.json"
+        result = trace.to_exportable_json(out)
+        assert out.exists()
+        assert result == out.read_text()
 
 
 class TestPredictCallCollector:
@@ -356,6 +408,36 @@ class TestUsageSince:
         lm = MagicMock(spec=[])
         usage = usage_since(lm, 0)
         assert usage.input_tokens == 0
+
+
+class TestSanitizeForTrace:
+    def test_replaces_data_uri(self):
+        data_uri = "data:image/png;base64," + "A" * 40000
+        result = _sanitize_for_trace(data_uri)
+        assert result == "data:image/png;base64,<IMAGE_BASE_64_ENCODED(40000)>"
+
+    def test_replaces_nested_in_dict(self):
+        data = {
+            "page": "data:image/jpeg;base64," + "B" * 20000,
+            "question": "What is this?",
+        }
+        result = _sanitize_for_trace(data)
+        assert result["question"] == "What is this?"
+        assert result["page"] == "data:image/jpeg;base64,<IMAGE_BASE_64_ENCODED(20000)>"
+
+    def test_replaces_in_list(self):
+        data = ["data:image/png;base64," + "C" * 10000, "normal string"]
+        result = _sanitize_for_trace(data)
+        assert result[0] == "data:image/png;base64,<IMAGE_BASE_64_ENCODED(10000)>"
+        assert result[1] == "normal string"
+
+    def test_leaves_normal_strings(self):
+        assert _sanitize_for_trace("hello") == "hello"
+        assert _sanitize_for_trace("data:not-base64") == "data:not-base64"
+
+    def test_leaves_non_strings(self):
+        assert _sanitize_for_trace(42) == 42
+        assert _sanitize_for_trace(None) is None
 
 
 class TestMsSince:

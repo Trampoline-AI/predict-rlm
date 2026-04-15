@@ -114,9 +114,14 @@ for step in trace.steps:
     if step.error:
         print(f"  Error: {step.output}")
 
-# Serialize to JSON
-import json
-json.dumps(trace.model_dump(), indent=2)
+# Export to JSON file (compact — base64 images replaced with size summaries)
+trace.to_exportable_json("trace.json")
+
+# Or get the compact JSON string
+json_str = trace.to_exportable_json()
+
+# Full data including raw base64 payloads (use for programmatic access)
+data = trace.model_dump()
 ```
 
 ### Schema
