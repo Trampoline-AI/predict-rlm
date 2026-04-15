@@ -8,8 +8,11 @@ in a machine-readable format for postmortem analysis and downstream systems.
 
 from __future__ import annotations
 
+import json
+import re
 import time
 from contextvars import ContextVar
+from pathlib import Path
 from typing import Any, Literal
 
 from pydantic import BaseModel, Field
@@ -33,9 +36,15 @@ class PredictCallDetail(BaseModel):
     """Per-call metrics for a single predict() invocation."""
 
     duration_ms: int = Field(description="Wall-clock duration in milliseconds")
-    usage: TokenUsage = Field(default_factory=TokenUsage, description="Token usage for this call")
-    input: dict[str, Any] = Field(default_factory=dict, description="Input fields passed to the sub-LM")
-    output: dict[str, Any] = Field(default_factory=dict, description="Output fields returned by the sub-LM")
+    usage: TokenUsage = Field(
+        default_factory=TokenUsage, description="Token usage for this call"
+    )
+    input: dict[str, Any] = Field(
+        default_factory=dict, description="Input fields passed to the sub-LM"
+    )
+    output: dict[str, Any] = Field(
+        default_factory=dict, description="Output fields returned by the sub-LM"
+    )
 
 
 class PredictCallGroup(BaseModel):
@@ -46,9 +55,13 @@ class PredictCallGroup(BaseModel):
     """
 
     signature: str = Field(description="DSPy signature string")
-    instructions: str | None = Field(default=None, description="Task instructions passed to the sub-LM")
+    instructions: str | None = Field(
+        default=None, description="Task instructions passed to the sub-LM"
+    )
     model: str = Field(description="Model identifier used for these calls")
-    total_usage: TokenUsage = Field(default_factory=TokenUsage, description="Sum of token usage across all calls")
+    total_usage: TokenUsage = Field(
+        default_factory=TokenUsage, description="Sum of token usage across all calls"
+    )
     calls: list[PredictCallDetail] = Field(description="Per-call duration and usage")
 
 
@@ -72,16 +85,16 @@ class IterationStep(BaseModel):
     output: str = Field(
         description="Sandbox output as shown to the model (truncated to 5K chars)"
     )
-    untruncated_output: str = Field(
-        description="Full sandbox output before prompt truncation"
-    )
+    untruncated_output: str = Field(description="Full sandbox output before prompt truncation")
     error: bool = Field(default=False, description="True if code execution raised an error")
     duration_ms: int = Field(description="Wall-clock duration of this iteration")
     tool_calls: list[ToolCall] = Field(
-        default_factory=list, description="Tool calls made during this iteration (excluding predict)"
+        default_factory=list,
+        description="Tool calls made during this iteration (excluding predict)",
     )
     predict_calls: list[PredictCallGroup] = Field(
-        default_factory=list, description="predict() subcalls made during this iteration, grouped by signature"
+        default_factory=list,
+        description="predict() subcalls made during this iteration, grouped by signature",
     )
 
 
@@ -115,25 +128,97 @@ class RunTrace(BaseModel):
     max_iterations: int = Field(description="Maximum iterations allowed")
     duration_ms: int = Field(description="Total wall-clock duration in milliseconds")
     usage: LMUsage = Field(
-        default_factory=lambda: LMUsage(), description="Token usage split by main and sub LM"
+        default_factory=LMUsage, description="Token usage split by main and sub LM"
     )
     steps: list[IterationStep] = Field(
         default_factory=list, description="Per-iteration execution steps"
     )
+
+    def __repr__(self) -> str:
+        return self.to_exportable_json()
+
+    def to_exportable_json(self, path: str | Path | None = None, indent: int = 2) -> str:
+        """Serialize the trace to a compact JSON string suitable for export.
+
+        Unlike ``model_dump()``, which preserves the full in-memory data
+        (including raw base64 image payloads from ``dspy.Image`` inputs),
+        this method replaces large binary data with compact summaries
+        before serializing — matching the format used by
+        ``dspy.Image.__repr__``.
+
+        For example, a 200KB base64 PNG becomes::
+
+            "data:image/png;base64,<IMAGE_BASE_64_ENCODED(273648)>"
+
+        Use ``model_dump()`` when you need the full data (e.g. to
+        programmatically access image payloads). Use this method when
+        writing traces to disk or sending them over the network.
+
+        Args:
+            path: If provided, write the JSON to this file and return the
+                  JSON string. If ``None``, just return the JSON string.
+            indent: JSON indentation level. Defaults to 2.
+
+        Returns:
+            The compact JSON string.
+        """
+        data = _sanitize_for_trace(self.model_dump())
+        output = json.dumps(data, indent=indent, default=str)
+        if path is not None:
+            Path(path).write_text(output)
+        return output
 
 
 # ---------------------------------------------------------------------------
 # Helpers for instrumentation
 # ---------------------------------------------------------------------------
 
+_BASE64_DATA_RE = re.compile(r"data:image/([^;]+);base64,([A-Za-z0-9+/=]+)")
+
+
+def _sanitize_for_trace(value: Any) -> Any:
+    """Replace base64 data URIs with length summaries.
+
+    Replaces ``data:image/{type};base64,{payload}`` with
+    ``data:image/{type};base64,<IMAGE_BASE_64_ENCODED({len})>``,
+    matching the format used by ``dspy.Image.__repr__``.
+    """
+    if isinstance(value, str):
+        if ";base64," not in value:
+            return value
+
+        def _replace_base64(m: re.Match) -> str:
+            return f"data:image/{m.group(1)};base64,<IMAGE_BASE_64_ENCODED({len(m.group(2))})>"
+
+        return _BASE64_DATA_RE.sub(_replace_base64, value)
+    if isinstance(value, dict):
+        return {k: _sanitize_for_trace(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_sanitize_for_trace(item) for item in value]
+    return value
+
+
 # Internal record for a single predict() call before aggregation.
 class _RawPredictCall:
-    __slots__ = ("signature", "instructions", "model", "duration_ms", "usage", "input", "output")
+    __slots__ = (
+        "signature",
+        "instructions",
+        "model",
+        "duration_ms",
+        "usage",
+        "input",
+        "output",
+    )
 
     def __init__(
-        self, signature: str, instructions: str | None, model: str,
-        duration_ms: int, usage: TokenUsage,
-        input: dict[str, Any], output: dict[str, Any],
+        self,
+        signature: str,
+        instructions: str | None,
+        model: str,
+        duration_ms: int,
+        usage: TokenUsage,
+        input: dict[str, Any],
+        output: dict[str, Any],
     ):
         self.signature = signature
         self.instructions = instructions
@@ -179,19 +264,23 @@ def drain_predict_calls() -> list[PredictCallGroup]:
         total_usage = TokenUsage()
         for c in group_calls:
             total_usage += c.usage
-        result.append(PredictCallGroup(
-            signature=sig,
-            instructions=instr,
-            model=model,
-            total_usage=total_usage,
-            calls=[
-                PredictCallDetail(
-                    duration_ms=c.duration_ms, usage=c.usage,
-                    input=c.input, output=c.output,
-                )
-                for c in group_calls
-            ],
-        ))
+        result.append(
+            PredictCallGroup(
+                signature=sig,
+                instructions=instr,
+                model=model,
+                total_usage=total_usage,
+                calls=[
+                    PredictCallDetail(
+                        duration_ms=c.duration_ms,
+                        usage=c.usage,
+                        input=c.input,
+                        output=c.output,
+                    )
+                    for c in group_calls
+                ],
+            )
+        )
 
     calls.clear()
     return result
