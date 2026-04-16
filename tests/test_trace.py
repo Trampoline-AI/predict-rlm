@@ -1,6 +1,7 @@
 """Tests for structured trace output."""
 
 import time
+import contextvars
 from unittest.mock import MagicMock
 
 import pytest
@@ -22,6 +23,8 @@ from predict_rlm.trace import (
     ms_since,
     record_predict_call,
     record_tool_call,
+    reset_predict_call_collector,
+    reset_tool_call_collector,
     snapshot_lm_history_len,
     usage_since,
 )
@@ -278,21 +281,44 @@ class TestPredictCallCollector:
         groups = drain_predict_calls()
         assert len(groups) == 2
 
+    def test_nested_collector_restores_parent_calls(self):
+        outer_token = init_predict_call_collector()
+        record_predict_call(_RawPredictCall(
+            signature="outer-before", instructions=None, model="m",
+            duration_ms=10, usage=TokenUsage(), input={}, output={},
+        ))
+
+        inner_token = init_predict_call_collector()
+        record_predict_call(_RawPredictCall(
+            signature="inner", instructions=None, model="m",
+            duration_ms=10, usage=TokenUsage(), input={}, output={},
+        ))
+        inner_groups = drain_predict_calls()
+        reset_predict_call_collector(inner_token)
+
+        record_predict_call(_RawPredictCall(
+            signature="outer-after", instructions=None, model="m",
+            duration_ms=10, usage=TokenUsage(), input={}, output={},
+        ))
+        outer_groups = drain_predict_calls()
+        reset_predict_call_collector(outer_token)
+
+        assert [group.signature for group in inner_groups] == ["inner"]
+        assert [group.signature for group in outer_groups] == ["outer-before", "outer-after"]
+
     def test_record_without_init_is_silent(self):
-        # In a fresh context (no collector set), recording is a no-op
-        import contextvars
+        from predict_rlm import trace
 
-        from predict_rlm.trace import _predict_calls
-
-        token = _predict_calls.set([])
+        original = trace._predict_calls
+        trace._predict_calls = contextvars.ContextVar("_predict_calls_fresh")
         try:
-            # Reset to simulate no collector
-            _predict_calls = contextvars.ContextVar("_predict_calls_fresh")
+            record_predict_call(_RawPredictCall(
+                signature="orphan", instructions=None, model="m",
+                duration_ms=1, usage=TokenUsage(), input={}, output={},
+            ))
+            assert drain_predict_calls() == []
         finally:
-            # Restore
-            from predict_rlm import trace
-
-            trace._predict_calls.reset(token)
+            trace._predict_calls = original
 
 
 class TestToolCall:
@@ -352,12 +378,40 @@ class TestToolCallCollector:
         assert len(calls) == 1
         assert calls[0].error == "boom"
 
-    def test_record_without_init_is_silent(self):
-        # No collector initialized — recording should not raise
+    def test_nested_collector_restores_parent_calls(self):
+        outer_token = init_tool_call_collector()
         record_tool_call(ToolCall(
-            name="orphan", args=[], kwargs={}, result="", duration_ms=1,
+            name="outer_before", args=[], kwargs={}, result="ok", duration_ms=1,
         ))
-        # No crash, no data — just a no-op
+
+        inner_token = init_tool_call_collector()
+        record_tool_call(ToolCall(
+            name="inner", args=[], kwargs={}, result="ok", duration_ms=1,
+        ))
+        inner_calls = drain_tool_calls()
+        reset_tool_call_collector(inner_token)
+
+        record_tool_call(ToolCall(
+            name="outer_after", args=[], kwargs={}, result="ok", duration_ms=1,
+        ))
+        outer_calls = drain_tool_calls()
+        reset_tool_call_collector(outer_token)
+
+        assert [call.name for call in inner_calls] == ["inner"]
+        assert [call.name for call in outer_calls] == ["outer_before", "outer_after"]
+
+    def test_record_without_init_is_silent(self):
+        from predict_rlm import trace
+
+        original = trace._tool_calls
+        trace._tool_calls = contextvars.ContextVar("_tool_calls_fresh")
+        try:
+            record_tool_call(ToolCall(
+                name="orphan", args=[], kwargs={}, result="", duration_ms=1,
+            ))
+            assert drain_tool_calls() == []
+        finally:
+            trace._tool_calls = original
 
 
 class TestSnapshotLmHistoryLen:
