@@ -762,96 +762,113 @@ class PredictRLM(dspy.RLM):
             predictor = dspy.Predict(sig)
             _call_start = time.perf_counter()
             _hist_len_before = snapshot_lm_history_len(lm)
-            with dspy.context(lm=lm):
-                prediction = await predictor.acall(**wrapped_kwargs)
-            _call_duration = ms_since(_call_start)
-            _call_usage = usage_since(lm, _hist_len_before)
+            result: dict[str, Any] = {}
+            try:
+                with dspy.context(lm=lm):
+                    prediction = await predictor.acall(**wrapped_kwargs)
 
-            # Convert Prediction to dict, serializing any Pydantic models to dicts
-            def _to_serializable(value: Any) -> Any:
-                """Convert Pydantic models and other objects to JSON-serializable dicts."""
-                if value is None or isinstance(value, (str, int, float, bool)):
-                    return value
+                # Convert Prediction to dict, serializing any Pydantic models to dicts
+                def _to_serializable(value: Any) -> Any:
+                    """Convert Pydantic models and other objects to JSON-serializable dicts."""
+                    if value is None or isinstance(value, (str, int, float, bool)):
+                        return value
 
-                from pydantic import BaseModel as PydanticBaseModel
+                    from pydantic import BaseModel as PydanticBaseModel
 
-                if isinstance(value, PydanticBaseModel):
-                    return value.model_dump(mode="python")
+                    if isinstance(value, PydanticBaseModel):
+                        return value.model_dump(mode="python")
 
-                if hasattr(value, "dict") and hasattr(value, "__fields__"):
-                    return value.dict()
+                    if hasattr(value, "dict") and hasattr(value, "__fields__"):
+                        return value.dict()
 
-                if hasattr(value, "__dataclass_fields__"):
-                    import dataclasses
+                    if hasattr(value, "__dataclass_fields__"):
+                        import dataclasses
 
-                    return {
-                        k: _to_serializable(v) for k, v in dataclasses.asdict(value).items()
-                    }
+                        return {
+                            k: _to_serializable(v)
+                            for k, v in dataclasses.asdict(value).items()
+                        }
 
-                if isinstance(value, list):
-                    return [_to_serializable(item) for item in value]
+                    if isinstance(value, list):
+                        return [_to_serializable(item) for item in value]
 
-                if isinstance(value, tuple):
-                    return [_to_serializable(item) for item in value]
+                    if isinstance(value, tuple):
+                        return [_to_serializable(item) for item in value]
 
-                if isinstance(value, dict):
-                    return {k: _to_serializable(v) for k, v in value.items()}
+                    if isinstance(value, dict):
+                        return {k: _to_serializable(v) for k, v in value.items()}
 
-                if isinstance(value, set):
-                    return list(value)
+                    if isinstance(value, set):
+                        return list(value)
 
-                if hasattr(value, "__dict__") and type(value).__name__ == "Prediction":
-                    return {
-                        k: _to_serializable(v)
-                        for k, v in value.__dict__.items()
-                        if not k.startswith("_")
-                    }
-
-                if hasattr(value, "__dict__"):
-                    try:
+                    if hasattr(value, "__dict__") and type(value).__name__ == "Prediction":
                         return {
                             k: _to_serializable(v)
                             for k, v in value.__dict__.items()
-                            if not k.startswith("_") and not callable(v)
+                            if not k.startswith("_")
                         }
-                    except Exception:
-                        pass
 
-                return str(value)
+                    if hasattr(value, "__dict__"):
+                        try:
+                            return {
+                                k: _to_serializable(v)
+                                for k, v in value.__dict__.items()
+                                if not k.startswith("_") and not callable(v)
+                            }
+                        except Exception:
+                            pass
 
-            # Use prediction[field] for extracting values from DSPy Prediction.
-            # Enforce type contract: if the VLM returned None for a field
-            # whose declared type does NOT allow None (e.g. list[X] not
-            # Optional[list[X]]), raise loudly. Silently coercing None→[] or
-            # passing None through hides VLM failures behind ambiguous empty
-            # values and causes models to speculate "predict returned None".
-            result = {}
-            for field in prediction.keys():
-                if field.startswith("_"):
-                    continue
-                value = prediction[field]
-                if value is None and field in output_field_annotations:
-                    anno = output_field_annotations[field]
-                    if not _allows_none(anno):
-                        raise RuntimeError(
-                            f"predict: VLM returned None for non-Optional output "
-                            f"field {field!r} (declared type: {anno}). The VLM "
-                            f"couldn't produce a valid value. Schema may be too "
-                            f"complex — try simplifying the signature, or mark "
-                            f"the field Optional (e.g. Optional[list[X]]) if None "
-                            f"is acceptable."
-                        )
-                result[field] = _to_serializable(value)
-            record_predict_call(_RawPredictCall(
-                signature=signature,
-                instructions=instructions,
-                model=str(getattr(lm, "model", lm)),
-                duration_ms=_call_duration,
-                usage=_call_usage,
-                input=kwargs,
-                output=result,
-            ))
-            return result
+                    return str(value)
+
+                # Use prediction[field] for extracting values from DSPy Prediction.
+                # Enforce type contract: if the VLM returned None for a field
+                # whose declared type does NOT allow None (e.g. list[X] not
+                # Optional[list[X]]), raise loudly. Silently coercing None→[] or
+                # passing None through hides VLM failures behind ambiguous empty
+                # values and causes models to speculate "predict returned None".
+                for field in prediction.keys():
+                    if field.startswith("_"):
+                        continue
+                    value = prediction[field]
+                    if value is None and field in output_field_annotations:
+                        anno = output_field_annotations[field]
+                        if not _allows_none(anno):
+                            raise RuntimeError(
+                                f"predict: VLM returned None for non-Optional output "
+                                f"field {field!r} (declared type: {anno}). The VLM "
+                                f"couldn't produce a valid value. Schema may be too "
+                                f"complex — try simplifying the signature, or mark "
+                                f"the field Optional (e.g. Optional[list[X]]) if None "
+                                f"is acceptable."
+                            )
+                    result[field] = _to_serializable(value)
+            except Exception as exc:
+                record_predict_call(
+                    _RawPredictCall(
+                        signature=signature,
+                        instructions=instructions,
+                        model=str(getattr(lm, "model", lm)),
+                        duration_ms=ms_since(_call_start),
+                        usage=usage_since(lm, _hist_len_before),
+                        input=kwargs,
+                        output=result,
+                        error=str(exc),
+                    )
+                )
+                raise
+            else:
+                record_predict_call(
+                    _RawPredictCall(
+                        signature=signature,
+                        instructions=instructions,
+                        model=str(getattr(lm, "model", lm)),
+                        duration_ms=ms_since(_call_start),
+                        usage=usage_since(lm, _hist_len_before),
+                        input=kwargs,
+                        output=result,
+                    )
+                )
+                return result
 
         return predict
 
