@@ -11,7 +11,7 @@ from __future__ import annotations
 import json
 import re
 import time
-from contextvars import ContextVar
+from contextvars import ContextVar, Token
 from pathlib import Path
 from typing import Any, Literal
 
@@ -286,9 +286,14 @@ def drain_predict_calls() -> list[PredictCallGroup]:
     return result
 
 
-def init_predict_call_collector() -> None:
+def init_predict_call_collector() -> Token:
     """Initialize (or reset) the predict call collector for a new run."""
-    _predict_calls.set([])
+    return _predict_calls.set([])
+
+
+def reset_predict_call_collector(token: Token) -> None:
+    """Restore the previous predict call collector."""
+    _predict_calls.reset(token)
 
 
 # ContextVar holding tool calls for the current iteration.
@@ -315,9 +320,14 @@ def drain_tool_calls() -> list[ToolCall]:
     return result
 
 
-def init_tool_call_collector() -> None:
+def init_tool_call_collector() -> Token:
     """Initialize (or reset) the tool call collector for a new run."""
-    _tool_calls.set([])
+    return _tool_calls.set([])
+
+
+def reset_tool_call_collector(token: Token) -> None:
+    """Restore the previous tool call collector."""
+    _tool_calls.reset(token)
 
 
 def snapshot_lm_history_len(lm: Any) -> int:

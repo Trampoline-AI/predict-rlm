@@ -28,6 +28,8 @@ from .trace import (
     init_tool_call_collector,
     ms_since,
     record_predict_call,
+    reset_predict_call_collector,
+    reset_tool_call_collector,
     snapshot_lm_history_len,
     usage_since,
 )
@@ -979,6 +981,34 @@ class PredictRLM(dspy.RLM):
             file_plan, kwargs = self._prepare_file_io(kwargs)
             return self._forward_traced(file_plan, **kwargs)
 
+    def _build_run_trace(
+        self,
+        status: Literal["completed", "max_iterations", "error"],
+        steps: list[IterationStep],
+        lm: Any,
+        sub_lm: Any,
+        lm_hist_start: int,
+        sub_hist_start: int,
+        run_start: float,
+    ) -> RunTrace:
+        main_usage = usage_since(lm, lm_hist_start)
+        sub_usage = (
+            usage_since(sub_lm, sub_hist_start)
+            if sub_lm is not None and sub_lm is not lm
+            else None
+        )
+
+        return RunTrace(
+            status=status,
+            model=str(getattr(lm, "model", lm)),
+            sub_model=str(getattr(sub_lm, "model", sub_lm)) if sub_lm is not lm else None,
+            iterations=len(steps),
+            max_iterations=self.max_iterations,
+            duration_ms=ms_since(run_start),
+            usage=LMUsage(main=main_usage, **({"sub": sub_usage} if sub_usage else {})),
+            steps=steps,
+        )
+
     async def aforward(self, **kwargs: Any) -> dspy.Prediction:
         """Async version of forward(). Sets the LM context for async execution.
 
@@ -1186,6 +1216,14 @@ class PredictRLM(dspy.RLM):
             self.generate_action, self.extract = self._build_signatures_with_files(
                 file_plan["instructions"]
             )
+
+        run_start = time.perf_counter()
+        lm = dspy.settings.lm
+        lm_hist_start = snapshot_lm_history_len(lm)
+        sub_lm = self._sub_lm
+        sub_hist_start = snapshot_lm_history_len(sub_lm) if sub_lm and sub_lm is not lm else 0
+        steps: list[IterationStep] = []
+
         try:
             self._validate_inputs(input_args)
             output_field_names = list(self.signature.output_fields.keys())
@@ -1203,96 +1241,100 @@ class PredictRLM(dspy.RLM):
 
                 from dspy.primitives.repl_types import REPLHistory
 
-                run_start = time.perf_counter()
-                lm = dspy.settings.lm
-                lm_hist_start = snapshot_lm_history_len(lm)
-                sub_lm = self._sub_lm
-                sub_hist_start = snapshot_lm_history_len(sub_lm) if sub_lm and sub_lm is not lm else 0
-                init_predict_call_collector()
-                init_tool_call_collector()
+                predict_token = init_predict_call_collector()
+                tool_token = init_tool_call_collector()
 
-                steps: list[IterationStep] = []
-                status = "max_iterations"
-                history = REPLHistory()
+                try:
+                    status = "max_iterations"
+                    history = REPLHistory()
 
-                for iteration in range(self.max_iterations):
-                    iter_start = time.perf_counter()
-                    result = self._execute_iteration(
-                        repl, variables, history, iteration, input_args, output_field_names
-                    )
-
-                    # Extract step data from the new history entry
-                    new_history = result if isinstance(result, REPLHistory) else None
-                    if new_history and len(new_history.entries) > len(history.entries):
-                        entry = new_history.entries[-1]
-                    elif isinstance(result, dspy.Prediction) and hasattr(result, "trajectory"):
-                        traj = result.trajectory
-                        entry_data = traj[-1] if traj else {}
-                        from dspy.primitives.repl_types import REPLEntry
-
-                        entry = REPLEntry(
-                            reasoning=entry_data.get("reasoning", ""),
-                            code=entry_data.get("code", ""),
-                            output=entry_data.get("output", ""),
+                    for iteration in range(self.max_iterations):
+                        iter_start = time.perf_counter()
+                        result = self._execute_iteration(
+                            repl, variables, history, iteration, input_args, output_field_names
                         )
-                    else:
-                        entry = None
 
-                    full_output = entry.output if entry else ""
-                    if len(full_output) > 5000:
-                        prompt_output = (
-                            full_output[:5000]
-                            + f"\n... (truncated to 5000/{len(full_output):,} chars)"
+                        # Extract step data from the new history entry
+                        new_history = result if isinstance(result, REPLHistory) else None
+                        if new_history and len(new_history.entries) > len(history.entries):
+                            entry = new_history.entries[-1]
+                        elif isinstance(result, dspy.Prediction) and hasattr(result, "trajectory"):
+                            traj = result.trajectory
+                            entry_data = traj[-1] if traj else {}
+                            from dspy.primitives.repl_types import REPLEntry
+
+                            entry = REPLEntry(
+                                reasoning=entry_data.get("reasoning", ""),
+                                code=entry_data.get("code", ""),
+                                output=entry_data.get("output", ""),
+                            )
+                        else:
+                            entry = None
+
+                        full_output = entry.output if entry else ""
+                        if len(full_output) > 5000:
+                            prompt_output = (
+                                full_output[:5000]
+                                + f"\n... (truncated to 5000/{len(full_output):,} chars)"
+                            )
+                        else:
+                            prompt_output = full_output
+
+                        step = IterationStep(
+                            iteration=iteration + 1,
+                            reasoning=entry.reasoning if entry else "",
+                            code=entry.code if entry else "",
+                            output=prompt_output,
+                            untruncated_output=full_output,
+                            error=full_output.startswith(("[Error]", "[Type Error]")),
+                            duration_ms=ms_since(iter_start),
+                            tool_calls=drain_tool_calls(),
+                            predict_calls=drain_predict_calls(),
                         )
+                        steps.append(step)
+
+                        if isinstance(result, dspy.Prediction):
+                            status = "completed"
+                            prediction = result
+                            if output_file_fields:
+                                self._sync_output_files(
+                                    repl, prediction, output_file_fields, file_plan
+                                )
+                            break
+                        history = result
                     else:
-                        prompt_output = full_output
-
-                    step = IterationStep(
-                        iteration=iteration + 1,
-                        reasoning=entry.reasoning if entry else "",
-                        code=entry.code if entry else "",
-                        output=prompt_output,
-                        untruncated_output=full_output,
-                        error=full_output.startswith(("[Error]", "[Type Error]")),
-                        duration_ms=ms_since(iter_start),
-                        tool_calls=drain_tool_calls(),
-                        predict_calls=drain_predict_calls(),
-                    )
-                    steps.append(step)
-
-                    if isinstance(result, dspy.Prediction):
-                        status = "completed"
-                        prediction = result
+                        prediction = self._extract_fallback(
+                            variables, history, output_field_names
+                        )
                         if output_file_fields:
                             self._sync_output_files(
                                 repl, prediction, output_file_fields, file_plan
                             )
-                        break
-                    history = result
-                else:
-                    prediction = self._extract_fallback(
-                        variables, history, output_field_names
+
+                    prediction.trace = self._build_run_trace(
+                        status=status,
+                        steps=steps,
+                        lm=lm,
+                        sub_lm=sub_lm,
+                        lm_hist_start=lm_hist_start,
+                        sub_hist_start=sub_hist_start,
+                        run_start=run_start,
                     )
-                    if output_file_fields:
-                        self._sync_output_files(
-                            repl, prediction, output_file_fields, file_plan
-                        )
-
-                # Build per-LM usage
-                main_usage = usage_since(lm, lm_hist_start)
-                sub_usage = usage_since(sub_lm, sub_hist_start) if sub_lm and sub_lm is not lm else None
-
-                prediction.trace = RunTrace(
-                    status=status,
-                    model=str(getattr(lm, "model", lm)),
-                    sub_model=str(getattr(sub_lm, "model", sub_lm)) if sub_lm and sub_lm is not lm else None,
-                    iterations=len(steps),
-                    max_iterations=self.max_iterations,
-                    duration_ms=ms_since(run_start),
-                    usage=LMUsage(main=main_usage, **({"sub": sub_usage} if sub_usage else {})),
-                    steps=steps,
-                )
-                return prediction
+                    return prediction
+                finally:
+                    reset_tool_call_collector(tool_token)
+                    reset_predict_call_collector(predict_token)
+        except Exception as exc:
+            exc.trace = self._build_run_trace(
+                status="error",
+                steps=steps,
+                lm=lm,
+                sub_lm=sub_lm,
+                lm_hist_start=lm_hist_start,
+                sub_hist_start=sub_hist_start,
+                run_start=run_start,
+            )
+            raise
         finally:
             if file_plan:
                 self.generate_action, self.extract = orig_action, orig_extract
@@ -1308,6 +1350,14 @@ class PredictRLM(dspy.RLM):
             self.generate_action, self.extract = self._build_signatures_with_files(
                 file_plan["instructions"]
             )
+
+        run_start = time.perf_counter()
+        lm = dspy.settings.lm
+        lm_hist_start = snapshot_lm_history_len(lm)
+        sub_lm = self._sub_lm
+        sub_hist_start = snapshot_lm_history_len(sub_lm) if sub_lm and sub_lm is not lm else 0
+        steps: list[IterationStep] = []
+
         try:
             self._validate_inputs(input_args)
             output_field_names = list(self.signature.output_fields.keys())
@@ -1325,94 +1375,99 @@ class PredictRLM(dspy.RLM):
 
                 from dspy.primitives.repl_types import REPLHistory
 
-                run_start = time.perf_counter()
-                lm = dspy.settings.lm
-                lm_hist_start = snapshot_lm_history_len(lm)
-                sub_lm = self._sub_lm
-                sub_hist_start = snapshot_lm_history_len(sub_lm) if sub_lm and sub_lm is not lm else 0
-                init_predict_call_collector()
-                init_tool_call_collector()
+                predict_token = init_predict_call_collector()
+                tool_token = init_tool_call_collector()
 
-                steps: list[IterationStep] = []
-                status = "max_iterations"
-                history = REPLHistory()
+                try:
+                    status = "max_iterations"
+                    history = REPLHistory()
 
-                for iteration in range(self.max_iterations):
-                    iter_start = time.perf_counter()
-                    result = await self._aexecute_iteration(
-                        repl, variables, history, iteration, input_args, output_field_names
-                    )
-
-                    new_history = result if isinstance(result, REPLHistory) else None
-                    if new_history and len(new_history.entries) > len(history.entries):
-                        entry = new_history.entries[-1]
-                    elif isinstance(result, dspy.Prediction) and hasattr(result, "trajectory"):
-                        traj = result.trajectory
-                        entry_data = traj[-1] if traj else {}
-                        from dspy.primitives.repl_types import REPLEntry
-
-                        entry = REPLEntry(
-                            reasoning=entry_data.get("reasoning", ""),
-                            code=entry_data.get("code", ""),
-                            output=entry_data.get("output", ""),
+                    for iteration in range(self.max_iterations):
+                        iter_start = time.perf_counter()
+                        result = await self._aexecute_iteration(
+                            repl, variables, history, iteration, input_args, output_field_names
                         )
-                    else:
-                        entry = None
 
-                    full_output = entry.output if entry else ""
-                    if len(full_output) > 5000:
-                        prompt_output = (
-                            full_output[:5000]
-                            + f"\n... (truncated to 5000/{len(full_output):,} chars)"
+                        new_history = result if isinstance(result, REPLHistory) else None
+                        if new_history and len(new_history.entries) > len(history.entries):
+                            entry = new_history.entries[-1]
+                        elif isinstance(result, dspy.Prediction) and hasattr(result, "trajectory"):
+                            traj = result.trajectory
+                            entry_data = traj[-1] if traj else {}
+                            from dspy.primitives.repl_types import REPLEntry
+
+                            entry = REPLEntry(
+                                reasoning=entry_data.get("reasoning", ""),
+                                code=entry_data.get("code", ""),
+                                output=entry_data.get("output", ""),
+                            )
+                        else:
+                            entry = None
+
+                        full_output = entry.output if entry else ""
+                        if len(full_output) > 5000:
+                            prompt_output = (
+                                full_output[:5000]
+                                + f"\n... (truncated to 5000/{len(full_output):,} chars)"
+                            )
+                        else:
+                            prompt_output = full_output
+
+                        step = IterationStep(
+                            iteration=iteration + 1,
+                            reasoning=entry.reasoning if entry else "",
+                            code=entry.code if entry else "",
+                            output=prompt_output,
+                            untruncated_output=full_output,
+                            error=full_output.startswith(("[Error]", "[Type Error]")),
+                            duration_ms=ms_since(iter_start),
+                            tool_calls=drain_tool_calls(),
+                            predict_calls=drain_predict_calls(),
                         )
+                        steps.append(step)
+
+                        if isinstance(result, dspy.Prediction):
+                            status = "completed"
+                            prediction = result
+                            if output_file_fields:
+                                self._sync_output_files(
+                                    repl, prediction, output_file_fields, file_plan
+                                )
+                            break
+                        history = result
                     else:
-                        prompt_output = full_output
-
-                    step = IterationStep(
-                        iteration=iteration + 1,
-                        reasoning=entry.reasoning if entry else "",
-                        code=entry.code if entry else "",
-                        output=prompt_output,
-                        untruncated_output=full_output,
-                        error=full_output.startswith(("[Error]", "[Type Error]")),
-                        duration_ms=ms_since(iter_start),
-                        tool_calls=drain_tool_calls(),
-                        predict_calls=drain_predict_calls(),
-                    )
-                    steps.append(step)
-
-                    if isinstance(result, dspy.Prediction):
-                        status = "completed"
-                        prediction = result
+                        prediction = await self._aextract_fallback(
+                            variables, history, output_field_names
+                        )
                         if output_file_fields:
                             self._sync_output_files(
                                 repl, prediction, output_file_fields, file_plan
                             )
-                        break
-                    history = result
-                else:
-                    prediction = await self._aextract_fallback(
-                        variables, history, output_field_names
+
+                    prediction.trace = self._build_run_trace(
+                        status=status,
+                        steps=steps,
+                        lm=lm,
+                        sub_lm=sub_lm,
+                        lm_hist_start=lm_hist_start,
+                        sub_hist_start=sub_hist_start,
+                        run_start=run_start,
                     )
-                    if output_file_fields:
-                        self._sync_output_files(
-                            repl, prediction, output_file_fields, file_plan
-                        )
-
-                main_usage = usage_since(lm, lm_hist_start)
-                sub_usage = usage_since(sub_lm, sub_hist_start) if sub_lm and sub_lm is not lm else None
-
-                prediction.trace = RunTrace(
-                    status=status,
-                    model=str(getattr(lm, "model", lm)),
-                    sub_model=str(getattr(sub_lm, "model", sub_lm)) if sub_lm and sub_lm is not lm else None,
-                    iterations=len(steps),
-                    max_iterations=self.max_iterations,
-                    duration_ms=ms_since(run_start),
-                    usage=LMUsage(main=main_usage, **({"sub": sub_usage} if sub_usage else {})),
-                    steps=steps,
-                )
-                return prediction
+                    return prediction
+                finally:
+                    reset_tool_call_collector(tool_token)
+                    reset_predict_call_collector(predict_token)
+        except Exception as exc:
+            exc.trace = self._build_run_trace(
+                status="error",
+                steps=steps,
+                lm=lm,
+                sub_lm=sub_lm,
+                lm_hist_start=lm_hist_start,
+                sub_hist_start=sub_hist_start,
+                run_start=run_start,
+            )
+            raise
         finally:
             if file_plan:
                 self.generate_action, self.extract = orig_action, orig_extract
