@@ -6,11 +6,13 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import dspy
 import pytest
+from dspy.primitives.repl_types import REPLEntry, REPLHistory
 from pydantic import BaseModel
 
 from predict_rlm import PredictRLM
 from predict_rlm.predict_rlm import _models_from_schema
 from predict_rlm.rlm_skills import Skill
+from predict_rlm.trace import drain_predict_calls, init_predict_call_collector
 
 
 def _run(coro):
@@ -323,6 +325,35 @@ class TestPredictTool:
             assert all(isinstance(img, dspy.Image) for img in call_kwargs["images"])
             assert call_kwargs["question"] == "What do these images show?"
 
+    @pytest.mark.asyncio
+    async def test_predict_records_failed_subcall_in_trace_collector(self):
+        """predict failures are still recorded for structured tracing."""
+        mock_lm = MagicMock()
+        mock_lm.model = "test-sub-lm"
+        mock_lm.history = []
+        rlm = PredictRLM(ImageAnalysisSignature, sub_lm=mock_lm, max_iterations=5)
+
+        init_predict_call_collector()
+
+        with patch("predict_rlm.predict_rlm.dspy.Predict") as mock_predict_class:
+            mock_predictor = MagicMock()
+            mock_predictor.acall = AsyncMock(side_effect=RuntimeError("subcall boom"))
+            mock_predict_class.return_value = mock_predictor
+
+            with pytest.raises(RuntimeError, match="subcall boom"):
+                await rlm.tools["predict"].func(
+                    "question -> answer",
+                    question="What is the capital of France?",
+                )
+
+        groups = drain_predict_calls()
+        assert len(groups) == 1
+        assert groups[0].signature == "question -> answer"
+        assert len(groups[0].calls) == 1
+        assert groups[0].calls[0].error == "subcall boom"
+        assert groups[0].calls[0].input == {"question": "What is the capital of France?"}
+        assert groups[0].calls[0].output == {}
+
 
 class TestTypeContractEnforcement:
     """Tests for type contract enforcement on predict outputs."""
@@ -410,6 +441,37 @@ class TestTypeContractEnforcement:
                     "text: str -> answer: str",
                     text="some input",
                 )
+
+    @pytest.mark.asyncio
+    async def test_type_contract_failure_is_recorded_in_trace_collector(self):
+        """Post-call validation failures still record the predict attempt."""
+        mock_lm = MagicMock()
+        mock_lm.model = "test-sub-lm"
+        mock_lm.history = []
+        rlm = PredictRLM(ImageAnalysisSignature, sub_lm=mock_lm, max_iterations=5)
+
+        init_predict_call_collector()
+
+        with patch("predict_rlm.predict_rlm.dspy.Predict") as mock_predict_class:
+            mock_predictor = MagicMock()
+            mock_prediction = MagicMock()
+            values = {"answer": None}
+            mock_prediction.keys.return_value = list(values.keys())
+            mock_prediction.__getitem__ = MagicMock(side_effect=lambda k: values[k])
+            mock_predictor.acall = AsyncMock(return_value=mock_prediction)
+            mock_predict_class.return_value = mock_predictor
+
+            with pytest.raises(RuntimeError, match="VLM returned None for non-Optional"):
+                await rlm.tools["predict"].func(
+                    "text: str -> answer: str",
+                    text="some input",
+                )
+
+        groups = drain_predict_calls()
+        assert len(groups) == 1
+        assert len(groups[0].calls) == 1
+        assert "VLM returned None for non-Optional" in groups[0].calls[0].error
+        assert groups[0].calls[0].input == {"text": "some input"}
 
 
 class TestPredictRLMConfiguration:
@@ -608,6 +670,88 @@ class TestMainLMParameter:
                 await rlm.aforward(images=["img"], query="test?")
 
             assert captured_lm is external_lm
+
+
+class TestTracedErrorHandling:
+    """Tests for trace data when traced execution fails."""
+
+    def test_forward_traced_error_attaches_error_trace(self):
+        mock_lm = MagicMock()
+        rlm = PredictRLM(ImageAnalysisSignature, sub_lm=mock_lm, max_iterations=2)
+
+        repl = MagicMock()
+        context = MagicMock()
+        context.__enter__.return_value = repl
+        context.__exit__.return_value = False
+
+        with patch.object(PredictRLM, "_interpreter_context", return_value=context), \
+            patch.object(PredictRLM, "_prepare_execution_tools", return_value={}), \
+            patch.object(PredictRLM, "_build_variables", return_value={}), \
+            patch.object(rlm, "_execute_iteration", side_effect=RuntimeError("boom")):
+
+            with pytest.raises(RuntimeError, match="boom") as exc_info:
+                rlm._forward_traced(None, images=["img"], query="q")
+
+        exc = exc_info.value
+        assert exc.trace.status == "error"
+        assert exc.trace.iterations == 0
+        assert exc.trace.steps == []
+
+    def test_forward_traced_error_preserves_steps_before_failure(self):
+        mock_lm = MagicMock()
+        rlm = PredictRLM(ImageAnalysisSignature, sub_lm=mock_lm, max_iterations=2)
+
+        repl = MagicMock()
+        context = MagicMock()
+        context.__enter__.return_value = repl
+        context.__exit__.return_value = False
+
+        def side_effect(repl_obj, _variables, _history, iteration, _input_args, _output_fields):
+            if iteration == 0:
+                return REPLHistory(
+                    entries=[
+                        REPLEntry(reasoning="first", code="print('ok')", output="ok"),
+                    ]
+                )
+            raise RuntimeError("boom")
+
+        with patch.object(PredictRLM, "_interpreter_context", return_value=context), \
+            patch.object(PredictRLM, "_prepare_execution_tools", return_value={}), \
+            patch.object(PredictRLM, "_build_variables", return_value={}), \
+            patch.object(rlm, "_execute_iteration", side_effect=side_effect):
+
+            with pytest.raises(RuntimeError, match="boom") as exc_info:
+                rlm._forward_traced(None, images=["img"], query="q")
+
+        exc = exc_info.value
+        assert exc.trace.status == "error"
+        assert exc.trace.iterations == 1
+        assert len(exc.trace.steps) == 1
+        assert exc.trace.steps[0].iteration == 1
+        assert exc.trace.steps[0].reasoning == "first"
+
+    @pytest.mark.asyncio
+    async def test_aforward_traced_error_attaches_error_trace(self):
+        mock_lm = MagicMock()
+        rlm = PredictRLM(ImageAnalysisSignature, sub_lm=mock_lm, max_iterations=2)
+
+        repl = MagicMock()
+        context = MagicMock()
+        context.__enter__.return_value = repl
+        context.__exit__.return_value = False
+
+        with patch.object(PredictRLM, "_interpreter_context", return_value=context), \
+            patch.object(PredictRLM, "_prepare_execution_tools", return_value={}), \
+            patch.object(PredictRLM, "_build_variables", return_value={}), \
+            patch.object(rlm, "_aexecute_iteration", new=AsyncMock(side_effect=RuntimeError("boom"))):
+
+            with pytest.raises(RuntimeError, match="boom") as exc_info:
+                await rlm._aforward_traced(None, images=["img"], query="q")
+
+        exc = exc_info.value
+        assert exc.trace.status == "error"
+        assert exc.trace.iterations == 0
+        assert exc.trace.steps == []
 
 
 class TestModelsFromSchema:

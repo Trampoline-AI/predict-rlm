@@ -45,6 +45,9 @@ class PredictCallDetail(BaseModel):
     output: dict[str, Any] = Field(
         default_factory=dict, description="Output fields returned by the sub-LM"
     )
+    error: str | None = Field(
+        default=None, description="Error message if the predict() call failed"
+    )
 
 
 class PredictCallGroup(BaseModel):
@@ -208,6 +211,7 @@ class _RawPredictCall:
         "usage",
         "input",
         "output",
+        "error",
     )
 
     def __init__(
@@ -219,6 +223,7 @@ class _RawPredictCall:
         usage: TokenUsage,
         input: dict[str, Any],
         output: dict[str, Any],
+        error: str | None = None,
     ):
         self.signature = signature
         self.instructions = instructions
@@ -227,6 +232,7 @@ class _RawPredictCall:
         self.usage = usage
         self.input = input
         self.output = output
+        self.error = error
 
 
 # ContextVar holding raw predict() calls for the current iteration.
@@ -276,6 +282,7 @@ def drain_predict_calls() -> list[PredictCallGroup]:
                         usage=c.usage,
                         input=c.input,
                         output=c.output,
+                        error=c.error,
                     )
                     for c in group_calls
                 ],
