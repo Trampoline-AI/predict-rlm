@@ -1,7 +1,7 @@
 """Tests for structured trace output."""
 
-import time
 import contextvars
+import time
 from unittest.mock import MagicMock
 
 import pytest
