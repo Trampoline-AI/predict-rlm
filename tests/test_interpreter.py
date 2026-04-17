@@ -1,8 +1,9 @@
 """Tests for JspiInterpreter with concurrent async tool execution."""
 
 import pytest
+from dspy.primitives.code_interpreter import CodeInterpreterError
 
-from predict_rlm.interpreter import JspiInterpreter
+from predict_rlm.interpreter import JspiInterpreter, SandboxFatalError
 
 pytestmark = pytest.mark.integration
 
@@ -3126,3 +3127,43 @@ for item in result.items:
             assert "fruit: cherry" in output
         finally:
             interpreter.shutdown()
+
+
+class TestSandboxFatalErrors:
+    """Sandbox-level failures (exec timeout, BrokenPipe) must raise
+    SandboxFatalError, which is NOT a subclass of CodeInterpreterError.
+
+    This ensures DSPy's RLM._execute_iteration catch on
+    (CodeInterpreterError, SyntaxError) cannot swallow them. The run
+    aborts instead of limping on with a freshly-spawned sandbox that
+    no longer has the per-run file_plan mounts.
+    """
+
+    def test_exec_timeout_raises_sandbox_fatal_error(self):
+        """exec_timeout firing raises SandboxFatalError, not CodeInterpreterError."""
+        interpreter = JspiInterpreter(preinstall_packages=False, exec_timeout=2.0)
+        try:
+            with pytest.raises(SandboxFatalError, match="timed out"):
+                interpreter.execute("while True:\n    pass\n")
+        finally:
+            interpreter.shutdown()
+
+    def test_timeout_error_survives_rlm_catch_tuple(self):
+        """Simulate DSPy's RLM._execute_iteration handler: the fatal error
+        must propagate past `except (CodeInterpreterError, SyntaxError)`."""
+        interpreter = JspiInterpreter(preinstall_packages=False, exec_timeout=2.0)
+        caught_by_rlm_handler = False
+        propagated = False
+        try:
+            try:
+                interpreter.execute("while True:\n    pass\n")
+            except (CodeInterpreterError, SyntaxError):
+                caught_by_rlm_handler = True
+            except SandboxFatalError:
+                propagated = True
+        finally:
+            interpreter.shutdown()
+        assert propagated, "SandboxFatalError should propagate past RLM's handler"
+        assert not caught_by_rlm_handler, (
+            "SandboxFatalError must not be caught by (CodeInterpreterError, SyntaxError)"
+        )

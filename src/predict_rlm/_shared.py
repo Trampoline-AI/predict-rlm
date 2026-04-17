@@ -15,6 +15,7 @@ if TYPE_CHECKING:
     from dspy.signatures.signature import Signature
 
 
+
 def format_tool_docs_full(tools: dict[str, Callable]) -> str:
     """Format tools with full docstrings for inclusion in instructions.
 
