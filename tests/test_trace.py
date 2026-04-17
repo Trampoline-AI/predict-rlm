@@ -463,6 +463,139 @@ class TestUsageSince:
         usage = usage_since(lm, 0)
         assert usage.input_tokens == 0
 
+    def test_cache_hit_via_response_flag_excluded_from_cost(self):
+        """DSPy's Cache.get() zeros response.usage but keeps response._hidden_params
+        on a cache hit. Without care, usage_since double-counts: 0 tokens yet
+        phantom cost. We detect cache hits via response.cache_hit and drop them
+        from the billed aggregate, surfacing the count via TokenUsage.cache_hits.
+        """
+        fresh_resp = MagicMock()
+        fresh_resp.cache_hit = False
+        cached_resp = MagicMock()
+        cached_resp.cache_hit = True
+
+        lm = MagicMock()
+        lm.history = [
+            {
+                "usage": {"prompt_tokens": 1000, "completion_tokens": 50},
+                "cost": 0.001,
+                "response": fresh_resp,
+            },
+            {
+                "usage": {},  # DSPy clears usage on cache hit
+                "cost": 0.001,  # but leaves cost
+                "response": cached_resp,
+            },
+        ]
+        usage = usage_since(lm, 0)
+        # Only the fresh call counts toward tokens and cost.
+        assert usage.input_tokens == 1000
+        assert usage.output_tokens == 50
+        assert usage.cost == pytest.approx(0.001)
+        # The cache hit is surfaced for observability.
+        assert usage.cache_hits == 1
+
+    def test_cache_hit_via_empty_usage_heuristic(self):
+        """When the response object isn't accessible (e.g. synthetic history or
+        the response was dropped), an empty usage dict paired with non-zero
+        cost is an unambiguous cache-hit signature: a real call always
+        populates prompt_tokens/completion_tokens.
+        """
+        lm = MagicMock()
+        lm.history = [
+            {"usage": {"prompt_tokens": 1000, "completion_tokens": 50}, "cost": 0.001},
+            {"usage": {}, "cost": 0.001},  # no response key, usage empty, cost > 0
+        ]
+        usage = usage_since(lm, 0)
+        assert usage.input_tokens == 1000
+        assert usage.output_tokens == 50
+        assert usage.cost == pytest.approx(0.001)
+        assert usage.cache_hits == 1
+
+    def test_legitimate_zero_usage_entry_not_flagged(self):
+        """An entry with zero usage AND zero cost is a legitimate no-op, not a
+        cache hit. Don't surface it as one.
+        """
+        lm = MagicMock()
+        lm.history = [
+            {"usage": {"prompt_tokens": 0, "completion_tokens": 0}, "cost": 0},
+        ]
+        usage = usage_since(lm, 0)
+        assert usage.input_tokens == 0
+        assert usage.output_tokens == 0
+        assert usage.cost == 0
+        assert usage.cache_hits == 0
+
+
+class TestConcurrentUsageAccounting:
+    """Regression test for the concurrency overcount bug.
+
+    The naïve ``usage_since(shared_lm, snapshot)`` pattern inflated each
+    worker's delta under concurrent execution: two workers starting at the
+    same ``lm.history`` length and finishing after each other's entries
+    have landed each see the OTHER's entries in their "delta", doubling
+    the logged total.
+
+    The fix is architectural: each PredictRLM instance makes its own
+    ``lm.copy()`` (fresh history, shared cache/callbacks/config) in
+    ``__init__``. Each worker's ``lm.history`` is isolated, so
+    ``usage_since`` sees only that worker's own calls.
+    """
+
+    def test_lm_history_delta_overcounts_under_shared_history(self):
+        """Demonstrates the bug shape. Two workers sharing an lm.history
+        both see the full delta; sum is 2x the real tokens. This is why
+        PredictRLM copies the lm in __init__.
+        """
+        class SharedLM:
+            def __init__(self):
+                self.history = []
+
+        lm = SharedLM()
+        snap_A = snapshot_lm_history_len(lm)
+        snap_B = snapshot_lm_history_len(lm)
+        lm.history.append({"usage": {"prompt_tokens": 100, "completion_tokens": 10}, "cost": 0.001})
+        lm.history.append({"usage": {"prompt_tokens": 200, "completion_tokens": 20}, "cost": 0.002})
+        lm.history.append({"usage": {"prompt_tokens": 150, "completion_tokens": 15}, "cost": 0.0015})
+        usage_A = usage_since(lm, snap_A)
+        usage_B = usage_since(lm, snap_B)
+
+        real_total = sum(e["cost"] for e in lm.history)
+        logged_total = usage_A.cost + usage_B.cost
+        assert logged_total == pytest.approx(real_total * 2), (
+            "shared history always inflates — that's the bug we fix via "
+            "per-RLM lm.copy()"
+        )
+
+    def test_lm_copy_gives_fresh_history_per_instance(self):
+        """The fix: dspy.LM.copy() creates a new LM with an empty
+        history list. Calls made through one copy don't pollute the
+        other's history — so two concurrent PredictRLM instances sharing
+        an 'original' LM still see only their own calls via usage_since.
+        """
+        import dspy
+
+        original = dspy.LM(model="openai/gpt-4o", cache=False)
+        # PredictRLM.__init__ does this internally:
+        lm_a = original.copy()
+        lm_b = original.copy()
+
+        # Simulate calls landing in each instance's history
+        lm_a.history.append({"usage": {"prompt_tokens": 100, "completion_tokens": 10}, "cost": 0.001})
+        lm_a.history.append({"usage": {"prompt_tokens": 150, "completion_tokens": 15}, "cost": 0.0015})
+        lm_b.history.append({"usage": {"prompt_tokens": 200, "completion_tokens": 20}, "cost": 0.002})
+
+        # Each copy's usage_since sees only ITS own calls
+        u_a = usage_since(lm_a, 0)
+        u_b = usage_since(lm_b, 0)
+        assert u_a.input_tokens == 250
+        assert u_b.input_tokens == 200
+        # Sum matches real total — no inflation
+        assert u_a.cost + u_b.cost == pytest.approx(0.0045)
+        # And the original lm's history is untouched
+        assert len(original.history) == 0
+
+
 
 class TestSanitizeForTrace:
     def test_replaces_data_uri(self):

@@ -19,16 +19,25 @@ from pydantic import BaseModel, Field
 
 
 class TokenUsage(BaseModel):
-    """Aggregated token counts and cost for a set of LM calls."""
+    """Aggregated token counts and cost for a set of LM calls.
+
+    Cache hits are excluded from ``input_tokens``, ``output_tokens``, and
+    ``cost`` (no new tokens were consumed and no new spend was incurred);
+    they are surfaced separately via ``cache_hits`` for observability.
+    """
 
     input_tokens: int = Field(default=0, description="Total input/prompt tokens")
     output_tokens: int = Field(default=0, description="Total output/completion tokens")
-    cost: float = Field(default=0.0, description="Total cost in USD")
+    cost: float = Field(default=0.0, description="Total billed cost in USD (excludes cache hits)")
+    cache_hits: int = Field(
+        default=0, description="Number of LM calls served from DSPy's cache"
+    )
 
     def __iadd__(self, other: TokenUsage) -> TokenUsage:
         self.input_tokens += other.input_tokens
         self.output_tokens += other.output_tokens
         self.cost += other.cost
+        self.cache_hits += other.cache_hits
         return self
 
 
@@ -344,19 +353,53 @@ def snapshot_lm_history_len(lm: Any) -> int:
 
 
 def usage_since(lm: Any, since: int) -> TokenUsage:
-    """Sum token usage from LM history entries added after index ``since``."""
+    """Sum token usage from LM history entries added after index ``since``.
+
+    Cache hits are detected and excluded from ``input_tokens`` / ``output_tokens``
+    / ``cost`` — DSPy's ``Cache.get()`` zeros ``response.usage`` on a hit but
+    leaves ``response._hidden_params["response_cost"]`` intact, so a naïve sum
+    would mis-report phantom cost with no matching tokens. The hit count is
+    surfaced via ``TokenUsage.cache_hits``.
+    """
     history = getattr(lm, "history", None)
     if not history or len(history) <= since:
         return TokenUsage()
     input_tok = 0
     output_tok = 0
     cost = 0.0
+    cache_hits = 0
     for entry in history[since:]:
-        usage = entry.get("usage", {})
+        usage = entry.get("usage", {}) or {}
+        entry_cost = entry.get("cost", 0) or 0
+        if _is_cache_hit(entry, usage, entry_cost):
+            cache_hits += 1
+            continue
         input_tok += usage.get("prompt_tokens", 0) or 0
         output_tok += usage.get("completion_tokens", 0) or 0
-        cost += entry.get("cost", 0) or 0
-    return TokenUsage(input_tokens=input_tok, output_tokens=output_tok, cost=cost)
+        cost += entry_cost
+    return TokenUsage(
+        input_tokens=input_tok,
+        output_tokens=output_tok,
+        cost=cost,
+        cache_hits=cache_hits,
+    )
+
+
+def _is_cache_hit(entry: dict, usage: dict, cost: float) -> bool:
+    """Return True if ``entry`` is a DSPy cache-hit artifact.
+
+    Two signals, checked in order of reliability:
+      1. ``response.cache_hit`` flag set by ``dspy.clients.cache.Cache.get``.
+      2. Empty usage dict paired with non-zero cost — a real LM call always
+         populates prompt_tokens / completion_tokens, so this combination is
+         unambiguous even when the response object is missing.
+    """
+    response = entry.get("response")
+    if response is not None and getattr(response, "cache_hit", False):
+        return True
+    if not usage and cost:
+        return True
+    return False
 
 
 def ms_since(start: float) -> int:
