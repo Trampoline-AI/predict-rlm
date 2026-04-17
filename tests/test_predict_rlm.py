@@ -524,13 +524,20 @@ class TestMainLMParameter:
     """Tests for the lm parameter on PredictRLM."""
 
     def test_lm_as_dspy_lm_instance(self):
-        """Passing a dspy.LM instance stores it directly."""
+        """Passing a dspy.LM instance copies it (fresh history) so
+        concurrent PredictRLM instances don't share mutable state.
+        """
         mock_lm = MagicMock(spec=dspy.LM)
+        mock_lm.copy.return_value = MagicMock(spec=dspy.LM)
         rlm = PredictRLM(ImageAnalysisSignature, lm=mock_lm, max_iterations=1)
-        assert rlm._lm is mock_lm
+        # rlm._lm is the COPY, not the original
+        assert rlm._lm is mock_lm.copy.return_value
+        mock_lm.copy.assert_called_once()
 
     def test_lm_as_string_creates_dspy_lm(self):
-        """Passing a model string creates a dspy.LM instance."""
+        """Passing a model string creates a dspy.LM instance directly
+        (no copy needed — it's already a fresh instance).
+        """
         with patch("predict_rlm.predict_rlm.dspy.LM") as mock_lm_class:
             mock_lm_class.return_value = MagicMock()
             rlm = PredictRLM(ImageAnalysisSignature, lm="openai/gpt-4o", max_iterations=1)
@@ -543,8 +550,13 @@ class TestMainLMParameter:
         assert rlm._lm is None
 
     def test_forward_uses_lm_as_context(self):
-        """forward() wraps execution in dspy.context(lm=...) when lm is provided."""
+        """forward() wraps execution in dspy.context(lm=...) using the
+        per-RLM copy (not the original passed in) so the context LM has
+        an isolated history.
+        """
         mock_lm = MagicMock()
+        mock_lm_copy = MagicMock()
+        mock_lm.copy.return_value = mock_lm_copy
         rlm = PredictRLM(ImageAnalysisSignature, lm=mock_lm, max_iterations=1)
 
         with patch.object(PredictRLM, "_forward_traced") as mock_traced:
@@ -559,7 +571,8 @@ class TestMainLMParameter:
 
             mock_traced.side_effect = capture_context
             rlm.forward(images=["img"], query="test?")
-            assert captured_lm is mock_lm
+            # The context LM is our PRIVATE copy, not the original
+            assert captured_lm is mock_lm_copy
 
     def test_forward_without_lm_uses_external_context(self):
         """forward() without lm uses whatever is in dspy.context."""
@@ -608,22 +621,30 @@ class TestMainLMParameter:
         assert rlm._context_lm is None
 
     def test_lm_and_sub_lm_both_accepted(self):
-        """Both lm and sub_lm can be provided together."""
+        """Both lm and sub_lm can be provided together; each is copied
+        for per-instance history isolation.
+        """
         mock_lm = MagicMock(spec=dspy.LM)
         mock_sub_lm = MagicMock(spec=dspy.LM)
+        mock_lm.copy.return_value = MagicMock(spec=dspy.LM)
+        mock_sub_lm.copy.return_value = MagicMock(spec=dspy.LM)
         rlm = PredictRLM(
             ImageAnalysisSignature,
             lm=mock_lm,
             sub_lm=mock_sub_lm,
             max_iterations=1,
         )
-        assert rlm._lm is mock_lm
-        assert rlm._sub_lm is mock_sub_lm
+        assert rlm._lm is mock_lm.copy.return_value
+        assert rlm._sub_lm is mock_sub_lm.copy.return_value
 
     @pytest.mark.asyncio
     async def test_aforward_uses_lm_as_context(self):
-        """aforward() wraps execution in dspy.context(lm=...) when lm is provided."""
+        """aforward() wraps execution in dspy.context(lm=...) using the
+        per-RLM copy (isolated history from the caller's original).
+        """
         mock_lm = MagicMock()
+        mock_lm_copy = MagicMock()
+        mock_lm.copy.return_value = mock_lm_copy
         rlm = PredictRLM(ImageAnalysisSignature, lm=mock_lm, max_iterations=1)
 
         with patch.object(PredictRLM, "_aforward_traced") as mock_traced:
@@ -636,7 +657,7 @@ class TestMainLMParameter:
 
             mock_traced.side_effect = capture_context
             await rlm.aforward(images=["img"], query="test?")
-            assert captured_lm is mock_lm
+            assert captured_lm is mock_lm_copy
 
     @pytest.mark.asyncio
     async def test_aforward_clears_context_lm_after_execution(self):
@@ -1426,6 +1447,39 @@ class TestAexecuteIteration:
         error_arg = mock_process.call_args[0][2 if _PARENT_TAKES_CODE else 1]
         assert "[Error]" in error_arg
         assert "sandbox crashed" in error_arg
+
+
+class TestAforwardTracedUsage:
+    """Usage accounting regression tests.
+
+    PredictRLM reads usage from its per-instance ``self._lm.history``
+    (via ``usage_since``). DSPy's ``BaseLM._process_lm_response``
+    populates each history entry with ``usage`` (prompt/completion
+    tokens) and ``cost`` (from ``_hidden_params["response_cost"]``).
+    Across iterations, history grows and ``usage_since(lm, 0)`` sums
+    everything in the run.
+    """
+
+    @pytest.mark.asyncio
+    async def test_usage_since_sums_history_across_iterations(self):
+        """Two iterations each append an entry to ``lm.history``;
+        ``usage_since(lm, 0)`` returns the combined tokens + cost,
+        reflecting both calls.
+        """
+        from predict_rlm.trace import usage_since
+
+        mock_lm = MagicMock()
+        mock_lm.history = [
+            # Iteration 1: retry (small empty-ish call, still billed)
+            {"usage": {"prompt_tokens": 50, "completion_tokens": 5}, "cost": 0.0001},
+            # Iteration 2: full call with real tokens
+            {"usage": {"prompt_tokens": 240, "completion_tokens": 80}, "cost": 0.003},
+        ]
+
+        u = usage_since(mock_lm, 0)
+        assert u.input_tokens == 290
+        assert u.output_tokens == 85
+        assert u.cost == pytest.approx(0.0031)
 
 
 class TestSkillsMergeIntoInit:
