@@ -490,14 +490,38 @@ class PredictRLM(dspy.RLM):
                        File output fields without an explicit path
                        are written here. If None, a temp directory is used.
         """
-        # Store main LM (None means use context LM at call time)
-        self._lm = dspy.LM(lm, cache=False) if isinstance(lm, str) else lm
+        # Store main LM. ``dspy.LM.copy()`` gives a fresh history so
+        # concurrent PredictRLM instances don't share mutable state —
+        # without this, running N RLMs in parallel (asyncio.gather) would
+        # make each call's usage_since delta include every other
+        # concurrent call's history entries. Cache / callbacks / config
+        # stay shared by reference; only the ``history`` list is reset.
+        if lm is None:
+            self._lm = None
+        elif isinstance(lm, str):
+            self._lm = dspy.LM(lm, cache=False)
+        else:
+            self._lm = lm.copy() if hasattr(lm, "copy") else lm
 
-        # Store sub_lm for tool creation (None means use context LM at call time)
-        self._sub_lm = dspy.LM(sub_lm, cache=False) if isinstance(sub_lm, str) else sub_lm
+        if sub_lm is None:
+            self._sub_lm = None
+        elif isinstance(sub_lm, str):
+            self._sub_lm = dspy.LM(sub_lm, cache=False)
+        else:
+            self._sub_lm = sub_lm.copy() if hasattr(sub_lm, "copy") else sub_lm
 
         # Will be set during forward() to capture context LM for thread-safe predict calls
         self._context_lm = None
+
+        # Partial trajectory capture. Updated per-iteration during execution
+        # so a caller that catches a timeout or exception can still recover
+        # whatever REPL steps completed before the failure. Two slots:
+        #   _partial_history: REPLHistory of fully-executed steps
+        #   _partial_pending_entry: reasoning+code from the CURRENT iteration
+        #       captured before execution, so a crash mid-execution still
+        #       surfaces what the agent was trying to do.
+        self._partial_history = None
+        self._partial_pending_entry = None
 
         # Store allowed_domains, debug, and output_dir for interpreter creation
         self._allowed_domains = allowed_domains
@@ -1027,6 +1051,13 @@ class PredictRLM(dspy.RLM):
         sub_hist_start: int,
         run_start: float,
     ) -> RunTrace:
+        # Per-RLM instance ``lm`` has its own history (isolated via
+        # ``lm.copy()`` in ``__init__``) so ``usage_since`` is free of
+        # the shared-history concurrency bug that plagued the old
+        # delta-read pattern. Cost is populated by DSPy's
+        # ``BaseLM._process_lm_response`` from
+        # ``_hidden_params["response_cost"]`` — LiteLLM's authoritative
+        # number with cache/batch discounts baked in.
         main_usage = usage_since(lm, lm_hist_start)
         sub_usage = (
             usage_since(sub_lm, sub_hist_start)
@@ -1091,17 +1122,52 @@ class PredictRLM(dspy.RLM):
             )
 
         code = _strip_code_fences(pred.code)
+
+        # Capture reasoning+code BEFORE executing so a mid-execution
+        # cancellation still leaves this iteration visible in the partial
+        # trajectory (output will be empty / placeholder).
+        from dspy.primitives.repl_types import REPLEntry
+
+        self._partial_pending_entry = REPLEntry(
+            reasoning=getattr(pred, "reasoning", "") or "",
+            code=code,
+            output="",
+        )
         try:
             if hasattr(repl, "aexecute"):
                 result = await repl.aexecute(code, variables=dict(input_args))
             else:
                 result = repl.execute(code, variables=dict(input_args))
         except Exception as e:
-            result = f"[Error] {e}"
+            err = str(e)
+            if code.count('"""') >= 3 and (
+                "unterminated" in err.lower()
+                or "invalid syntax" in err.lower()
+            ):
+                result = (
+                    f"[Error] {err}\n\n"
+                    'Hint: your code contains nested `"""` inside a '
+                    "triple-quoted string literal. Python cannot distinguish "
+                    "the inner delimiter from the outer one. Fix: build the "
+                    "string with '\\n'.join([line1, line2, ...]) using "
+                    "single-quoted strings per line, or switch the outer "
+                    "delimiter to '''...'''."
+                )
+            else:
+                result = f"[Error] {e}"
 
         if _PARENT_TAKES_CODE:
-            return self._process_execution_result(pred, code, result, history, output_field_names)
-        return self._process_execution_result(pred, result, history, output_field_names)
+            step_result = self._process_execution_result(pred, code, result, history, output_field_names)
+        else:
+            step_result = self._process_execution_result(pred, result, history, output_field_names)
+        # Snapshot the updated REPL history for partial-trajectory recovery.
+        # step_result is either a new REPLHistory (iteration continues) or a
+        # dspy.Prediction (SUBMIT happened). Only the former gets snapshot;
+        # Predictions mean the forward() call will return normally.
+        if not isinstance(step_result, dspy.Prediction):
+            self._partial_history = step_result
+            self._partial_pending_entry = None
+        return step_result
 
     def _prepare_file_io(
         self, input_args: dict[str, Any]
@@ -1255,9 +1321,15 @@ class PredictRLM(dspy.RLM):
 
         run_start = time.perf_counter()
         lm = dspy.settings.lm
-        lm_hist_start = snapshot_lm_history_len(lm)
         sub_lm = self._sub_lm
-        sub_hist_start = snapshot_lm_history_len(sub_lm) if sub_lm and sub_lm is not lm else 0
+        # Per-RLM instance ``lm`` has its own history (via ``lm.copy()``
+        # in ``__init__``) so these snapshots are isolated from other
+        # concurrent PredictRLM runs. No track_usage context needed —
+        # DSPy's BaseLM stamps cost and tokens into history on every call.
+        lm_hist_start = snapshot_lm_history_len(lm)
+        sub_hist_start = (
+            snapshot_lm_history_len(sub_lm) if sub_lm and sub_lm is not lm else 0
+        )
         steps: list[IterationStep] = []
 
         try:
@@ -1283,6 +1355,12 @@ class PredictRLM(dspy.RLM):
                 try:
                     status = "max_iterations"
                     history = REPLHistory()
+                    # Reset partial-trajectory capture for this forward() call
+                    # so crash-recovery consumers (see e.g. the spreadbench
+                    # optimizer's _recover_partial_trace) can read the last
+                    # committed REPL state if an iteration hangs or errors.
+                    self._partial_history = history
+                    self._partial_pending_entry = None
 
                     for iteration in range(self.max_iterations):
                         iter_start = time.perf_counter()
@@ -1389,9 +1467,17 @@ class PredictRLM(dspy.RLM):
 
         run_start = time.perf_counter()
         lm = dspy.settings.lm
-        lm_hist_start = snapshot_lm_history_len(lm)
         sub_lm = self._sub_lm
-        sub_hist_start = snapshot_lm_history_len(sub_lm) if sub_lm and sub_lm is not lm else 0
+        # Snapshot lm.history lengths at run start so ``usage_since`` can
+        # sum the delta at end. Per-RLM ``lm.copy()`` in __init__ means
+        # each PredictRLM instance has its OWN history — concurrent runs
+        # don't cross-contaminate. DSPy's BaseLM populates
+        # ``entry["cost"]`` from ``_hidden_params["response_cost"]``, so
+        # ``usage_since`` returns LiteLLM-computed authoritative cost.
+        lm_hist_start = snapshot_lm_history_len(lm)
+        sub_hist_start = (
+            snapshot_lm_history_len(sub_lm) if sub_lm and sub_lm is not lm else 0
+        )
         steps: list[IterationStep] = []
 
         try:
@@ -1417,6 +1503,12 @@ class PredictRLM(dspy.RLM):
                 try:
                     status = "max_iterations"
                     history = REPLHistory()
+                    # Reset partial-trajectory capture for this aforward() call
+                    # so crash-recovery consumers (see e.g. the spreadbench
+                    # optimizer's _recover_partial_trace) can read the last
+                    # committed REPL state if an iteration hangs or errors.
+                    self._partial_history = history
+                    self._partial_pending_entry = None
 
                     for iteration in range(self.max_iterations):
                         iter_start = time.perf_counter()
