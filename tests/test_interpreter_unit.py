@@ -4,7 +4,14 @@ import subprocess
 import tempfile
 from unittest.mock import patch
 
-from predict_rlm.interpreter import RUNNER_PATH, JspiInterpreter, _needs_jspi_flag
+from dspy.primitives.code_interpreter import CodeInterpreterError
+
+from predict_rlm.interpreter import (
+    RUNNER_PATH,
+    JspiInterpreter,
+    SandboxFatalError,
+    _needs_jspi_flag,
+)
 
 
 class TestNeedsJspiFlag:
@@ -151,3 +158,26 @@ class TestGetDenoDir:
         ):
             dirs = interp._get_deno_dir()
         assert "/custom/deno" in dirs
+
+
+class TestSandboxFatalError:
+    """SandboxFatalError must NOT inherit from CodeInterpreterError.
+
+    DSPy's RLM._execute_iteration catches (CodeInterpreterError, SyntaxError)
+    and converts the exception into an "[Error] ..." string that gets fed
+    back to the model as regular iteration output. For ordinary in-sandbox
+    errors (NameError, tool raised, etc.) that's correct — the model can
+    self-correct. But when the sandbox subprocess itself dies (exec timeout,
+    BrokenPipe), the per-run file_plan mounts and output dirs are gone, so
+    subsequent iterations trip over FileNotFoundError with no way to recover.
+
+    Keeping SandboxFatalError a sibling of CodeInterpreterError ensures the
+    base class's catch tuple does not swallow it — it propagates out of
+    rlm.forward() and the run fails fast.
+    """
+
+    def test_is_runtime_error(self):
+        assert issubclass(SandboxFatalError, RuntimeError)
+
+    def test_is_not_code_interpreter_error(self):
+        assert not issubclass(SandboxFatalError, CodeInterpreterError)

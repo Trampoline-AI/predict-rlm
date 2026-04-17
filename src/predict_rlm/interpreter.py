@@ -40,6 +40,35 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+class SandboxFatalError(RuntimeError):
+    """Raised when the sandbox subprocess dies and the run cannot continue.
+
+    Deliberately NOT a subclass of ``CodeInterpreterError``. DSPy's
+    ``RLM._execute_iteration`` catches ``(CodeInterpreterError, SyntaxError)``
+    and converts the exception into an ``[Error] ...`` string fed back to
+    the model on the next iteration. That's the right move for ordinary
+    in-sandbox errors (``NameError``, a tool raising, ``SUBMIT`` validation
+    failure, etc.) — the model can read the error and self-correct.
+
+    Sandbox-level failures are categorically different:
+    - the Deno subprocess has been killed (exec timeout) or crashed
+      (BrokenPipe)
+    - any per-run setup done by ``PredictRLM._setup_sandbox_files`` —
+      input mounts, output dirs, skill module imports — is gone with it
+
+    If we surfaced these as ``CodeInterpreterError``, the RLM would keep
+    iterating on a freshly-spawned but empty sandbox. The model would trip
+    over ``FileNotFoundError`` on previously-mounted inputs, fabricate an
+    explanation (e.g. "my markdown was malformed"), and burn iterations
+    until the outer deadline kills the whole run.
+
+    Making this a ``RuntimeError`` sibling means DSPy's catch tuple can't
+    swallow it: the exception propagates out of ``rlm.forward()`` and the
+    run fails fast. Callers that want to retry must do so at a higher level
+    (new ``PredictRLM`` call), not by reusing the dead interpreter.
+    """
+
+
 # JSON-RPC 2.0 helpers (local to avoid coupling to dspy internals)
 JSONRPC_APP_ERRORS = {
     "SyntaxError": -32000,
@@ -170,6 +199,7 @@ class JspiInterpreter(PythonInterpreter):
         extra_write_paths: list[PathLike | str] | None = None,
         enable_env_vars: list[str] | None = None,
         sync_files: bool = True,
+        exec_timeout: float = 120.0,
     ) -> None:
         """Initialize interpreter with JSPI and concurrent tool support.
 
@@ -198,6 +228,12 @@ class JspiInterpreter(PythonInterpreter):
                               without triggering parent's auto-sync.
             enable_env_vars: Environment variable names to expose.
             sync_files: Whether to sync file changes back to host.
+            exec_timeout: Wall-clock seconds to allow for a single REPL
+                         execute call before killing the sandbox subprocess.
+                         Defaults to 120s. Guards against pathological code
+                         in the sandbox (e.g. regex catastrophic backtracking)
+                         that would otherwise spin indefinitely with no
+                         LM-call progress visible to the host.
         """
         # Merge default domains with user-provided domains
         network_access = list(DEFAULT_ALLOWED_DOMAINS) if preinstall_packages else []
@@ -268,6 +304,8 @@ class JspiInterpreter(PythonInterpreter):
         # Pending file-sync operations requested by tools during execution.
         # Maps request ID → asyncio.Future resolved by the execute loop.
         self._pending_file_ops: dict[int, asyncio.Future] = {}
+        # Per-execute wall-clock timeout (see __init__ docstring).
+        self._exec_timeout = exec_timeout
 
     def _ensure_deno_process(self) -> None:
         """Override to capture raw fds for non-blocking I/O."""
@@ -596,23 +634,66 @@ class JspiInterpreter(PythonInterpreter):
         })
         try:
             await self._write_stdin_async(input_data + "\n")
-        except BrokenPipeError:
-            self._tools_registered = False
-            self._mounted_files = False
-            self._ensure_deno_process()
-            self._mount_files()
-            self._register_tools()
-            self._request_id += 1
-            execute_request_id = self._request_id
-            input_data = json.dumps({
-                "jsonrpc": "2.0",
-                "method": "execute",
-                "params": {"code": code},
-                "id": execute_request_id,
-            })
-            await self._write_stdin_async(input_data + "\n")
+        except BrokenPipeError as e:
+            self._kill_sandbox()
+            raise SandboxFatalError(
+                "Sandbox subprocess died before receiving the execute "
+                "request (BrokenPipeError). Per-run mounts cannot be "
+                "restored on a fresh process, so this run is unrecoverable."
+            ) from e
 
-        return await self._execute_async(execute_request_id)
+        return await self._execute_with_timeout(execute_request_id)
+
+    async def _execute_with_timeout(self, execute_request_id: int) -> Any:
+        """Run the execute loop under a wall-clock deadline.
+
+        On timeout the Deno subprocess is almost certainly CPU-bound in
+        pathological Python code (regex catastrophic backtracking, infinite
+        loop) and ``asyncio`` cancellation cannot reach it. We force-kill
+        it and raise ``SandboxFatalError`` — the run is unrecoverable
+        because ``PredictRLM._setup_sandbox_files`` (input mounts, output
+        dirs, skill imports) was only invoked on the original subprocess.
+        """
+        try:
+            return await asyncio.wait_for(
+                self._execute_async(execute_request_id),
+                timeout=self._exec_timeout,
+            )
+        except asyncio.TimeoutError:
+            self._kill_sandbox()
+            raise SandboxFatalError(
+                f"Sandbox exec timed out after {self._exec_timeout}s "
+                f"(request id {execute_request_id}). The Deno subprocess "
+                f"was force-killed; per-run mounts are gone, so this "
+                f"interpreter is dead. Usually indicates pathological code "
+                f"in the sandbox (regex catastrophic backtracking, infinite "
+                f"loop, or a host-side tool that never returns)."
+            )
+
+    def _kill_sandbox(self) -> None:
+        """Force-kill the Deno subprocess for shutdown.
+
+        Called when we're tearing the sandbox down for good (timeout or
+        crash). No state bookkeeping — the interpreter is not expected to
+        be reused after this; the context manager's ``shutdown`` will run
+        next and the raised ``SandboxFatalError`` propagates out of the
+        RLM run.
+        """
+        if self.deno_process is not None:
+            try:
+                self.deno_process.kill()
+            except Exception:
+                pass
+            try:
+                self.deno_process.wait(timeout=2)
+            except Exception:
+                pass
+        self.deno_process = None
+        # Cancel any pending file-sync futures; they can't complete now.
+        for fut in list(self._pending_file_ops.values()):
+            if not fut.done():
+                fut.cancel()
+        self._pending_file_ops.clear()
 
     def execute(
         self,
@@ -647,24 +728,13 @@ class JspiInterpreter(PythonInterpreter):
         )
         try:
             self._write_stdin(input_data + "\n")
-        except BrokenPipeError:
-            # Process died - restart it
-            self._tools_registered = False
-            self._mounted_files = False
-            self._ensure_deno_process()
-            self._mount_files()
-            self._register_tools()
-            self._request_id += 1
-            execute_request_id = self._request_id
-            input_data = json.dumps(
-                {
-                    "jsonrpc": "2.0",
-                    "method": "execute",
-                    "params": {"code": code},
-                    "id": execute_request_id,
-                }
-            )
-            self._write_stdin(input_data + "\n")
+        except BrokenPipeError as e:
+            self._kill_sandbox()
+            raise SandboxFatalError(
+                "Sandbox subprocess died before receiving the execute "
+                "request (BrokenPipeError). Per-run mounts cannot be "
+                "restored on a fresh process, so this run is unrecoverable."
+            ) from e
 
         # Run the async execute loop. Use nest_asyncio to allow
         # run_until_complete even inside an already-running loop (e.g. marimo).
@@ -672,7 +742,7 @@ class JspiInterpreter(PythonInterpreter):
 
         nest_asyncio.apply()
         loop = asyncio.get_event_loop()
-        return loop.run_until_complete(self._execute_async(execute_request_id))
+        return loop.run_until_complete(self._execute_with_timeout(execute_request_id))
 
     async def _execute_async(self, execute_request_id: int) -> Any:
         """Read messages and handle tool calls concurrently using asyncio."""
