@@ -405,3 +405,32 @@ def _is_cache_hit(entry: dict, usage: dict, cost: float) -> bool:
 def ms_since(start: float) -> int:
     """Milliseconds elapsed since ``start`` (from ``time.perf_counter()``)."""
     return int((time.perf_counter() - start) * 1000)
+
+
+def extract_trace_from_exc(exc: BaseException | None) -> Any:
+    """Walk the exception chain looking for an attached RunTrace.
+
+    ``PredictRLM`` attaches ``exc.trace`` to any exception that flows
+    through its error handler. When ``asyncio.wait_for`` times out, the
+    inner ``CancelledError`` carries the trace but the outer
+    ``TimeoutError`` raised by ``wait_for`` does not — the trace lives
+    on the outer exception's ``__context__`` (or ``__cause__`` if
+    something in between used ``raise X from Y``).
+
+    This helper walks ``exc`` → ``__cause__`` → ``__context__`` until
+    it finds a ``.trace`` attribute or runs out of links, so callers
+    can treat all error paths uniformly without caring where in the
+    chain the trace was attached. Cycles (pathological but possible)
+    are guarded via an id-set.
+    """
+    if exc is None:
+        return None
+    seen: set[int] = set()
+    cur: BaseException | None = exc
+    while cur is not None and id(cur) not in seen:
+        seen.add(id(cur))
+        tr = getattr(cur, "trace", None)
+        if tr is not None:
+            return tr
+        cur = cur.__cause__ or cur.__context__
+    return None
