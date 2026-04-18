@@ -1,3 +1,141 @@
+## Methodology notes (scratch — flesh out before publishing)
+
+These are bullets to make sure we address the most likely reviewer criticisms
+about our train/test split and the way we used SpreadsheetBench. Not writeup
+copy yet — just flags to remember.
+
+### On training against SpreadsheetBench at all
+
+- **Split we used**: 912 total → held out the verified 400 as testset, optimized
+  GEPA against the other 512 as trainset (`val_ratio=0.20`, `val_limit=50`
+  inside the trainset). The testset was never seen during optimization.
+- **Dataset vs benchmark distinction matters here.** Some published evaluation
+  sets are *datasets* (HotpotQA, HoVer, GSM8K, SQuAD) — they ship with
+  official train/dev/test splits and the authors designed them to be trained
+  on. Others are *benchmarks* (BIG-Bench Hard, MMLU, SpreadsheetBench,
+  IFBench) — they have no official train split and are intended for
+  zero/few-shot evaluation. Our situation is the second kind: SpreadsheetBench
+  calls itself a benchmark throughout the paper, never publishes a train/test
+  split, and §2.1 says explicitly "We define the dataset of a benchmark as
+  D = {(q_i, c_i, a_i)}" — singular D, no split.
+- **Standard prompt-optimization practice on eval-only benchmarks**: when no
+  official train split exists, researchers create one from the benchmark's
+  task pool and hold out a disjoint subset for evaluation. Concrete citation:
+  the GEPA paper (Agrawal et al., ICLR 2026, §4 Evaluation, p.8) explicitly
+  says *"We adopt a standard train/validation/test split. Optimizers have
+  full access to the train split, including text and labels, for program
+  tuning. [...] We evaluate on six benchmarks—AIME-2025, LiveBench-Math,
+  HotpotQA, IFBench, HoVer, and PUPA."*
+- **Four of GEPA's six benchmarks are direct analogs to our setup** —
+  eval-only benchmarks with no official train split that the GEPA authors
+  had to partition themselves:
+  - **AIME-2025** (Balunović et al. 2025): 30 contest problems from the
+    American Invitational Mathematics Examination 2025. Eval-only. No
+    published training data. GEPA invented its own split.
+  - **LiveBench-Math** (White et al. 2025): "refresh" math benchmark,
+    eval-only by design.
+  - **IFBench** (Pyatkin et al. 2025, arXiv 2507.02833): **verified
+    eval-only** — the paper says *"The final benchmark consists of 300
+    prompts"* and provides no train/val/test split within IFBench itself.
+    (The "29 IFTrain constraints" released alongside IFBench are
+    supplementary training material, *not* an official IFBench split.)
+  - **PUPA** (Li et al. 2025, PAPILLON, arXiv 2410.17127): **verified no
+    shipped splits** — 901 total instances (237 PUPA-TNB + 664 PUPA-New).
+    The paper says *"We use PUPA-TNB for pipeline and model comparisons,
+    and PUPA-New for any optimization we perform"* and ad-hoc samples
+    150/150 for its own MIPRO-v2 setup, leaving 364 examples unassigned.
+    No canonical split is defined for downstream use.
+- **The other two GEPA benchmarks DO have official splits**: HotpotQA
+  (Yang et al. 2018) and HoVer (Jiang et al. 2020). When GEPA uses them
+  it's using the official train splits — the sanctioned setup. **Do NOT
+  cite HotpotQA or HoVer as precedent for our case** — they're the
+  opposite of our situation.
+- **But a benchmark purist will still push back**: "SpreadsheetBench is
+  published as a benchmark for zero-shot evaluation; any subset used for
+  optimization is contamination." Acknowledge the tension in the writeup
+  instead of ignoring it. Lead with the seed-vs-optimized delta so the
+  reader can see what GEPA actually added on top of the base agent.
+- **Prompt optimization ≠ fine-tuning**: GEPA evolves a natural-language
+  artifact (signature docstring + skill instructions). The base model is
+  unchanged. Say this explicitly.
+- **Scope the claim honestly**: the evolved prompt is
+  SpreadsheetBench-distribution-specific. It will not necessarily transfer to
+  other spreadsheet task formats without re-optimization.
+
+### On the specific 512 / 400 split (the more pointed criticism)
+
+- **The 400 is the *verified* subset, not a random half.** The 512 trainset is
+  by construction the tasks that the curators *rejected* during the
+  verification pass — the messier, more ambiguous, more error-prone ones.
+- **Framing: the split *disadvantages* us**, it doesn't advantage us. Our
+  training distribution is strictly noisier than our eval distribution. A
+  random 512/400 split would probably be easier to GEPA against. Say this
+  explicitly in the writeup — it flips the default assumption that "training
+  set must have been cherry-picked".
+- **Preempt the leakage concern**: run a near-duplicate check between the 512
+  trainset and the 400 testset (instruction-text hash match + cosine
+  similarity on task text). Report "zero structural overlaps" if that's
+  what we find. Take any overlapping tasks out of the training set and re-run
+  if there are any.
+- **Cross-validation option if we need to strengthen the claim**: optimize on
+  a random 512/400 split (ignoring the verified-vs-unverified distinction) and
+  compare the optimized score. If similar, the split choice didn't buy us
+  anything unfair. Only do this if the criticism lands hard.
+
+### On benchmark pretraining contamination (the bigger problem nobody raises)
+
+- **The paper itself flags this** in Section 2.3 ("Against Data Leakage"):
+  SpreadsheetBench was scraped from public Excel forums that every frontier
+  model likely saw during pretraining. The authors mitigated it by modifying
+  each question (rewording, perturbing spreadsheets, changing answer
+  positions). That mitigation is imperfect for modern models.
+- **This is a bigger threat to any SpreadsheetBench number than our 512/400
+  split**. Cite the paper's own disclosure as context. Reframes the
+  conversation from "did you overfit to 512?" to "can any published
+  SpreadsheetBench number be trusted given pretraining contamination?"
+- Not our problem to solve, but worth one paragraph.
+
+### Defense paragraph (drop into the final writeup's methodology section)
+
+> We optimize against the 512-task non-verified subset of SpreadsheetBench
+> and evaluate on the disjoint 400-task verified subset, which was never
+> seen during optimization. SpreadsheetBench publishes no official
+> train/test split, so our partition is defined de novo. This follows
+> standard practice in the prompt-optimization literature: the GEPA paper
+> (Agrawal et al., ICLR 2026) evaluates on six benchmarks, four of which
+> (AIME-2025, LiveBench-Math, IFBench, PUPA) similarly ship without
+> official training splits and require researchers to invent their own
+> partition. GEPA's §4 Evaluation explicitly describes the protocol as
+> *"a standard train/validation/test split"* in which *"optimizers have
+> full access to the train split."* Our setup matches that protocol, with
+> the additional caveat that the 400-task verified subset is the
+> quality-filtered half of SpreadsheetBench — which disadvantages us
+> rather than advantages us, since our training distribution is strictly
+> noisier than our eval distribution.
+
+### What to report in the final writeup
+
+- **Seed score on the 400 testset** (ManipulateSpreadsheet seed docstring +
+  seed libreoffice_spreadsheet_skill, no optimization). Measures base agent
+  quality before any GEPA work.
+- **Optimized score on the 400 testset** (best GEPA candidate applied).
+  Measures what GEPA added.
+- **Delta**. This is the claim. Make it concrete and don't oversell it.
+- **Costs at both seed and optimized** (rollout cost + optimization cost).
+  Cost-per-pp framing is more honest than raw scores.
+- **Timeouts / failures broken down** — how much of the failure set is
+  LLM-strength-bound (would improve with a better model) vs benchmark-bug /
+  grader-tolerance issues (would never improve). We have this data from the
+  failure analysis passes.
+- **Prompt format disclosure**: we use the canonical SpreadsheetBench
+  single-round prompt format from the paper's Figure 25 (instruction +
+  answer_position + answer_sheet), with one deviation — we removed
+  `instruction_type` and `spreadsheet_content` from the input fields because
+  our RLM agent reads the full file via sandbox mount rather than from a
+  prompt-embedded preview. Document this explicitly so the comparison to
+  published numbers is apples-to-apples where possible.
+
+---
 
 ## Baselines
 
