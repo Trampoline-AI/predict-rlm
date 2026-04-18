@@ -547,18 +547,22 @@ async def _run_case(
                 cr.run_trace = run_trace  # type: ignore[attr-defined]
                 return cr
             shutil.copy2(result.output_spreadsheet.path, output_path)
-        except asyncio.TimeoutError:
+        except asyncio.TimeoutError as e:
+            from predict_rlm.trace import extract_trace_from_exc
+
             cr = CaseResult(
                 idx, 0.0, False, f"Timeout ({config.task_timeout}s)",
                 log_file=log_file_str,
             )
-            cr.run_trace = None  # type: ignore[attr-defined]
+            cr.run_trace = extract_trace_from_exc(e)  # type: ignore[attr-defined]
             return cr
         except Exception as e:
+            from predict_rlm.trace import extract_trace_from_exc
+
             cr = CaseResult(
                 idx, 0.0, False, f"RLM error: {e}", log_file=log_file_str,
             )
-            cr.run_trace = getattr(e, "trace", None)  # type: ignore[attr-defined]
+            cr.run_trace = extract_trace_from_exc(e)  # type: ignore[attr-defined]
             return cr
 
     recalc_source: str | None = None
