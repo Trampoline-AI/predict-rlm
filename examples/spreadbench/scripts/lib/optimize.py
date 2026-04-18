@@ -930,7 +930,9 @@ class SpreadsheetAdapter:
         """
         import traceback
 
-        trace_obj = getattr(exc, "trace", None)
+        from predict_rlm.trace import extract_trace_from_exc
+
+        trace_obj = extract_trace_from_exc(exc)
         run_trace_json: Any = None
         main_usage = None
         sub_usage = None
@@ -1355,23 +1357,27 @@ class SpreadsheetAdapter:
                         "run_trace": run_trace,
                     }
                 shutil.copy2(result.output_spreadsheet.path, output_path)
-            except asyncio.TimeoutError:
+            except asyncio.TimeoutError as e:
+                from predict_rlm.trace import extract_trace_from_exc
+
                 return {
                     "idx": idx,
                     "score": 0.0,
                     "passed": False,
                     "message": f"RLM timeout at {self.task_timeout}s",
                     "trace": self._recover_partial_trace(predictor),
-                    "run_trace": None,
+                    "run_trace": extract_trace_from_exc(e),
                 }
             except Exception as e:
+                from predict_rlm.trace import extract_trace_from_exc
+
                 return {
                     "idx": idx,
                     "score": 0.0,
                     "passed": False,
                     "message": f"RLM {type(e).__name__}: {e}",
                     "trace": self._recover_partial_trace(predictor),
-                    "run_trace": getattr(e, "trace", None),
+                    "run_trace": extract_trace_from_exc(e),
                 }
 
         # Host-side recalc — the same two-stage pipeline used by eval.py.

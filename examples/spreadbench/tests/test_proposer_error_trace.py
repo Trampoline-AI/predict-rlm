@@ -236,6 +236,76 @@ def test_proposer_timeout_is_tracked(tmp_path):
     assert payload["component"] == "skill_instructions"
 
 
+def test_proposer_timeout_recovers_trace_from_chain(tmp_path):
+    """When a proposer times out, the CancelledError that PredictRLM
+    caught carries the partial RunTrace via ``exc.trace``. The outer
+    TimeoutError raised by asyncio.wait_for holds it on
+    ``__context__``. ``_persist_proposer_error`` walks the chain via
+    ``extract_trace_from_exc`` so the ERROR file AND the cost_log
+    event both capture the partial cost accumulated before cancellation.
+    """
+    adapter = _make_adapter(tmp_path)
+    adapter.proposer_timeout = 5
+
+    # Build a TimeoutError whose __context__ is a CancelledError
+    # carrying a sentinel .trace (what PredictRLM would attach).
+    fake_trace = _FakeRunTrace(status="error")
+    inner = asyncio.CancelledError()
+    inner.trace = fake_trace  # type: ignore[attr-defined]
+
+    outer = asyncio.TimeoutError("wait_for budget exhausted")
+    outer.__context__ = inner
+
+    async def _raises_outer(**_kw):
+        raise outer
+
+    async def _mock_wait_for(awaitable, timeout):
+        if hasattr(awaitable, "close"):
+            awaitable.close()
+        raise outer
+
+    from unittest.mock import MagicMock
+
+    predictor = MagicMock()
+    predictor.acall = _raises_outer
+    with patch("lib.optimize.PredictRLM") as mock_cls, patch(
+        "lib.optimize.asyncio.wait_for", new=_mock_wait_for
+    ):
+        mock_cls.return_value = predictor
+
+        import pytest
+
+        with pytest.raises(asyncio.TimeoutError):
+            adapter._propose_one_component(
+                "skill_instructions",
+                current_text="# seed",
+                records=[],
+            )
+
+    # ERROR file carries the recovered RunTrace (not None)
+    error_files = list(tmp_path.glob("proposer_*_ERROR.json"))
+    assert len(error_files) == 1
+    payload = json.loads(error_files[0].read_text())
+    assert payload["run_trace"] is not None, (
+        "extract_trace_from_exc should have walked __context__ and "
+        "pulled the partial RunTrace the inner CancelledError carried"
+    )
+    assert payload["run_trace"]["status"] == "error"
+
+    # cost_log event for the timeout includes the partial token/cost
+    # pulled from trace.usage.main (0.001 by _FakeLMUsage default)
+    rows = [
+        json.loads(ln)
+        for ln in (tmp_path / "cost_log.jsonl").read_text().splitlines()
+        if ln.strip()
+    ]
+    proposer_error_rows = [r for r in rows if r.get("event") == "proposer_error"]
+    assert len(proposer_error_rows) == 1
+    assert proposer_error_rows[0]["input_tokens"] == 50
+    assert proposer_error_rows[0]["output_tokens"] == 5
+    assert proposer_error_rows[0]["cost_usd"] == pytest.approx(0.001)
+
+
 def test_adapter_resumes_counters_from_existing_artifacts(tmp_path):
     from lib.optimize import SpreadsheetAdapter
 
