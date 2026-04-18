@@ -22,12 +22,22 @@ Examples:
 from __future__ import annotations
 
 import argparse
+import faulthandler
 import json
 import shlex
+import signal
 import sys
 from datetime import datetime
 from pathlib import Path
 from typing import Any
+
+# On-demand stack dumps: ``kill -USR1 <pid>`` dumps every Python thread's
+# stack to stderr (which lands in the run's log file). Essential for
+# diagnosing stalls where the process goes 0% CPU with no log activity
+# and neither ``sample``, ``lldb``, nor ``py-spy`` can attach without
+# sudo on macOS 14+. ``PYTHONFAULTHANDLER=1`` alone only covers crashes;
+# the explicit register() call adds on-demand live-process dumps.
+faulthandler.register(signal.SIGUSR1, all_threads=True)
 
 _SCRIPTS_DIR = Path(__file__).resolve().parent
 if str(_SCRIPTS_DIR) not in sys.path:
