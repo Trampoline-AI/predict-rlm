@@ -1438,16 +1438,19 @@ class PredictRLM(dspy.RLM):
                 finally:
                     reset_tool_call_collector(tool_token)
                     reset_predict_call_collector(predict_token)
-        except Exception as exc:
-            exc.trace = self._build_run_trace(
-                status="error",
-                steps=steps,
-                lm=lm,
-                sub_lm=sub_lm,
-                lm_hist_start=lm_hist_start,
-                sub_hist_start=sub_hist_start,
-                run_start=run_start,
-            )
+        except BaseException as exc:
+            try:
+                exc.trace = self._build_run_trace(
+                    status="error",
+                    steps=steps,
+                    lm=lm,
+                    sub_lm=sub_lm,
+                    lm_hist_start=lm_hist_start,
+                    sub_hist_start=sub_hist_start,
+                    run_start=run_start,
+                )
+            except Exception:
+                pass
             raise
         finally:
             if file_plan:
@@ -1585,16 +1588,19 @@ class PredictRLM(dspy.RLM):
                 finally:
                     reset_tool_call_collector(tool_token)
                     reset_predict_call_collector(predict_token)
-        except Exception as exc:
-            exc.trace = self._build_run_trace(
-                status="error",
-                steps=steps,
-                lm=lm,
-                sub_lm=sub_lm,
-                lm_hist_start=lm_hist_start,
-                sub_hist_start=sub_hist_start,
-                run_start=run_start,
-            )
+        except BaseException as exc:
+            try:
+                exc.trace = self._build_run_trace(
+                    status="error",
+                    steps=steps,
+                    lm=lm,
+                    sub_lm=sub_lm,
+                    lm_hist_start=lm_hist_start,
+                    sub_hist_start=sub_hist_start,
+                    run_start=run_start,
+                )
+            except Exception:
+                pass
             raise
         finally:
             if file_plan:
