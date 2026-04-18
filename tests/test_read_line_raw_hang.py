@@ -129,6 +129,87 @@ def test_read_line_raw_directly_respects_timeout_when_given_one():
             pass
 
 
+def test_send_request_does_not_hang_on_silent_deno():
+    """The real-world trigger: ``_send_request`` calls
+    ``_read_with_timeout`` and must NOT pass ``timeout=None``. If it
+    does, a deno process that never replies freezes the caller (and,
+    when the caller is on the asyncio event loop, every sibling
+    coroutine with it).
+
+    We mock the deno process's stdin (absorb writes silently) and stdout
+    (real pipe that emits partial bytes then stalls). ``_send_request``
+    must raise within a bounded window — the previous hang behavior
+    would block forever and fail the 3s thread-join safety net.
+    """
+    import predict_rlm.interpreter as rlm_interpreter
+
+    # Shrink the request-read budget so the test doesn't wait 30s for
+    # the default fix to fire. Reusing the module-level knob the fix
+    # introduces keeps this test honest against future tuning.
+    if hasattr(rlm_interpreter, "DENO_REQUEST_TIMEOUT_SEC"):
+        original = rlm_interpreter.DENO_REQUEST_TIMEOUT_SEC
+        rlm_interpreter.DENO_REQUEST_TIMEOUT_SEC = 0.3
+    else:
+        original = None  # RED state — attribute doesn't exist yet
+
+    try:
+        interp, write_fd = _make_interp_with_partial_pipe()
+        # Silence writes to stdin so _write_stdin doesn't raise.
+        class _QuietStdin:
+            def write(self, _data): pass
+            def flush(self): pass
+            def close(self): pass
+        interp.deno_process = types.SimpleNamespace(
+            stdin=_QuietStdin(),
+            stdout=types.SimpleNamespace(fileno=lambda: interp._stdout_fd),
+            stderr=None,
+            poll=lambda: None,
+        )
+        interp._request_id = 0
+        interp._use_jspi = False
+        interp._stdin_fd = -1  # force the stdin.write() fallback path
+        interp._loop = None
+
+        result = {"returned": False, "exc": None, "elapsed": 0.0}
+
+        def _call():
+            t0 = time.monotonic()
+            try:
+                interp._send_request("health_check", {}, context="test")
+            except BaseException as e:
+                result["exc"] = e
+            result["elapsed"] = time.monotonic() - t0
+            result["returned"] = True
+
+        t = threading.Thread(target=_call, daemon=True)
+        t.start()
+        t.join(timeout=3.0)
+
+        assert not t.is_alive(), (
+            "JspiInterpreter._send_request hung on a silent deno stdout — "
+            "_send_request is still passing timeout=None to _read_with_timeout"
+        )
+        assert result["exc"] is not None, (
+            "_send_request returned without raising — the silent-stdout "
+            "case should produce a CodeInterpreterError, not a silent success"
+        )
+        assert result["elapsed"] < 2.0, (
+            f"_send_request took {result['elapsed']:.2f}s to fail — "
+            "timeout enforcement is too loose"
+        )
+    finally:
+        if original is not None:
+            rlm_interpreter.DENO_REQUEST_TIMEOUT_SEC = original
+        try:
+            os.close(write_fd)
+        except OSError:
+            pass
+        try:
+            os.close(interp._stdout_fd)
+        except OSError:
+            pass
+
+
 def test_read_line_raw_returns_full_line_when_newline_arrives():
     """Healthy-path guardrail: when the writer eventually emits a newline,
     ``_read_line_raw`` must return the full line. Guards against the fix

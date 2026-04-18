@@ -106,6 +106,14 @@ DEFAULT_ALLOWED_DOMAINS: list[str] = [
 # Path to our custom runner.js with concurrent tool support
 RUNNER_PATH = Path(__file__).parent / "sandbox" / "runner.js"
 
+# Wall-clock budget for a single JSON-RPC request/response round-trip with the
+# deno subprocess (health_check, mount, sync_file, etc). Without this ceiling,
+# ``_send_request`` used to pass ``timeout=None`` and block indefinitely if
+# deno emitted partial bytes then stalled — freezing the entire asyncio event
+# loop when called from ``_health_check`` inside an ``aexecute`` coroutine.
+# Exposed as a module-level knob so callers / tests can override.
+DENO_REQUEST_TIMEOUT_SEC: float = 30.0
+
 
 def _needs_jspi_flag() -> bool:
     """Check if Deno's V8 needs --experimental-wasm-jspi.
@@ -466,7 +474,7 @@ class JspiInterpreter(PythonInterpreter):
         max_skip = 100
         skipped = 0
         while skipped <= max_skip:
-            response_line = self._read_with_timeout(timeout=None)
+            response_line = self._read_with_timeout(timeout=DENO_REQUEST_TIMEOUT_SEC)
             if not response_line:
                 exit_code = self.deno_process.poll()
                 if exit_code is not None:
