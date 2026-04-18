@@ -1,0 +1,155 @@
+"""RED-GREEN repro for the deno-stdout blocking-read hang.
+
+Background:
+    ``JspiInterpreter._read_with_timeout`` is called inline from
+    ``_send_request``, which is used by the synchronous health-check
+    path (``_health_check`` → ``_ensure_deno_process``). When that path
+    runs inside an asyncio coroutine (via ``aexecute`` → ``_aexecute_inner``),
+    a blocking read on the deno stdout fd freezes the **entire event loop**.
+
+    The outer ``_read_with_timeout`` uses ``select.select()`` with a
+    timeout — but only to check *whether there is data to read*. Once
+    select says ready it calls ``_read_line_raw()``, which loops on
+    ``os.read(fd, 65536)`` until a newline arrives. If the first ``os.read``
+    returns partial bytes without a newline, the next ``os.read`` iteration
+    has **no timeout** and blocks indefinitely waiting for more data.
+
+    This caused a production stall on 2026-04-18: a gemini+medium eval
+    seized at 319/400 tasks with the main asyncio event loop parked in
+    ``os.read`` inside ``_read_line_raw``. ``kill -USR1`` via the
+    faulthandler committed that morning confirmed the exact frame.
+
+RED (pre-fix): partial bytes (no newline) followed by an unbounded wait
+    makes ``_read_with_timeout(timeout=0.2)`` hang forever. The test's
+    outer thread-join timeout of 2s catches the hang and fails the
+    assertion — proves the bug exists.
+
+GREEN (post-fix): ``_read_line_raw`` re-checks the deadline between
+    each ``os.read`` iteration and raises ``TimeoutError`` (or returns
+    ``None`` via ``_read_with_timeout``) when the budget is exhausted.
+"""
+
+from __future__ import annotations
+
+import os
+import threading
+import time
+import types
+
+import pytest
+
+from predict_rlm.interpreter import JspiInterpreter
+
+
+def _make_interp_with_partial_pipe():
+    """Build a JspiInterpreter pointed at a real OS pipe fd, with
+    some partial bytes (no newline) already sitting in the kernel
+    buffer. The write end is left open and silent, simulating a deno
+    process that wrote a partial line then stopped producing output
+    (crashed, hung on GC, blocked on its own I/O — doesn't matter).
+    """
+    read_fd, write_fd = os.pipe()
+    # Write partial data (no '\n'). Writer stays open so read won't get EOF.
+    os.write(write_fd, b"partial-line-no-newline-here")
+
+    interp = JspiInterpreter.__new__(JspiInterpreter)
+    interp._stdout_fd = read_fd
+    interp._read_buf = ""
+    interp.deno_process = types.SimpleNamespace(
+        stdout=types.SimpleNamespace(fileno=lambda: read_fd),
+        poll=lambda: None,
+    )
+    return interp, write_fd
+
+
+def test_read_with_timeout_does_not_hang_on_partial_line():
+    """Hand ``_read_with_timeout`` an fd that emits partial bytes then
+    goes silent. It must return within the configured timeout (plus a
+    small safety margin) — not block forever.
+
+    Run in a background thread so a hang in the code under test
+    doesn't freeze pytest itself.
+    """
+    interp, write_fd = _make_interp_with_partial_pipe()
+    try:
+        result = {"returned": False, "value": None, "elapsed": 0.0}
+
+        def _call():
+            t0 = time.monotonic()
+            result["value"] = interp._read_with_timeout(timeout=0.2)
+            result["elapsed"] = time.monotonic() - t0
+            result["returned"] = True
+
+        t = threading.Thread(target=_call, daemon=True)
+        t.start()
+        # 2s safety net: if the bug is present the thread hangs here
+        # and we fail the assertion below with a clean message.
+        t.join(timeout=2.0)
+
+        assert not t.is_alive(), (
+            "JspiInterpreter._read_with_timeout hung on a partial-line "
+            "stdout — deno-stdout deadlock is present"
+        )
+        assert result["returned"], "thread ended without returning a value"
+        # The caller configured timeout=0.2s, so the call should return
+        # within roughly that window plus a small safety margin.
+        assert result["elapsed"] < 1.0, (
+            f"returned but took {result['elapsed']:.2f}s — longer than "
+            "the 0.2s caller-requested timeout, fix may be too loose"
+        )
+    finally:
+        os.close(write_fd)
+        try:
+            os.close(interp._stdout_fd)
+        except OSError:
+            pass
+
+
+def test_read_line_raw_directly_respects_timeout_when_given_one():
+    """``_read_line_raw`` itself must accept a timeout (the fix's API
+    addition) and raise when exceeded. Narrower anchor than the
+    integration test above: fails if someone re-removes the timeout
+    parameter or short-circuits its check.
+    """
+    interp, write_fd = _make_interp_with_partial_pipe()
+    try:
+        t0 = time.monotonic()
+        with pytest.raises((TimeoutError, OSError)):
+            interp._read_line_raw(timeout=0.1)
+        elapsed = time.monotonic() - t0
+        assert elapsed < 0.5, (
+            f"_read_line_raw(timeout=0.1) took {elapsed:.2f}s to fail — "
+            "timeout not being enforced tightly"
+        )
+    finally:
+        os.close(write_fd)
+        try:
+            os.close(interp._stdout_fd)
+        except OSError:
+            pass
+
+
+def test_read_line_raw_returns_full_line_when_newline_arrives():
+    """Healthy-path guardrail: when the writer eventually emits a newline,
+    ``_read_line_raw`` must return the full line. Guards against the fix
+    regressing to "always raise/return None prematurely".
+    """
+    interp, write_fd = _make_interp_with_partial_pipe()
+    try:
+        # Finish the partial line; writer then closes.
+        os.write(write_fd, b"-completion\nleftover-bytes")
+        os.close(write_fd)
+        write_fd = -1
+
+        line = interp._read_line_raw()
+        assert line == "partial-line-no-newline-here-completion"
+    finally:
+        if write_fd >= 0:
+            try:
+                os.close(write_fd)
+            except OSError:
+                pass
+        try:
+            os.close(interp._stdout_fd)
+        except OSError:
+            pass

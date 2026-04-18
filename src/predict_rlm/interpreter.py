@@ -871,7 +871,15 @@ class JspiInterpreter(PythonInterpreter):
             raise CodeInterpreterError(f"Unexpected message format from sandbox: {result}")
 
     def _read_with_timeout(self, timeout: float | None) -> str | None:
-        """Sync read — used by _send_request (registration, mount, etc.)."""
+        """Sync read — used by _send_request (registration, mount, etc.).
+
+        The ``timeout`` is a **wall-clock budget** for the entire line
+        (including any inter-chunk gaps), not just the initial "wait
+        until fd is readable". If the deno subprocess streams partial
+        bytes then stalls before the newline, the budget still fires
+        and this returns ``None`` — freeing the caller (and the asyncio
+        event loop) from an unbounded wait on a silent pipe.
+        """
         if timeout is not None:
             if "\n" in self._read_buf:
                 line, self._read_buf = self._read_buf.split("\n", 1)
@@ -887,7 +895,10 @@ class JspiInterpreter(PythonInterpreter):
                 ready, _, _ = select.select([stdout.fileno()], [], [], timeout)
                 if not ready:
                     return None
-        return self._read_line_raw()
+        try:
+            return self._read_line_raw(timeout=timeout)
+        except TimeoutError:
+            return None
 
     async def _read_with_timeout_async(self, timeout: float | None) -> str | None:
         """Async read using event loop fd watching — zero threads.
@@ -912,15 +923,44 @@ class JspiInterpreter(PythonInterpreter):
             finally:
                 loop.remove_reader(self._stdout_fd)
 
-        return self._read_line_raw()
+        try:
+            return self._read_line_raw(timeout=timeout)
+        except TimeoutError:
+            return None
 
-    def _read_line_raw(self) -> str:
-        """Read one line from the raw stdout fd, accumulating in _read_buf."""
+    def _read_line_raw(self, timeout: float | None = None) -> str:
+        """Read one line from the raw stdout fd, accumulating in _read_buf.
+
+        When ``timeout`` is given, each ``os.read`` iteration is gated by
+        a ``select`` on the remaining wall-clock budget. If the budget
+        expires before a newline arrives, raise ``TimeoutError``.
+        Without this bound, a deno subprocess that emits partial bytes
+        then hangs freezes the caller indefinitely — and if the caller
+        is the asyncio event loop (via ``_ensure_deno_process``'s sync
+        health check) the whole process goes 0% CPU with no progress.
+        """
         stdout = getattr(self.deno_process, "stdout", None)
         if self._stdout_fd < 0 or stdout is None:
             return (stdout.readline() if stdout else "").strip()
 
+        deadline = None if timeout is None else time.monotonic() + timeout
+
         while "\n" not in self._read_buf:
+            if deadline is not None:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError(
+                        "deno stdout read exceeded heartbeat budget "
+                        "before newline arrived"
+                    )
+                ready, _, _ = select.select(
+                    [self._stdout_fd], [], [], remaining
+                )
+                if not ready:
+                    raise TimeoutError(
+                        "deno stdout read exceeded heartbeat budget "
+                        "before newline arrived"
+                    )
             chunk = os.read(self._stdout_fd, 65536)
             if not chunk:
                 remainder = self._read_buf
