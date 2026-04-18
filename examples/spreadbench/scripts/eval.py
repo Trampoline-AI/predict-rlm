@@ -81,6 +81,13 @@ def _parse_args() -> argparse.Namespace:
         "Prefix with '@' to read from a file with one ID per line, "
         "e.g. --task_ids @failing_ids.txt",
     )
+    p.add_argument(
+        "--cases_per_task",
+        type=int,
+        default=0,
+        help="max test cases per task (0 = all cases, default). "
+        "Pass 1 to match the optimize loop's default and run one case per task.",
+    )
     p.add_argument("--concurrency", type=int, default=30)
     p.add_argument("--max_iterations", type=int, default=50)
     p.add_argument("--task_timeout", type=int, default=300)
@@ -157,6 +164,7 @@ def main() -> int:
         only=args.only,
         limit=args.limit,
         task_ids=_parse_task_ids(args.task_ids),
+        cases_per_task=args.cases_per_task,
         concurrency=args.concurrency,
         max_iterations=args.max_iterations,
         task_timeout=args.task_timeout,
