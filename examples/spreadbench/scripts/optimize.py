@@ -112,6 +112,44 @@ def _build_summary_payload(
     return report_dict
 
 
+def _slug_lm(model: str | None) -> str:
+    """Short filesystem-safe slug for an LM model identifier.
+
+    ``openai/gpt-5.4-mini`` → ``gpt-5.4-mini``
+    ``gemini/gemini-3.0-flash`` → ``gemini-3.0-flash``
+    ``anthropic/claude-opus-4-6`` → ``claude-opus-4-6``
+    """
+    if not model:
+        return "unknown"
+    tail = model.split("/")[-1]
+    # Collapse any remaining filesystem-unfriendly characters.
+    return "".join(c if c.isalnum() or c in "._-" else "_" for c in tail)
+
+
+def _append_launch_history(run_dir: Path) -> None:
+    """Record this invocation in ``<run_dir>/launch_history.log``.
+
+    Each line:
+      ``<iso-timestamp>\\t<cwd>\\t<shlex-joined argv>``
+
+    Appending (rather than overwriting) preserves the full invocation
+    history across resumes — handy when a run was relaunched several
+    times with slightly different flags and you want to see which
+    configuration produced which iterations in the state bin.
+    """
+    try:
+        run_dir.mkdir(parents=True, exist_ok=True)
+        cmd = shlex.join([sys.executable, *sys.argv])
+        line = (
+            f"{datetime.now().isoformat(timespec='seconds')}\t"
+            f"{Path.cwd()}\t{cmd}\n"
+        )
+        with (run_dir / "launch_history.log").open("a") as f:
+            f.write(line)
+    except Exception:
+        pass  # best-effort; a missing log shouldn't block a real run
+
+
 def _resolve_run_dir_for_cli(config: OptimizeConfig) -> Path:
     """Resolve and pin ``config.run_dir`` before optimization starts."""
     if config.run_dir is not None:
@@ -120,7 +158,15 @@ def _resolve_run_dir_for_cli(config: OptimizeConfig) -> Path:
     runs_dir = example_dir / "runs"
     runs_dir.mkdir(parents=True, exist_ok=True)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    run_dir = runs_dir / f"optimize_{timestamp}"
+    # Encode the three LM roles into the directory name so a glance at
+    # runs/ tells you what model mix produced each artifact. The order
+    # matches the flag order: main LM, sub LM, reflection/proposer LM.
+    main_slug = _slug_lm(getattr(config, "lm", None))
+    sub_slug = _slug_lm(getattr(config, "sub_lm", None))
+    refl_slug = _slug_lm(getattr(config, "reflection_lm", None))
+    run_dir = runs_dir / (
+        f"optimize_{timestamp}_{main_slug}__sub-{sub_slug}__prop-{refl_slug}"
+    )
     config.run_dir = run_dir
     return run_dir
 
@@ -199,8 +245,9 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument(
         "--val_limit",
         type=int,
-        default=50,
-        help="cap val tasks during the GEPA inner loop (None = no cap)",
+        default=None,
+        help="cap val tasks during the GEPA inner loop (None = no cap, "
+        "use the full held-out val set; cap is still useful for smoke runs)",
     )
     p.add_argument(
         "--cases_per_task",
@@ -217,7 +264,14 @@ def _parse_args() -> argparse.Namespace:
         help="GEPA budget — total candidate evaluations (each evaluation = "
         "one minibatch eval)",
     )
-    p.add_argument("--minibatch_size", type=int, default=20)
+    p.add_argument(
+        "--minibatch_size",
+        type=int,
+        default=50,
+        help="minibatch size for GEPA's inner-loop reflection — each "
+        "iteration evaluates the new candidate on this many tasks "
+        "before gating against the parent's score",
+    )
     p.add_argument("--seed", type=int, default=42)
     p.add_argument(
         "--module_selector",
@@ -225,6 +279,14 @@ def _parse_args() -> argparse.Namespace:
         default="round_robin",
         help="which components GEPA updates per round: round_robin alternates "
         "sig and skill, all updates both every round (2x reflection cost)",
+    )
+
+    p.add_argument(
+        "--candidate_selection_strategy",
+        choices=["pareto", "current_best", "epsilon_greedy"],
+        default="pareto",
+        help="GEPA parent selection: pareto (diversity), current_best (exploit), "
+        "epsilon_greedy (90%% exploit / 10%% random)",
     )
 
     # Proposer
@@ -240,15 +302,41 @@ def _parse_args() -> argparse.Namespace:
         default=20,
         help="max iterations for the RLM proposer when --rlm_proposer is set",
     )
+    p.add_argument(
+        "--proposer_timeout",
+        type=int,
+        default=600,
+        help="wall-time timeout (seconds) for each proposer acall (default: 600)",
+    )
+    p.add_argument(
+        "--use_optimize_gen",
+        action="store_true",
+        help="use the generic skill-evolution proposer from "
+        "lib/optimize_gen.py (discovery-first: 4 rule shapes, signal "
+        "processing, 3-bucket trace pass) instead of the hardcoded "
+        "ImproveInstructions class. Requires --rlm_proposer.",
+    )
 
     # Eval-side budget (per task case)
     p.add_argument("--concurrency", type=int, default=30)
     p.add_argument("--max_iterations", type=int, default=50)
     p.add_argument("--task_timeout", type=int, default=300)
     p.add_argument(
-        "--no_cache",
+        "--with_cache",
         action="store_true",
-        help="disable dspy.LM caching",
+        help="enable dspy.LM's per-call response cache. Off by default — "
+        "cache hits return response.usage=0 which makes per-run cost "
+        "accounting lie; GEPA already stores candidate scores in "
+        "gepa_state.bin, so LM-call caching adds no value for resumes. "
+        "Opt in for dev iteration where you're repeating identical prompts.",
+    )
+    p.add_argument(
+        "--verbose_rlm",
+        action="store_true",
+        help="stream per-iteration reasoning/code/output from the eval-side "
+        "PredictRLM to stdout. Noisy with concurrency>1 since many cases "
+        "interleave, but useful for smoke runs. The same information is "
+        "always persisted to task_traces/evaluate_NNNN.jsonl regardless.",
     )
 
     # Run directory (resume support)
@@ -287,17 +375,22 @@ def main() -> int:
         minibatch_size=args.minibatch_size,
         seed=args.seed,
         module_selector=args.module_selector,
+        candidate_selection_strategy=args.candidate_selection_strategy,
         rlm_proposer=args.rlm_proposer,
         proposer_max_iterations=args.proposer_max_iterations,
+        proposer_timeout=args.proposer_timeout,
+        use_optimize_gen=args.use_optimize_gen,
         concurrency=args.concurrency,
         max_iterations=args.max_iterations,
         task_timeout=args.task_timeout,
-        cache=not args.no_cache,
+        cache=args.with_cache,
+        verbose_rlm=args.verbose_rlm,
         run_dir=Path(args.run_dir) if args.run_dir else None,
     )
 
     run_dir = _resolve_run_dir_for_cli(config)
     resume_argv = _build_resume_argv(run_dir, sys.argv[1:])
+    _append_launch_history(run_dir)
 
     try:
         report = run_optimization(config)

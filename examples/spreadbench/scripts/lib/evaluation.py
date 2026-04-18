@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import contextvars
+import json
 import logging
 import os
 import pickle
@@ -19,6 +20,7 @@ import tempfile
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 import dspy
 import nest_asyncio
@@ -104,6 +106,8 @@ class EvalConfig:
     only: str | None = None
     limit: int | None = None
     task_ids: tuple[str, ...] | None = None
+    cases_per_task: int = 0
+    """Cap on test cases per task (0 = all cases, matching the dataset loader default)."""
     concurrency: int = 30
     max_iterations: int = 50
     task_timeout: int = 300
@@ -170,6 +174,106 @@ def summarize_lm_cost(role: str, lm: dspy.LM) -> LMCost:
         completion_tokens=completion_tokens,
         cost_usd=cost,
     )
+
+
+def _write_eval_trace_event(
+    log_dir: Path,
+    task_results: list["TaskResult"],
+    total: int,
+) -> None:
+    """Append per-(role, model) JSONL rows summarising one eval run.
+
+    Reads ``run_trace`` attached to each CaseResult by ``_run_case`` and
+    sums the token/cost across all completed cases. Best-effort; any
+    failure is swallowed so the eval's main path is unaffected.
+    """
+    try:
+        from predict_rlm.trace import TokenUsage
+
+        main_usage = TokenUsage()
+        sub_usage = TokenUsage()
+        main_model = ""
+        sub_model: str | None = None
+        traces_seen = 0
+        for tr in task_results:
+            for c in tr.cases:
+                rt = getattr(c, "run_trace", None)
+                if rt is None:
+                    continue
+                traces_seen += 1
+                if not main_model:
+                    main_model = str(getattr(rt, "model", ""))
+                    sub_model = getattr(rt, "sub_model", None)
+                main_usage += rt.usage.main
+                if rt.usage.sub is not None:
+                    sub_usage += rt.usage.sub
+
+        if traces_seen == 0:
+            return
+
+        from datetime import datetime as _dt
+        ts = _dt.now().isoformat()
+        rows = []
+        if main_usage.input_tokens or main_usage.output_tokens:
+            rows.append({
+                "ts": ts, "event": "evaluate", "role": "main", "model": main_model,
+                "input_tokens": int(main_usage.input_tokens),
+                "output_tokens": int(main_usage.output_tokens),
+                "cost_usd": float(main_usage.cost),
+                "tasks": total, "traces_captured": traces_seen,
+            })
+        if sub_model and (sub_usage.input_tokens or sub_usage.output_tokens):
+            rows.append({
+                "ts": ts, "event": "evaluate", "role": "sub", "model": sub_model,
+                "input_tokens": int(sub_usage.input_tokens),
+                "output_tokens": int(sub_usage.output_tokens),
+                "cost_usd": float(sub_usage.cost),
+                "tasks": total, "traces_captured": traces_seen,
+            })
+
+        log_path = log_dir / "cost_log.jsonl"
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        with log_path.open("a") as f:
+            for row in rows:
+                f.write(json.dumps(row, default=str) + "\n")
+    except Exception:
+        pass  # best-effort observability
+
+
+def _dump_eval_task_traces(log_dir: Path, task_results: list["TaskResult"]) -> None:
+    """Write ``{log_dir}/task_traces.jsonl`` with one row per case.
+
+    Each row carries the full RunTrace (serialized via
+    ``to_exportable_json``) plus task_id / case_idx / score metadata so
+    the log is self-describing. Best-effort; swallows errors.
+    """
+    try:
+        out = log_dir / "task_traces.jsonl"
+        out.parent.mkdir(parents=True, exist_ok=True)
+        with out.open("w") as f:
+            for tr in task_results:
+                for c in tr.cases:
+                    rt = getattr(c, "run_trace", None)
+                    row: dict = {
+                        "task_id": tr.task_id,
+                        "case_idx": c.idx,
+                        "score": c.score,
+                        "passed": c.passed,
+                        "message": c.message,
+                        "recalc_source": c.recalc_source,
+                    }
+                    if rt is not None:
+                        try:
+                            row["trace"] = json.loads(
+                                rt.to_exportable_json(indent=0)
+                            )
+                        except Exception:
+                            row["trace"] = None
+                    else:
+                        row["trace"] = None
+                    f.write(json.dumps(row, default=str) + "\n")
+    except Exception:
+        pass  # best-effort observability
 
 
 @dataclass
@@ -261,6 +365,67 @@ def make_dynamic_signature(docstring: str) -> type[dspy.Signature]:
     return ManipulateSpreadsheet.with_instructions(docstring)
 
 
+def _build_instruction(
+    instruction: str,
+    answer_range: str,
+    answer_sheet: str,
+    instruction_type: str,
+) -> str:
+    if instruction_type == "Sheet-Level Manipulation":
+        pos_note = (
+            f"Answer position: {answer_range} on sheet '{answer_sheet}'. "
+            "This is the maximum range of cells you may modify. "
+            "You only need to modify or fill in values within this range."
+        )
+    else:
+        pos_note = (
+            f"Answer position: {answer_range} on sheet '{answer_sheet}'. "
+            "This is the cell position to be modified or filled. "
+            "You only need to modify or fill in values within this range."
+        )
+    return f"{instruction}\n\n{pos_note}"
+
+
+def parse_answer_position(
+    answer_position: str, input_path: str
+) -> tuple[str, str]:
+    """Split *answer_position* into ``(sheet_name, cell_range)``.
+
+    Mirrors the grader's parse logic in ``lib.scoring``:
+
+    * ``"'output'!A2:G15"`` → ``("output", "A2:G15")``
+    * ``"Sheet1'!A1:F14"``  → ``("Sheet1", "A1:F14")`` (handles a malformed
+      closing-only quote seen in ~19 tasks)
+    * ``"A3:D32"``          → first sheet of the input workbook + original
+      range
+    * ``"'OUT CAS'!A2:C10,'OUT CAS'!E2:G5"`` → first fragment's sheet, plus
+      the original multi-range string so the model sees every range
+
+    Falls back to ``"Sheet1"`` if the input workbook cannot be opened.
+    """
+    from openpyxl import load_workbook
+
+    has_comma = "," in answer_position
+    first_fragment = answer_position.split(",", 1)[0].strip()
+
+    if "!" in first_fragment:
+        sheet_part, range_part = first_fragment.split("!", 1)
+        sheet_name = sheet_part.strip().strip("'")
+        if has_comma:
+            return sheet_name, answer_position
+        return sheet_name, range_part.strip()
+
+    try:
+        wb = load_workbook(input_path, read_only=True)
+        try:
+            sheet_name = wb.sheetnames[0] if wb.sheetnames else "Sheet1"
+        finally:
+            wb.close()
+    except Exception:
+        sheet_name = "Sheet1"
+    return sheet_name, answer_position
+
+
 def make_dynamic_skill(instructions: str) -> Skill:
     """Return a copy of the LO spreadsheet skill with custom instructions.
 
@@ -345,6 +510,7 @@ async def _run_case(
         _current_log_file.set(log_file)
         log_file_str = str(log_file)
 
+    run_trace: Any = None
     async with sem:
         try:
             predictor = PredictRLM(
@@ -363,23 +529,30 @@ async def _run_case(
                 ),
                 timeout=config.task_timeout,
             )
+            run_trace = getattr(result, "trace", None)
             if not (
                 result
                 and result.output_spreadsheet
                 and result.output_spreadsheet.path
                 and os.path.exists(result.output_spreadsheet.path)
             ):
-                return CaseResult(idx, 0.0, False, "No output", log_file=log_file_str)
+                cr = CaseResult(idx, 0.0, False, "No output", log_file=log_file_str)
+                cr.run_trace = run_trace  # type: ignore[attr-defined]
+                return cr
             shutil.copy2(result.output_spreadsheet.path, output_path)
         except asyncio.TimeoutError:
-            return CaseResult(
+            cr = CaseResult(
                 idx, 0.0, False, f"Timeout ({config.task_timeout}s)",
                 log_file=log_file_str,
             )
+            cr.run_trace = None  # type: ignore[attr-defined]
+            return cr
         except Exception as e:
-            return CaseResult(
+            cr = CaseResult(
                 idx, 0.0, False, f"RLM error: {e}", log_file=log_file_str,
             )
+            cr.run_trace = getattr(e, "trace", None)  # type: ignore[attr-defined]
+            return cr
 
     recalc_source: str | None = None
     try:
@@ -389,10 +562,12 @@ async def _run_case(
         recalc_source = f"failed: {e}"
 
     if answer_path is None:
-        return CaseResult(
+        cr = CaseResult(
             idx, 0.0, False, "Answer file not found",
             recalc_source=recalc_source, log_file=log_file_str,
         )
+        cr.run_trace = run_trace  # type: ignore[attr-defined]
+        return cr
 
     try:
         ratio, msg = await asyncio.to_thread(
@@ -411,15 +586,19 @@ async def _run_case(
                     f"{'PASS' if ratio == 1.0 else 'FAIL'}\n"
                     f"{msg}\n"
                 )
-        return CaseResult(
+        cr = CaseResult(
             idx, ratio, ratio == 1.0, msg,
             recalc_source=recalc_source, log_file=log_file_str,
         )
+        cr.run_trace = run_trace  # type: ignore[attr-defined]
+        return cr
     except Exception as e:
-        return CaseResult(
+        cr = CaseResult(
             idx, 0.0, False, f"Comparison error: {e}",
             recalc_source=recalc_source, log_file=log_file_str,
         )
+        cr.run_trace = run_trace  # type: ignore[attr-defined]
+        return cr
 
 
 async def _run_tasks_async(
@@ -536,7 +715,7 @@ def run_evaluation(config: EvalConfig) -> EvalReport:
     print(f"Main LM: {config.lm}  (reasoning_effort={effort})")
     print(f"Sub LM:  {config.sub_lm}")
 
-    tasks = load_dataset(config.dataset, max_cases_per_task=0)
+    tasks = load_dataset(config.dataset, max_cases_per_task=config.cases_per_task)
     if config.task_ids:
         wanted = set(config.task_ids)
         tasks = [t for t in tasks if t.task_id in wanted]
@@ -576,6 +755,14 @@ def run_evaluation(config: EvalConfig) -> EvalReport:
         summarize_lm_cost("main", lm),
         summarize_lm_cost("sub", sub_lm),
     ]
+
+    # Append one JSONL event row per (role, model) to config.log_dir/cost_log.jsonl
+    # and dump full per-case RunTraces to config.log_dir/task_traces.jsonl. We
+    # pull usage straight from each PredictRLM's trace rather than re-aggregating
+    # from LM history.
+    if config.log_dir is not None:
+        _write_eval_trace_event(config.log_dir, results, total)
+        _dump_eval_task_traces(config.log_dir, results)
 
     return EvalReport(
         config=config,
