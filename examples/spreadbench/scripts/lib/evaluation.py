@@ -510,6 +510,13 @@ async def _run_case(
         _current_log_file.set(log_file)
         log_file_str = str(log_file)
 
+    answer_sheet, answer_range = await asyncio.to_thread(
+        parse_answer_position, task.answer_position, input_path
+    )
+    formatted_instruction = _build_instruction(
+        task.instruction, answer_range, answer_sheet, task.instruction_type
+    )
+
     run_trace: Any = None
     async with sem:
         try:
@@ -525,7 +532,7 @@ async def _run_case(
             result = await asyncio.wait_for(
                 predictor.acall(
                     input_spreadsheet=File(path=input_path),
-                    instruction=task.instruction,
+                    instruction=formatted_instruction,
                 ),
                 timeout=config.task_timeout,
             )
