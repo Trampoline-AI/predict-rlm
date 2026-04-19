@@ -40,6 +40,13 @@ SUB_LM: str = "openai/gpt-5.1"
 
 _MERCURY_MODEL = "openai/mercury-2"
 
+# Internal Qwen vLLM service. Served on the cluster's internal DNS;
+# only reachable when on VPN / in-cluster. ``enable_thinking=False``
+# disables Qwen 3.x's built-in reasoning mode so we measure the model
+# without its default chain-of-thought — matches how the forma-qwen
+# deployment is intended to be consumed by other services.
+_QWEN_CLUSTER_API_BASE = "http://trampoline-ai-forma-qwen-llm-svc:8000/v1"
+
 # Per-model price overrides as (input_usd_per_mtok, output_usd_per_mtok).
 # LiteLLM's cost map doesn't cover non-OpenAI/Anthropic providers like
 # Inception Labs, so any model listed here gets its cost recomputed from
@@ -77,6 +84,13 @@ def validate_lm_env(lm: str) -> None:
     """Raise if *lm* requires an API key env var that is missing."""
     if lm == _MERCURY_MODEL:
         _require_env("INCEPTION_API_KEY", lm)
+        return
+    if "Qwen" in lm:
+        # Qwen runs on the internal vLLM service with no real auth —
+        # ``api_key="unused"`` is set in get_lm_config. LiteLLM's env
+        # validator would flag OPENAI_API_KEY as missing because the
+        # model string has an ``openai/`` prefix, but the actual call
+        # routes to our cluster api_base, not api.openai.com.
         return
 
     check = litellm.validate_environment(model=lm)
@@ -128,6 +142,21 @@ def get_lm_config(
                 "api_base": "https://api.inceptionlabs.ai/v1",
                 "api_key": os.environ["INCEPTION_API_KEY"],
                 "extra_body": {"reasoning_effort": reasoning_effort or "instant"},
+            }
+        )
+    elif "Qwen" in lm:
+        # vLLM-served Qwen on the internal cluster. No real API key;
+        # vLLM ignores it but LiteLLM/OpenAI SDK require *some* value.
+        # Disable Qwen's default thinking mode via the provider's
+        # chat_template_kwargs so the model produces direct answers
+        # instead of the built-in <think>...</think> cot wrapper.
+        cfg.update(
+            {
+                "api_base": _QWEN_CLUSTER_API_BASE,
+                "api_key": "unused",
+                "extra_body": {
+                    "chat_template_kwargs": {"enable_thinking": False}
+                },
             }
         )
     elif reasoning_effort:

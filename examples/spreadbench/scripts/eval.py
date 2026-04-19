@@ -136,12 +136,58 @@ def _parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 
-def _resolve_output(path_arg: str | None) -> Path:
+def _slug_lm(model: str | None) -> str:
+    """Short filesystem-safe slug for an LM model identifier (matches
+    the convention in optimize.py::_slug_lm). Strips the ``provider/``
+    prefix and replaces any filesystem-unfriendly chars with ``_``.
+    """
+    if not model:
+        return "unknown"
+    tail = model.split("/", 1)[-1]
+    return "".join(c if c.isalnum() or c in "._-" else "_" for c in tail)
+
+
+def _resolve_output(
+    path_arg: str | None, args: argparse.Namespace | None = None
+) -> Path:
+    """Build the eval output JSON path.
+
+    When ``--output`` isn't given, encode the model mix into the
+    filename so a glance at ``runs/`` tells you what each eval
+    measured (effort tier, main LM, sub LM, source of evolved
+    skill). Matches the ``optimize_<ts>_<main>__sub-<sub>__prop-<refl>``
+    convention on the optimize side.
+    """
     if path_arg:
         return Path(path_arg)
     DEFAULT_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    return DEFAULT_OUTPUT_DIR / f"eval_{ts}.json"
+
+    if args is None:
+        return DEFAULT_OUTPUT_DIR / f"eval_{ts}.json"
+
+    # Match optimize.py's convention:
+    #   optimize_<ts>_<main>__sub-<sub>__prop-<refl>
+    # becomes, on the eval side:
+    #   eval_<ts>_<main>__eff-<effort>__sub-<sub>__sk-<opt-ts>
+    main_slug = _slug_lm(getattr(args, "lm", None))
+    head = f"eval_{ts}_{main_slug}"
+    tail_parts = []
+    effort = getattr(args, "reasoning_effort", None) or "none"
+    tail_parts.append(f"eff-{effort}")
+    sub = getattr(args, "sub_lm", None)
+    if sub:
+        tail_parts.append(f"sub-{_slug_lm(sub)}")
+    run_dir = getattr(args, "run_dir", None)
+    if run_dir:
+        rd_name = Path(run_dir).name
+        # Extract ``optimize_<YYYYMMDD_HHMMSS>`` prefix if present;
+        # fall back to the full name otherwise.
+        import re
+        m = re.match(r"optimize_(\d{8}_\d{6})", rd_name)
+        tail_parts.append(f"sk-{m.group(1) if m else _slug_lm(rd_name)}")
+    fname = head + ("__" + "__".join(tail_parts) if tail_parts else "") + ".json"
+    return DEFAULT_OUTPUT_DIR / fname
 
 
 def _resolve_log_dir(
@@ -168,7 +214,7 @@ def _parse_task_ids(raw: str | None) -> tuple[str, ...] | None:
 def main() -> int:
     args = _parse_args()
 
-    output_path = _resolve_output(args.output)
+    output_path = _resolve_output(args.output, args)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     log_dir = _resolve_log_dir(args.log_dir, output_path, args.no_logs)
 
