@@ -114,6 +114,15 @@ RUNNER_PATH = Path(__file__).parent / "sandbox" / "runner.js"
 # Exposed as a module-level knob so callers / tests can override.
 DENO_REQUEST_TIMEOUT_SEC: float = 30.0
 
+# Wall-clock budget for a single host-side tool call (recalculate, render,
+# predict, user-provided tools). Exceeding this returns an error value to
+# the sandbox rather than letting the overall ``_execute_with_timeout``
+# wall expire and kill the Deno subprocess. The contract is: tool errors
+# are RECOVERABLE (the RLM sees "[Error] tool timed out after …s" and
+# can rewrite its code), while sandbox death is NOT (mounts lost, etc).
+# Must be less than ``exec_timeout`` so the tool guard fires first.
+TOOL_CALL_TIMEOUT_SEC: float = 180.0
+
 
 def _needs_jspi_flag() -> bool:
     """Check if Deno's V8 needs --experimental-wasm-jspi.
@@ -1118,14 +1127,42 @@ class JspiInterpreter(PythonInterpreter):
                         if idx < len(args):
                             args[idx] = host_path
 
-            # Check if tool is async or sync
+            # Check if tool is async or sync. Wrap in a per-call wall-
+            # clock budget so a slow host tool (e.g. recalculate() on a
+            # whole-column formula → 2-3 min via LibreOffice) can't
+            # blow past the outer ``_exec_timeout`` ceiling. On
+            # timeout the guard converts the hang into a ``TimeoutError``
+            # which the ``except Exception`` handler below turns into
+            # a normal ``{"error": "tool timed out …"}`` response —
+            # routed back to the sandbox's ``await tool()`` as a
+            # recoverable error. Sandbox stays alive, RLM sees the
+            # error and can rewrite its code to avoid the slow path.
             if asyncio.iscoroutinefunction(tool_fn):
-                result = await tool_fn(*args, **kwargs)
+                try:
+                    result = await asyncio.wait_for(
+                        tool_fn(*args, **kwargs),
+                        timeout=TOOL_CALL_TIMEOUT_SEC,
+                    )
+                except asyncio.TimeoutError as e:
+                    raise TimeoutError(
+                        f"tool {tool_name!r} timed out after "
+                        f"{TOOL_CALL_TIMEOUT_SEC}s (per-call budget)"
+                    ) from e
             else:
                 loop = asyncio.get_running_loop()
-                result = await loop.run_in_executor(
-                    self._executor, functools.partial(tool_fn, *args, **kwargs)
-                )
+                try:
+                    result = await asyncio.wait_for(
+                        loop.run_in_executor(
+                            self._executor,
+                            functools.partial(tool_fn, *args, **kwargs),
+                        ),
+                        timeout=TOOL_CALL_TIMEOUT_SEC,
+                    )
+                except asyncio.TimeoutError as e:
+                    raise TimeoutError(
+                        f"tool {tool_name!r} timed out after "
+                        f"{TOOL_CALL_TIMEOUT_SEC}s (per-call budget)"
+                    ) from e
 
             # Mount modified files back into the sandbox (only for writeback params)
             if synced_entries:
