@@ -344,7 +344,12 @@ def test_send_request_deno_exit_detection():
 
 
 def test_send_request_response_id_mismatch():
-    """_send_request raises CodeInterpreterError on response ID mismatch."""
+    """_send_request raises CodeInterpreterError when no matching response
+    ever arrives. The resync loop discards mismatched-id frames (stale
+    responses from prior timed-out requests) and only raises after
+    exhausting its safety cap — ensuring that a runaway wrong-id stream
+    doesn't hang the caller forever.
+    """
     interpreter = JspiInterpreter(preinstall_packages=False)
     stdin = _BufferingStdin()
 
@@ -353,12 +358,13 @@ def test_send_request_response_id_mismatch():
     )
     interpreter._stdin_fd = -1
 
-    # Return a response with mismatched id
+    # Return a response with mismatched id forever — the resync cap
+    # ensures we bail instead of spinning.
     interpreter._read_with_timeout = lambda timeout=None: json.dumps(  # type: ignore[assignment]
         {"id": 9999, "result": {"output": "ok"}}
     )
 
-    with pytest.raises(CodeInterpreterError, match="Response ID mismatch"):
+    with pytest.raises(CodeInterpreterError, match="stale|resync"):
         interpreter._send_request("execute", {"code": "1+1"}, "during test")
 
 

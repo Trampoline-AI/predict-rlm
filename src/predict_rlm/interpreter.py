@@ -471,10 +471,20 @@ class JspiInterpreter(PythonInterpreter):
         )
         self._write_stdin(msg + "\n")
 
-        max_skip = 100
-        skipped = 0
-        while skipped <= max_skip:
-            response_line = self._read_with_timeout(timeout=DENO_REQUEST_TIMEOUT_SEC)
+        # Resync loop: after a timed-out ``_send_request`` (the
+        # DENO_REQUEST_TIMEOUT_SEC fix), deno may still eventually
+        # deliver its response, leaving a stale JSON-RPC frame buffered
+        # in stdout. The NEXT request would read THAT frame first and
+        # see an old id. Instead of raising (which sends the RLM into
+        # an infinite "retry the same code" loop because the model
+        # thinks the mismatch is a code-format bug), discard any
+        # stale-id responses until we find one that matches or hit the
+        # safety cap.
+        max_stale_discards = 50
+        for _attempt in range(max_stale_discards + 1):
+            response_line = self._read_with_timeout(
+                timeout=DENO_REQUEST_TIMEOUT_SEC
+            )
             if not response_line:
                 exit_code = self.deno_process.poll()
                 if exit_code is not None:
@@ -485,26 +495,32 @@ class JspiInterpreter(PythonInterpreter):
                 raise CodeInterpreterError(f"No response {context}")
 
             if not response_line.startswith("{"):
-                skipped += 1
                 continue
 
             try:
                 response = json.loads(response_line)
             except json.JSONDecodeError:
-                skipped += 1
                 continue
 
-            if response.get("id") != request_id:
-                raise CodeInterpreterError(
-                    f"Response ID mismatch {context}: expected {request_id}, got {response.get('id')}"
-                )
-            if "error" in response:
-                raise CodeInterpreterError(
-                    f"Error {context}: {response['error'].get('message', 'Unknown error')}"
-                )
-            return response
+            resp_id = response.get("id")
+            if resp_id == request_id:
+                break
+            logger.warning(
+                "Discarding stale deno response (id=%s, expected %s) "
+                "in %s — likely a prior request's late arrival",
+                resp_id, request_id, context,
+            )
+        else:
+            raise CodeInterpreterError(
+                f"Too many stale responses in {context}: couldn't resync to "
+                f"id={request_id} after {max_stale_discards} discards"
+            )
 
-        raise CodeInterpreterError(f"Too many non-JSON lines ({skipped}) {context}")
+        if "error" in response:
+            raise CodeInterpreterError(
+                f"Error {context}: {response['error'].get('message', 'Unknown error')}"
+            )
+        return response
 
     def _get_deno_dir(self) -> list[str]:
         """Get Deno cache directory paths (may have multiple on different platforms)."""
