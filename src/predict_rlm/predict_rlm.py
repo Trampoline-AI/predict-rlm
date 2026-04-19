@@ -1121,7 +1121,8 @@ class PredictRLM(dspy.RLM):
                 f"Reasoning: {pred.reasoning}\nCode:\n{pred.code}"
             )
 
-        code = _strip_code_fences(pred.code)
+        code = pred.code or ""
+        code = _strip_code_fences(code)
 
         # Capture reasoning+code BEFORE executing so a mid-execution
         # cancellation still leaves this iteration visible in the partial
@@ -1133,6 +1134,7 @@ class PredictRLM(dspy.RLM):
             code=code,
             output="",
         )
+
         try:
             if hasattr(repl, "aexecute"):
                 result = await repl.aexecute(code, variables=dict(input_args))
