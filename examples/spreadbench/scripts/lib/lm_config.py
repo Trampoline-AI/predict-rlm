@@ -147,15 +147,24 @@ def get_lm_config(
     elif "Qwen" in lm:
         # vLLM-served Qwen on the internal cluster. No real API key;
         # vLLM ignores it but LiteLLM/OpenAI SDK require *some* value.
-        # Disable Qwen's default thinking mode via the provider's
-        # chat_template_kwargs so the model produces direct answers
-        # instead of the built-in <think>...</think> cot wrapper.
+        # Qwen 3.x exposes a boolean ``enable_thinking`` (its built-in
+        # <think>...</think> cot wrapper) rather than LiteLLM's tiered
+        # ``reasoning_effort``. Map the harness's existing effort flag
+        # to this boolean: ``none``/unset → thinking OFF (direct
+        # answer), any other effort value → thinking ON. Keeps the
+        # CLI consistent across providers without inventing a
+        # Qwen-specific flag.
+        enable_thinking = bool(reasoning_effort) and str(
+            reasoning_effort
+        ).strip().lower() not in ("", "none")
         cfg.update(
             {
                 "api_base": _QWEN_CLUSTER_API_BASE,
                 "api_key": "unused",
                 "extra_body": {
-                    "chat_template_kwargs": {"enable_thinking": False}
+                    "chat_template_kwargs": {
+                        "enable_thinking": enable_thinking
+                    }
                 },
             }
         )
