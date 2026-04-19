@@ -129,6 +129,15 @@ def _parse_args() -> argparse.Namespace:
         help="disable per-case RLM logging (logs are on by default)",
     )
     p.add_argument(
+        "--verbose_rlm",
+        action="store_true",
+        help="stream per-iteration reasoning/code/output from PredictRLM "
+        "to stdout in addition to the per-case log file. Noisy with "
+        "concurrency>1 since many cases interleave, but useful for "
+        "smoke runs. The same information is always persisted to the "
+        "per-case case_1.log regardless.",
+    )
+    p.add_argument(
         "--no_cache",
         action="store_true",
         help="disable dspy.LM caching (useful when re-running the same prompt)",
@@ -217,6 +226,28 @@ def main() -> int:
     output_path = _resolve_output(args.output, args)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     log_dir = _resolve_log_dir(args.log_dir, output_path, args.no_logs)
+
+    # Optional stdout stream of per-iteration reasoning/code/output.
+    # Per-case logs always capture this info; --verbose_rlm additionally
+    # fans it out to stdout so you can follow the RLM live while a run
+    # is executing. Concurrency>1 causes interleaving; read at your own
+    # peril for smoke runs with concurrency=1.
+    if args.verbose_rlm:
+        import logging as _logging
+        import sys as _sys
+
+        rlm_logger = _logging.getLogger("dspy.predict.rlm")
+        rlm_logger.setLevel(_logging.INFO)
+        # Avoid duplicate handlers if main() is called twice (e.g. tests).
+        if not any(
+            isinstance(h, _logging.StreamHandler)
+            and getattr(h, "stream", None) is _sys.stdout
+            for h in rlm_logger.handlers
+        ):
+            h = _logging.StreamHandler(_sys.stdout)
+            h.setLevel(_logging.INFO)
+            h.setFormatter(_logging.Formatter("%(asctime)s %(message)s"))
+            rlm_logger.addHandler(h)
 
     effort = args.reasoning_effort
     if effort and effort.strip().lower() == "none":
