@@ -207,7 +207,7 @@ class JspiInterpreter(PythonInterpreter):
         extra_write_paths: list[PathLike | str] | None = None,
         enable_env_vars: list[str] | None = None,
         sync_files: bool = True,
-        exec_timeout: float = 120.0,
+        exec_timeout: float = 300.0,
     ) -> None:
         """Initialize interpreter with JSPI and concurrent tool support.
 
@@ -238,10 +238,16 @@ class JspiInterpreter(PythonInterpreter):
             sync_files: Whether to sync file changes back to host.
             exec_timeout: Wall-clock seconds to allow for a single REPL
                          execute call before killing the sandbox subprocess.
-                         Defaults to 120s. Guards against pathological code
-                         in the sandbox (e.g. regex catastrophic backtracking)
-                         that would otherwise spin indefinitely with no
-                         LM-call progress visible to the host.
+                         Defaults to 300s. Must exceed the slowest expected
+                         host-side tool call: e.g. ``recalculate()`` on a
+                         workbook with whole-column formulas can take 2-3
+                         minutes via LibreOffice. When this fires it also
+                         tears down the Deno subprocess (mounts are lost —
+                         the interpreter can't be reused), so the value
+                         should be generous; the guard is only meant to
+                         catch genuinely pathological code (regex
+                         catastrophic backtracking, infinite loops, or a
+                         host tool that never returns).
         """
         # Merge default domains with user-provided domains
         network_access = list(DEFAULT_ALLOWED_DOMAINS) if preinstall_packages else []
