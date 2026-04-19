@@ -64,6 +64,16 @@ def _parse_args() -> argparse.Namespace:
     )
     p.add_argument("--sub_lm", default=SUB_LM, help="sub LM for predict() calls")
     p.add_argument(
+        "--thinking_budget",
+        type=int,
+        default=None,
+        help="explicit thinking-token budget for the main LM (e.g. 0 to "
+        "attempt disabling reasoning). Passed through to LiteLLM's "
+        "``thinking_budget`` kwarg; for Gemini 3 non-flash models this "
+        "maps to the minimum tier rather than fully off. Overrides the "
+        "``--reasoning_effort`` → budget mapping when set.",
+    )
+    p.add_argument(
         "--dataset",
         default="testset",
         help="dataset folder under data/ (e.g. testset, trainset)",
@@ -170,6 +180,7 @@ def main() -> int:
         lm=args.lm,
         sub_lm=args.sub_lm,
         reasoning_effort=effort or None,
+        thinking_budget=args.thinking_budget,
         dataset=args.dataset,
         run_dir=args.run_dir,
         only=args.only,

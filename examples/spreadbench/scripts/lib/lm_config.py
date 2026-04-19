@@ -91,7 +91,11 @@ def validate_lm_env(lm: str) -> None:
     raise RuntimeError(f"{lm} is missing required provider environment configuration.")
 
 
-def get_lm_config(lm: str, reasoning_effort: str | None = None) -> dict:
+def get_lm_config(
+    lm: str,
+    reasoning_effort: str | None = None,
+    thinking_budget: int | None = None,
+) -> dict:
     """Return the kwargs for ``dspy.LM(**kwargs)``.
 
     Args:
@@ -102,6 +106,13 @@ def get_lm_config(lm: str, reasoning_effort: str | None = None) -> dict:
             ``extra_body.reasoning_effort`` field and defaults to
             ``"instant"`` when omitted. For every other provider it's
             applied as a top-level kwarg only when explicitly set.
+        thinking_budget: Optional explicit token budget for the reasoning
+            phase. Passed through to LiteLLM's ``thinking_budget`` kwarg,
+            which gemini's wrapper translates into the provider-native
+            ``thinkingConfig.thinkingBudget`` field. ``0`` disables
+            thinking where the model supports it (Gemini 3 non-flash
+            cannot fully disable but maps 0 to the minimum tier).
+            Overrides ``reasoning_effort`` when both are set.
 
     Raises:
         RuntimeError: if an API key env var required by ``lm`` is missing.
@@ -121,6 +132,9 @@ def get_lm_config(lm: str, reasoning_effort: str | None = None) -> dict:
         )
     elif reasoning_effort:
         cfg["reasoning_effort"] = reasoning_effort
+
+    if thinking_budget is not None:
+        cfg["thinking_budget"] = thinking_budget
 
     return cfg
 
