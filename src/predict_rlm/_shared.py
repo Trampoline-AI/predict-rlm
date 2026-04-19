@@ -143,7 +143,10 @@ def build_rlm_signatures(
     )
     action_sig = action_sig.append(
         "code",
-        dspy.OutputField(desc="Python code wrapped in ```python blocks."),
+        dspy.OutputField(
+            desc="Python code wrapped in ```repl blocks.",
+            min_length=1,
+        ),
         type_=str,
     )
 
