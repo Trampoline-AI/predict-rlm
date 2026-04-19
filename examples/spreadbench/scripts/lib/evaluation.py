@@ -96,6 +96,7 @@ class EvalConfig:
     lm: str = "openai/gpt-5.4"
     sub_lm: str = SUB_LM
     reasoning_effort: str | None = "low"
+    thinking_budget: int | None = None
     dataset: str = "testset"
     run_dir: str | None = None
     # When `run_dir` is set, by default both evolved components (signature
@@ -717,7 +718,11 @@ def run_evaluation(config: EvalConfig) -> EvalReport:
     sig_cls = make_dynamic_signature(sig_text)
     skill = make_dynamic_skill(skill_text)
 
-    lm_cfg = get_lm_config(config.lm, config.reasoning_effort)
+    lm_cfg = get_lm_config(
+        config.lm,
+        config.reasoning_effort,
+        thinking_budget=config.thinking_budget,
+    )
     sub_lm_cfg = get_sub_lm_config(config.sub_lm)
     lm = dspy.LM(**lm_cfg, cache=config.cache)
     sub_lm = dspy.LM(**sub_lm_cfg, cache=config.cache)
