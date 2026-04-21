@@ -60,6 +60,7 @@ from .dataset import SpreadsheetTask, load_dataset
 from .evaluation import (
     LMCost,
     _build_instruction,
+    aggregate_costs_from_log,
     make_dynamic_signature,
     make_dynamic_skill,
     parse_answer_position,
@@ -860,6 +861,8 @@ class SpreadsheetAdapter:
         sub_usage: Any,
         main_role: str,
         sub_role: str,
+        main_calls: int = 0,
+        sub_calls: int = 0,
         **extra: Any,
     ) -> None:
         """Append one JSONL row per nonzero (role, model) from a RunTrace.
@@ -868,6 +871,12 @@ class SpreadsheetAdapter:
         objects (attributes: input_tokens, output_tokens, cost). The shape
         mirrors :class:`predict_rlm.trace.RunTrace.usage`; we just flatten
         it into per-role rows with an event label.
+
+        ``main_calls`` / ``sub_calls`` are the true LM-call counts for
+        this event (one main call per RLM iteration; one sub call per
+        ``predict()`` invocation including parallel fan-outs). Emitted
+        as a ``calls`` field on each row so end-of-run summaries can
+        report real call counts instead of event counts.
         """
         if self.cost_log_path is None:
             return
@@ -885,6 +894,7 @@ class SpreadsheetAdapter:
                         "event": event,
                         "role": main_role,
                         "model": main_model,
+                        "calls": int(main_calls),
                         "input_tokens": int(main_usage.input_tokens),
                         "output_tokens": int(main_usage.output_tokens),
                         "cost_usd": float(main_usage.cost),
@@ -903,6 +913,7 @@ class SpreadsheetAdapter:
                         "event": event,
                         "role": sub_role,
                         "model": sub_model,
+                        "calls": int(sub_calls),
                         "input_tokens": int(sub_usage.input_tokens),
                         "output_tokens": int(sub_usage.output_tokens),
                         "cost_usd": float(sub_usage.cost),
@@ -948,6 +959,8 @@ class SpreadsheetAdapter:
         sub_usage = None
         main_model = ""
         sub_model: str | None = None
+        err_main_calls = 0
+        err_sub_calls = 0
         if trace_obj is not None:
             try:
                 run_trace_json = json.loads(trace_obj.to_exportable_json(indent=0))
@@ -957,6 +970,14 @@ class SpreadsheetAdapter:
             sub_usage = getattr(getattr(trace_obj, "usage", None), "sub", None)
             main_model = str(getattr(trace_obj, "model", ""))
             sub_model = getattr(trace_obj, "sub_model", None)
+            (
+                _em_usage,
+                _es_usage,
+                _em_model,
+                _es_model,
+                err_main_calls,
+                err_sub_calls,
+            ) = self._sum_traces([trace_obj])
 
         # Emit the cost_log event first — cheap and gives us at-a-glance
         # visibility even if the file write fails for some reason.
@@ -968,6 +989,8 @@ class SpreadsheetAdapter:
             sub_usage=sub_usage,
             main_role="proposer",
             sub_role="proposer_sub",
+            main_calls=err_main_calls,
+            sub_calls=err_sub_calls,
             component=component_name,
             proposer_call_idx=call_idx,
             error=str(exc),
@@ -999,12 +1022,28 @@ class SpreadsheetAdapter:
             log.debug("proposer error-trace persist failed: %s", e)
 
     @staticmethod
-    def _sum_traces(traces: list[Any]) -> tuple[Any, Any, str, str | None]:
-        """Sum usage across multiple RunTraces. Returns (main, sub, main_model, sub_model).
+    def _sum_traces(
+        traces: list[Any],
+    ) -> tuple[Any, Any, str, str | None, int, int]:
+        """Sum usage across multiple RunTraces. Returns
+        (main_usage, sub_usage, main_model, sub_model, main_calls, sub_calls).
 
         Models are taken from the first non-empty trace — they should all
         match within a single evaluate() call since the adapter uses the
         same ``self.lm`` / ``self.sub_lm`` for every task.
+
+        Call counts are computed from the trace structure:
+          - ``main_calls`` = sum(len(t.steps)) across traces. Each step
+            is one main-LM action call. Extract calls are not counted
+            (they don't appear in ``steps``); use this as a floor on
+            main-LM usage, which is close enough at RLM scale.
+          - ``sub_calls`` = sum of ``len(group.calls)`` across every
+            ``predict_calls`` group in every step. This is the exact
+            number of sub-LM predict() invocations, including
+            concurrent fan-outs from one iteration.
+
+        ``RunTrace.iterations`` is the scalar count (int); the list of
+        steps is ``RunTrace.steps`` — don't conflate them.
         """
         from predict_rlm.trace import TokenUsage
 
@@ -1012,6 +1051,8 @@ class SpreadsheetAdapter:
         sub = TokenUsage()
         main_model = ""
         sub_model: str | None = None
+        main_calls = 0
+        sub_calls = 0
         for t in traces:
             if t is None:
                 continue
@@ -1021,7 +1062,13 @@ class SpreadsheetAdapter:
             main += t.usage.main
             if t.usage.sub is not None:
                 sub += t.usage.sub
-        return main, sub if sub.input_tokens or sub.output_tokens else None, main_model, sub_model
+            steps = getattr(t, "steps", None) or []
+            main_calls += len(steps)
+            for step in steps:
+                for group in getattr(step, "predict_calls", None) or []:
+                    sub_calls += len(getattr(group, "calls", None) or [])
+        sub_usage = sub if sub.input_tokens or sub.output_tokens else None
+        return main, sub_usage, main_model, sub_model, main_calls, sub_calls
 
     def _write_case_trace_row(
         self,
@@ -1233,7 +1280,14 @@ class SpreadsheetAdapter:
                 rt = c.get("run_trace")
                 if rt is not None:
                     all_traces.append(rt)
-        main_usage, sub_usage, main_model, sub_model = self._sum_traces(all_traces)
+        (
+            main_usage,
+            sub_usage,
+            main_model,
+            sub_model,
+            main_calls,
+            sub_calls,
+        ) = self._sum_traces(all_traces)
         if eval_kind == "minibatch":
             self._minibatch_count += 1
         else:
@@ -1246,6 +1300,8 @@ class SpreadsheetAdapter:
             sub_usage=sub_usage,
             main_role="main",
             sub_role="sub",
+            main_calls=main_calls,
+            sub_calls=sub_calls,
             evaluate_idx=eval_idx,
             kind=eval_kind,
             cases=sum(len(cr) for _, cr in task_results),
@@ -1950,6 +2006,14 @@ class SpreadsheetAdapter:
             # the proposer's PredictRLM attached to its Prediction.
             proposer_trace = getattr(result, "trace", None)
             if proposer_trace is not None:
+                (
+                    _pm_usage,
+                    _ps_usage,
+                    _pm_model,
+                    _ps_model,
+                    proposer_main_calls,
+                    proposer_sub_calls,
+                ) = self._sum_traces([proposer_trace])
                 self._write_trace_event(
                     "proposer_call",
                     main_model=str(getattr(proposer_trace, "model", "")),
@@ -1958,6 +2022,8 @@ class SpreadsheetAdapter:
                     sub_usage=proposer_trace.usage.sub,
                     main_role="proposer",
                     sub_role="proposer_sub",
+                    main_calls=proposer_main_calls,
+                    sub_calls=proposer_sub_calls,
                     component=component_name,
                     proposer_call_idx=call_idx,
                     iterations=proposer_trace.iterations,
@@ -2259,16 +2325,26 @@ def run_optimization(config: OptimizeConfig) -> OptimizeReport:
     elapsed = time.time() - t0
 
     # --- Costs --------------------------------------------------------------
-    costs = [
-        summarize_lm_cost("main", lm),
-        summarize_lm_cost("sub", sub_lm),
-        summarize_lm_cost(
-            "proposer" if config.rlm_proposer else "reflection",
-            reflection_lm_instance,
-        ),
-    ]
-    if proposer_sub_lm is not None:
-        costs.append(summarize_lm_cost("proposer_sub", proposer_sub_lm))
+    # GEPA's use_cloudpickle=True forks candidate-eval workers that have
+    # their own dspy.LM copies; their call history never flows back to
+    # the parent's lm / sub_lm / reflection_lm_instance objects. The
+    # adapter already writes a per-evaluate JSONL event log to
+    # cost_log.jsonl via the shared filesystem (fork-safe), so the
+    # end-of-run cost summary reads from there. We only fall back to
+    # summarize_lm_cost(lm.history) if the log is missing or empty —
+    # which only happens on a trivially short run where the adapter
+    # wrote nothing but the startup sentinel.
+    proposer_role = "proposer" if config.rlm_proposer else "reflection"
+    role_order = ["main", "sub", proposer_role, "proposer_sub"]
+    costs = aggregate_costs_from_log(run_dir / "cost_log.jsonl", role_order=role_order)
+    if not costs:
+        costs = [
+            summarize_lm_cost("main", lm),
+            summarize_lm_cost("sub", sub_lm),
+            summarize_lm_cost(proposer_role, reflection_lm_instance),
+        ]
+        if proposer_sub_lm is not None:
+            costs.append(summarize_lm_cost("proposer_sub", proposer_sub_lm))
 
     best_idx = result.best_idx
     best_candidate = result.candidates[best_idx]

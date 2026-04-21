@@ -451,28 +451,61 @@ def main() -> int:
     print(f"Best val score:    {report.best_val_score:.4f}  (idx={report.best_idx})")
     print()
     print("Costs:")
+
+    # Role-to-aggregate mapping — keep in sync with the report's
+    # rollout_cost_usd / optimization_cost_usd computation so the
+    # per-row sums match the summary totals.
+    _ROLLOUT_ROLES = {"main", "sub"}
+    _OPTIMIZE_ROLES = {"proposer", "proposer_sub", "reflection"}
+
+    def _sum_rows(rows, keys, field):
+        return sum(getattr(r, field) for r in rows if r.role in keys)
+
+    rollout_calls = _sum_rows(report.costs, _ROLLOUT_ROLES, "calls")
+    rollout_in = _sum_rows(report.costs, _ROLLOUT_ROLES, "prompt_tokens")
+    rollout_out = _sum_rows(report.costs, _ROLLOUT_ROLES, "completion_tokens")
+    optimize_calls = _sum_rows(report.costs, _OPTIMIZE_ROLES, "calls")
+    optimize_in = _sum_rows(report.costs, _OPTIMIZE_ROLES, "prompt_tokens")
+    optimize_out = _sum_rows(report.costs, _OPTIMIZE_ROLES, "completion_tokens")
+    total_calls = sum(c.calls for c in report.costs)
+    total_in = sum(c.prompt_tokens for c in report.costs)
+    total_out = sum(c.completion_tokens for c in report.costs)
+
+    cum_rows = summary_payload.get("cumulative_costs") or []
+    cum_calls = sum(int(r.get("calls") or 0) for r in cum_rows)
+    cum_in = sum(int(r.get("prompt_tokens") or 0) for r in cum_rows)
+    cum_out = sum(int(r.get("completion_tokens") or 0) for r in cum_rows)
+
     for c in report.costs:
         print(
-            f"  {c.role:<10s} {c.model:<32s} "
-            f"{c.calls:>5d} calls  "
-            f"{c.prompt_tokens:>11,d} in / {c.completion_tokens:>10,d} out  "
-            f"${c.cost_usd:>9.4f}"
+            f"  {c.role:<12s} {c.model:<32s} "
+            f"{c.calls:>6,d} calls  "
+            f"{c.prompt_tokens:>13,d} in / {c.completion_tokens:>12,d} out  "
+            f"${c.cost_usd:>10.4f}"
         )
     print(
-        f"  {'rollouts':<10s} {'':<32s} {'':<5s}         "
-        f"{'':<27s}  ${report.rollout_cost_usd:>9.4f}"
+        f"  {'rollouts':<12s} {'':<32s} "
+        f"{rollout_calls:>6,d} calls  "
+        f"{rollout_in:>13,d} in / {rollout_out:>12,d} out  "
+        f"${report.rollout_cost_usd:>10.4f}"
     )
     print(
-        f"  {'optimize':<10s} {'':<32s} {'':<5s}         "
-        f"{'':<27s}  ${report.optimization_cost_usd:>9.4f}"
+        f"  {'optimize':<12s} {'':<32s} "
+        f"{optimize_calls:>6,d} calls  "
+        f"{optimize_in:>13,d} in / {optimize_out:>12,d} out  "
+        f"${report.optimization_cost_usd:>10.4f}"
     )
     print(
-        f"  {'total':<10s} {'':<32s} {'':<5s}         "
-        f"{'':<27s}  ${report.total_cost_usd:>9.4f}"
+        f"  {'total':<12s} {'':<32s} "
+        f"{total_calls:>6,d} calls  "
+        f"{total_in:>13,d} in / {total_out:>12,d} out  "
+        f"${report.total_cost_usd:>10.4f}"
     )
     print(
-        f"  {'cum_total':<10s} {'':<32s} {'':<5s}         "
-        f"{'':<27s}  ${summary_payload['cumulative_total_cost_usd']:>9.4f}"
+        f"  {'cum_total':<12s} {'':<32s} "
+        f"{cum_calls:>6,d} calls  "
+        f"{cum_in:>13,d} in / {cum_out:>12,d} out  "
+        f"${summary_payload['cumulative_total_cost_usd']:>10.4f}"
     )
     print()
     print("Best candidate written:")
