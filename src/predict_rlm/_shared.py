@@ -143,6 +143,11 @@ def build_rlm_signatures(
     )
     action_sig = action_sig.append(
         "code",
+        # ``min_length=1`` gives PredictRLM's validating adapter a concrete
+        # client-side constraint to enforce after parsing. A ChatAdapter
+        # validation failure triggers the JSONAdapter fallback; if the
+        # fallback also returns null/empty code, the adapter raises instead of
+        # constructing a Prediction with ``pred.code=None``.
         dspy.OutputField(
             desc="Python code wrapped in ```repl blocks.",
             min_length=1,
