@@ -226,17 +226,29 @@ def _parse_args() -> argparse.Namespace:
     # Reflection / proposer LM
     p.add_argument(
         "--reflection_lm",
-        default="anthropic/claude-opus-4-6",
+        default="openai/gpt-5.4",
         help="reflection LM (also used as the SURGICAL RLM proposer's main LM "
         "when --rlm_proposer is set)",
     )
     p.add_argument(
         "--reflection_reasoning_effort",
-        default=None,
-        help="reasoning effort for the reflection LM. Default: unset (no "
-        "extended thinking — matches the sibling repo's validated config). "
-        "On Claude 4.6 any non-empty value maps to adaptive thinking, which "
-        "increases cost ~2-3x on the proposer.",
+        default="medium",
+        help="reasoning effort for the reflection LM (e.g. low, medium, high). "
+        "Pass '' or 'none' to omit. On Claude 4.6 any non-empty value maps to "
+        "adaptive thinking, which increases proposer cost ~2-3x.",
+    )
+    p.add_argument(
+        "--proposer_sub_lm",
+        default="openai/gpt-5.4",
+        help="sub LM for the RLM proposer's predict() calls when "
+        "--rlm_proposer is set. Independent of --sub_lm (which is the "
+        "executor's sub LM). Used only when --rlm_proposer is on.",
+    )
+    p.add_argument(
+        "--proposer_sub_lm_reasoning_effort",
+        default="medium",
+        help="reasoning effort for the proposer's sub LM. Pass '' or 'none' "
+        "to omit. Used only when --rlm_proposer is on.",
     )
 
     # Datasets
@@ -377,6 +389,10 @@ def main() -> int:
         reasoning_effort=_normalize_effort(args.reasoning_effort),
         reflection_lm=args.reflection_lm,
         reflection_reasoning_effort=_normalize_effort(args.reflection_reasoning_effort),
+        proposer_sub_lm=args.proposer_sub_lm,
+        proposer_sub_lm_reasoning_effort=_normalize_effort(
+            args.proposer_sub_lm_reasoning_effort
+        ),
         train_dataset=args.train_dataset,
         val_ratio=args.val_ratio,
         val_limit=args.val_limit,

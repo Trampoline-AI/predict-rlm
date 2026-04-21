@@ -506,11 +506,21 @@ class OptimizeConfig:
     reasoning_effort: str | None = "low"
 
     # Reflection / proposer LM
-    reflection_lm: str = "anthropic/claude-opus-4-6"
-    # Default unset (no extended thinking). On Claude 4.6 any non-empty
-    # value maps to adaptive thinking via LiteLLM, which meaningfully
-    # raises proposer cost. The sibling repo's validated run used None.
-    reflection_reasoning_effort: str | None = None
+    reflection_lm: str = "openai/gpt-5.4"
+    # gpt-5.4 at medium effort is the default proposer: strong enough to
+    # reason about replicated failure patterns across traces, cheap
+    # enough to stay well inside GEPA's "executor cost dominates"
+    # economics.
+    reflection_reasoning_effort: str | None = "medium"
+
+    # RLM proposer's own sub LM (for its predict() calls). Independent
+    # of ``sub_lm`` (which is the executor's sub LM). Used only when
+    # ``rlm_proposer`` is True. Defaulting to gpt-5.4 medium matches
+    # the reflection LM — classification / clustering over trace
+    # excerpts benefits from reasoning capacity the executor sub LM
+    # doesn't need.
+    proposer_sub_lm: str = "openai/gpt-5.4"
+    proposer_sub_lm_reasoning_effort: str | None = "medium"
 
     # Datasets
     train_dataset: str = "trainset"
@@ -2012,6 +2022,71 @@ def _resolve_run_dir(config: OptimizeConfig) -> Path:
     return runs_dir / f"optimize_{timestamp}"
 
 
+def _extract_reflection_lm_text(value: Any, *, join_lists: bool = False) -> str | None:
+    """Extract assistant text from the response shapes DSPy/LiteLLM can return."""
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace")
+
+    if isinstance(value, Mapping):
+        for key in ("output_text", "text", "completion"):
+            if key in value:
+                text = _extract_reflection_lm_text(value[key], join_lists=True)
+                if text is not None:
+                    return text
+
+        for key in ("message", "delta", "response"):
+            if key in value:
+                text = _extract_reflection_lm_text(value[key])
+                if text is not None:
+                    return text
+
+        for key, nested_join in (
+            ("content", True),
+            ("output", True),
+            ("choices", False),
+        ):
+            if key in value:
+                text = _extract_reflection_lm_text(
+                    value[key], join_lists=nested_join
+                )
+                if text is not None:
+                    return text
+        return None
+
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+        texts: list[str] = []
+        for item in value:
+            text = _extract_reflection_lm_text(item, join_lists=True)
+            if text:
+                texts.append(text)
+        if texts:
+            return "\n".join(texts) if join_lists else texts[0]
+        return "" if not value else None
+
+    for attr in ("output_text", "text", "content", "message"):
+        if hasattr(value, attr):
+            text = _extract_reflection_lm_text(getattr(value, attr), join_lists=True)
+            if text is not None:
+                return text
+
+    return None
+
+
+def _coerce_reflection_lm_text(value: Any) -> str:
+    text = _extract_reflection_lm_text(value)
+    if text is not None:
+        return text
+
+    detail = type(value).__name__
+    if isinstance(value, Mapping):
+        detail += f" keys={sorted(str(k) for k in value.keys())}"
+    raise TypeError(f"Reflection LM returned non-text response ({detail})")
+
+
 def run_optimization(config: OptimizeConfig) -> OptimizeReport:
     """Run GEPA multi-component optimization described by *config*.
 
@@ -2061,7 +2136,7 @@ def run_optimization(config: OptimizeConfig) -> OptimizeReport:
     )
 
     def reflection_lm_call(prompt: str) -> str:
-        return reflection_lm_instance(prompt)[0]
+        return _coerce_reflection_lm_text(reflection_lm_instance(prompt))
 
     reflect_effort = (
         config.reflection_reasoning_effort
@@ -2077,8 +2152,20 @@ def run_optimization(config: OptimizeConfig) -> OptimizeReport:
     proposer_sub_lm: dspy.LM | None = None
     if config.rlm_proposer:
         proposer_sub_lm = dspy.LM(
-            **get_sub_lm_config(config.sub_lm),
+            **get_lm_config(
+                config.proposer_sub_lm,
+                reasoning_effort=config.proposer_sub_lm_reasoning_effort,
+            ),
             cache=config.cache,
+        )
+        proposer_sub_effort = (
+            config.proposer_sub_lm_reasoning_effort
+            if config.proposer_sub_lm_reasoning_effort
+            else "none"
+        )
+        print(
+            f"Proposer sub: {config.proposer_sub_lm}  "
+            f"(reasoning_effort={proposer_sub_effort})"
         )
 
     adapter = SpreadsheetAdapter(
