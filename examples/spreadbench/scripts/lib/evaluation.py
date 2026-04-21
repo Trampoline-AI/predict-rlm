@@ -597,7 +597,11 @@ async def _run_case(
     log_file: Path | None = None
     log_file_str: str | None = None
     if config.log_dir is not None:
-        log_file = config.log_dir / task.task_id / f"case_{idx}.log"
+        # Per-case logs nest under ``cases/<task_id>/case_<idx>.log`` so the
+        # eval dir's top level stays readable — summary ``eval.json`` and
+        # aggregate ``cost_log.jsonl`` / ``task_traces.jsonl`` live at root,
+        # per-case trees under a single ``cases/`` subfolder.
+        log_file = config.log_dir / "cases" / task.task_id / f"case_{idx}.log"
         log_file.parent.mkdir(parents=True, exist_ok=True)
         log_file.write_text(
             f"task: {task.task_id}  case: {idx}\n"
@@ -847,7 +851,7 @@ def run_evaluation(config: EvalConfig) -> EvalReport:
     if config.log_dir is not None:
         config.log_dir.mkdir(parents=True, exist_ok=True)
         _install_log_handler()
-        print(f"Per-case RLM logs: {config.log_dir}/<task_id>/case_<idx>.log")
+        print(f"Per-case RLM logs: {config.log_dir}/cases/<task_id>/case_<idx>.log")
 
     print(
         f"Running {len(tasks)} tasks with concurrency={config.concurrency}, "
