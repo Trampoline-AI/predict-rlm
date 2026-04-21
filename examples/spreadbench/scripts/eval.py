@@ -115,13 +115,16 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument(
         "--output",
         default=None,
-        help=f"results JSON path (default: {DEFAULT_OUTPUT_DIR}/eval_<timestamp>.json)",
+        help=f"output directory path — the result JSON is written to "
+        f"<dir>/eval.json and per-case logs to <dir>/<task_id>/case_<idx>.log "
+        f"(default: {DEFAULT_OUTPUT_DIR}/eval_<timestamp>_<lm>__eff-<e>__sub-<s>__sk-<skill>). "
+        f"Legacy: a path ending in .json has the suffix stripped.",
     )
     p.add_argument(
         "--log_dir",
         default=None,
-        help="per-case RLM log directory (default: sibling of --output, "
-        "named after it without the .json suffix)",
+        help="per-case RLM log directory (default: same as --output dir, "
+        "so the result JSON and per-case logs share a folder)",
     )
     p.add_argument(
         "--no_logs",
@@ -156,24 +159,36 @@ def _slug_lm(model: str | None) -> str:
     return "".join(c if c.isalnum() or c in "._-" else "_" for c in tail)
 
 
-def _resolve_output(
+def _resolve_output_dir(
     path_arg: str | None, args: argparse.Namespace | None = None
 ) -> Path:
-    """Build the eval output JSON path.
+    """Build the eval output directory path.
+
+    The directory contains both the result JSON (``eval.json`` inside)
+    and the per-case log tree. Co-locating them makes an eval a single
+    self-contained artifact and keeps ``runs/`` from developing twin
+    ``foo.json`` + ``foo/`` siblings.
 
     When ``--output`` isn't given, encode the model mix into the
-    filename so a glance at ``runs/`` tells you what each eval
-    measured (effort tier, main LM, sub LM, source of evolved
-    skill). Matches the ``optimize_<ts>_<main>__sub-<sub>__prop-<refl>``
+    directory name so a glance at ``runs/`` tells you what each eval
+    measured (effort tier, main LM, sub LM, source of evolved skill).
+    Matches the ``optimize_<ts>_<main>__sub-<sub>__prop-<refl>``
     convention on the optimize side.
+
+    ``--output`` accepts either a directory path or a legacy
+    ``.json`` path (the ``.json`` suffix is stripped so existing
+    scripts keep working).
     """
     if path_arg:
-        return Path(path_arg)
+        p = Path(path_arg)
+        if p.suffix == ".json":
+            p = p.with_suffix("")
+        return p
     DEFAULT_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
 
     if args is None:
-        return DEFAULT_OUTPUT_DIR / f"eval_{ts}.json"
+        return DEFAULT_OUTPUT_DIR / f"eval_{ts}"
 
     # Match optimize.py's convention:
     #   optimize_<ts>_<main>__sub-<sub>__prop-<refl>
@@ -195,18 +210,19 @@ def _resolve_output(
         import re
         m = re.match(r"optimize_(\d{8}_\d{6})", rd_name)
         tail_parts.append(f"sk-{m.group(1) if m else _slug_lm(rd_name)}")
-    fname = head + ("__" + "__".join(tail_parts) if tail_parts else "") + ".json"
-    return DEFAULT_OUTPUT_DIR / fname
+    dname = head + ("__" + "__".join(tail_parts) if tail_parts else "")
+    return DEFAULT_OUTPUT_DIR / dname
 
 
 def _resolve_log_dir(
-    arg: str | None, output_path: Path, disabled: bool
+    arg: str | None, output_dir: Path, disabled: bool
 ) -> Path | None:
     if disabled:
         return None
     if arg:
         return Path(arg)
-    return output_path.with_suffix("")
+    # Log tree lives inside the output dir alongside the result JSON.
+    return output_dir
 
 
 def _parse_task_ids(raw: str | None) -> tuple[str, ...] | None:
@@ -223,9 +239,10 @@ def _parse_task_ids(raw: str | None) -> tuple[str, ...] | None:
 def main() -> int:
     args = _parse_args()
 
-    output_path = _resolve_output(args.output, args)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    log_dir = _resolve_log_dir(args.log_dir, output_path, args.no_logs)
+    output_dir = _resolve_output_dir(args.output, args)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    output_path = output_dir / "eval.json"
+    log_dir = _resolve_log_dir(args.log_dir, output_dir, args.no_logs)
 
     # Optional stdout stream of per-iteration reasoning/code/output.
     # Per-case logs always capture this info; --verbose_rlm additionally
@@ -294,15 +311,22 @@ def main() -> int:
     )
     print()
     print("Costs:")
+    total_calls = sum(c.calls for c in report.costs)
+    total_in = sum(c.prompt_tokens for c in report.costs)
+    total_out = sum(c.completion_tokens for c in report.costs)
     for c in report.costs:
         print(
             f"  {c.role:<8s} {c.model:<32s} "
-            f"{c.calls:>5d} calls  "
-            f"{c.prompt_tokens:>10,d} in / {c.completion_tokens:>10,d} out  "
+            f"{c.calls:>6,d} calls  "
+            f"{c.prompt_tokens:>12,d} in / {c.completion_tokens:>12,d} out  "
             f"${c.cost_usd:>9.4f}"
         )
-    print(f"  {'total':<8s} {'':<32s} {'':<5s}         "
-          f"{'':<27s}  ${report.total_cost_usd:>9.4f}")
+    print(
+        f"  {'total':<8s} {'':<32s} "
+        f"{total_calls:>6,d} calls  "
+        f"{total_in:>12,d} in / {total_out:>12,d} out  "
+        f"${report.total_cost_usd:>9.4f}"
+    )
     print()
     print(f"Saved to:       {output_path}")
     if config.log_dir is not None:
