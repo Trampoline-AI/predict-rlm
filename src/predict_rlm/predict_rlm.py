@@ -403,14 +403,14 @@ You work inside a Python REPL environment. Write Python code and it will be exec
 ### Iterative loop
 - Explore first: inspect sample inputs before extracting anything complicated.
 - Plan each block: treat every iteration as a chance to learn, react to results, and refine.
-- Persist intermediate work: save state to variables (`all_items`, `page_urls`, etc.) between iterations.
+- Persist intermediate work: save state to variables (`all_items`, `records`, `chunks`, etc.) between iterations.
 
 ### Think before you build
-On your first iteration, **explore before you extract**. Print samples of your input data — check types, lengths, what the data looks like. Understand what you're working with before writing any extraction logic. Even a quick `print(type(images), len(images))` or examining the first page can save you from going down the wrong path.
+On your first iteration, **explore before you extract**. Print samples of your input data — check types, lengths, what the data looks like. Understand what you're working with before writing any extraction logic. Even a quick `print(type(records), len(records))` or examining the first item/chunk can save you from going down the wrong path.
 
 After exploring, plan your approach, then execute it in focused steps. Save intermediate results to variables so you can build on them across iterations.
 
-Use `predict()` for anything requiring understanding of meaning — it's a powerful vision-language model. Use Python for computation, formatting, and aggregation.
+Use `predict()` whenever you need the model to read content and produce structured output — classification, extraction, summarization, clustering, comparison, or perception over text, code, JSON, tables, documents, or images. Use Python for deterministic computation, I/O, formatting, and aggregation.
 
 ## Environment & Tools
 
@@ -418,12 +418,13 @@ Use `predict()` for anything requiring understanding of meaning — it's a power
 
 - Variables: {inputs} (your input data).
 - `await predict(signature, *, instructions=None, **kwargs)` — your primary analysis tool (async, must await).
-  - signature: str with type hints, e.g. `"page: dspy.Image, question: str -> answer: str"`.
-  - For images, use `dspy.Image` type hint and pass URL or base64 string directly.
+  - signature: str with type hints, e.g. `"text: str, question: str -> answer: str"` or `"image: dspy.Image, question: str -> answer: str"`.
+  - Use ordinary Python types for text/data inputs (`str`, `list[str]`, `dict`, custom Pydantic models, etc.).
+  - For image inputs, use the `dspy.Image` type hint and pass URL or base64 string directly.
   - For fields that may be absent (the caller sometimes has no value to pass), use `Optional[T]` in the signature and pass `None` when missing. Example: `"context: Optional[str], question: str -> answer: str"` lets you call `predict(..., context=None, question=q)` when no context is available. Works for any type: `Optional[int]`, `Optional[dspy.Image]`, `Optional[list[str]]`.
   - instructions: optional str describing the task.
   - Returns a result that supports BOTH `result.answer` (attribute) and `result["answer"]` (subscript). Attribute access works for ALL field names including `items`, `keys`, `values` — no collision issues.
-  - **Type contract is enforced on outputs**: if you declare `field: list[X]` (non-Optional) and the VLM fails to produce a valid list, `predict()` raises `RuntimeError` with a clear message telling you to simplify the schema or mark the field `Optional`. An empty list `[]` is ALWAYS valid — it means "VLM extracted nothing matching the criteria", which is distinct from "VLM failed to produce a list". Don't speculate "predict returned None" — check what you actually got back: `[]` is valid empty output, `None` is only possible for Optional-declared fields.
+  - **Type contract is enforced on outputs**: if you declare `field: list[X]` (non-Optional) and the LM fails to produce a valid list, `predict()` raises `RuntimeError` with a clear message telling you to simplify the schema or mark the field `Optional`. An empty list `[]` is ALWAYS valid — it means "the LM extracted nothing matching the criteria", which is distinct from "the LM failed to produce a list". Don't speculate "predict returned None" — check what you actually got back: `[]` is valid empty output, `None` is only possible for Optional-declared fields.
   - Capacity: ~400K tokens per call — you can pass substantial data.
 - `print()` — ALWAYS print to see results (output is truncated per iteration — see "Managing state & output" below).
 - `SUBMIT({final_output_names})` — submit final output when done. The argument names are EXACTLY the output field names from your task's signature (shown above) — use them verbatim. If the task outputs `-> result: SomeType`, call `SUBMIT(result=...)`, NOT `SUBMIT(items=...)` or `SUBMIT(output=...)`.
@@ -436,7 +437,7 @@ The REPL runs inside an async event loop — use `await` directly, not `asyncio.
 
 Each iteration's printed output is captured and shown to you in subsequent iterations, but **truncated to ~5000 characters**. This is a hard limit — output beyond 5K chars is cut off.
 
-**What persists fully:** Python variables. Everything you store in a variable (`all_items`, `page_urls`, etc.) survives intact across iterations. The runtime state is never lost.
+**What persists fully:** Python variables. Everything you store in a variable (`all_items`, `records`, `chunks`, etc.) survives intact across iterations. The runtime state is never lost.
 
 **What gets truncated:** printed output. If you `print(big_list)` and it's 50K chars, you'll only see the first 5K in the next iteration's context.
 
@@ -453,7 +454,14 @@ Each iteration's printed output is captured and shown to you in subsequent itera
 
 ```python
 import asyncio
-tasks = [predict("img: dspy.Image -> text: str", img=url) for url in page_urls]
+tasks = [
+    predict(
+        "text: str -> category: str, confidence: float",
+        instructions="Classify this item into the most relevant category.",
+        text=item,
+    )
+    for item in items
+]
 results = await asyncio.gather(*tasks)
 ```
 
@@ -464,12 +472,16 @@ Prefer typed outputs over JSON strings:
 
 ```python
 # Typed fields — attribute access works for ALL field names
-result = await predict("page: dspy.Image -> title: str, date: str, amount: float", page=url)
-print(result.title, result.date, result.amount)
+result = await predict("text: str -> summary: str, topic: str, sentiment: str", text=excerpt)
+print(result.summary, result.topic, result.sentiment)
 
 # Lists
 result = await predict("text: str -> keywords: list[str]", text=doc)
 print(result.keywords)
+
+# Images: use dspy.Image only when the input is visual
+result = await predict("page: dspy.Image -> visible_text: str", page=page_image_url)
+print(result.visible_text)
 ```
 
 For complex/nested structures, define a Pydantic `BaseModel` and reference it by name in the signature string. The type name IS resolved — `predict()` automatically finds your class definition, sends its schema to the LLM for structured output, and returns real model instances inside the result. Use `list[YourModel]`, NOT `list[dict]`:
@@ -478,22 +490,25 @@ For complex/nested structures, define a Pydantic `BaseModel` and reference it by
 from pydantic import BaseModel
 from typing import Optional
 
-class LineItem(BaseModel):
-    description: str
-    amount: float
-    category: Optional[str] = None
+class Person(BaseModel):
+    name: str
+    role: str
+    email: Optional[str] = None
 
-# The class name "LineItem" in the signature string resolves to the class above.
-result = await predict("page: dspy.Image -> items: list[LineItem]", page=url)
-for item in result.items:                # attribute access works even for "items"
-    print(item.description, item.amount)
+# The class name "Person" in the signature string resolves to the class above.
+result = await predict(
+    "text: str -> people: list[Person]",
+    text=doc_text,
+)
+for person in result.people:
+    print(person.name, person.role, person.email)
 ```
 
 Important: the model MUST extend `BaseModel` (not `dict`). Only include fields the model can actually produce from the input. Any fields you populate yourself after prediction must have defaults.
 
 ### Working with Pydantic values returned by `predict`
 
-When your signature uses a custom type like `list[LineItem]`, the values inside the result are **real Pydantic instances** (not dicts):
+When your signature uses a custom type like `list[Person]` or `list[LineItem]`, the values inside the result are **real Pydantic instances** (not dicts):
 
 - **Read fields**: `item.description` (attribute access — natural Pydantic). Do NOT use `item["description"]` — Pydantic instances don't support subscript.
 - **Convert to dict** (e.g. for JSON-serializing or spreading): `item.model_dump()`. Do NOT use `**item`, `dict(item)`, or `.dict()` — `**item` fails because a Pydantic instance is not a mapping, and `.dict()` is Pydantic v1 (deprecated).
@@ -508,20 +523,20 @@ Don't add defensive handling like `if isinstance(x, dict): ...else: ...` for fie
 ### Explore inputs before writing logic
 Whatever the task, start by understanding what the runtime handed you. Quick probes prevent wasted iterations:
 
-```python
-print(f"Total inputs: {{len(documents)}}")
-print(type(documents[0]))
+```repl
+print(f"Total inputs: {{len(records)}}")
+print(type(records[0]))
 
 orientation = await predict(
-    "doc: dspy.Image -> overview: str, notable_elements: list[str]",
-    instructions="Give a short description so I know what this document is about and what signals it contains.",
-    doc=documents[0],
+    "record: str -> overview: str, notable_elements: list[str]",
+    instructions="Give a short description so I know what this input is about and what signals it contains.",
+    record=str(records[0]),
 )
 print(orientation.overview)
 print(orientation.notable_elements[:2])
 ```
 
-Swap `documents` for the variables your task provides — the idea is to look before you build.
+Swap `records` for the variables your task provides — the idea is to look before you build.
 
 ### Sequential context-building
 When each step depends on the last (requirements evolving across drafts, calculations that feed future pages, etc.), surface what you already know and pass it forward:
@@ -549,18 +564,18 @@ If inputs are independent, fan out `predict()` calls concurrently, then use Pyth
 import asyncio
 tasks = [
     predict(
-        "page: dspy.Image -> signals: list[str], follow_up: Optional[str]",
-        instructions="List the most important insights on this page and anything that needs deeper review.",
-        page=img,
+        "chunk: str -> signals: list[str], follow_up: Optional[str]",
+        instructions="List the most important insights in this chunk and anything that needs deeper review.",
+        chunk=chunk,
     )
-    for img in images
+    for chunk in chunks
 ]
-page_results = await asyncio.gather(*tasks)
+chunk_results = await asyncio.gather(*tasks)
 
 signals = []
-for i, r in enumerate(page_results):
+for i, r in enumerate(chunk_results):
     for signal in r.signals:
-        signals.append(f"Page {{i+1}}: {{signal}}")
+        signals.append(f"Chunk {{i+1}}: {{signal}}")
 
 summary = await predict(
     "signals: list[str] -> clusters: list[str], action_items: list[str]",
@@ -1086,10 +1101,10 @@ class PredictRLM(dspy.RLM):
                     return str(value)
 
                 # Use prediction[field] for extracting values from DSPy Prediction.
-                # Enforce type contract: if the VLM returned None for a field
+                # Enforce type contract: if the LM returned None for a field
                 # whose declared type does NOT allow None (e.g. list[X] not
                 # Optional[list[X]]), raise loudly. Silently coercing None→[] or
-                # passing None through hides VLM failures behind ambiguous empty
+                # passing None through hides LM failures behind ambiguous empty
                 # values and causes models to speculate "predict returned None".
                 for field in prediction.keys():
                     if field.startswith("_"):
@@ -1099,8 +1114,8 @@ class PredictRLM(dspy.RLM):
                         anno = output_field_annotations[field]
                         if not _allows_none(anno):
                             raise RuntimeError(
-                                f"predict: VLM returned None for non-Optional output "
-                                f"field {field!r} (declared type: {anno}). The VLM "
+                                f"predict: LM returned None for non-Optional output "
+                                f"field {field!r} (declared type: {anno}). The LM "
                                 f"couldn't produce a valid value. Schema may be too "
                                 f"complex — try simplifying the signature, or mark "
                                 f"the field Optional (e.g. Optional[list[X]]) if None "
