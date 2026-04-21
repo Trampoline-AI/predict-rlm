@@ -151,6 +151,13 @@ def summarize_lm_cost(role: str, lm: dspy.LM) -> LMCost:
     Inception Labs) report ``cost = None`` per call; for those models we
     fall back to :func:`compute_lm_cost`, which applies the per-model
     USD/MTok overrides declared in ``lm_config``.
+
+    Note: unreliable under ``gepa.optimize(use_cloudpickle=True)``. GEPA
+    forks candidate-eval workers that get their own ``dspy.LM`` copies;
+    the LM calls populate worker-side history, leaving the parent's
+    ``lm.history`` empty. Prefer :func:`aggregate_costs_from_log` for
+    optimize-run summaries, which reads the adapter's per-evaluate
+    JSONL event log and is fork-safe.
     """
     history = getattr(lm, "history", []) or []
     calls = len(history)
@@ -175,6 +182,98 @@ def summarize_lm_cost(role: str, lm: dspy.LM) -> LMCost:
         completion_tokens=completion_tokens,
         cost_usd=cost,
     )
+
+
+def aggregate_costs_from_log(
+    log_path: Path,
+    role_order: list[str] | None = None,
+) -> list[LMCost]:
+    """Aggregate costs by (role, model) from an adapter ``cost_log.jsonl``.
+
+    Fork-safe counterpart to :func:`summarize_lm_cost`: the adapter
+    writes one JSONL row per completed evaluate() (valset or minibatch)
+    and per proposer call, via the shared filesystem. Those rows carry
+    real usage + cost pulled from worker-side ``run_trace`` objects, so
+    they aren't affected by the ``use_cloudpickle=True`` fork that
+    empties the parent process's ``lm.history``.
+
+    Each log row has keys: ``role``, ``model``, ``input_tokens``,
+    ``output_tokens``, ``cost_usd``, ``event`` (``"startup"``,
+    ``"valset"``, ``"minibatch"``, ``"proposer"``, etc.). The startup
+    row is skipped; everything else is grouped by (role, model) and
+    summed.
+
+    ``calls`` in each returned ``LMCost`` records the true LM-call
+    count when rows carry a ``"calls"`` field (main = one per RLM
+    iteration; sub = one per ``predict()`` invocation including
+    parallel fan-outs). For historical logs written before the
+    call-count instrumentation landed, rows lack ``"calls"`` and the
+    aggregator falls back to counting non-startup events, which is a
+    lower bound (one event = one evaluate()/proposer call, which
+    internally drives many LM calls).
+
+    ``role_order``, if given, orders the result; unknown roles appear
+    after it sorted alphabetically by role. When ``log_path`` is
+    missing or has no non-startup rows, returns ``[]`` — the caller
+    should fall back to :func:`summarize_lm_cost` in that case.
+    """
+    if not log_path.exists():
+        return []
+
+    agg: dict[tuple[str, str], dict[str, Any]] = {}
+    try:
+        with log_path.open() as f:
+            for raw in f:
+                raw = raw.strip()
+                if not raw:
+                    continue
+                try:
+                    row = json.loads(raw)
+                except json.JSONDecodeError:
+                    continue
+                if row.get("event") == "startup":
+                    continue
+                role = row.get("role") or "unknown"
+                model = row.get("model") or "unknown"
+                key = (role, model)
+                bucket = agg.setdefault(
+                    key,
+                    {"calls": 0, "prompt_tokens": 0, "completion_tokens": 0, "cost_usd": 0.0},
+                )
+                # Prefer the explicit call count if the row carries one
+                # (instrumented adapter). Fall back to event-count +1 for
+                # historical logs that predate the instrumentation.
+                row_calls = row.get("calls")
+                if row_calls is None:
+                    bucket["calls"] += 1
+                else:
+                    bucket["calls"] += int(row_calls)
+                bucket["prompt_tokens"] += int(row.get("input_tokens") or 0)
+                bucket["completion_tokens"] += int(row.get("output_tokens") or 0)
+                bucket["cost_usd"] += float(row.get("cost_usd") or 0.0)
+    except OSError:
+        return []
+
+    if not agg:
+        return []
+
+    def _sort_key(item: tuple[tuple[str, str], dict[str, Any]]) -> tuple[int, str, str]:
+        (role, model), _ = item
+        if role_order and role in role_order:
+            return (role_order.index(role), role, model)
+        return (len(role_order) if role_order else 0, role, model)
+
+    return [
+        LMCost(
+            role=role,
+            model=model,
+            calls=bucket["calls"],
+            prompt_tokens=bucket["prompt_tokens"],
+            completion_tokens=bucket["completion_tokens"],
+            cost_usd=bucket["cost_usd"],
+        )
+        for (role, model), bucket in sorted(agg.items(), key=_sort_key)
+    ]
 
 
 def _write_eval_trace_event(
