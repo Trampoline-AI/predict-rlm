@@ -47,6 +47,10 @@ _MERCURY_MODEL = "openai/mercury-2"
 # deployment is intended to be consumed by other services.
 _QWEN_CLUSTER_API_BASE = "http://trampoline-ai-forma-qwen-llm-svc:8000/v1"
 
+# Qwen 3.6 35B A3B (FP8 MoE) standalone VM endpoint — different
+# deployment from the 9B cluster service. Routed by model-string match.
+_QWEN_35B_A3B_API_BASE = "http://vllm-qwen-35b-1.taild76bf.ts.net:8000/v1"
+
 # Per-model price overrides as (input_usd_per_mtok, output_usd_per_mtok).
 # LiteLLM's cost map doesn't cover non-OpenAI/Anthropic providers like
 # Inception Labs, so any model listed here gets its cost recomputed from
@@ -157,9 +161,12 @@ def get_lm_config(
         enable_thinking = bool(reasoning_effort) and str(
             reasoning_effort
         ).strip().lower() not in ("", "none")
+        # Route by Qwen variant — the 35B A3B FP8 MoE lives on a standalone
+        # VM at a different endpoint from the 9B cluster service.
+        api_base = _QWEN_35B_A3B_API_BASE if "35B-A3B" in lm else _QWEN_CLUSTER_API_BASE
         cfg.update(
             {
-                "api_base": _QWEN_CLUSTER_API_BASE,
+                "api_base": api_base,
                 "api_key": "unused",
                 "extra_body": {
                     "chat_template_kwargs": {
