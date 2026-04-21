@@ -6,13 +6,32 @@ import inspect
 import os
 import re
 import time
+import types
 from contextlib import contextmanager
+from copy import deepcopy
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Callable, Iterator, List, Literal, Optional
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Callable,
+    Iterator,
+    List,
+    Literal,
+    Optional,
+    get_args,
+    get_origin,
+)
 
 import dspy
+import json_repair
+import regex
+from dspy.adapters.base import Adapter
+from dspy.adapters.chat_adapter import ChatAdapter
+from dspy.adapters.json_adapter import JSONAdapter
 from dspy.primitives.code_interpreter import CodeInterpreter
-from pydantic import create_model
+from dspy.utils.exceptions import AdapterParseError
+from litellm import ContextWindowExceededError
+from pydantic import ConfigDict, ValidationError, create_model
 
 from ._shared import build_rlm_signatures, format_tool_docs_full
 from .files import File, build_file_plan, scan_file_fields
@@ -56,6 +75,209 @@ def _strip_code_fences(code: str) -> str:
 
 if TYPE_CHECKING:
     from dspy.signatures.signature import Signature
+
+
+_OUTPUT_VALIDATION_MODELS: dict[type[Any], type[Any]] = {}
+
+
+def _annotation_allows_none(annotation: Any) -> bool:
+    """Return True when a type annotation explicitly accepts None."""
+    if annotation is Any:
+        return True
+    origin = get_origin(annotation)
+    if origin in (types.UnionType, getattr(types, "UnionType", object)):
+        return type(None) in get_args(annotation)
+
+    import typing as _typing
+
+    if origin is _typing.Union:
+        return type(None) in get_args(annotation)
+    return False
+
+
+def _output_validation_model(signature: type[Any]) -> type[Any]:
+    """Build a Pydantic model containing only a signature's output fields."""
+    model = _OUTPUT_VALIDATION_MODELS.get(signature)
+    if model is not None:
+        return model
+
+    fields = {
+        name: (field.annotation, deepcopy(field))
+        for name, field in signature.output_fields.items()
+    }
+    model = create_model(
+        f"{signature.__name__}Outputs",
+        __config__=ConfigDict(arbitrary_types_allowed=True, extra="ignore"),
+        **fields,
+    )
+    _OUTPUT_VALIDATION_MODELS[signature] = model
+    return model
+
+
+def _raise_output_validation_error(
+    *,
+    adapter_name: str,
+    signature: type[Any],
+    lm_response: str,
+    parsed_result: dict[str, Any],
+    error: Exception,
+) -> None:
+    raise AdapterParseError(
+        adapter_name=adapter_name,
+        signature=signature,
+        lm_response=lm_response,
+        parsed_result=parsed_result,
+        message=f"Parsed output failed client-side signature validation: {error}",
+    )
+
+
+def _validate_signature_outputs(
+    *,
+    adapter_name: str,
+    signature: type[Any],
+    parsed_result: dict[str, Any],
+    lm_response: str,
+) -> None:
+    try:
+        _output_validation_model(signature).model_validate(parsed_result)
+    except ValidationError as e:
+        _raise_output_validation_error(
+            adapter_name=adapter_name,
+            signature=signature,
+            lm_response=lm_response,
+            parsed_result=parsed_result,
+            error=e,
+        )
+
+
+class _ValidatingOutputAdapterMixin:
+    """Validate adapter outputs before they become DSPy Predictions."""
+
+    def _call_postprocess(
+        self,
+        processed_signature: type[Any],
+        original_signature: type[Any],
+        outputs: list[dict[str, Any] | str],
+        lm: Any,
+        lm_kwargs: dict[str, Any],
+    ) -> list[dict[str, Any]]:
+        values = super()._call_postprocess(  # type: ignore[misc]
+            processed_signature,
+            original_signature,
+            outputs,
+            lm,
+            lm_kwargs,
+        )
+        for output, value in zip(outputs, values, strict=False):
+            lm_response = output.get("text", "") if isinstance(output, dict) else output
+            _validate_signature_outputs(
+                adapter_name=type(self).__name__,
+                signature=original_signature,
+                parsed_result=value,
+                lm_response=str(lm_response or ""),
+            )
+        return values
+
+
+class _ValidatingJSONAdapter(_ValidatingOutputAdapterMixin, JSONAdapter):
+    """JSONAdapter that rejects raw nulls for required output fields."""
+
+    def parse(self, signature: type[Any], completion: str) -> dict[str, Any]:
+        self._reject_required_json_nulls(signature, completion)
+        fields = super().parse(signature, completion)
+        _validate_signature_outputs(
+            adapter_name=type(self).__name__,
+            signature=signature,
+            parsed_result=fields,
+            lm_response=completion,
+        )
+        return fields
+
+    def _reject_required_json_nulls(
+        self,
+        signature: type[Any],
+        completion: str,
+    ) -> None:
+        try:
+            fields = json_repair.loads(completion)
+            if not isinstance(fields, dict):
+                match = regex.search(
+                    r"\{(?:[^{}]|(?R))*\}",
+                    completion,
+                    regex.DOTALL,
+                )
+                fields = json_repair.loads(match.group(0)) if match else None
+        except Exception:
+            return
+
+        if not isinstance(fields, dict):
+            return
+
+        parsed_result = {
+            k: v for k, v in fields.items() if k in signature.output_fields
+        }
+        for name, value in parsed_result.items():
+            field = signature.output_fields[name]
+            if value is None and not _annotation_allows_none(field.annotation):
+                _raise_output_validation_error(
+                    adapter_name=type(self).__name__,
+                    signature=signature,
+                    lm_response=completion,
+                    parsed_result=parsed_result,
+                    error=ValueError(f"Field {name!r} is required and cannot be null."),
+                )
+
+
+class _ValidatingChatAdapter(_ValidatingOutputAdapterMixin, ChatAdapter):
+    """ChatAdapter whose fallback preserves client-side output validation."""
+
+    def __call__(
+        self,
+        lm: Any,
+        lm_kwargs: dict[str, Any],
+        signature: type[Any],
+        demos: list[dict[str, Any]],
+        inputs: dict[str, Any],
+    ) -> list[dict[str, Any]]:
+        try:
+            return Adapter.__call__(self, lm, lm_kwargs, signature, demos, inputs)
+        except Exception as e:
+            if (
+                isinstance(e, ContextWindowExceededError)
+                or not self.use_json_adapter_fallback
+            ):
+                raise e
+            return _ValidatingJSONAdapter()(
+                lm,
+                lm_kwargs,
+                signature,
+                demos,
+                inputs,
+            )
+
+    async def acall(
+        self,
+        lm: Any,
+        lm_kwargs: dict[str, Any],
+        signature: type[Any],
+        demos: list[dict[str, Any]],
+        inputs: dict[str, Any],
+    ) -> list[dict[str, Any]]:
+        try:
+            return await Adapter.acall(self, lm, lm_kwargs, signature, demos, inputs)
+        except Exception as e:
+            if (
+                isinstance(e, ContextWindowExceededError)
+                or not self.use_json_adapter_fallback
+            ):
+                raise e
+            return await _ValidatingJSONAdapter().acall(
+                lm,
+                lm_kwargs,
+                signature,
+                demos,
+                inputs,
+            )
 
 
 def _models_from_schema(schema: dict) -> dict[str, type]:
@@ -1017,14 +1239,13 @@ class PredictRLM(dspy.RLM):
     @contextmanager
     def _lm_context(self):
         """Set the configured LM as active context and capture it for predict() calls."""
+        context_kwargs: dict[str, Any] = {}
         if self._lm is not None:
-            with dspy.context(lm=self._lm):
-                self._context_lm = dspy.settings.lm
-                try:
-                    yield
-                finally:
-                    self._context_lm = None
-        else:
+            context_kwargs["lm"] = self._lm
+        if getattr(dspy.settings, "adapter", None) is None:
+            context_kwargs["adapter"] = _ValidatingChatAdapter()
+
+        with dspy.context(**context_kwargs):
             self._context_lm = dspy.settings.lm
             try:
                 yield
@@ -1113,6 +1334,16 @@ class PredictRLM(dspy.RLM):
             repl_history=history,
             iteration=f"{iteration + 1}/{self.max_iterations}",
         )
+        if not isinstance(getattr(pred, "reasoning", None), str):
+            raise RuntimeError(
+                "PredictRLM action adapter returned invalid reasoning; "
+                "expected a validated non-null string."
+            )
+        if not isinstance(getattr(pred, "code", None), str) or len(pred.code) < 1:
+            raise RuntimeError(
+                "PredictRLM action adapter returned invalid code; "
+                "expected a validated non-empty string."
+            )
         if self.verbose:
             import logging as _logging
 
