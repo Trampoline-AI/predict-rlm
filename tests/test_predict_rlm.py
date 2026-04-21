@@ -360,7 +360,7 @@ class TestTypeContractEnforcement:
 
     @pytest.mark.asyncio
     async def test_none_for_non_optional_list_raises(self):
-        """VLM returning None for non-Optional list[X] field raises RuntimeError."""
+        """LM returning None for non-Optional list[X] field raises RuntimeError."""
         mock_lm = MagicMock()
         rlm = PredictRLM(ImageAnalysisSignature, sub_lm=mock_lm, max_iterations=5)
 
@@ -373,7 +373,7 @@ class TestTypeContractEnforcement:
             mock_predictor.acall = AsyncMock(return_value=mock_prediction)
             mock_predict_class.return_value = mock_predictor
 
-            with pytest.raises(RuntimeError, match="VLM returned None for non-Optional"):
+            with pytest.raises(RuntimeError, match="LM returned None for non-Optional"):
                 await rlm.tools["predict"].func(
                     "text: str -> items: list[str]",
                     text="some input",
@@ -423,7 +423,7 @@ class TestTypeContractEnforcement:
 
     @pytest.mark.asyncio
     async def test_none_for_non_optional_str_raises(self):
-        """VLM returning None for non-Optional str field raises RuntimeError."""
+        """LM returning None for non-Optional str field raises RuntimeError."""
         mock_lm = MagicMock()
         rlm = PredictRLM(ImageAnalysisSignature, sub_lm=mock_lm, max_iterations=5)
 
@@ -436,7 +436,7 @@ class TestTypeContractEnforcement:
             mock_predictor.acall = AsyncMock(return_value=mock_prediction)
             mock_predict_class.return_value = mock_predictor
 
-            with pytest.raises(RuntimeError, match="VLM returned None for non-Optional"):
+            with pytest.raises(RuntimeError, match="LM returned None for non-Optional"):
                 await rlm.tools["predict"].func(
                     "text: str -> answer: str",
                     text="some input",
@@ -461,7 +461,7 @@ class TestTypeContractEnforcement:
             mock_predictor.acall = AsyncMock(return_value=mock_prediction)
             mock_predict_class.return_value = mock_predictor
 
-            with pytest.raises(RuntimeError, match="VLM returned None for non-Optional"):
+            with pytest.raises(RuntimeError, match="LM returned None for non-Optional"):
                 await rlm.tools["predict"].func(
                     "text: str -> answer: str",
                     text="some input",
@@ -470,7 +470,7 @@ class TestTypeContractEnforcement:
         groups = drain_predict_calls()
         assert len(groups) == 1
         assert len(groups[0].calls) == 1
-        assert "VLM returned None for non-Optional" in groups[0].calls[0].error
+        assert "LM returned None for non-Optional" in groups[0].calls[0].error
         assert groups[0].calls[0].input == {"text": "some input"}
 
 
@@ -1165,7 +1165,7 @@ class TestAnnotationHelpers:
             mock_predictor.acall = AsyncMock(return_value=mock_prediction)
             mock_predict_class.return_value = mock_predictor
 
-            with pytest.raises(RuntimeError, match="VLM returned None for non-Optional"):
+            with pytest.raises(RuntimeError, match="LM returned None for non-Optional"):
                 await rlm.tools["predict"].func(
                     "text: str -> tags: list[str]",
                     text="some input",
@@ -1186,7 +1186,7 @@ class TestAnnotationHelpers:
             mock_predictor.acall = AsyncMock(return_value=mock_prediction)
             mock_predict_class.return_value = mock_predictor
 
-            with pytest.raises(RuntimeError, match="VLM returned None for non-Optional"):
+            with pytest.raises(RuntimeError, match="LM returned None for non-Optional"):
                 await rlm.tools["predict"].func(
                     "text: str -> name: str",
                     text="some input",
