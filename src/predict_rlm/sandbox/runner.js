@@ -523,10 +523,13 @@ if (preinstall) {
   await pyodide.runPythonAsync(`
 import micropip
 
-# Install packages silently
-await micropip.install(${JSON.stringify(allPackages)}, verbose=False)
+_packages = ${JSON.stringify(allPackages)}
+for _pkg in _packages:
+    try:
+        await micropip.install([_pkg], verbose=False)
+    except ValueError:
+        pass  # skip packages without pure-Python wheels (e.g. pymupdf)
 
-# Import default packages now so they're ready and cached
 import pandas
 import pydantic
 `);
