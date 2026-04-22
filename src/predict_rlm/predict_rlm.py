@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import inspect
 import os
 import re
 import time
@@ -37,6 +38,21 @@ from .trace import (
 # Capture the real dspy.Image class at import time so type comparisons
 # work even when tests patch predict_rlm.dspy.Image to a mock.
 _ImageType = dspy.Image
+
+_PARENT_TAKES_CODE = "code" in inspect.signature(
+    dspy.RLM._process_execution_result
+).parameters
+
+
+def _strip_code_fences(code: str) -> str:
+    """Extract code from markdown fences, accepting python/py/repl tags."""
+    matches = re.findall(
+        r"```(?:python|py|repl)?\s*\n(.*?)^```\s*$", code, re.DOTALL | re.MULTILINE
+    )
+    if matches:
+        return "\n\n".join(block.rstrip() for block in matches)
+    return code
+
 
 if TYPE_CHECKING:
     from dspy.signatures.signature import Signature
@@ -1060,8 +1076,6 @@ class PredictRLM(dspy.RLM):
         repl.aexecute() (available on JspiInterpreter) so the event loop
         stays free for other coroutines.
         """
-        from dspy.predict.rlm import _strip_code_fences
-
         variables_info = [variable.format() for variable in variables]
         pred = await self.generate_action.acall(
             variables_info=variables_info,
@@ -1076,8 +1090,8 @@ class PredictRLM(dspy.RLM):
                 f"Reasoning: {pred.reasoning}\nCode:\n{pred.code}"
             )
 
+        code = _strip_code_fences(pred.code)
         try:
-            code = _strip_code_fences(pred.code)
             if hasattr(repl, "aexecute"):
                 result = await repl.aexecute(code, variables=dict(input_args))
             else:
@@ -1085,6 +1099,8 @@ class PredictRLM(dspy.RLM):
         except Exception as e:
             result = f"[Error] {e}"
 
+        if _PARENT_TAKES_CODE:
+            return self._process_execution_result(pred, code, result, history, output_field_names)
         return self._process_execution_result(pred, result, history, output_field_names)
 
     def _prepare_file_io(
