@@ -1341,7 +1341,7 @@ class TestAexecuteIteration:
 
         mock_result = MagicMock()
         with patch.object(rlm, "_process_execution_result", return_value=mock_result) as mock_process:
-            with patch("dspy.predict.rlm._strip_code_fences", return_value="print('hello')"):
+            with patch("predict_rlm.predict_rlm._strip_code_fences", return_value="print('hello')"):
                 result = await rlm._aexecute_iteration(
                     repl=mock_repl,
                     variables=[],
@@ -1353,9 +1353,15 @@ class TestAexecuteIteration:
 
         mock_repl.aexecute.assert_called_once_with("print('hello')", variables={})
         assert result is mock_result
-        mock_process.assert_called_once_with(
-            mock_pred, "output from aexecute", [], ["answer"]
-        )
+        from predict_rlm.predict_rlm import _PARENT_TAKES_CODE
+        if _PARENT_TAKES_CODE:
+            mock_process.assert_called_once_with(
+                mock_pred, "print('hello')", "output from aexecute", [], ["answer"]
+            )
+        else:
+            mock_process.assert_called_once_with(
+                mock_pred, "output from aexecute", [], ["answer"]
+            )
 
     @pytest.mark.asyncio
     async def test_falls_back_to_execute_when_no_aexecute(self):
@@ -1375,7 +1381,7 @@ class TestAexecuteIteration:
 
         mock_result = MagicMock()
         with patch.object(rlm, "_process_execution_result", return_value=mock_result):
-            with patch("dspy.predict.rlm._strip_code_fences", return_value="print('hi')"):
+            with patch("predict_rlm.predict_rlm._strip_code_fences", return_value="print('hi')"):
                 result = await rlm._aexecute_iteration(
                     repl=mock_repl,
                     variables=[],
@@ -1406,7 +1412,7 @@ class TestAexecuteIteration:
 
         mock_result = MagicMock()
         with patch.object(rlm, "_process_execution_result", return_value=mock_result) as mock_process:
-            with patch("dspy.predict.rlm._strip_code_fences", return_value="bad_code()"):
+            with patch("predict_rlm.predict_rlm._strip_code_fences", return_value="bad_code()"):
                 await rlm._aexecute_iteration(
                     repl=mock_repl,
                     variables=[],
@@ -1416,8 +1422,8 @@ class TestAexecuteIteration:
                     output_field_names=["answer"],
                 )
 
-        # The error should be formatted as "[Error] ..."
-        error_arg = mock_process.call_args[0][1]
+        from predict_rlm.predict_rlm import _PARENT_TAKES_CODE
+        error_arg = mock_process.call_args[0][2 if _PARENT_TAKES_CODE else 1]
         assert "[Error]" in error_arg
         assert "sandbox crashed" in error_arg
 
