@@ -408,7 +408,11 @@ class JspiInterpreter(PythonInterpreter):
             self._write_stdin(msg + "\n")
 
     def _send_request(self, method: str, params: dict, context: str) -> dict:
-        """Send a JSON-RPC request without blocking the OS pipe."""
+        """Send a JSON-RPC request without blocking the OS pipe.
+
+        Skips non-JSON lines (e.g. Pyodide package-loading messages) matching
+        the parent PythonInterpreter behaviour.
+        """
         self._request_id += 1
         request_id = self._request_id
         msg = json.dumps(
@@ -421,26 +425,40 @@ class JspiInterpreter(PythonInterpreter):
         )
         self._write_stdin(msg + "\n")
 
-        response_line = self._read_with_timeout(timeout=None)
-        if not response_line:
-            exit_code = self.deno_process.poll()
-            if exit_code is not None:
-                stderr = self.deno_process.stderr.read() if self.deno_process.stderr else ""
-                raise CodeInterpreterError(
-                    f"Deno exited (code {exit_code}) {context}: {stderr}"
-                )
-            raise CodeInterpreterError(f"No response {context}")
+        max_skip = 100
+        skipped = 0
+        while skipped <= max_skip:
+            response_line = self._read_with_timeout(timeout=None)
+            if not response_line:
+                exit_code = self.deno_process.poll()
+                if exit_code is not None:
+                    stderr = self.deno_process.stderr.read() if self.deno_process.stderr else ""
+                    raise CodeInterpreterError(
+                        f"Deno exited (code {exit_code}) {context}: {stderr}"
+                    )
+                raise CodeInterpreterError(f"No response {context}")
 
-        response = json.loads(response_line)
-        if response.get("id") != request_id:
-            raise CodeInterpreterError(
-                f"Response ID mismatch {context}: expected {request_id}, got {response.get('id')}"
-            )
-        if "error" in response:
-            raise CodeInterpreterError(
-                f"Error {context}: {response['error'].get('message', 'Unknown error')}"
-            )
-        return response
+            if not response_line.startswith("{"):
+                skipped += 1
+                continue
+
+            try:
+                response = json.loads(response_line)
+            except json.JSONDecodeError:
+                skipped += 1
+                continue
+
+            if response.get("id") != request_id:
+                raise CodeInterpreterError(
+                    f"Response ID mismatch {context}: expected {request_id}, got {response.get('id')}"
+                )
+            if "error" in response:
+                raise CodeInterpreterError(
+                    f"Error {context}: {response['error'].get('message', 'Unknown error')}"
+                )
+            return response
+
+        raise CodeInterpreterError(f"Too many non-JSON lines ({skipped}) {context}")
 
     def _get_deno_dir(self) -> list[str]:
         """Get Deno cache directory paths (may have multiple on different platforms)."""
