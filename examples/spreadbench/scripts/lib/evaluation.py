@@ -295,6 +295,8 @@ def _write_eval_trace_event(
         main_model = ""
         sub_model: str | None = None
         traces_seen = 0
+        main_calls = 0
+        sub_calls = 0
         for tr in task_results:
             for c in tr.cases:
                 rt = getattr(c, "run_trace", None)
@@ -307,6 +309,16 @@ def _write_eval_trace_event(
                 main_usage += rt.usage.main
                 if rt.usage.sub is not None:
                     sub_usage += rt.usage.sub
+                # Count real LM calls from the RunTrace structure:
+                # main_calls = len(steps) (one action call per iteration);
+                # sub_calls = sum of len(predict_calls[g].calls) across every
+                # step (one sub call per predict() invocation including
+                # parallel fan-outs).
+                steps = getattr(rt, "steps", None) or []
+                main_calls += len(steps)
+                for step in steps:
+                    for g in getattr(step, "predict_calls", None) or []:
+                        sub_calls += len(getattr(g, "calls", None) or [])
 
         if traces_seen == 0:
             return
@@ -317,6 +329,7 @@ def _write_eval_trace_event(
         if main_usage.input_tokens or main_usage.output_tokens:
             rows.append({
                 "ts": ts, "event": "evaluate", "role": "main", "model": main_model,
+                "calls": int(main_calls),
                 "input_tokens": int(main_usage.input_tokens),
                 "output_tokens": int(main_usage.output_tokens),
                 "cost_usd": float(main_usage.cost),
@@ -325,6 +338,7 @@ def _write_eval_trace_event(
         if sub_model and (sub_usage.input_tokens or sub_usage.output_tokens):
             rows.append({
                 "ts": ts, "event": "evaluate", "role": "sub", "model": sub_model,
+                "calls": int(sub_calls),
                 "input_tokens": int(sub_usage.input_tokens),
                 "output_tokens": int(sub_usage.output_tokens),
                 "cost_usd": float(sub_usage.cost),
@@ -870,18 +884,31 @@ def run_evaluation(config: EvalConfig) -> EvalReport:
     hard_avg = sum(r.hard for r in results) / total if total else 0.0
     hard_count = sum(r.hard for r in results)
 
-    costs = [
-        summarize_lm_cost("main", lm),
-        summarize_lm_cost("sub", sub_lm),
-    ]
-
-    # Append one JSONL event row per (role, model) to config.log_dir/cost_log.jsonl
-    # and dump full per-case RunTraces to config.log_dir/task_traces.jsonl. We
-    # pull usage straight from each PredictRLM's trace rather than re-aggregating
-    # from LM history.
+    # Write cost_log.jsonl + task_traces.jsonl first — both pull usage
+    # straight from each PredictRLM's trace rather than re-aggregating
+    # from lm.history (which is empty under PredictRLM's per-case
+    # worker-pool isolation, same fork-safe reason optimize.py reads
+    # cost_log instead of lm.history for its summary).
     if config.log_dir is not None:
         _write_eval_trace_event(config.log_dir, results, total)
         _dump_eval_task_traces(config.log_dir, results)
+
+    # Build end-of-run cost summary. Prefer aggregate_costs_from_log —
+    # the cost_log row we just wrote carries real token counts + call
+    # counts aggregated from the per-case RunTraces. Fall back to
+    # summarize_lm_cost(lm.history) only when the cost_log wasn't
+    # written (log_dir is None, or a trivially short run).
+    costs: list[LMCost] = []
+    if config.log_dir is not None:
+        costs = aggregate_costs_from_log(
+            config.log_dir / "cost_log.jsonl",
+            role_order=["main", "sub"],
+        )
+    if not costs:
+        costs = [
+            summarize_lm_cost("main", lm),
+            summarize_lm_cost("sub", sub_lm),
+        ]
 
     return EvalReport(
         config=config,
