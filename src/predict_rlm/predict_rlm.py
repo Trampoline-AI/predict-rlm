@@ -158,7 +158,7 @@ def _models_from_schema(schema: dict) -> dict[str, type]:
 PREDICT_RLM_INSTRUCTIONS = """You are tasked with producing the following outputs given the inputs {inputs}:
 {output_fields}
 
-You work inside a Python REPL environment. Write code in ```repl blocks and it will be executed. You will see the output, then write more code based on what you learned. This is an iterative, interactive process — explore your data, plan your approach, and build up your answer step by step across multiple iterations.
+You work inside a Python REPL environment. Write Python code and it will be executed. You will see the output, then write more code based on what you learned. This is an iterative, interactive process — explore your data, plan your approach, and build up your answer step by step across multiple iterations.
 
 ## Workflow Overview
 
@@ -213,7 +213,7 @@ Each iteration's printed output is captured and shown to you in subsequent itera
 ### Core usage pattern
 `predict()` is async and much faster when run concurrently. For independent calls, always use `asyncio.gather()`:
 
-```repl
+```python
 import asyncio
 tasks = [predict("img: dspy.Image -> text: str", img=url) for url in page_urls]
 results = await asyncio.gather(*tasks)
@@ -224,7 +224,7 @@ Use sequential iteration only when each step depends on previous results (e.g. a
 ### Typed outputs and schemas
 Prefer typed outputs over JSON strings:
 
-```repl
+```python
 # Typed fields — attribute access works for ALL field names
 result = await predict("page: dspy.Image -> title: str, date: str, amount: float", page=url)
 print(result.title, result.date, result.amount)
@@ -236,7 +236,7 @@ print(result.keywords)
 
 For complex/nested structures, define a Pydantic `BaseModel` and reference it by name in the signature string. The type name IS resolved — `predict()` automatically finds your class definition, sends its schema to the LLM for structured output, and returns real model instances inside the result. Use `list[YourModel]`, NOT `list[dict]`:
 
-```repl
+```python
 from pydantic import BaseModel
 from typing import Optional
 
@@ -270,7 +270,7 @@ Don't add defensive handling like `if isinstance(x, dict): ...else: ...` for fie
 ### Explore inputs before writing logic
 Whatever the task, start by understanding what the runtime handed you. Quick probes prevent wasted iterations:
 
-```repl
+```python
 print(f"Total inputs: {{len(documents)}}")
 print(type(documents[0]))
 
@@ -288,7 +288,7 @@ Swap `documents` for the variables your task provides — the idea is to look be
 ### Sequential context-building
 When each step depends on the last (requirements evolving across drafts, calculations that feed future pages, etc.), surface what you already know and pass it forward:
 
-```repl
+```python
 insights = []
 for i, chunk in enumerate(chunks):
     context = "; ".join(insights[-2:]) if insights else "None yet"
@@ -307,7 +307,7 @@ This approach works for reasoning chains, progressive audits, or simulations whe
 ### Parallel mapping then synthesis
 If inputs are independent, fan out `predict()` calls concurrently, then use Python (or another `predict`) to combine the partial work:
 
-```repl
+```python
 import asyncio
 tasks = [
     predict(
@@ -343,7 +343,7 @@ Adjust the signatures to match your task (classification, QA, calculations, simu
 
 Once you've verified the results, submit them. `SUBMIT` takes **one argument per output field**, named after each field. Use keyword arguments for clarity, especially when there are multiple outputs:
 
-```repl
+```python
 # For a signature like: ... -> items: list[str], total_count: int, sources: list[int]
 SUBMIT(
     items=all_items,
@@ -355,7 +355,7 @@ SUBMIT(
 Positional also works, in the order of the output fields: `SUBMIT(all_items, len(all_items), sorted(set(all_sources)))`. Prefer keyword form when there are more than two outputs — it's easier to spot a missing or swapped argument.
 
 **SUBMIT accepts Pydantic instances OR plain dicts OR mixed.** Pass Pydantic objects directly, or nest them inside dicts/lists, whatever's natural:
-```repl
+```python
 # All of these work:
 SUBMIT(result={{"items": [TaskItem(title="a"), TaskItem(title="b")]}})
 SUBMIT(result=ExtractionResult(items=[TaskItem(title="a")]))

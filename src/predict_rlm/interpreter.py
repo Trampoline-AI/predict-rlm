@@ -515,28 +515,16 @@ class JspiInterpreter(PythonInterpreter):
         self.deno_process.stdin.flush()
 
     def _strip_code_fences(self, code: str) -> str:
-        """Extract code from ```repl fences.
+        """Extract code from markdown fences.
 
-        Uses a specific ```repl tag (like the original RLM) to avoid ambiguity.
         The closing ``` must be on its own line (^```$) to handle:
         1. Code containing inline ``` (like in strings) - not on own line, won't match
         2. Double fences from model (```...```\\n```) - stops at first proper close
-        Falls back to generic fence matching for backwards compatibility.
 
-        Supports multiple ```repl blocks - all blocks are concatenated with newlines.
+        Supports multiple fenced blocks - all blocks are concatenated with newlines.
         """
-        # Primary: look for ```repl blocks
-        # Use MULTILINE so ^ matches start of line - closing ``` must be alone on a line
-        # Non-greedy .*? stops at FIRST ``` on its own line
-        # findall to get ALL blocks, not just the first
-        matches = re.findall(r"```repl\s*\n(.*?)^```\s*$", code, re.DOTALL | re.MULTILINE)
-        if matches:
-            # Join all blocks with double newlines to ensure separation
-            return "\n\n".join(block.rstrip() for block in matches)
-
-        # Fallback: try generic ```python or ``` blocks for backwards compatibility
         matches = re.findall(
-            r"```(?:python|py)?\s*\n(.*?)^```\s*$", code, re.DOTALL | re.MULTILINE
+            r"```(?:python|py|repl)?\s*\n(.*?)^```\s*$", code, re.DOTALL | re.MULTILINE
         )
         if matches:
             return "\n\n".join(block.rstrip() for block in matches)
