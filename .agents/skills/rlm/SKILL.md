@@ -92,7 +92,7 @@ Use web search and the Explore subagent to:
 4. **Identify host-side tool needs**. If any functionality cannot run in WASM (native binaries, C extensions, heavy computation), it must be a **host-side tool** — a Python function running on the host that the RLM calls like any other tool.
 
 5. **Check for existing skills**. The built-in skills are:
-   - `pdf` — pymupdf for PDF rendering, text extraction, manipulation
+   - `pdf` — pypdf for reading in sandbox, host-side render_pdf_page tool via pymupdf
    - `spreadsheet` — openpyxl, pandas, formulas for Excel work
    - `docx` — python-docx for reading, writing, and modifying Word documents
 
@@ -358,16 +358,16 @@ from predict_rlm.skills import pdf as pdf_skill
 
 redaction_skill = Skill(
     name="redaction",
-    instructions="""How to redact content from PDFs using pymupdf.
+    instructions="""How to redact content from PDFs using the provided tools.
 
-## Text redaction
-Search for text, create redaction annotations, then apply:
-    page = doc[page_num]
-    hits = page.search_for("sensitive text")
-    for rect in hits:
-        page.add_redact_annot(rect, fill=(0, 0, 0))
-    page.apply_redactions()
+## Workflow
+1. Use render_pdf_page() to visually inspect each page
+2. Use predict() to identify all PII on the rendered page images
+3. Copy the input PDF to the output directory using shutil.copy()
+4. Call apply_pdf_redactions() with identified text and bounding boxes
+5. Verify by re-rendering the redacted pages
 ...""",
+    tools={"apply_pdf_redactions": apply_pdf_redactions},
 )
 
 __all__ = ["pdf_skill", "redaction_skill"]
@@ -440,14 +440,14 @@ Skills can bundle **host-side tools** via their `tools=` field. When skills are 
 ## Built-in skills
 
 ```python
-from predict_rlm.skills import pdf as pdf_skill          # pymupdf
+from predict_rlm.skills import pdf as pdf_skill          # pypdf + render_pdf_page tool
 from predict_rlm.skills import spreadsheet as spreadsheet_skill  # openpyxl, pandas, formulas
 from predict_rlm.skills import docx as docx_skill        # python-docx
 ```
 
 | Skill | Packages | Modules | What it teaches the RLM |
 |---|---|---|---|
-| **pdf** | `pymupdf` | — | Read, render, modify, and redact PDFs |
+| **pdf** | `pypdf` | `render_pdf_page` | Read PDFs in sandbox, render pages via host-side pymupdf |
 | **spreadsheet** | `openpyxl`, `pandas`, `formulas` | `formula_eval` | Build and modify Excel workbooks with formulas and formatting |
 | **docx** | `python-docx` | `md2docx` | Read, write, and modify Word documents with tables, formatting, and styles |
 

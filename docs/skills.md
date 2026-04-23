@@ -99,7 +99,7 @@ Tools can be sync or async (async preferred for I/O). Their full docstrings are 
 
 ## Package compatibility
 
-The sandbox runs [Pyodide](https://pyodide.org/) (CPython compiled to WebAssembly), which supports **pure-Python packages** out of the box via micropip. Packages with C extensions only work if they ship a pre-built Pyodide wheel — [many popular ones do](https://pyodide.org/en/stable/usage/packages-in-pyodide.html) (numpy, pandas, scipy, Pillow, pymupdf, etc.), but packages that rely on system libraries without a Pyodide build (e.g. psycopg2, torch) cannot be installed in the sandbox.
+The sandbox runs [Pyodide](https://pyodide.org/) (CPython compiled to WebAssembly), which supports **pure-Python packages** out of the box via micropip. Packages with C extensions only work if they ship a pre-built Pyodide wheel — [many popular ones do](https://pyodide.org/en/stable/usage/packages-in-pyodide.html) (numpy, pandas, scipy, Pillow, etc.), but packages that rely on system libraries without a Pyodide build (e.g. pymupdf, psycopg2, torch) cannot be installed in the sandbox.
 
 For these, expose the functionality as a **host-side tool** instead — the tool runs in your normal Python environment and the RLM calls it from the sandbox via the tool bridge.
 
@@ -115,7 +115,7 @@ rlm = PredictRLM(MySignature, skills=[pdf, spreadsheet, docx])
 
 | Skill | Import | Packages | Modules | What it teaches the RLM | |
 |---|---|---|---|---|---|
-| **pdf** | `from predict_rlm.skills import pdf` | `pymupdf` | — | Read, render, modify, and redact PDFs | [source](../src/predict_rlm/skills/pdf/skill.py) |
+| **pdf** | `from predict_rlm.skills import pdf` | `pypdf` | `render_pdf_page` | Read, render, and write PDFs (rendering via host-side pymupdf) | [source](../src/predict_rlm/skills/pdf/skill.py) |
 | **spreadsheet** | `from predict_rlm.skills import spreadsheet` | `openpyxl`, `pandas`, `formulas` | `formula_eval` | Build and modify Excel workbooks with formulas and formatting | [source](../src/predict_rlm/skills/spreadsheet/skill.py) |
 | **docx** | `from predict_rlm.skills import docx` | `python-docx` | `md2docx` | Read, write, and modify Word documents with tables, formatting, and styles | [source](../src/predict_rlm/skills/docx/skill.py) |
 

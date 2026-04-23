@@ -27,8 +27,9 @@ class AnalyzeDocuments(dspy.Signature):
 
 pdf_skill = Skill(
     name="pdf",
-    instructions="Use pymupdf to open and render PDF pages...",
-    packages=["pymupdf"],
+    instructions="Use pypdf to read PDFs, render_pdf_page tool for visual inspection...",
+    packages=["pypdf"],
+    tools={"render_pdf_page": render_pdf_page},
 )
 
 rlm = PredictRLM(
@@ -46,16 +47,13 @@ Inside the sandbox, the RLM autonomously decides which pages to load and when:
 
 ```python
 # The RLM writes code like this — you don't write this, the LLM does:
-import pymupdf, base64, asyncio
+import asyncio
 
-doc = pymupdf.open(documents[0])
-images = [
-    "data:image/png;base64,"
-    + base64.b64encode(
-        doc[i].get_pixmap(dpi=200).tobytes("png")
-    ).decode()
+# render_pdf_page is a host-side tool (pymupdf runs on the host, not in WASM)
+images = await asyncio.gather(*[
+    render_pdf_page(path=pdf_path, page_num=i, dpi=200)
     for i in range(3)
-]
+])
 results = await asyncio.gather(*[
     predict("page: dspy.Image -> dates: list[str]", page=img)
     for img in images

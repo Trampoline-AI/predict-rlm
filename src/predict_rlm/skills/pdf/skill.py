@@ -1,79 +1,82 @@
-"""PDF skill — pymupdf for reading, rendering, and writing PDFs in the sandbox."""
+"""PDF skill — pypdf for reading in the sandbox, host-side rendering via pymupdf."""
+
+from __future__ import annotations
+
+from typing import Annotated
 
 from predict_rlm import Skill
+from predict_rlm.files import SyncedFile
+
+
+def render_pdf_page(
+    path: Annotated[str, SyncedFile(writeback=False)],
+    page_num: int,
+    dpi: int = 200,
+) -> str:
+    """Render a PDF page as a base64-encoded PNG data URI for use with predict().
+
+    Args:
+        path: Path to the PDF file in the sandbox filesystem.
+        page_num: 0-indexed page number.
+        dpi: Image resolution in dots per inch (default 200).
+
+    Returns:
+        A data URI string "data:image/png;base64,..." for use as a dspy.Image value.
+    """
+    import base64
+
+    import pymupdf
+
+    doc = pymupdf.open(path)
+    pix = doc[page_num].get_pixmap(dpi=dpi)
+    uri = f"data:image/png;base64,{base64.b64encode(pix.tobytes('png')).decode()}"
+    doc.close()
+    return uri
+
 
 pdf_skill = Skill(
     name="pdf",
-    instructions="""Use pymupdf to work with PDF files mounted in the sandbox.
+    instructions="""Use pypdf to read PDFs and the render_pdf_page tool to view pages visually.
 
 ## Opening and inspecting
 
-    import pymupdf
-    doc = pymupdf.open(path)
-    print(f"Pages: {len(doc)}")
-    toc = doc.get_toc()  # [[level, title, page_num], ...]
-    metadata = doc.metadata  # dict with title, author, subject, etc.
+    from pypdf import PdfReader
+    reader = PdfReader(path)
+    print(f"Pages: {len(reader.pages)}")
+    metadata = reader.metadata  # title, author, subject, etc.
 
 ## Reading pages — prefer visual rendering over raw text
 
 Always render pages as images for analysis with predict(). Raw text
 extraction loses layout, tables, headers, and formatting that are
-critical for understanding documents. Use get_text() only for
+critical for understanding documents. Use extract_text() only for
 keyword searches or when you need to find specific strings.
 
-Render a page as an image:
+Render a page as an image using the render_pdf_page tool:
 
-    import base64
-    pix = doc[page_num].get_pixmap(dpi=200)
-    uri = f"data:image/png;base64,{base64.b64encode(pix.tobytes('png')).decode()}"
+    uri = await render_pdf_page(path=pdf_path, page_num=0, dpi=200)
     result = await predict("page: dspy.Image -> ...", page=uri)
 
-Render multiple pages in parallel:
+Render and analyze multiple pages in parallel:
 
-    import asyncio, base64
+    import asyncio
+    render_tasks = [render_pdf_page(path=pdf_path, page_num=i) for i in range(num_pages)]
+    uris = await asyncio.gather(*render_tasks)
 
-    def render_page(doc, i):
-        pix = doc[i].get_pixmap(dpi=200)
-        return f"data:image/png;base64,{base64.b64encode(pix.tobytes('png')).decode()}"
-
-    images = [render_page(doc, i) for i in range(len(doc))]
-    tasks = [predict("page: dspy.Image -> ...", page=img) for img in images]
-    results = await asyncio.gather(*tasks)
+    analysis_tasks = [predict("page: dspy.Image -> ...", page=uri) for uri in uris]
+    results = await asyncio.gather(*analysis_tasks)
 
 ## Text extraction (for searching, not analysis)
 
-    text = doc[page_num].get_text()           # plain text
-    blocks = doc[page_num].get_text_blocks()   # [(x0,y0,x1,y1,text,block_no,type), ...]
-    words = doc[page_num].get_text_words()     # [(x0,y0,x1,y1,word,block,line,word_no), ...]
+    text = reader.pages[page_num].extract_text()
 
-## Searching
+## Writing PDFs
 
-    results = doc[page_num].search_for("keyword")  # list of Rect objects
-
-## Table extraction
-
-    tables = doc[page_num].find_tables()
-    for table in tables:
-        data = table.extract()  # list of lists (rows x cols)
-
-## Images
-
-    images = doc[page_num].get_images()       # [(xref, smask, w, h, bpc, cs, ...), ...]
-    img_bytes = doc.extract_image(xref)        # dict with "image" (bytes), "ext", etc.
-
-## Annotations and links
-
-    links = doc[page_num].get_links()          # [{"kind": ..., "uri": ..., ...}, ...]
-    annots = list(doc[page_num].annots())      # annotation objects
-
-## Writing and modifying
-
-    doc[page_num].insert_text((x, y), "text")
-    doc[page_num].add_redact_annot(rect)
-    doc[page_num].apply_redactions()
-    doc.save("/sandbox/output/field_name/modified.pdf")
-    doc.close()
-
-Always close the document when done.""",
-    packages=["pymupdf"],
+    from pypdf import PdfWriter
+    writer = PdfWriter()
+    writer.append(reader)
+    with open("/sandbox/output/field_name/output.pdf", "wb") as f:
+        writer.write(f)""",
+    packages=["pypdf"],
+    tools={"render_pdf_page": render_pdf_page},
 )
