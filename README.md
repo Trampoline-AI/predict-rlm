@@ -1,3 +1,6 @@
+> [!NOTE]
+> Read the launch post for our optimized [SpreadsheetBench skill](https://x.com/GabLesperance/status/2048072367876735415).
+
 # predict-rlm
 Production focused Self-harnessed LM runtime (RLM) that allows the LM to call its sub-lm with [DSPy](https://dspy.ai) signatures. Define your inputs, outputs, and tools — the model handles its own control flow. Get fully interpretable trajectories and performance that scales directly with model improvements. Without context rot.
 
@@ -96,6 +99,52 @@ result = rlm(
 )
 
 print(result.answer)
+```
+
+### Using the spreadsheet skill
+
+The optimized spreadsheet skill is built in. Import it and pass it through `skills=[spreadsheet]` so the RLM gets the spreadsheet-specific instructions, `openpyxl`, `pandas`, `formulas`, and the `formula_eval` verification module inside its sandbox.
+
+```python
+import dspy
+
+from predict_rlm import File, PredictRLM
+from predict_rlm.skills import spreadsheet
+
+
+class UpdateWorkbook(dspy.Signature):
+    """Update the workbook following the request.
+
+    Use openpyxl for workbook edits, Excel formulas for derived values, and
+    verify formulas before returning the final .xlsx file.
+    """
+
+    workbook: File = dspy.InputField(desc="Input .xlsx workbook")
+    request: str = dspy.InputField(desc="Requested spreadsheet changes")
+    updated_workbook: File = dspy.OutputField(desc="Updated .xlsx workbook")
+
+
+rlm = PredictRLM(
+    UpdateWorkbook,
+    lm="openai/gpt-5.4",
+    sub_lm="openai/gpt-5.1",
+    skills=[spreadsheet],
+)
+
+result = rlm(
+    workbook=File(path="model.xlsx"),
+    request="Add a Summary sheet with revenue by quarter and formulas for totals.",
+)
+
+print(result.updated_workbook.path)
+```
+
+For workflows that combine source documents and spreadsheets, compose skills:
+
+```python
+from predict_rlm.skills import pdf, spreadsheet
+
+rlm = PredictRLM(ProcessInvoices, skills=[pdf, spreadsheet])
 ```
 
 ## Next steps
