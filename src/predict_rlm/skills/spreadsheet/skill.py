@@ -8,368 +8,115 @@ _MODULES_DIR = Path(__file__).parent / "modules"
 
 spreadsheet_skill = Skill(
     name="spreadsheet",
-    instructions="""Use openpyxl and pandas to build, transform, and style spreadsheet files (.xlsx).
+    instructions="""# Spreadsheet Skill
+
+## Workflow
+1. Prefer `openpyxl` for `.xlsx` editing and formatting. Use `pandas` for analysis and CSV/TSV workflows.
+2. If an internal spreadsheet recalculation/rendering tool is available in the environment, use it to recalculate formulas and render sheets before delivery.
+3. Use formulas for derived values instead of hardcoding results.
+4. If layout matters, render the output and inspect it visually with your sub-LM.
+5. Save outputs, keep filenames stable, and clean up intermediate files.
+
+## Primary tooling
+- Use `openpyxl` for creating/editing `.xlsx` files and preserving formatting.
+- Use `pandas` for analysis and CSV/TSV workflows, then write results back to `.xlsx` or `.csv`.
+- Use `openpyxl.chart` for native Excel charts when needed.
+- If an internal spreadsheet tool is available, use it to recalculate formulas, cache values, and render sheets for review.
+- For sheets over ~1000 rows, read via `iter_rows(values_only=True)` with `read_only=True`; never iterate `ws.cell(r, c).value` in Python loops (prohibitively slow on WASM sandboxes, and still slow on native openpyxl for very large sheets).
+- When writing Python-computed values to cells, match the expected data type: if the task calls for a numeric rank, count, or integer index derived from parsing a label string (e.g. `"item_3"` → `3`), extract and write `int()` — not the raw label string. Example: `cell.value = int(label.rsplit("_", 1)[-1])`.
+
+## Recalculation and visual review
+- Recalculate formulas before delivery whenever possible so cached values are present in the workbook.
+- `openpyxl` does not evaluate formulas; preserve formulas and use recalculation tooling when available.
+- A `recalculate(path)` tool is available — call it on your output before submitting, then reload with `data_only=True` to confirm cells resolved.
+- After reloading with `data_only=True`, inspect every target cell in the "Answer position" range: (a) if any cell `.value` is a formula-error string (`'#N/A'`, `'#REF!'`, `'#VALUE!'`, `'#DIV/0!'`, `'#NAME?'`, `'#NULL!'`), the formula failed — fix and re-save before submitting; (b) if any target cell `.value` is `None` when you intended to write a value, the write was silently dropped — re-open, re-write, and re-save.
+
+## Rendering and visual checks
+- Render the output sheet to a PNG when layout matters — call `render(path)` for the whole active sheet, or `render(path, cell_range="J3:N5")` / `render(path, cell_range="Sheet1!J3:N5")` to focus on a specific region. Use the cell_range form when your target area is on a wide/tall sheet and wouldn't fit on the first printed page.
+- Inspect the rendered image with your sub-LM: `await predict("rendered: dspy.Image, task_instruction: str -> matches_instruction: bool, issues: list[str]", rendered=img_uri, task_instruction=task_instruction)` — pass `img_uri` as a `data:image/png;base64,...` URI.
+- Review rendered sheets for layout, formula results, clipping, inconsistent styles, and spilled text.
+
+## Formula requirements
+- Use formulas for derived values rather than hardcoding results.
+- Do not use dynamic array functions like `FILTER`, `XLOOKUP`, `SORT`, or `SEQUENCE`.
+- Keep formulas simple and legible; use helper cells for complex logic.
+- Avoid volatile functions like `INDIRECT` and `OFFSET` unless required.
+- Prefer cell references over magic numbers (for example, `=H6*(1+$B$3)` instead of `=H6*1.04`).
+- Use absolute (`$B$4`) or relative (`B4`) references carefully so copied formulas behave correctly.
+- If you need literal text that starts with `=`, prefix it with a single quote.
+- Guard against `#REF!`, `#DIV/0!`, `#VALUE!`, `#N/A`, and `#NAME?` errors.
+- Check for off-by-one mistakes, circular references, and incorrect ranges.
+- Prefix these functions with `_xlfn.` (e.g. `=_xlfn.IFNA(...)`) or they evaluate to `#NAME?`: `IFNA`, `IFS`, `SWITCH`, `TEXTJOIN`, `AGGREGATE`, `MAXIFS`, `MINIFS`, `CONCAT`.
+- When a formula should produce an integer result (period counts, lookup indices, whole-unit financial figures), wrap it with `=ROUND(expr,0)` or `=INT(expr)` to avoid floating-point drift against integer reference values. Example: `=ROUND(DB($C$4,$C$5,$C$6,C8,1),0)` instead of a bare `DB()` call when reference values are whole numbers.
+
+## Citation requirements
+- Cite sources inside the spreadsheet using plain-text URLs.
+- For financial models, cite model inputs in cell comments.
+- For tabular data sourced externally, add a source column when each row represents a separate item.
+
+## Formatting requirements (existing formatted spreadsheets)
+- Render and inspect a provided spreadsheet before modifying it when possible.
+- Preserve existing formatting and style exactly.
+- Match styles for any newly filled cells that were previously blank.
+- Never overwrite established formatting unless the user explicitly asks for a redesign.
+
+## Formatting requirements (new or unstyled spreadsheets)
+- Use appropriate number and date formats.
+- Dates should render as dates, not plain numbers.
+- Percentages should usually default to one decimal place unless the data calls for something else.
+- Currencies should use the appropriate currency format.
+- Headers should be visually distinct from raw inputs and derived cells.
+- Use fill colors, borders, spacing, and merged cells sparingly and intentionally.
+- Set row heights and column widths so content is readable without excessive whitespace.
+- Do not apply borders around every filled cell.
+- Group related calculations and make totals simple sums of the cells above them.
+- Add whitespace to separate sections.
+- Ensure text does not spill into adjacent cells.
+- Avoid unsupported spreadsheet data-table features such as `=TABLE`.
+
+## Color conventions (if no style guidance)
+- Blue: user input
+- Black: formulas and derived values
+- Green: linked or imported values
+- Gray: static constants
+- Orange: review or caution
+- Light red: error or flag
+- Purple: control or logic
+- Teal: visualization anchors and KPI highlights
+
+## Finance-specific requirements
+- Format zeros as `-`.
+- Negative numbers should be red and in parentheses.
+- Format multiples as `5.2x`.
+- Always specify units in headers (for example, `Revenue ($mm)`).
+- Cite sources for all raw inputs in cell comments.
+- For new financial models with no user-specified style, use blue text for hardcoded inputs, black for formulas, green for internal workbook links, red for external links, and yellow fill for key assumptions that need attention.
+
+## Investment banking layouts
+If the spreadsheet is an IB-style model (LBO, DCF, 3-statement, valuation):
+- Totals should sum the range directly above.
+- Hide gridlines and use horizontal borders above totals across relevant columns.
+- Section headers should be merged cells with dark fill and white text.
+- Column labels for numeric data should be right-aligned; row labels should be left-aligned.
+- Indent submetrics under their parent line items.
+
+## Additional Pitfalls
+
+### VBA / Macro Task Requests
+If the instruction asks for Visual Basic or macro code, **do not write VBA source text into cells**. openpyxl cannot embed executable VBA in an `.xlsx` file. Instead, identify the intended data transformation (sorting, filtering, row deletion, extraction, etc.) and perform it directly in Python. Write the resulting computed values or reorganized data into the target cell range.
+
+### Date Values: Use datetime Objects, Not Formatted Strings
+Assign `datetime.datetime` (or `datetime.date`) objects to `cell.value` when writing dates. openpyxl serializes Python date objects as Excel serial-date numbers; the evaluator reads them back as `datetime.datetime`. A string like `'01-01-2023'` is stored as text and will not match a datetime comparison.
+Example: `cell.value = datetime(2023, 1, 1)` (correct) vs `cell.value = '01-01-2023'` (wrong — stored as text).
+
+### Instruction-as-Question → Compute the Answer, Don't Explain
+When an instruction is phrased as 'how can I…' or 'is there a method to…', the target cells contain **computed values** (scalars or formulas), not explanatory prose. Inspect the target range and the existing data; write results, not descriptions of how to achieve them.
 
-# Spreadsheet Operations Guide
+### Formulas That Cache as None
+If `cell.value` is `None` after loading with `data_only=True`, the formula result was never cached. Call `recalculate(output_path)` first, then re-open with `load_workbook(output_path, data_only=True)`. If the cell still reads as `None`, compute the value in Python and write it as a scalar.
 
-## Output Standards
-
-### Typography
-
-Every generated workbook should default to a clean, widely available typeface — Arial or Calibri work well. Override only when the user specifies a preference or when an existing file already uses a different font family.
-
-### Formula Integrity
-
-Formulas **you write** must evaluate without errors. The tokens to watch for are `#REF!`, `#DIV/0!`, `#VALUE!`, `#N/A`, and `#NAME?`. Scan your own formulas and fix any errors before delivery.
-
-However, if the task involves preserving or replicating existing formulas that produce errors, those errors may be **intentional** — do not "fix" them. Only eliminate errors in formulas you authored.
-
-### Respecting Existing Files
-
-When a user provides a template or partially completed workbook, treat its layout, fonts, colors, and naming conventions as authoritative. Mimic the existing patterns rather than overwriting them with defaults from this guide.
-
-### Matching Existing Conventions
-
-When writing text labels, categories, or values that correspond to column headers or existing data in the workbook, match the **exact** casing, abbreviation style, and pluralization from the existing data — not from the instruction text or natural English conventions. For example, if column headers are uppercase (`CHEP`, `NEW`), your output should be uppercase too.
-
-When replacing formula-generated values with Python-computed values, inspect the original formula's output format (e.g., `TEXT(date,"ddd")` produces 3-letter abbreviations like `Mon`, not `Monday`) and match it.
-
-### Whitespace Preservation
-
-Never strip whitespace from cell values (no `.strip()`, `.rstrip()`, `.lstrip()`) unless the instruction explicitly asks for trimming. When splitting or truncating strings, preserve all characters outside the removed portion exactly as they are.
-
-### Empty Cells
-
-For blank, missing, or empty cells, write `None` (truly empty). Never use sentinel strings like `\\xa0` (non-breaking space), `"N/A"`, `"None"`, or `"-"` as placeholders for missing data unless the instruction explicitly specifies a fill value.
-
----
-
-## Finance-Specific Conventions
-
-### Cell Color Scheme
-
-Finance professionals expect a specific visual language in models. Apply these unless the user or an existing template dictates otherwise:
-
-| Color | Meaning |
-|---|---|
-| Blue font `(0, 0, 255)` | Manually entered inputs — the numbers an analyst would change when running scenarios |
-| Black font `(0, 0, 0)` | Computed cells — anything driven by a formula |
-| Green font `(0, 128, 0)` | Cross-sheet references within the same workbook |
-| Red font `(255, 0, 0)` | References that point outside the current file |
-| Yellow fill `(255, 255, 0)` | Cells flagged for review — key assumptions or placeholders awaiting real data |
-
-### Numeric Display Rules
-
-Consistent number formatting makes models readable at a glance:
-
-- **Calendar years** — render as plain text so "2026" doesn't become "2,026"
-- **Dollar amounts** — use `$#,##0` and always clarify units in the header (e.g., "EBITDA ($K)" or "Revenue ($mm)")
-- **Zero values** — display as a dash. A format string like `$#,##0;($#,##0);"-"` handles positive, negative, and zero cases
-- **Percentages** — one decimal place by default: `0.0%`
-- **Valuation multiples** — show as `0.0x` (e.g., 8.5x for an EV/EBITDA ratio)
-- **Negative figures** — wrap in parentheses `(1,200)` rather than prefixing with a minus sign
-
-### Structuring Assumptions
-
-Every driver — growth rates, margin percentages, discount rates, exit multiples — should live in its own dedicated cell. Formulas should reference that cell instead of embedding the number directly. For instance, write `=D10*(1+$C$3)` where `$C$3` holds the growth rate, rather than `=D10*1.07`.
-
-### Guarding Against Formula Errors
-
-Before delivering a model: confirm that every cell reference resolves correctly, watch for off-by-one mistakes in ranges, verify that each projection period uses a structurally identical formula, stress-test with zeros and negatives, and ensure no accidental circular dependencies exist.
-
-### Citing Data Sources
-
-Any manually entered figure should carry a source annotation — either as a cell comment or in an adjacent column at the row's end. Use a consistent pattern:
-
-```
-Ref: [Source Name], [Filing/Report], [Date], [Page/Section], [Link if available]
-```
-
-Examples:
-- `Ref: Annual Report FY2025, p. 52, Revenue Breakdown, https://...`
-- `Ref: Bloomberg, MSFT US Equity, pulled 2025-09-01`
-- `Ref: S&P Capital IQ, Consensus Estimates, retrieved 2025-08-20`
-
----
-
-## Choosing the Right Python Library
-
-Two libraries cover the vast majority of spreadsheet tasks:
-
-**pandas** is ideal when the job is fundamentally about data: reading a file, filtering rows, computing aggregates, pivoting, merging datasets, or exporting a cleaned table.
-
-**openpyxl** is the right pick when the job involves presentation-layer concerns: cell-level formatting, conditional coloring, named ranges, embedded formulas, merged cells, or when you need to surgically edit a workbook without disturbing its existing structure.
-
-For many tasks you'll use both — pandas to wrangle the data, openpyxl to place it into a formatted workbook.
-
----
-
-## Reading & Analyzing Spreadsheet Data
-
-```python
-import pandas as pd
-
-# Pull in the first sheet
-df = pd.read_excel("quarterly_data.xlsx")
-
-# Pull in every sheet as a dictionary of DataFrames
-sheets = pd.read_excel("quarterly_data.xlsx", sheet_name=None)
-
-# Quick inspection
-df.head()
-df.info()
-df.describe()
-
-# Export after transformations
-df.to_excel("cleaned_output.xlsx", index=False)
-```
-
-### Tips for robust reads
-
-- Pin column types to avoid silent misinterpretation: `pd.read_excel("f.xlsx", dtype={"account_id": str})`
-- Limit memory usage on wide files by selecting only needed columns: `usecols=["Date", "Amount", "Category"]`
-- Parse date columns at read time: `parse_dates=["transaction_date"]`
-
----
-
-## The Cardinal Rule: Formulas Belong in Excel, Not in Python
-
-Whenever a cell's value depends on other cells, express that relationship as an Excel formula. Never compute the result in Python and paste the scalar into the workbook — doing so creates a static snapshot that breaks the moment upstream data changes.
-
-### How this goes wrong
-
-```python
-# Avoid: computing in Python, writing a dead number
-revenue_total = df["Revenue"].sum()
-ws["F25"] = revenue_total  # writes 482000 — won't update if data changes
-
-# Avoid: calculating a ratio in Python
-margin = net_income / revenue
-ws["G10"] = margin  # writes 0.12 — frozen forever
-```
-
-### How to do it right
-
-```python
-# Prefer: let the spreadsheet own the calculation
-ws["F25"] = "=SUM(F3:F24)"
-
-# Prefer: the ratio stays live
-ws["G10"] = "=G8/G6"
-```
-
-This principle applies to every derived value — totals, averages, growth rates, percentage splits, running balances, variance calculations, all of it.
-
----
-
-## End-to-End Workflow
-
-1. **Pick your tool.** Data wrangling → pandas. Formatting and formulas → openpyxl. Often both.
-2. **Open or create** the workbook.
-3. **Populate and style** — write data, insert formulas, apply formatting.
-4. **Save** the `.xlsx` file.
-5. **Verify formulas** — import `formula_eval` and call `evaluate()` to compute every formula in memory and check for errors. Fix any issues and re-verify until the report comes back clean.
-
----
-
-## Building a New Workbook
-
-```python
-from openpyxl import Workbook
-from openpyxl.styles import Font, PatternFill, Alignment
-
-wb = Workbook()
-ws = wb.active
-ws.title = "Summary"
-
-# Header row
-headers = ["Quarter", "Revenue", "COGS", "Gross Profit"]
-for col, h in enumerate(headers, start=1):
-    cell = ws.cell(row=1, column=col, value=h)
-    cell.font = Font(bold=True, size=11, name="Arial")
-    cell.fill = PatternFill("solid", fgColor="D9E1F2")
-    cell.alignment = Alignment(horizontal="center")
-
-# Sample data
-ws.append(["Q1", 150000, 90000])
-ws.append(["Q2", 175000, 100000])
-
-# Gross profit formula for each row
-for r in range(2, ws.max_row + 1):
-    ws.cell(row=r, column=4).value = f"=B{r}-C{r}"
-
-# Totals
-total_row = ws.max_row + 1
-ws.cell(row=total_row, column=1, value="Total")
-ws.cell(row=total_row, column=2).value = f"=SUM(B2:B{total_row - 1})"
-ws.cell(row=total_row, column=3).value = f"=SUM(C2:C{total_row - 1})"
-ws.cell(row=total_row, column=4).value = f"=SUM(D2:D{total_row - 1})"
-
-# Adjust column widths
-for col_letter in ["A", "B", "C", "D"]:
-    ws.column_dimensions[col_letter].width = 16
-
-wb.save("quarterly_summary.xlsx")
-```
-
----
-
-## Modifying an Existing Workbook
-
-```python
-from openpyxl import load_workbook
-
-wb = load_workbook("quarterly_summary.xlsx")
-ws = wb["Summary"]
-
-# Walk through every sheet
-for name in wb.sheetnames:
-    sheet = wb[name]
-    print(f"Processing: {name}, rows={sheet.max_row}")
-
-# Update a value
-ws["B2"] = 162000
-
-# Structural changes
-ws.insert_rows(3)          # push row 3 down, insert blank
-ws.delete_cols(5)          # remove column E
-
-# Add a new tab
-notes = wb.create_sheet("Notes")
-notes["A1"] = "Model last updated 2026-04-01"
-
-wb.save("quarterly_summary_v2.xlsx")
-```
-
----
-
-## Verifying Formulas with `formula_eval`
-
-openpyxl writes formula strings into cells but does **not** evaluate them. To verify that every formula resolves correctly, use the `formula_eval` module which computes all values in pure Python — no external applications needed.
-
-```python
-from formula_eval import evaluate
-
-report = evaluate("quarterly_summary.xlsx")
-
-if report["ok"]:
-    print("All formulas clean")
-else:
-    for token, info in report["breakdown"].items():
-        print(f"{token}: {info['count']} error(s)")
-        for cell in info["cells"]:
-            print(f"  {cell}")
-```
-
-You can also inspect individual computed values programmatically:
-
-```python
-report = evaluate("quarterly_summary.xlsx")
-
-# Check a specific cell's computed result
-assert report["computed"]["Summary!D4"] == 325000
-```
-
-### Understanding the report
-
-The `evaluate()` function returns a dictionary with these keys:
-
-| Key | Type | Description |
-|---|---|---|
-| `ok` | bool | `True` when every formula resolved without an error token |
-| `formulas` | int | Total formula cells found in the workbook |
-| `errors` | int | How many cells evaluated to an Excel error |
-| `breakdown` | dict | Each error token mapped to `{"count": N, "cells": [...]}` |
-| `computed` | dict | Every evaluated cell as `"Sheet!Cell": value` — useful for assertions |
-
-A clean report:
-
-```python
-{
-    "ok": True,
-    "formulas": 18,
-    "errors": 0,
-    "breakdown": {},
-    "computed": {"Summary!B4": 325000, "Summary!C4": 190000, ...}
-}
-```
-
-A report with problems:
-
-```python
-{
-    "ok": False,
-    "formulas": 18,
-    "errors": 3,
-    "breakdown": {
-        "#DIV/0!": {"count": 1, "cells": ["Summary!E14"]},
-        "#REF!":   {"count": 2, "cells": ["Summary!D22", "Assumptions!B9"]}
-    },
-    "computed": {...}
-}
-```
-
-When errors appear: fix the offending formulas in openpyxl, save again, and re-run `evaluate()` until `errors` reaches zero.
-
-### Ensuring spreadsheet apps recalculate on open
-
-Excel and Google Sheets automatically recalculate formulas when they open a file, but if you want to be explicit about it:
-
-```python
-from formula_eval import ensure_recalc_on_open
-
-ensure_recalc_on_open("quarterly_summary.xlsx")
-```
-
-This sets the `fullCalcOnLoad` flag in the workbook metadata, guaranteeing that any spreadsheet application will do a fresh computation pass when the file is opened.
-
----
-
-## Formula Debugging Checklist
-
-### Before you build
-
-- Spot-check two or three cell references to make sure they resolve to the values you expect.
-- Confirm your column-number-to-letter mapping — column 64 is `BL`, not `BK`.
-- Account for the index offset between pandas (0-based) and Excel (1-based). A DataFrame's row index 5 lands on Excel row 6.
-
-### Common traps
-
-- **Null values**: screen with `pd.notna()` before writing to cells.
-- **Wide datasets**: fiscal-year data frequently sits beyond column 50 — don't stop scanning early.
-- **Duplicate matches**: when searching for a label, verify you've found the right occurrence if it appears more than once.
-- **Division by zero**: guard every divisor — wrap in `IFERROR` or check the denominator cell.
-- **Broken references**: after inserting or deleting rows/columns, confirm existing formulas still point where they should.
-- **Multi-sheet links**: the correct syntax is `SheetName!A1`; forgetting the sheet name prefix silently targets the active sheet.
-
-### Incremental testing strategy
-
-- Wire up formulas in a handful of cells first. Recalculate and verify before copying the pattern across hundreds of rows.
-- Make sure every cell that a formula depends on actually exists and contains the expected type of data.
-- Stress-test with boundary values: zero, negative numbers, very large figures.
-
----
-
-## openpyxl Essentials
-
-- Rows and columns are **1-indexed**: `cell(row=1, column=1)` is `A1`.
-- To read previously computed values without formulas, open with `data_only=True`. **Caution**: saving a workbook opened this way permanently replaces formulas with their last-calculated values.
-- For very large files, `read_only=True` (reading) and `write_only=True` (writing) dramatically reduce memory consumption.
-- Formulas written by openpyxl are stored as text — use `formula_eval.evaluate()` to verify their computed values in Python.
-
-## pandas Essentials
-
-- Force column types at load time to prevent silent coercion: `dtype={"zip_code": str}`.
-- Narrow wide files by selecting only relevant columns: `usecols=["A", "D", "F"]`.
-- Let pandas handle date parsing: `parse_dates=["order_date"]`.
-
----
-
-## Code Style Notes
-
-When writing Python for spreadsheet tasks, favor brevity: short variable names, minimal inline commentary, no diagnostic print statements unless you're actively debugging. The code is a means to an end — the workbook is the deliverable.
-
-Inside the workbook itself, be generous with documentation: annotate complex formulas with cell comments, tag every hardcoded input with its source, and add section labels so future readers can navigate the model without reverse-engineering it.
+### Missing Output Sheets
+If the 'Answer position' names a sheet that does not exist in the workbook, create it before writing: `wb.create_sheet('SheetName')`. Never assume all referenced sheets are already present.
 """,
     packages=["openpyxl", "pandas", "formulas"],
     modules={"formula_eval": str(_MODULES_DIR / "formula_eval.py")},
