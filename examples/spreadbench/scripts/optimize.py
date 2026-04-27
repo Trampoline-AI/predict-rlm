@@ -339,6 +339,46 @@ def _parse_args() -> argparse.Namespace:
         "ImproveInstructions class. Requires --rlm_proposer.",
     )
 
+    # RLM merge proposer
+    p.add_argument(
+        "--rlm_merge_proposer",
+        action="store_true",
+        help="replace GEPA's stock MergeProposer with RlmMergeProposer "
+        "(lib/rlm_merge_proposer.py). Stock mechanical merges are "
+        "effectively no-ops on single-component skills (per-component "
+        "filter blocks divergent pairs); the RLM merge proposer "
+        "synthesizes a merged skill from two parents + a paired trace "
+        "file via an LM call on MergeInstructions. Triggers direct "
+        "GEPAEngine construction instead of gepa.api.optimize.",
+    )
+    p.add_argument(
+        "--max_rlm_merge_attempts",
+        type=int,
+        default=12,
+        help="attempt cap for RLM merge synthesis (includes rejects — "
+        "cost-aware). Distinct from max_merge_invocations which counts "
+        "accepted merges only (default: 12).",
+    )
+    p.add_argument(
+        "--rlm_merge_minibatch_size",
+        type=int,
+        default=50,
+        help="size of the shared train minibatch for per-parent trace "
+        "capture AND the subsample eval size for the merged candidate. "
+        "Defaults to 50 to match the reflective minibatch_size default — "
+        "so merge's decision power matches reflective iteration. The "
+        "subsample eval piece uses this to override GEPA's stock n=5 "
+        "default (too small for meaningful McNemar stats).",
+    )
+    p.add_argument(
+        "--rlm_merge_min_each",
+        type=int,
+        default=3,
+        help="pair-selection mutual-wins threshold: each parent must "
+        "strictly win at least this many val tasks the other loses "
+        "(default: 3).",
+    )
+
     # Eval-side budget (per task case)
     p.add_argument("--concurrency", type=int, default=30)
     p.add_argument("--max_iterations", type=int, default=50)
@@ -406,6 +446,10 @@ def main() -> int:
         proposer_max_iterations=args.proposer_max_iterations,
         proposer_timeout=args.proposer_timeout,
         use_optimize_gen=args.use_optimize_gen,
+        rlm_merge_proposer=args.rlm_merge_proposer,
+        max_rlm_merge_attempts=args.max_rlm_merge_attempts,
+        rlm_merge_minibatch_size=args.rlm_merge_minibatch_size,
+        rlm_merge_min_each=args.rlm_merge_min_each,
         concurrency=args.concurrency,
         max_iterations=args.max_iterations,
         task_timeout=args.task_timeout,
