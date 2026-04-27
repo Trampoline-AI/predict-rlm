@@ -94,6 +94,13 @@ def _parse_args() -> argparse.Namespace:
         "use the seed value for the other (useful for A/B'ing each component's "
         "individual contribution). Default: apply both.",
     )
+    p.add_argument(
+        "--cand_idx",
+        type=int,
+        default=None,
+        help="when --run_dir is set, use this specific candidate index "
+        "instead of best-by-mean (0-based). E.g. --cand_idx 2 for cand 2.",
+    )
     p.add_argument("--limit", type=int, default=None, help="cap tasks for smoke tests")
     p.add_argument(
         "--task_ids",
@@ -141,9 +148,9 @@ def _parse_args() -> argparse.Namespace:
         "per-case case_1.log regardless.",
     )
     p.add_argument(
-        "--no_cache",
+        "--cache",
         action="store_true",
-        help="disable dspy.LM caching (useful when re-running the same prompt)",
+        help="enable dspy.LM caching (off by default to ensure clean cost tracking)",
     )
     return p.parse_args()
 
@@ -209,7 +216,11 @@ def _resolve_output_dir(
         # fall back to the full name otherwise.
         import re
         m = re.match(r"optimize_(\d{8}_\d{6})", rd_name)
-        tail_parts.append(f"sk-{m.group(1) if m else _slug_lm(rd_name)}")
+        sk_tag = m.group(1) if m else _slug_lm(rd_name)
+        cand_idx = getattr(args, "cand_idx", None)
+        if cand_idx is not None:
+            sk_tag += f"_c{cand_idx}"
+        tail_parts.append(f"sk-{sk_tag}")
     dname = head + ("__" + "__".join(tail_parts) if tail_parts else "")
     return DEFAULT_OUTPUT_DIR / dname
 
@@ -278,13 +289,14 @@ def main() -> int:
         dataset=args.dataset,
         run_dir=args.run_dir,
         only=args.only,
+        cand_idx=args.cand_idx,
         limit=args.limit,
         task_ids=_parse_task_ids(args.task_ids),
         cases_per_task=args.cases_per_task,
         concurrency=args.concurrency,
         max_iterations=args.max_iterations,
         task_timeout=args.task_timeout,
-        cache=not args.no_cache,
+        cache=args.cache,
         log_dir=log_dir,
     )
 
