@@ -18,9 +18,12 @@ Background:
 from __future__ import annotations
 
 import asyncio
+import time
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
+from dspy.primitives.repl_types import REPLEntry
 
 
 def _patch_build_run_trace(predictor, sentinel):
@@ -137,6 +140,34 @@ class TestAsyncForwardTracedCancellationPath:
 
         with pytest.raises(asyncio.CancelledError):
             asyncio.run(_raises_cancelled_with_broken_trace())
+
+    def test_error_trace_includes_pending_iteration(self):
+        from predict_rlm.predict_rlm import PredictRLM
+
+        predictor = PredictRLM.__new__(PredictRLM)
+        predictor.max_iterations = 3
+        predictor._partial_pending_entry = REPLEntry(
+            reasoning="about to call a slow tool",
+            code="await slow_tool()",
+            output="",
+        )
+        predictor._partial_pending_start = time.perf_counter()
+        lm = SimpleNamespace(model="fake-main", history=[])
+
+        trace = predictor._build_run_trace(
+            status="error",
+            steps=[],
+            lm=lm,
+            sub_lm=None,
+            lm_hist_start=0,
+            sub_hist_start=0,
+            run_start=time.perf_counter(),
+        )
+
+        assert trace.iterations == 1
+        assert trace.steps[0].reasoning == "about to call a slow tool"
+        assert trace.steps[0].code == "await slow_tool()"
+        assert trace.steps[0].error is True
 
 
 class TestHandlerWideningIsAnchored:

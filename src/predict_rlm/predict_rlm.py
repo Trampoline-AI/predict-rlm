@@ -28,14 +28,14 @@ import regex
 from dspy.adapters.base import Adapter
 from dspy.adapters.chat_adapter import ChatAdapter
 from dspy.adapters.json_adapter import JSONAdapter
-from dspy.primitives.code_interpreter import CodeInterpreter
+from dspy.primitives.code_interpreter import CodeInterpreter, CodeInterpreterError
 from dspy.utils.exceptions import AdapterParseError
 from litellm import ContextWindowExceededError
 from pydantic import ConfigDict, ValidationError, create_model
 
 from ._shared import build_rlm_signatures, format_tool_docs_full
 from .files import File, build_file_plan, scan_file_fields
-from .interpreter import JspiInterpreter
+from .interpreter import JspiInterpreter, SandboxFatalError
 from .rlm_skills import Skill, merge_skills
 from .trace import (
     IterationStep,
@@ -71,6 +71,24 @@ def _strip_code_fences(code: str) -> str:
     if matches:
         return "\n\n".join(block.rstrip() for block in matches)
     return code
+
+
+def _format_execution_error(code: str, exc: Exception) -> str:
+    err = str(exc)
+    if code.count('"""') >= 3 and (
+        "unterminated" in err.lower()
+        or "invalid syntax" in err.lower()
+    ):
+        return (
+            f"[Error] {err}\n\n"
+            'Hint: your code contains nested `"""` inside a '
+            "triple-quoted string literal. Python cannot distinguish "
+            "the inner delimiter from the outer one. Fix: build the "
+            "string with '\\n'.join([line1, line2, ...]) using "
+            "single-quoted strings per line, or switch the outer "
+            "delimiter to '''...'''."
+        )
+    return f"[Error] {exc}"
 
 
 if TYPE_CHECKING:
@@ -759,6 +777,7 @@ class PredictRLM(dspy.RLM):
         #       surfaces what the agent was trying to do.
         self._partial_history = None
         self._partial_pending_entry = None
+        self._partial_pending_start = None
 
         # Store allowed_domains, debug, and output_dir for interpreter creation
         self._allowed_domains = allowed_domains
@@ -1287,6 +1306,24 @@ class PredictRLM(dspy.RLM):
         sub_hist_start: int,
         run_start: float,
     ) -> RunTrace:
+        trace_steps = steps
+        pending_entry = getattr(self, "_partial_pending_entry", None)
+        if status == "error" and pending_entry is not None:
+            trace_steps = list(steps)
+            pending_start = getattr(self, "_partial_pending_start", None)
+            trace_steps.append(
+                IterationStep(
+                    iteration=len(steps) + 1,
+                    reasoning=pending_entry.reasoning,
+                    code=pending_entry.code,
+                    output=pending_entry.output,
+                    untruncated_output=pending_entry.output,
+                    error=True,
+                    duration_ms=ms_since(pending_start) if pending_start else 0,
+                    tool_calls=drain_tool_calls(),
+                    predict_calls=drain_predict_calls(),
+                )
+            )
         # Per-RLM instance ``lm`` has its own history (isolated via
         # ``lm.copy()`` in ``__init__``) so ``usage_since`` is free of
         # the shared-history concurrency bug that plagued the old
@@ -1305,11 +1342,11 @@ class PredictRLM(dspy.RLM):
             status=status,
             model=str(getattr(lm, "model", lm)),
             sub_model=str(getattr(sub_lm, "model", sub_lm)) if sub_lm is not lm else None,
-            iterations=len(steps),
+            iterations=len(trace_steps),
             max_iterations=self.max_iterations,
             duration_ms=ms_since(run_start),
             usage=LMUsage(main=main_usage, **({"sub": sub_usage} if sub_usage else {})),
-            steps=steps,
+            steps=trace_steps,
         )
 
     async def aforward(self, **kwargs: Any) -> dspy.Prediction:
@@ -1326,6 +1363,69 @@ class PredictRLM(dspy.RLM):
                 return await self._aforward_traced(file_plan, **kwargs)
         finally:
             self._context_lm = None
+
+    def _execute_iteration(
+        self,
+        repl,
+        variables,
+        history,
+        iteration,
+        input_args,
+        output_field_names,
+    ):
+        """Execute one synchronous RLM iteration with PredictRLM validation."""
+        variables_info = [variable.format() for variable in variables]
+        pred = self.generate_action(
+            variables_info=variables_info,
+            repl_history=history,
+            iteration=f"{iteration + 1}/{self.max_iterations}",
+        )
+        if not isinstance(getattr(pred, "reasoning", None), str):
+            raise RuntimeError(
+                "PredictRLM action adapter returned invalid reasoning; "
+                "expected a validated non-null string."
+            )
+        if not isinstance(getattr(pred, "code", None), str) or len(pred.code) < 1:
+            raise RuntimeError(
+                "PredictRLM action adapter returned invalid code; "
+                "expected a validated non-empty string."
+            )
+        if self.verbose:
+            import logging as _logging
+
+            _logging.getLogger("dspy.predict.rlm").info(
+                f"RLM iteration {iteration + 1}/{self.max_iterations}\n"
+                f"Reasoning: {pred.reasoning}\nCode:\n{pred.code}"
+            )
+
+        code = pred.code or ""
+        code = _strip_code_fences(code)
+
+        from dspy.primitives.repl_types import REPLEntry
+
+        self._partial_pending_entry = REPLEntry(
+            reasoning=getattr(pred, "reasoning", "") or "",
+            code=code,
+            output="",
+        )
+        self._partial_pending_start = time.perf_counter()
+
+        try:
+            result = repl.execute(code, variables=dict(input_args))
+        except SandboxFatalError:
+            raise
+        except (CodeInterpreterError, SyntaxError) as e:
+            result = _format_execution_error(code, e)
+
+        if _PARENT_TAKES_CODE:
+            step_result = self._process_execution_result(pred, code, result, history, output_field_names)
+        else:
+            step_result = self._process_execution_result(pred, result, history, output_field_names)
+        if not isinstance(step_result, dspy.Prediction):
+            self._partial_history = step_result
+        self._partial_pending_entry = None
+        self._partial_pending_start = None
+        return step_result
 
     async def _aexecute_iteration(
         self,
@@ -1380,29 +1480,17 @@ class PredictRLM(dspy.RLM):
             code=code,
             output="",
         )
+        self._partial_pending_start = time.perf_counter()
 
         try:
             if hasattr(repl, "aexecute"):
                 result = await repl.aexecute(code, variables=dict(input_args))
             else:
                 result = repl.execute(code, variables=dict(input_args))
+        except SandboxFatalError:
+            raise
         except Exception as e:
-            err = str(e)
-            if code.count('"""') >= 3 and (
-                "unterminated" in err.lower()
-                or "invalid syntax" in err.lower()
-            ):
-                result = (
-                    f"[Error] {err}\n\n"
-                    'Hint: your code contains nested `"""` inside a '
-                    "triple-quoted string literal. Python cannot distinguish "
-                    "the inner delimiter from the outer one. Fix: build the "
-                    "string with '\\n'.join([line1, line2, ...]) using "
-                    "single-quoted strings per line, or switch the outer "
-                    "delimiter to '''...'''."
-                )
-            else:
-                result = f"[Error] {e}"
+            result = _format_execution_error(code, e)
 
         if _PARENT_TAKES_CODE:
             step_result = self._process_execution_result(pred, code, result, history, output_field_names)
@@ -1410,11 +1498,12 @@ class PredictRLM(dspy.RLM):
             step_result = self._process_execution_result(pred, result, history, output_field_names)
         # Snapshot the updated REPL history for partial-trajectory recovery.
         # step_result is either a new REPLHistory (iteration continues) or a
-        # dspy.Prediction (SUBMIT happened). Only the former gets snapshot;
-        # Predictions mean the forward() call will return normally.
+        # dspy.Prediction (SUBMIT happened). Only the former gets a history
+        # snapshot, but both mean execution is no longer in flight.
         if not isinstance(step_result, dspy.Prediction):
             self._partial_history = step_result
-            self._partial_pending_entry = None
+        self._partial_pending_entry = None
+        self._partial_pending_start = None
         return step_result
 
     def _prepare_file_io(
@@ -1609,6 +1698,7 @@ class PredictRLM(dspy.RLM):
                     # committed REPL state if an iteration hangs or errors.
                     self._partial_history = history
                     self._partial_pending_entry = None
+                    self._partial_pending_start = None
 
                     for iteration in range(self.max_iterations):
                         iter_start = time.perf_counter()
@@ -1760,6 +1850,7 @@ class PredictRLM(dspy.RLM):
                     # committed REPL state if an iteration hangs or errors.
                     self._partial_history = history
                     self._partial_pending_entry = None
+                    self._partial_pending_start = None
 
                     for iteration in range(self.max_iterations):
                         iter_start = time.perf_counter()
