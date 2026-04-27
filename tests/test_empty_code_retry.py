@@ -161,6 +161,7 @@ def test_validating_adapter_retries_empty_chat_code_via_json_fallback():
 
     class _FakeLM:
         model = "openai/gpt-4o-mini"
+        supported_params = {"response_format", "temperature", "max_tokens"}
 
         def __init__(self):
             self.calls = []
