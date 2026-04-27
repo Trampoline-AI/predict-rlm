@@ -28,6 +28,7 @@ GREEN: it returns an error response with a timeout message within
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import time
 
 import pytest
@@ -126,3 +127,33 @@ def test_tool_exception_still_routes_through_error_path(monkeypatch):
     )
     assert "error" in response
     assert "blew up" in str(response["error"])
+
+
+def test_sync_tool_timeout_does_not_poison_executor(monkeypatch):
+    monkeypatch.setattr(rlm_interpreter, "TOOL_CALL_TIMEOUT_SEC", 0.05)
+
+    def _slow_tool():
+        time.sleep(0.5)
+        return "unreachable"
+
+    def _fast_tool():
+        return "ok"
+
+    interp = _build_interp_with_tool(_slow_tool)
+    interp._executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    try:
+        first = asyncio.run(
+            interp._execute_tool_async("slow_tool", {"args": [], "kwargs": {}})
+        )
+        assert "error" in first
+
+        interp.tools["slow_tool"] = _fast_tool
+        started = time.monotonic()
+        second = asyncio.run(
+            interp._execute_tool_async("slow_tool", {"args": [], "kwargs": {}})
+        )
+
+        assert second.get("value") == "ok"
+        assert time.monotonic() - started < 0.3
+    finally:
+        interp._executor.shutdown(wait=False, cancel_futures=True)

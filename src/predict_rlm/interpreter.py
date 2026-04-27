@@ -1150,15 +1150,19 @@ class JspiInterpreter(PythonInterpreter):
                     ) from e
             else:
                 loop = asyncio.get_running_loop()
+                future = loop.run_in_executor(
+                    self._executor,
+                    functools.partial(tool_fn, *args, **kwargs),
+                )
                 try:
                     result = await asyncio.wait_for(
-                        loop.run_in_executor(
-                            self._executor,
-                            functools.partial(tool_fn, *args, **kwargs),
-                        ),
+                        future,
                         timeout=TOOL_CALL_TIMEOUT_SEC,
                     )
                 except asyncio.TimeoutError as e:
+                    future.cancel()
+                    self._executor.shutdown(wait=False, cancel_futures=True)
+                    self._executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
                     raise TimeoutError(
                         f"tool {tool_name!r} timed out after "
                         f"{TOOL_CALL_TIMEOUT_SEC}s (per-call budget)"

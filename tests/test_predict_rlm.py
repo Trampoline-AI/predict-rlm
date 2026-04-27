@@ -1341,6 +1341,60 @@ class TestUnresolvedTypesFallback:
                 assert isinstance(sig_arg, str)
 
 
+class TestExecuteIteration:
+    """Tests for _execute_iteration sync-path behavior."""
+
+    def test_accepts_repl_fence_in_sync_path(self):
+        mock_lm = MagicMock()
+        rlm = PredictRLM(ImageAnalysisSignature, sub_lm=mock_lm, max_iterations=5)
+
+        mock_repl = MagicMock()
+        mock_repl.execute = MagicMock(return_value="output from execute")
+
+        mock_pred = MagicMock()
+        mock_pred.reasoning = "thinking"
+        mock_pred.code = "```repl\nprint('hello')\n```"
+        rlm.generate_action = MagicMock(return_value=mock_pred)
+
+        mock_result = MagicMock()
+        with patch.object(rlm, "_process_execution_result", return_value=mock_result):
+            result = rlm._execute_iteration(
+                repl=mock_repl,
+                variables=[],
+                history=[],
+                iteration=0,
+                input_args={},
+                output_field_names=["answer"],
+            )
+
+        mock_repl.execute.assert_called_once_with("print('hello')", variables={})
+        assert result is mock_result
+
+    def test_sync_sandbox_fatal_error_propagates(self):
+        from predict_rlm.interpreter import SandboxFatalError
+
+        mock_lm = MagicMock()
+        rlm = PredictRLM(ImageAnalysisSignature, sub_lm=mock_lm, max_iterations=5)
+
+        mock_repl = MagicMock()
+        mock_repl.execute = MagicMock(side_effect=SandboxFatalError("fatal"))
+
+        mock_pred = MagicMock()
+        mock_pred.reasoning = "thinking"
+        mock_pred.code = "print('hello')"
+        rlm.generate_action = MagicMock(return_value=mock_pred)
+
+        with pytest.raises(SandboxFatalError, match="fatal"):
+            rlm._execute_iteration(
+                repl=mock_repl,
+                variables=[],
+                history=[],
+                iteration=0,
+                input_args={},
+                output_field_names=["answer"],
+            )
+
+
 class TestAexecuteIteration:
     """Tests for _aexecute_iteration: async vs sync interpreter dispatch."""
 
@@ -1447,6 +1501,32 @@ class TestAexecuteIteration:
         error_arg = mock_process.call_args[0][2 if _PARENT_TAKES_CODE else 1]
         assert "[Error]" in error_arg
         assert "sandbox crashed" in error_arg
+
+    @pytest.mark.asyncio
+    async def test_sandbox_fatal_error_propagates(self):
+        from predict_rlm.interpreter import SandboxFatalError
+
+        mock_lm = MagicMock()
+        rlm = PredictRLM(ImageAnalysisSignature, sub_lm=mock_lm, max_iterations=5)
+
+        mock_repl = MagicMock()
+        mock_repl.aexecute = AsyncMock(side_effect=SandboxFatalError("fatal"))
+
+        mock_pred = MagicMock()
+        mock_pred.reasoning = "thinking"
+        mock_pred.code = "print('hello')"
+        rlm.generate_action = MagicMock()
+        rlm.generate_action.acall = AsyncMock(return_value=mock_pred)
+
+        with pytest.raises(SandboxFatalError, match="fatal"):
+            await rlm._aexecute_iteration(
+                repl=mock_repl,
+                variables=[],
+                history=[],
+                iteration=0,
+                input_args={},
+                output_field_names=["answer"],
+            )
 
 
 class TestAforwardTracedUsage:
