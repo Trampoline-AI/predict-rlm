@@ -105,6 +105,8 @@ class EvalConfig:
     # one and use the seed value for the other — useful for A/B'ing each
     # component's individual contribution.
     only: str | None = None
+    cand_idx: int | None = None
+    """When set with ``run_dir``, use this specific candidate index instead of best-by-mean."""
     limit: int | None = None
     task_ids: tuple[str, ...] | None = None
     cases_per_task: int = 0
@@ -112,7 +114,7 @@ class EvalConfig:
     concurrency: int = 30
     max_iterations: int = 50
     task_timeout: int = 300
-    cache: bool = True
+    cache: bool = False
     log_dir: Path | None = None
 
 
@@ -440,6 +442,7 @@ class EvalReport:
                 "concurrency": self.config.concurrency,
                 "max_iterations": self.config.max_iterations,
                 "task_timeout": self.config.task_timeout,
+                "cache": self.config.cache,
             },
             "signature_source": self.signature_source,
             "signature_length": self.signature_length,
@@ -553,8 +556,13 @@ def make_dynamic_skill(instructions: str) -> Skill:
     )
 
 
-def extract_best_candidate(run_dir: str | Path) -> dict[str, str]:
-    """Pull the best-by-mean candidate (full dict) from a GEPA ``run_dir``.
+def extract_best_candidate(
+    run_dir: str | Path, cand_idx: int | None = None
+) -> dict[str, str]:
+    """Pull a candidate (full dict) from a GEPA ``run_dir``.
+
+    When *cand_idx* is ``None`` (default), returns the best-by-mean
+    candidate. When set, returns the candidate at that specific index.
 
     Returns the full ``{component_name: component_text}`` dict. For
     multi-component runs this includes both ``signature_docstring`` and
@@ -564,8 +572,14 @@ def extract_best_candidate(run_dir: str | Path) -> dict[str, str]:
     state_path = Path(run_dir) / "gepa_state.bin"
     with state_path.open("rb") as f:
         state = pickle.load(f)
-    subs = state["prog_candidate_val_subscores"]
     cands = state["program_candidates"]
+    if cand_idx is not None:
+        if cand_idx < 0 or cand_idx >= len(cands):
+            raise ValueError(
+                f"cand_idx={cand_idx} out of range; run has {len(cands)} candidates"
+            )
+        return cands[cand_idx]
+    subs = state["prog_candidate_val_subscores"]
     best_idx = max(
         range(len(cands)),
         key=lambda i: (sum(subs[i].values()) / len(subs[i])) if subs[i] else 0.0,
@@ -798,20 +812,21 @@ def _resolve_components(
     if not config.run_dir:
         return seed_sig, "seed", seed_skill, "seed"
 
-    candidate = extract_best_candidate(config.run_dir)
+    candidate = extract_best_candidate(config.run_dir, cand_idx=config.cand_idx)
     run_basename = Path(config.run_dir).name
+    cand_tag = f"cand{config.cand_idx}" if config.cand_idx is not None else "best"
 
     sig_text = seed_sig
     sig_source = "seed"
     if config.only != "skill" and GEPA_COMPONENT_SIGNATURE in candidate:
         sig_text = candidate[GEPA_COMPONENT_SIGNATURE]
-        sig_source = f"{run_basename}#sig"
+        sig_source = f"{run_basename}#{cand_tag}#sig"
 
     skill_text = seed_skill
     skill_source = "seed"
     if config.only != "signature" and GEPA_COMPONENT_SKILL in candidate:
         skill_text = candidate[GEPA_COMPONENT_SKILL]
-        skill_source = f"{run_basename}#skill"
+        skill_source = f"{run_basename}#{cand_tag}#skill"
 
     return sig_text, sig_source, skill_text, skill_source
 
