@@ -39,7 +39,7 @@ import re
 import shutil
 import tempfile
 import time
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -445,6 +445,139 @@ class ImproveInstructions(dspy.Signature):
     )
 
 
+class MergeInstructions(dspy.Signature):
+    """Synthesize a single MERGED skill-instructions text from TWO parent
+    skills (A and B) that evolved from a COMMON ANCESTOR along DIFFERENT
+    branches. Each parent's execution on the SAME task set is provided in
+    ``paired_traces_file``. Your job is to produce one merged skill that
+    inherits the strengths of both.
+
+    # Inputs
+
+    - ``current_instructions_a`` / ``current_instructions_b``: full skill
+      text for parents A and B.
+    - ``common_ancestor_instructions``: full skill text for the common
+      ancestor A and B diverged from. Use this to precisely label inherited
+      vs. branch-unique vs. differently-rewritten text.
+    - ``paired_traces_file`` (mounted at /sandbox/input/paired_traces_file/):
+      JSONL, one record per task, each carrying BOTH parents' trajectories,
+      scores, and a pre-computed ``winner`` field. Schema:
+        {
+          "data_id": ...,
+          "task_id": "benchmark id for audit citations",
+          "inputs": {...},
+          "parent_a": {"Generated Outputs": "...", "Feedback": "..."},
+          "parent_b": {"Generated Outputs": "...", "Feedback": "..."},
+          "parent_a_score": 0.72,
+          "parent_b_score": 0.45,
+          "winner": "a" | "b" | "tie"
+        }
+
+    # How to identify inherited vs branch-unique text
+
+    1. Compute VERBATIM-MATCH text across A and B: text that appears
+       unchanged in both. Cross-reference with ``common_ancestor_instructions``
+       to confirm it came from the ancestor. This is your [COMMON] corpus.
+    2. Text present in ``common_ancestor_instructions`` but REWRITTEN
+       differently in A and B → [MERGED] candidates. The ancestor gives you
+       the ``before`` to diff both parents against.
+    3. Text present in A but NOT in ancestor and NOT in B → [A_ONLY].
+       Symmetric for [B_ONLY].
+
+    # How to merge
+
+    1. Identify the four sets above.
+    2. Read the paired trace file. For each task, note which parent won
+       and the failure mode of the loser. Bucket tasks into A_WINS,
+       B_WINS, BOTH_FAIL.
+    3. For [A_ONLY]: keep if A_WINS tasks show the rule in use. Drop if
+       not. Symmetric for [B_ONLY].
+    4. For [MERGED]: pick whichever branch's rewrite the winning-side
+       tasks support, and state which you chose and why in the audit.
+    5. For BOTH_FAIL tasks: optional [NEW] rule, BUT only if the trace
+       evidence names a concrete actionable runtime fact AND you cite
+       the specific task_id in the audit.
+
+    # Structural tests (same as ImproveInstructions)
+
+    Every rule you keep or add must still pass:
+      (a) NAMES A SPECIFIC API, TOOL, OR ENVIRONMENT FACT (openpyxl
+          symbol, LibreOffice behavior, sandbox limit, concrete tool name).
+      (b) HAS A CONCRETE NON-BENCHMARK USE CASE from
+          {IB modeling, form-filling, PM tracking, data wrangling}.
+      (c) STATES A PRINCIPLE, NOT A LITERAL TRACE TOKEN (no literal
+          sheet names, ranges, values, or phrases copied from traces).
+      (d) May include a SHORT code example using only generic symbols
+          (``cell``, ``ws``, ``recalculate``) — no trace-specific tokens.
+
+    # Length discipline
+
+    Merged skill must NOT exceed ``1.10 × max(|A|, |B|)`` characters. Additive
+    bloat (concatenating ALL rules from A AND B) is the single largest
+    merge-specific failure mode. The merge SYNTHESIZES; it does not
+    CONCATENATE.
+
+    # Audit tag contract
+
+    Each audit line in ``generalization_check`` starts with exactly one of:
+      [COMMON]  — text inherited verbatim from common ancestor, preserved here
+      [A_ONLY]  — text unique to parent A, kept based on A_WINS evidence
+      [B_ONLY]  — text unique to parent B, kept based on B_WINS evidence
+      [MERGED]  — ancestor section rewritten differently by A and B;
+                  reconciled here (state which branch's version and why)
+      [NEW]     — NEW text added in this merge call, addressing a
+                  BOTH_FAIL failure mode. MUST cite a specific task_id
+                  from the paired trace file as grounding. Lines without
+                  a task_id citation will be rejected structurally before
+                  validation.
+
+    After the tag, use the same five-slot audit format as
+    ``ImproveInstructions``:
+      ``[TAG] <rule> | api: <...> | use case: <...> | principle: <...> |
+      counterfactual_1: <workbook shape, domain A> |
+      counterfactual_2: <workbook shape, domain B, B ≠ A>``
+
+    The two counterfactuals MUST come from different domains across
+    {IB modeling, form-filling, PM tracking, data wrangling}.
+    """
+
+    current_instructions_a: str = dspy.InputField(
+        desc="Full skill instructions text for parent A"
+    )
+    current_instructions_b: str = dspy.InputField(
+        desc="Full skill instructions text for parent B"
+    )
+    common_ancestor_instructions: str = dspy.InputField(
+        desc="Full skill instructions text for the common ancestor A and B "
+        "diverged from. Used to precisely label inherited vs. "
+        "branch-unique vs. differently-rewritten text."
+    )
+    paired_traces_file: File = dspy.InputField(
+        desc="JSONL file with one record per task, carrying both parents' "
+        "trajectories side-by-side. Mounted at "
+        "/sandbox/input/paired_traces_file/."
+    )
+    new_instructions: str = dspy.OutputField(
+        desc="The full merged skill instructions text. Emit the entire "
+        "skill you want the agent to use, not a diff. Length must not "
+        "exceed 1.10 × max(|A|, |B|) characters."
+    )
+    generalization_check: list[str] = dspy.OutputField(
+        desc="One line per rule in the FINAL merged skill. Each line MUST "
+        "start with exactly one tag: [COMMON], [A_ONLY], [B_ONLY], "
+        "[MERGED], or [NEW]. Format: "
+        "'[TAG] <rule> | api: <specific api/env fact> | use case: "
+        "<concrete non-benchmark task> | principle: <abstract principle, "
+        "naming no trace token> | counterfactual_1: <workbook shape, "
+        "domain A> | counterfactual_2: <workbook shape, domain B, B ≠ A>'. "
+        "[NEW] lines MUST additionally cite a specific task_id from the "
+        "paired trace file (e.g. 'citing task_id=1_38655_input') or the "
+        "candidate is rejected structurally. The two counterfactuals MUST "
+        "come from different domains across {IB modeling, form-filling, "
+        "PM tracking, data wrangling}."
+    )
+
+
 # ---------------------------------------------------------------------------
 # Train/val split
 # ---------------------------------------------------------------------------
@@ -578,6 +711,21 @@ class OptimizeConfig:
     # this flag, so you can postmortem after the fact either way.
     verbose_rlm: bool = False
 
+    # --- RLM merge proposer ------------------------------------------------
+    # When True, use RlmMergeProposer (scripts/lib/rlm_merge_proposer.py)
+    # instead of GEPA's stock MergeProposer. Stock mechanical merges are
+    # no-ops on single-component skills (the per-component filter blocks
+    # divergent pairs); the RLM merge proposer replaces pair selection
+    # and runs an LM synthesis on both parents' traces.
+    rlm_merge_proposer: bool = False
+    # Attempt cap (includes rejects — cost-aware). Distinct from
+    # max_merge_invocations which counts accepted merges only.
+    max_rlm_merge_attempts: int = 12
+    # Shared train minibatch size for per-parent trace capture.
+    rlm_merge_minibatch_size: int = 50
+    # Mutual-wins threshold for pair selection.
+    rlm_merge_min_each: int = 3
+
     # Run directory (resume if it already exists)
     run_dir: Path | None = None
 
@@ -707,6 +855,13 @@ class SpreadsheetAdapter:
         # baseline, ``minibatch_0000`` is iter 0's first MB, etc.
         self._valset_count = -1
         self._minibatch_count = -1
+        # Merge-specific counters. merge_trace_count: evaluate(kind=
+        # "merge_trace_capture") writes per-parent trace JSONLs numbered
+        # merge_trace_NNNN.jsonl, one bump per parent per attempt.
+        # merge_proposer_call_count: one bump per synthesis LM dispatch,
+        # mirroring _proposer_call_count's pattern (stores LAST-USED index).
+        self._merge_trace_count = -1
+        self._merge_proposer_call_count = 0
         # Directory for per-case RunTrace dumps. If only ``cost_snapshot_path``
         # is available, infer the sibling ``task_traces`` directory.
         self.task_trace_dir: Path | None = (
@@ -762,13 +917,49 @@ class SpreadsheetAdapter:
         return max_idx
 
     @staticmethod
-    def _max_indices_from_cost_log(path: Path | None) -> tuple[int, int, int]:
+    def _max_index_from_merge_traces(path: str | None) -> int:
+        """Scan proposer_trace_dir for merge_NNNN_from_cand_X_and_cand_Y.json
+        (success) and merge_NNNN_..._ERROR.json / merge_attempt_NNNN_... ERROR
+        (failure) artifacts. Returns the max NNNN or -1. Used on resume to
+        restore _merge_proposer_call_count.
+        """
+        if not path:
+            return -1
+        trace_dir = Path(path)
+        if not trace_dir.is_dir():
+            return -1
+
+        pat = re.compile(
+            r"^merge_(\d+)_from_cand_\d+_and_cand_\d+(?:_ERROR)?\.json$"
+        )
+        max_idx = -1
+        for file in trace_dir.iterdir():
+            match = pat.match(file.name)
+            if not match:
+                continue
+            idx = SpreadsheetAdapter._safe_int(match.group(1))
+            if idx is not None:
+                max_idx = max(max_idx, idx)
+        return max_idx
+
+    @staticmethod
+    def _max_indices_from_cost_log(
+        path: Path | None,
+    ) -> tuple[int, int, int, int, int]:
+        """Returns (proposer, minibatch, valset, merge_trace, merge_proposer)
+        max indices from cost_log.jsonl, or -1 for any kind not seen.
+        """
         proposer_max = -1
         minibatch_max = -1
         valset_max = -1
+        merge_trace_max = -1
+        merge_proposer_max = -1
 
         if path is None or not path.is_file():
-            return proposer_max, minibatch_max, valset_max
+            return (
+                proposer_max, minibatch_max, valset_max,
+                merge_trace_max, merge_proposer_max,
+            )
 
         try:
             with path.open("r", encoding="utf-8") as f:
@@ -798,20 +989,46 @@ class SpreadsheetAdapter:
                         idx = SpreadsheetAdapter._safe_int(row.get("evaluate_idx"))
                         if idx is not None:
                             valset_max = max(valset_max, idx)
+                        continue
+                    if event == "merge_trace_capture":
+                        idx = SpreadsheetAdapter._safe_int(row.get("evaluate_idx"))
+                        if idx is not None:
+                            merge_trace_max = max(merge_trace_max, idx)
+                        continue
+                    if event in {"merge_proposer_call", "merge_proposer_error"}:
+                        idx = SpreadsheetAdapter._safe_int(
+                            row.get("merge_proposer_call_idx")
+                        )
+                        if idx is not None:
+                            merge_proposer_max = max(merge_proposer_max, idx)
         except Exception:
-            return proposer_max, minibatch_max, valset_max
+            return (
+                proposer_max, minibatch_max, valset_max,
+                merge_trace_max, merge_proposer_max,
+            )
 
-        return proposer_max, minibatch_max, valset_max
+        return (
+            proposer_max, minibatch_max, valset_max,
+            merge_trace_max, merge_proposer_max,
+        )
 
     @staticmethod
-    def _max_indices_from_task_traces(path: Path | None) -> tuple[int, int]:
+    def _max_indices_from_task_traces(
+        path: Path | None,
+    ) -> tuple[int, int, int]:
+        """Returns (minibatch, valset, merge_trace) max indices from per-kind
+        JSONL filenames in task_traces/. Merge trace files are numbered
+        per-parent (two trace files per merge attempt: A and B on the
+        same minibatch)."""
         minibatch_max = -1
         valset_max = -1
+        merge_trace_max = -1
         if path is None or not path.is_dir():
-            return minibatch_max, valset_max
+            return minibatch_max, valset_max, merge_trace_max
 
         mb_pat = re.compile(r"^minibatch_(\d+)\.jsonl$")
         vs_pat = re.compile(r"^valset_(\d+)\.jsonl$")
+        mt_pat = re.compile(r"^merge_trace_(\d+)\.jsonl$")
 
         for file in path.iterdir():
             if not file.is_file():
@@ -827,19 +1044,35 @@ class SpreadsheetAdapter:
                 idx = SpreadsheetAdapter._safe_int(match.group(1))
                 if idx is not None:
                     valset_max = max(valset_max, idx)
-        return minibatch_max, valset_max
+                continue
+            match = mt_pat.match(file.name)
+            if match is not None:
+                idx = SpreadsheetAdapter._safe_int(match.group(1))
+                if idx is not None:
+                    merge_trace_max = max(merge_trace_max, idx)
+        return minibatch_max, valset_max, merge_trace_max
 
     def _resume_from_artifacts(self) -> None:
+        (
+            cost_proposer_max,
+            cost_minibatch_max,
+            cost_valset_max,
+            cost_merge_trace_max,
+            cost_merge_proposer_max,
+        ) = self._max_indices_from_cost_log(self.cost_log_path)
         proposer_max = max(
             self._max_index_from_proposer_traces(self.proposer_trace_dir),
-            self._max_indices_from_cost_log(self.cost_log_path)[0],
+            cost_proposer_max,
         )
-        trace_minibatch_max, trace_valset_max = self._max_indices_from_task_traces(
-            self.task_trace_dir
+        merge_proposer_max = max(
+            self._max_index_from_merge_traces(self.proposer_trace_dir),
+            cost_merge_proposer_max,
         )
-        _, cost_minibatch_max, cost_valset_max = self._max_indices_from_cost_log(
-            self.cost_log_path
-        )
+        (
+            trace_minibatch_max,
+            trace_valset_max,
+            trace_merge_trace_max,
+        ) = self._max_indices_from_task_traces(self.task_trace_dir)
 
         self._proposer_call_count = max(self._proposer_call_count, proposer_max)
         self._minibatch_count = max(
@@ -847,6 +1080,14 @@ class SpreadsheetAdapter:
         )
         self._valset_count = max(
             self._valset_count, trace_valset_max, cost_valset_max
+        )
+        self._merge_trace_count = max(
+            self._merge_trace_count,
+            trace_merge_trace_max,
+            cost_merge_trace_max,
+        )
+        self._merge_proposer_call_count = max(
+            self._merge_proposer_call_count, merge_proposer_max
         )
 
     # -- cost logging -------------------------------------------------------
@@ -929,6 +1170,69 @@ class SpreadsheetAdapter:
                     f.write(json.dumps(row, default=str) + "\n")
         except Exception as e:
             log.debug("event log append failed: %s", e)
+
+    def _acall_with_heartbeat(
+        self,
+        coro,
+        *,
+        tag: str,
+        timeout: int,
+        heartbeat_every: float = 30.0,
+    ):
+        """Run ``coro`` under ``asyncio.wait_for(timeout=...)`` with a
+        periodic heartbeat that writes to the active tqdm pane.
+
+        Without this wrapper, a sonnet-medium LM call can be silent for
+        10+ minutes between "dispatched" and "first response token" —
+        looks like a hang. This heartbeat guarantees a line every
+        ``heartbeat_every`` seconds so anyone watching the tmux pane or
+        log file knows the process is alive and waiting on the remote
+        API (not stuck in Python).
+
+        Emits:
+        - `[<tag>] DISPATCH (timeout=<T>s)` immediately
+        - `[<tag>] WAITING Xs / <T>s` every ``heartbeat_every`` seconds
+        - `[<tag>] RETURNED after X.Xs` when the call completes
+        - `[<tag>] TIMED OUT after <T>s` on timeout (then re-raises)
+
+        Returns the awaited result. Re-raises any exception from the
+        wrapped coroutine (including ``TimeoutError`` from
+        ``wait_for``).
+        """
+        async def _runner():
+            start = time.monotonic()
+            tqdm.write(f"[{tag}] DISPATCH (timeout={timeout}s)")
+
+            async def _heartbeat():
+                try:
+                    while True:
+                        await asyncio.sleep(heartbeat_every)
+                        elapsed = time.monotonic() - start
+                        tqdm.write(
+                            f"[{tag}] WAITING {elapsed:.0f}s / {timeout}s"
+                        )
+                except asyncio.CancelledError:
+                    return
+
+            hb_task = asyncio.create_task(_heartbeat())
+            try:
+                result = await asyncio.wait_for(coro, timeout=timeout)
+                elapsed = time.monotonic() - start
+                tqdm.write(f"[{tag}] RETURNED after {elapsed:.1f}s")
+                return result
+            except asyncio.TimeoutError:
+                elapsed = time.monotonic() - start
+                tqdm.write(f"[{tag}] TIMED OUT after {elapsed:.1f}s")
+                raise
+            finally:
+                hb_task.cancel()
+                try:
+                    await hb_task
+                except (asyncio.CancelledError, BaseException):
+                    pass
+
+        loop = asyncio.get_event_loop()
+        return loop.run_until_complete(_runner())
 
     def _persist_proposer_error(
         self,
@@ -1156,9 +1460,18 @@ class SpreadsheetAdapter:
         batch: list[SpreadsheetTask],
         candidate: dict[str, str],
         capture_traces: bool = False,
+        kind: str | None = None,
     ) -> EvaluationBatch:
+        """Run candidate on batch. ``kind`` is a local extension for merge
+        trace captures: when ``None`` (default), derive from capture_traces
+        as before ("minibatch" if capture_traces else "valset"). When set
+        explicitly (e.g. ``kind="merge_trace_capture"``), use it directly.
+        Controls the trace-file filename prefix and the cost_log event name
+        so merge rollouts are distinguishable from ordinary minibatch/valset
+        rollouts during postmortem.
+        """
         return asyncio.get_event_loop().run_until_complete(
-            self._evaluate_async(batch, candidate, capture_traces)
+            self._evaluate_async(batch, candidate, capture_traces, kind)
         )
 
     async def _evaluate_async(
@@ -1166,6 +1479,7 @@ class SpreadsheetAdapter:
         batch: list[SpreadsheetTask],
         candidate: dict[str, str],
         capture_traces: bool,
+        kind: str | None = None,
     ) -> EvaluationBatch:
         # Signature is frozen at the pristine class docstring — GEPA
         # only ever evolves the skill now, so candidate may not carry
@@ -1195,9 +1509,19 @@ class SpreadsheetAdapter:
         # promotion/baseline eval, capture_traces=False). Each has its
         # own 0-indexed counter so ``valset_0000`` = seed VAL,
         # ``minibatch_0000`` = iter 0's MB, and so on.
-        eval_kind = "minibatch" if capture_traces else "valset"
+        # v11: kind kwarg overrides the default ternary. When set
+        # explicitly (by RlmMergeProposer passing kind="merge_trace_capture"),
+        # use it as the eval_kind + event label. When None, preserve the
+        # existing minibatch/valset behavior.
+        if kind is None:
+            eval_kind = "minibatch" if capture_traces else "valset"
+        else:
+            eval_kind = kind
+
         if eval_kind == "minibatch":
             eval_idx = self._minibatch_count + 1
+        elif eval_kind == "merge_trace_capture":
+            eval_idx = self._merge_trace_count + 1
         else:
             eval_idx = self._valset_count + 1
         trace_file = None
@@ -1290,16 +1614,30 @@ class SpreadsheetAdapter:
         ) = self._sum_traces(all_traces)
         if eval_kind == "minibatch":
             self._minibatch_count += 1
+        elif eval_kind == "merge_trace_capture":
+            self._merge_trace_count += 1
         else:
             self._valset_count += 1
+
+        # v11: merge_trace_capture evals use distinct roles so
+        # aggregate_costs_from_log (which groups by (role, model) and
+        # ignores event/kind) produces a separate merge-cost line.
+        # Ordinary minibatch/valset still use role=main/sub.
+        if eval_kind == "merge_trace_capture":
+            main_role_for_log = "merge_trace_main"
+            sub_role_for_log = "merge_trace_sub"
+        else:
+            main_role_for_log = "main"
+            sub_role_for_log = "sub"
+
         self._write_trace_event(
             eval_kind,
             main_model=main_model,
             main_usage=main_usage,
             sub_model=sub_model,
             sub_usage=sub_usage,
-            main_role="main",
-            sub_role="sub",
+            main_role=main_role_for_log,
+            sub_role=sub_role_for_log,
             main_calls=main_calls,
             sub_calls=sub_calls,
             evaluate_idx=eval_idx,
@@ -1962,12 +2300,10 @@ class SpreadsheetAdapter:
             try:
                 proposer_timeout = max(1, int(getattr(self, "proposer_timeout", 600)))
                 try:
-                    loop = asyncio.get_event_loop()
-                    result = loop.run_until_complete(
-                        asyncio.wait_for(
-                            predictor.acall(**acall_kwargs),
-                            timeout=proposer_timeout,
-                        )
+                    result = self._acall_with_heartbeat(
+                        predictor.acall(**acall_kwargs),
+                        tag=f"PROPOSER call#{call_idx} {component_name}",
+                        timeout=proposer_timeout,
                     )
                 finally:
                     rlm_logger.removeHandler(stream_handler)
@@ -2072,6 +2408,337 @@ class SpreadsheetAdapter:
             except Exception:
                 pass
 
+    # -- merge proposer (RLM synthesis from two parents) --------------------
+
+    def _reserve_merge_proposer_call_idx(self) -> int:
+        """Reserve the next merge-synthesis call index. Mirrors the
+        ``_proposer_call_count`` pattern (optimize.py:1884-1885): bump
+        the counter first, return the new value. Counter stores the
+        LAST-USED index so resume can recover it via
+        ``_max_indices_from_cost_log`` + ``_max_index_from_merge_traces``.
+        """
+        self._merge_proposer_call_count += 1
+        return self._merge_proposer_call_count
+
+    def _rlm_propose_merge_texts(
+        self,
+        *,
+        call_idx: int,
+        id1: int,
+        id2: int,
+        ancestor: int,
+        current_instructions_a: str,
+        current_instructions_b: str,
+        common_ancestor_instructions: str,
+        paired_traces_file: File,
+        trace_task_ids: list[str],
+    ) -> tuple[str, list[str]]:
+        """Run the RLM merge synthesis on two parents + ancestor + paired
+        trace file. Returns (new_instructions, generalization_check).
+
+        Semantics (v11):
+          - Reserves the call index via ``_reserve_merge_proposer_call_idx``
+            BEFORE this function is called (caller passes it in). We emit
+            the ``merge_proposer_call`` cost-log row and write the success
+            artifact ``merge_NNNN_from_cand_X_and_cand_Y.json`` here when
+            the RLM call succeeds.
+          - Does NOT persist errors on raise — the outer handler in
+            ``RlmMergeProposer.propose`` catches and dispatches to
+            ``_persist_merge_proposer_error``.
+          - Timeout enforcement mirrors ``_propose_one_component`` at
+            optimize.py:1962-1970 via ``asyncio.wait_for(..., timeout=
+            self.proposer_timeout)``.
+        """
+        predictor = PredictRLM(
+            MergeInstructions,
+            lm=self.proposer_lm,
+            sub_lm=self.proposer_sub_lm,
+            skills=[],
+            max_iterations=self.proposer_max_iterations,
+            verbose=True,
+            debug=False,
+        )
+
+        rlm_logger = logging.getLogger("dspy.predict.rlm")
+        old_level = rlm_logger.level
+        old_propagate = rlm_logger.propagate
+        rlm_logger.setLevel(logging.DEBUG)
+        rlm_logger.propagate = False
+
+        class _StreamWriter(logging.Handler):
+            def emit(self, record):
+                try:
+                    tqdm.write(self.format(record))
+                except Exception:
+                    pass
+
+        stream_handler = _StreamWriter()
+        stream_handler.setFormatter(
+            logging.Formatter(
+                f"[MERGE-PROPOSER cand_{id1}+cand_{id2}] %(message)s"
+            )
+        )
+        rlm_logger.addHandler(stream_handler)
+
+        tqdm.write("\n" + "=" * 80)
+        tqdm.write(
+            f"RLM MERGE PROPOSER STARTING (call_idx={call_idx}, "
+            f"cand_{id1} + cand_{id2}, ancestor=cand_{ancestor})"
+        )
+        tqdm.write("=" * 80)
+
+        acall_kwargs: dict[str, Any] = {
+            "current_instructions_a": current_instructions_a,
+            "current_instructions_b": current_instructions_b,
+            "common_ancestor_instructions": common_ancestor_instructions,
+            "paired_traces_file": paired_traces_file,
+        }
+
+        proposer_timeout = max(1, int(getattr(self, "proposer_timeout", 600)))
+        try:
+            result = self._acall_with_heartbeat(
+                predictor.acall(**acall_kwargs),
+                tag=(
+                    f"MERGE-PROPOSER call#{call_idx} "
+                    f"cand_{id1}+cand_{id2}"
+                ),
+                timeout=proposer_timeout,
+            )
+        finally:
+            rlm_logger.removeHandler(stream_handler)
+            rlm_logger.setLevel(old_level)
+            rlm_logger.propagate = old_propagate
+
+        tqdm.write("=" * 80)
+        tqdm.write(
+            f"RLM MERGE PROPOSER DONE (call_idx={call_idx}, "
+            f"{len(getattr(result, 'trajectory', []))} iterations)"
+        )
+        tqdm.write("=" * 80 + "\n")
+
+        new_text = getattr(result, "new_instructions", None)
+        if not new_text or not isinstance(new_text, str) or not new_text.strip():
+            raise RuntimeError(
+                f"RLM merge proposer returned empty new_instructions "
+                f"for call_idx={call_idx}"
+            )
+        audit = getattr(result, "generalization_check", None) or []
+
+        # Emit the merge_proposer_call cost-log row using the RunTrace
+        # the proposer's PredictRLM attached to its Prediction.
+        proposer_trace = getattr(result, "trace", None)
+        if proposer_trace is not None:
+            (
+                _pm_usage,
+                _ps_usage,
+                _pm_model,
+                _ps_model,
+                prop_main_calls,
+                prop_sub_calls,
+            ) = self._sum_traces([proposer_trace])
+            self._write_trace_event(
+                "merge_proposer_call",
+                main_model=str(getattr(proposer_trace, "model", "")),
+                main_usage=proposer_trace.usage.main,
+                sub_model=getattr(proposer_trace, "sub_model", None),
+                sub_usage=proposer_trace.usage.sub,
+                main_role="merge_proposer",
+                sub_role="merge_proposer_sub",
+                main_calls=prop_main_calls,
+                sub_calls=prop_sub_calls,
+                merge_proposer_call_idx=call_idx,
+                cand_ids=[id1, id2],
+                ancestor_id=ancestor,
+                iterations=proposer_trace.iterations,
+            )
+
+        # Write success artifact alongside the success case for ordinary
+        # proposer runs (proposer_NNNN_<component>.json). Filename includes
+        # parent ids for postmortem grep.
+        if self.proposer_trace_dir:
+            try:
+                os.makedirs(self.proposer_trace_dir, exist_ok=True)
+                run_trace_json: Any = None
+                if proposer_trace is not None:
+                    try:
+                        run_trace_json = json.loads(
+                            proposer_trace.to_exportable_json(indent=0)
+                        )
+                    except Exception:
+                        run_trace_json = None
+                payload = {
+                    "call_idx": call_idx,
+                    "kind": "merge_proposer",
+                    "cand_ids": [id1, id2],
+                    "ancestor_id": ancestor,
+                    "trace_task_ids": trace_task_ids,
+                    "current_instructions_a": current_instructions_a,
+                    "current_instructions_b": current_instructions_b,
+                    "common_ancestor_instructions": common_ancestor_instructions,
+                    "new_instructions": new_text,
+                    "generalization_check": audit,
+                    "rlm_trajectory": getattr(result, "trajectory", []),
+                    "run_trace": run_trace_json,
+                }
+                out_path = os.path.join(
+                    self.proposer_trace_dir,
+                    f"merge_{call_idx:04d}_from_cand_{id1}_and_cand_{id2}.json",
+                )
+                with open(out_path, "w") as f:
+                    json.dump(payload, f, indent=2, default=str)
+            except Exception as e:
+                tqdm.write(
+                    f"[MERGE-PROPOSER cand_{id1}+cand_{id2}] "
+                    f"persist failed: {e}"
+                )
+
+        return new_text, list(audit)
+
+    def _persist_merge_proposer_error(
+        self,
+        *,
+        call_idx: int | None,
+        attempt_idx: int,
+        id1: int,
+        id2: int,
+        ancestor: int,
+        instructions_a: str,
+        instructions_b: str,
+        instructions_ancestor: str,
+        trace_task_ids: list[str],
+        exc: BaseException,
+    ) -> None:
+        """Merge-shaped analog of _persist_proposer_error (optimize.py:933).
+
+        Filename scheme (v11 dual-artifact):
+          - ``call_idx is not None`` → synthesis started;
+            ``merge_{call_idx:04d}_from_cand_X_and_cand_Y_ERROR.json``
+            (pairs with the non-error merge_NNNN file that would have been
+            written on success).
+          - ``call_idx is None`` → pre-synthesis error (trace capture,
+            preflight); ``merge_attempt_{attempt_idx:04d}_..._ERROR.json``
+            (attempt-indexed so resume scanners stay sane).
+
+        Emits a ``merge_proposer_error`` cost-log row so
+        aggregate_costs_from_log sees the event even when the exception
+        has no RunTrace (pre-synthesis failures). Zero-usage sentinels
+        bypass _write_trace_event's "if not rows: return" early-exit.
+        """
+        import traceback
+
+        from predict_rlm.trace import extract_trace_from_exc
+
+        trace_obj = extract_trace_from_exc(exc)
+        run_trace_json: Any = None
+        main_usage = None
+        sub_usage = None
+        main_model = ""
+        sub_model: str | None = None
+        err_main_calls = 0
+        err_sub_calls = 0
+        if trace_obj is not None:
+            try:
+                run_trace_json = json.loads(
+                    trace_obj.to_exportable_json(indent=0)
+                )
+            except Exception:
+                run_trace_json = None
+            main_usage = getattr(getattr(trace_obj, "usage", None), "main", None)
+            sub_usage = getattr(getattr(trace_obj, "usage", None), "sub", None)
+            main_model = str(getattr(trace_obj, "model", ""))
+            sub_model = getattr(trace_obj, "sub_model", None)
+            (
+                _em_usage,
+                _es_usage,
+                _em_model,
+                _es_model,
+                err_main_calls,
+                err_sub_calls,
+            ) = self._sum_traces([trace_obj])
+
+        # Emit cost_log event (cheap, at-a-glance visibility even if
+        # file write fails). If there's no trace, write a zero-usage
+        # sentinel row directly so resume scanners see it.
+        if trace_obj is not None and main_usage is not None:
+            self._write_trace_event(
+                "merge_proposer_error",
+                main_model=main_model,
+                main_usage=main_usage,
+                sub_model=sub_model,
+                sub_usage=sub_usage,
+                main_role="merge_proposer",
+                sub_role="merge_proposer_sub",
+                main_calls=err_main_calls,
+                sub_calls=err_sub_calls,
+                merge_proposer_call_idx=call_idx,
+                rlm_merge_attempt_idx=attempt_idx,
+                cand_ids=[id1, id2],
+                ancestor_id=ancestor,
+                error=str(exc),
+                error_type=type(exc).__name__,
+            )
+        elif self.cost_log_path is not None:
+            # Zero-usage sentinel for pre-synthesis errors — bypass
+            # _write_trace_event's "if not rows: return" early-exit.
+            try:
+                self.cost_log_path.parent.mkdir(parents=True, exist_ok=True)
+                with self.cost_log_path.open("a") as f:
+                    f.write(json.dumps({
+                        "ts": datetime.now().isoformat(),
+                        "event": "merge_proposer_error",
+                        "role": "merge_proposer",
+                        "model": "unknown",
+                        "calls": 0,
+                        "input_tokens": 0,
+                        "output_tokens": 0,
+                        "cost_usd": 0.0,
+                        "cache_hits": 0,
+                        "merge_proposer_call_idx": call_idx,
+                        "rlm_merge_attempt_idx": attempt_idx,
+                        "cand_ids": [id1, id2],
+                        "ancestor_id": ancestor,
+                        "error_type": type(exc).__name__,
+                        "error_message": str(exc)[:500],
+                    }, default=str) + "\n")
+            except Exception as e:
+                log.debug("merge sentinel cost row write failed: %s", e)
+
+        if not self.proposer_trace_dir:
+            return
+        try:
+            os.makedirs(self.proposer_trace_dir, exist_ok=True)
+            if call_idx is not None:
+                fname = (
+                    f"merge_{call_idx:04d}_from_cand_{id1}_and_cand_{id2}_ERROR.json"
+                )
+            else:
+                fname = (
+                    f"merge_attempt_{attempt_idx:04d}_from_cand_{id1}_and_cand_{id2}_ERROR.json"
+                )
+            payload = {
+                "call_idx": call_idx,
+                "attempt_idx": attempt_idx,
+                "kind": "merge_proposer_error",
+                "cand_ids": [id1, id2],
+                "ancestor_id": ancestor,
+                "trace_task_ids": trace_task_ids,
+                "status": "error",
+                "error": str(exc),
+                "error_type": type(exc).__name__,
+                "traceback": "".join(
+                    traceback.format_exception(type(exc), exc, exc.__traceback__)
+                ),
+                "current_instructions_a": instructions_a,
+                "current_instructions_b": instructions_b,
+                "common_ancestor_instructions": instructions_ancestor,
+                "run_trace": run_trace_json,
+            }
+            out_path = os.path.join(self.proposer_trace_dir, fname)
+            with open(out_path, "w") as f:
+                json.dump(payload, f, indent=2, default=str)
+        except Exception as e:
+            log.debug("merge proposer error-trace persist failed: %s", e)
+
 
 # ---------------------------------------------------------------------------
 # Top-level entry point
@@ -2151,6 +2818,167 @@ def _coerce_reflection_lm_text(value: Any) -> str:
     if isinstance(value, Mapping):
         detail += f" keys={sorted(str(k) for k in value.keys())}"
     raise TypeError(f"Reflection LM returned non-text response ({detail})")
+
+
+def _optimize_with_rlm_merge(
+    *,
+    seed_candidate: dict[str, str],
+    train: list,
+    val: list,
+    adapter: "SpreadsheetAdapter",
+    reflection_lm: Callable[[str], str],
+    reflection_minibatch_size: int,
+    max_metric_calls: int,
+    candidate_selection_strategy: str,
+    module_selector: str,
+    run_dir: Path,
+    seed: int,
+    max_rlm_merge_attempts: int,
+    rlm_merge_minibatch_size: int,
+    rlm_merge_min_each: int,
+    max_merge_invocations: int,
+):
+    """Mini-replica of gepa.api.optimize that accepts a custom merge
+    proposer (RlmMergeProposer). Mirrors the strategy-object setup in
+    gepa/api.py:190-370: stop conditions (FileStopper + MaxMetricCallsStopper
+    + CompositeStopper), experiment tracker, candidate selector, module
+    selector, batch sampler, val eval policy.
+
+    Returns ``GEPAResult`` so the caller code downstream works unchanged.
+    """
+    import random as _random_mod
+
+    from gepa.core.engine import GEPAEngine
+    from gepa.core.result import GEPAResult
+    from gepa.logging.experiment_tracker import create_experiment_tracker
+    from gepa.logging.logger import StdOutLogger
+    from gepa.proposer.reflective_mutation.reflective_mutation import (
+        ReflectiveMutationProposer,
+    )
+    from gepa.strategies.batch_sampler import EpochShuffledBatchSampler
+    from gepa.strategies.candidate_selector import (
+        CurrentBestCandidateSelector,
+        EpsilonGreedyCandidateSelector,
+        ParetoCandidateSelector,
+    )
+    from gepa.strategies.component_selector import (
+        AllReflectionComponentSelector,
+        RoundRobinReflectionComponentSelector,
+    )
+    from gepa.strategies.eval_policy import FullEvaluationPolicy
+    from gepa.utils import (
+        CompositeStopper,
+        FileStopper,
+        MaxMetricCallsStopper,
+    )
+    from gepa.core.data_loader import ensure_loader
+
+    from .rlm_merge_proposer import RlmMergeProposer
+
+    rng = _random_mod.Random(seed)
+    logger = StdOutLogger()
+
+    train_loader = ensure_loader(train)
+    val_loader = ensure_loader(val) if val is not None else train_loader
+
+    # Stop conditions (api.py:194-229)
+    stoppers = [
+        FileStopper(str(run_dir / "gepa.stop")),
+        MaxMetricCallsStopper(max_metric_calls),
+    ]
+    stop_callback = (
+        stoppers[0] if len(stoppers) == 1 else CompositeStopper(*stoppers)
+    )
+
+    # Candidate selector
+    sel_factories = {
+        "pareto": lambda: ParetoCandidateSelector(rng=rng),
+        "current_best": lambda: CurrentBestCandidateSelector(),
+        "epsilon_greedy": lambda: EpsilonGreedyCandidateSelector(
+            epsilon=0.1, rng=rng
+        ),
+    }
+    candidate_selector = sel_factories[candidate_selection_strategy]()
+
+    module_selector_cls = {
+        "round_robin": RoundRobinReflectionComponentSelector,
+        "all": AllReflectionComponentSelector,
+    }[module_selector]
+    module_selector_instance = module_selector_cls()
+
+    batch_sampler = EpochShuffledBatchSampler(
+        minibatch_size=reflection_minibatch_size, rng=rng
+    )
+
+    val_policy = FullEvaluationPolicy()
+
+    experiment_tracker = create_experiment_tracker(
+        use_wandb=False,
+        wandb_api_key=None,
+        wandb_init_kwargs=None,
+        use_mlflow=False,
+        mlflow_tracking_uri=None,
+        mlflow_experiment_name=None,
+    )
+
+    reflective_proposer = ReflectiveMutationProposer(
+        logger=logger,
+        trainset=train_loader,
+        adapter=adapter,
+        candidate_selector=candidate_selector,
+        module_selector=module_selector_instance,
+        batch_sampler=batch_sampler,
+        perfect_score=1.0,
+        skip_perfect_score=True,
+        experiment_tracker=experiment_tracker,
+        reflection_lm=reflection_lm,
+        reflection_prompt_template=None,
+    )
+
+    def evaluator_fn(inputs, prog):
+        eval_out = adapter.evaluate(inputs, prog, capture_traces=False)
+        return eval_out.outputs, eval_out.scores, eval_out.objective_scores
+
+    merge_proposer = RlmMergeProposer(
+        logger=logger,
+        valset=val_loader,
+        evaluator=evaluator_fn,
+        adapter=adapter,
+        trainset=train_loader,
+        use_merge=True,
+        max_merge_invocations=max_merge_invocations,
+        max_rlm_merge_attempts=max_rlm_merge_attempts,
+        min_each=rlm_merge_min_each,
+        merge_minibatch_size=rlm_merge_minibatch_size,
+        rlm_merge_state_path=run_dir / "rlm_merge_state.json",
+        rng=rng,
+    )
+
+    engine = GEPAEngine(
+        adapter=adapter,
+        run_dir=str(run_dir),
+        valset=val_loader,
+        seed_candidate=seed_candidate,
+        perfect_score=1.0,
+        seed=seed,
+        reflective_proposer=reflective_proposer,
+        merge_proposer=merge_proposer,
+        frontier_type="instance",
+        logger=logger,
+        experiment_tracker=experiment_tracker,
+        track_best_outputs=False,
+        display_progress_bar=True,
+        raise_on_exception=True,
+        stop_callback=stop_callback,
+        val_evaluation_policy=val_policy,
+        use_cloudpickle=True,
+        evaluation_cache=None,
+    )
+
+    with experiment_tracker:
+        state = engine.run()
+
+    return GEPAResult.from_state(state, run_dir=str(run_dir), seed=seed)
 
 
 def run_optimization(config: OptimizeConfig) -> OptimizeReport:
@@ -2303,25 +3131,49 @@ def run_optimization(config: OptimizeConfig) -> OptimizeReport:
         f"concurrency={config.concurrency}"
     )
     t0 = time.time()
-    result = gepa.optimize(
-        seed_candidate=seed,
-        trainset=train,
-        valset=val,
-        adapter=adapter,
-        reflection_lm=reflection_lm_call,
-        reflection_minibatch_size=config.minibatch_size,
-        max_metric_calls=config.max_metric_calls,
-        perfect_score=1.0,
-        skip_perfect_score=True,
-        candidate_selection_strategy=config.candidate_selection_strategy,
-        module_selector=config.module_selector,
-        use_merge=True,
-        max_merge_invocations=10,
-        run_dir=str(run_dir),
-        seed=config.seed,
-        use_cloudpickle=True,
-        display_progress_bar=True,
-    )
+    if config.rlm_merge_proposer:
+        # Direct GEPAEngine construction — gepa.api.optimize has no kwarg
+        # for injecting a custom merge proposer. _optimize_with_rlm_merge
+        # mirrors api.optimize's strategy-object setup (stop conditions,
+        # experiment tracker, candidate selector, module selector, batch
+        # sampler, val policy) and swaps in our RlmMergeProposer.
+        result = _optimize_with_rlm_merge(
+            seed_candidate=seed,
+            train=train,
+            val=val,
+            adapter=adapter,
+            reflection_lm=reflection_lm_call,
+            reflection_minibatch_size=config.minibatch_size,
+            max_metric_calls=config.max_metric_calls,
+            candidate_selection_strategy=config.candidate_selection_strategy,
+            module_selector=config.module_selector,
+            run_dir=run_dir,
+            seed=config.seed,
+            max_rlm_merge_attempts=config.max_rlm_merge_attempts,
+            rlm_merge_minibatch_size=config.rlm_merge_minibatch_size,
+            rlm_merge_min_each=config.rlm_merge_min_each,
+            max_merge_invocations=10,
+        )
+    else:
+        result = gepa.optimize(
+            seed_candidate=seed,
+            trainset=train,
+            valset=val,
+            adapter=adapter,
+            reflection_lm=reflection_lm_call,
+            reflection_minibatch_size=config.minibatch_size,
+            max_metric_calls=config.max_metric_calls,
+            perfect_score=1.0,
+            skip_perfect_score=True,
+            candidate_selection_strategy=config.candidate_selection_strategy,
+            module_selector=config.module_selector,
+            use_merge=True,
+            max_merge_invocations=10,
+            run_dir=str(run_dir),
+            seed=config.seed,
+            use_cloudpickle=True,
+            display_progress_bar=True,
+        )
     elapsed = time.time() - t0
 
     # --- Costs --------------------------------------------------------------
@@ -2336,6 +3188,13 @@ def run_optimization(config: OptimizeConfig) -> OptimizeReport:
     # wrote nothing but the startup sentinel.
     proposer_role = "proposer" if config.rlm_proposer else "reflection"
     role_order = ["main", "sub", proposer_role, "proposer_sub"]
+    if config.rlm_merge_proposer:
+        role_order += [
+            "merge_trace_main",
+            "merge_trace_sub",
+            "merge_proposer",
+            "merge_proposer_sub",
+        ]
     costs = aggregate_costs_from_log(run_dir / "cost_log.jsonl", role_order=role_order)
     if not costs:
         costs = [
