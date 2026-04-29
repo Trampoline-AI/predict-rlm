@@ -18,8 +18,8 @@ import tarfile
 from collections import Counter
 from pathlib import Path
 
-SCRIPT_DIR = Path(__file__).resolve().parent
-EXAMPLE_DIR = SCRIPT_DIR.parent
+BENCH_DIR = Path(__file__).resolve().parent
+EXAMPLE_DIR = BENCH_DIR.parent.parent
 DATA_DIR = EXAMPLE_DIR / "data"
 
 ARCHIVES: dict[str, str] = {

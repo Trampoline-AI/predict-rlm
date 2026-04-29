@@ -6,8 +6,8 @@ from typing import Annotated
 
 from predict_rlm import Skill, SyncedFile
 
-from .recalculate import recalculate as _recalc_impl
-from .render import render_to_data_uri as _render_impl
+from ..tools.recalculate import recalculate as _recalc_impl
+from ..tools.render import render_to_data_uri as _render_impl
 
 
 def recalculate(file_path: Annotated[Path, SyncedFile()]) -> str:
@@ -81,7 +81,8 @@ def render(
     except Exception as e:
         return f"Error: {e}"
 
-
+# Adapted from OpenAI's Apache-2.0 curated spreadsheet skill.
+# See ../THIRD_PARTY_NOTICES.md for provenance and license terms.
 libreoffice_spreadsheet_skill = Skill(
     name="spreadsheet",
     instructions="""# Spreadsheet Skill

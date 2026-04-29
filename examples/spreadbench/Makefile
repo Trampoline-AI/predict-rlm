@@ -7,7 +7,7 @@ TRAINSET_DIR := $(DATA_DIR)/trainset
 TESTSET_LINK := $(DATA_DIR)/testset
 
 dataset:
-	uv run python scripts/prepare_dataset.py
+	uv run python -m spreadsheet_rlm.bench.prepare_dataset
 
 clean:
 	rm -rf $(VERIFIED_DIR) $(FULL_DIR) $(TRAINSET_DIR)

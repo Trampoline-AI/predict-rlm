@@ -71,7 +71,7 @@ def test_recalculate_does_not_hang_on_full_column_refs(tmp_path: Path):
         "import sys; "
         f"sys.path.insert(0, {child_src!r}); "
         "import json; "
-        "from spreadsheet_rlm.recalculate import recalculate; "
+        "from spreadsheet_rlm.tools.recalculate import recalculate; "
         f"r = recalculate({str(src)!r}); "
         "print(json.dumps({'source': r.source, 'resolved': r.resolved, "
         "'total': r.total_formulas, 'errors': r.errors}))"

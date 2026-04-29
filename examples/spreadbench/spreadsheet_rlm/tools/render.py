@@ -7,7 +7,7 @@ sheet they can inspect with ``dspy.Image``.
 
 Typical usage::
 
-    from spreadsheet_rlm.render import render
+    from spreadsheet_rlm.tools.render import render
 
     # Whole active sheet
     result = render("model_output.xlsx")
@@ -33,7 +33,7 @@ from openpyxl import load_workbook
 
 from .recalculate import _find_libreoffice
 
-log = logging.getLogger("spreadsheet_rlm.render")
+log = logging.getLogger("spreadsheet_rlm.tools.render")
 
 _RENDER_TIMEOUT_SECONDS = 120.0
 

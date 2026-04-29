@@ -20,7 +20,7 @@ into a failing one by destroying already-cached values.
 
 Typical usage::
 
-    from spreadsheet_rlm.recalculate import recalculate
+    from spreadsheet_rlm.tools.recalculate import recalculate
 
     result = recalculate("model_output.xlsx")
     # result.source      -> "baseline" | "formulas" | "libreoffice"
@@ -58,7 +58,7 @@ except ImportError:
 # openpyxl module only so we don't hide warnings from anything else.
 warnings.filterwarnings("ignore", category=UserWarning, module=r"openpyxl\..*")
 
-log = logging.getLogger("spreadsheet_rlm.recalculate")
+log = logging.getLogger("spreadsheet_rlm.tools.recalculate")
 
 _FORMULAS_TQDM_PATCHED = False
 

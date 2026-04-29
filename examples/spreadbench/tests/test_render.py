@@ -1,4 +1,4 @@
-"""Tests for the spreadsheet_rlm.render pipeline."""
+"""Tests for the spreadsheet_rlm.tools.render pipeline."""
 
 from __future__ import annotations
 
@@ -11,8 +11,8 @@ if str(_EXAMPLE_DIR) not in sys.path:
 
 import pytest  # noqa: E402
 from openpyxl import Workbook  # noqa: E402
-from spreadsheet_rlm.recalculate import _find_libreoffice  # noqa: E402
-from spreadsheet_rlm.render import (  # noqa: E402
+from spreadsheet_rlm.tools.recalculate import _find_libreoffice  # noqa: E402
+from spreadsheet_rlm.tools.render import (  # noqa: E402
     RenderResult,
     _find_pdftoppm,
     render,
@@ -118,7 +118,7 @@ def test_render_to_data_uri_format(tmp_path: Path):
 
 
 def test_render_tool_wrapper_happy_path(tmp_path: Path):
-    from spreadsheet_rlm.skills import render as render_tool
+    from spreadsheet_rlm.agent.skills import render as render_tool
 
     xlsx = tmp_path / "simple.xlsx"
     _build_simple_workbook(xlsx)
@@ -130,7 +130,7 @@ def test_render_tool_wrapper_happy_path(tmp_path: Path):
 
 
 def test_render_tool_wrapper_missing_file(tmp_path: Path):
-    from spreadsheet_rlm.skills import render as render_tool
+    from spreadsheet_rlm.agent.skills import render as render_tool
 
     result = render_tool(tmp_path / "does_not_exist.xlsx")
 
@@ -142,7 +142,7 @@ def test_render_tool_wrapper_rewrites_exceptions_as_error_strings(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):
     """Any exception raised by the render impl must be returned as an Error: string."""
-    from spreadsheet_rlm import skills as skills_module
+    from spreadsheet_rlm.agent import skills as skills_module
 
     xlsx = tmp_path / "simple.xlsx"
     _build_simple_workbook(xlsx)
@@ -160,7 +160,7 @@ def test_render_tool_wrapper_rewrites_exceptions_as_error_strings(
 
 
 def test_render_registered_on_skill():
-    from spreadsheet_rlm.skills import libreoffice_spreadsheet_skill
+    from spreadsheet_rlm.agent.skills import libreoffice_spreadsheet_skill
 
     assert "render" in libreoffice_spreadsheet_skill.tools
     assert "recalculate" in libreoffice_spreadsheet_skill.tools
@@ -233,7 +233,7 @@ def test_render_to_data_uri_with_cell_range(tmp_path: Path):
 
 
 def test_render_tool_wrapper_forwards_cell_range(tmp_path: Path):
-    from spreadsheet_rlm.skills import render as render_tool
+    from spreadsheet_rlm.agent.skills import render as render_tool
 
     xlsx = tmp_path / "wide.xlsx"
     _build_wide_workbook(xlsx)

@@ -1,8 +1,8 @@
 import dspy
 
 from predict_rlm import File, PredictRLM
-from .signature import ManipulateSpreadsheet
 
+from .signature import ManipulateSpreadsheet
 from .skills import libreoffice_spreadsheet_skill
 
 
