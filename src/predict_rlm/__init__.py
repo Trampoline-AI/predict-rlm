@@ -7,6 +7,12 @@ Core classes:
 File I/O:
     File — Unified file type for inputs (mount into sandbox) and outputs
            (sync from sandbox). Use ``list[File]`` for multiple files.
+
+Lifecycle callbacks:
+    IterationStep — payload passed to ``on_rlm_iteration_end`` callbacks.
+                    Subclass ``dspy.utils.callback.BaseCallback`` and
+                    implement ``on_rlm_iteration_start``/``on_rlm_iteration_end``
+                    to broadcast progress (e.g. to a websocket).
 """
 
 from .files import File, LocalDir, LocalFile, OutputDir, OutputFile, SyncedFile
@@ -19,10 +25,11 @@ from .interpreters import (
 )
 from .predict_rlm import PredictRLM
 from .rlm_skills import Skill
-from .trace import RunTrace
+from .trace import IterationStep, RunTrace
 
 __all__ = [
     "File",
+    "IterationStep",
     "LocalDir",
     "LocalFile",
     "OutputDir",
