@@ -491,6 +491,40 @@ def test_cost_aggregation_raw_and_logical(tmp_path: Path):
     assert logical[0].cost_usd == pytest.approx(0.1)
 
 
+def test_logical_cost_keeps_resumed_operations_with_reused_local_counters(tmp_path: Path):
+    path = tmp_path / "cost_log.jsonl"
+    original = CostRow(
+        event_id="run_a_eval_minibatch_attempt_0000",
+        operation_id="eval_minibatch_0000",
+        attempt_id="attempt_0000",
+        event="minibatch",
+        role="executor",
+        model="dummy",
+        calls=2,
+        input_tokens=10,
+        output_tokens=5,
+        cost_usd=0.1,
+    )
+    resumed = CostRow(
+        event_id="run_a_resume_b_eval_minibatch_attempt_0000",
+        operation_id="eval_minibatch_0000",
+        attempt_id="attempt_0000",
+        event="minibatch",
+        role="executor",
+        model="dummy",
+        calls=3,
+        input_tokens=20,
+        output_tokens=8,
+        cost_usd=0.2,
+    )
+    append_cost_rows(path, [original, original, resumed])
+
+    logical = aggregate_costs_from_log(path, logical=True)
+
+    assert logical[0].calls == 5
+    assert logical[0].cost_usd == pytest.approx(0.3)
+
+
 def test_logical_cost_does_not_collapse_legacy_rows_without_operation_ids(tmp_path: Path):
     path = tmp_path / "cost_log.jsonl"
     append_cost_rows(

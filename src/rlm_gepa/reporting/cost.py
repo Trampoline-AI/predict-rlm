@@ -51,12 +51,21 @@ def aggregate_costs_from_log(
             operation_id = row.get("operation_id")
             attempt_id = row.get("attempt_id")
             event_id = row.get("event_id")
-            if operation_id or attempt_id:
-                key = ("operation", str(operation_id or ""), str(attempt_id or ""), role, model)
+            if event_id and (operation_id or attempt_id):
+                key = (
+                    "operation",
+                    str(event_id),
+                    str(operation_id or ""),
+                    str(attempt_id or ""),
+                    role,
+                    model,
+                )
+            elif operation_id or attempt_id:
+                key = ("operation", "", str(operation_id or ""), str(attempt_id or ""), role, model)
             elif event_id:
-                key = ("event", str(event_id), "", role, model)
+                key = ("event", str(event_id), "", "", role, model)
             else:
-                key = ("row", str(index), "", role, model)
+                key = ("row", str(index), "", "", role, model)
             deduped[key] = row
         rows = list(deduped.values())
 
