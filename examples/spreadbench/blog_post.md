@@ -136,11 +136,9 @@ Caption: Seed skill + RLM(model*) baselines
 
 ![Seed baseline table](https://pbs.twimg.com/media/HGsvwNdX0AATTtT.jpg)
 
-We measured higher reasoning tiers (high, xhigh) but omit them from the main
-table because they demonstrate a plateau: more thinking does not seem to readily
-improve performance on this workload. On seed, gpt-5.4-xhigh actually scores
-slightly lower than low, albeit within the noise: 0.8698 soft, with 312 all-pass
-tasks.
+Higher reasoning tiers are omitted from the main table because the tracked run
+artifacts do not support a stronger baseline result than medium: more thinking
+did not seem to readily improve performance on this workload.
 
 Importantly, the plateau is the signal. Higher reasoning effort did not buy us
 much. In some settings it even made things worse, because many remaining
