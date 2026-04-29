@@ -4,6 +4,7 @@ import json
 import math
 import pickle
 import re
+import textwrap
 from pathlib import Path
 from statistics import mean
 from typing import Any
@@ -157,6 +158,48 @@ def candidate_rows(run_dir: str | Path) -> list[dict[str, Any]]:
             }
         )
     return rows
+
+
+def merge_rows(run_dir: str | Path) -> list[dict[str, Any]]:
+    state = load_run_state(run_dir)
+    rows: list[dict[str, Any]] = []
+    for entry in state.get("full_program_trace") or []:
+        if not _is_merge_entry(entry):
+            continue
+        status = str(entry.get("rlm_merge_status") or ("accepted" if entry.get("merged") else "scored"))
+        rows.append(
+            {
+                "iter": str(entry.get("i", len(rows))),
+                "pair@anc": _format_merge_pair(entry),
+                "status": status,
+                "pre": _format_merge_preflight(entry),
+                "n": _format_merge_subsample(entry),
+                "score Δ": _format_merge_score(entry),
+                "_detail": _format_merge_detail(entry, status),
+            }
+        )
+    return rows
+
+
+def merge_detail_lines(run_dir: str | Path, *, width: int = 80) -> list[str]:
+    lines: list[str] = []
+    for row in merge_rows(run_dir):
+        detail = row.get("_detail")
+        if not detail or detail == "-":
+            continue
+        label = f"iter {row['iter']}"
+        if row.get("pair@anc") not in (None, "-"):
+            label = f"{label} {row['pair@anc']}"
+        prefix = f"  {label}: "
+        lines.append(
+            textwrap.fill(
+                str(detail),
+                width=width,
+                initial_indent=prefix,
+                subsequent_indent=" " * len(prefix),
+            )
+        )
+    return lines
 
 
 def cost_rows(run_dir: str | Path) -> list[dict[str, Any]]:
@@ -350,6 +393,81 @@ def _format_parent_text(parents: Any) -> str:
     elif parents in (None, ""):
         return "seed"
     return str(parents)
+
+
+def _is_merge_entry(entry: dict[str, Any]) -> bool:
+    return (
+        bool(entry.get("invoked_merge"))
+        or bool(entry.get("merged"))
+        or "id1_subsample_scores" in entry
+        or any(str(key).startswith("rlm_merge_") for key in entry)
+    )
+
+
+def _format_merge_pair(entry: dict[str, Any]) -> str:
+    triplet = _coerce_sequence(entry.get("rlm_merge_triplet") or entry.get("merged_entities"))
+    pair = _coerce_sequence(entry.get("rlm_merge_candidate_pair"))
+    ancestor = entry.get("rlm_merge_ancestor")
+    if pair is None and triplet is not None and len(triplet) >= 2:
+        pair = triplet[:2]
+    if ancestor is None and triplet is not None and len(triplet) >= 3:
+        ancestor = triplet[2]
+    if pair is None or len(pair) < 2:
+        return "-"
+    ancestor_text = str(ancestor) if ancestor not in (None, "") else "-"
+    return f"{pair[0]}+{pair[1]}@{ancestor_text}"
+
+
+def _coerce_sequence(value: Any) -> list[Any] | None:
+    if isinstance(value, list | tuple):
+        return list(value)
+    return None
+
+
+def _format_merge_preflight(entry: dict[str, Any]) -> str:
+    a_wins = entry.get("rlm_merge_preflight_a_wins")
+    b_wins = entry.get("rlm_merge_preflight_b_wins")
+    if a_wins is None or b_wins is None:
+        return "-"
+    return f"{a_wins}/{b_wins}"
+
+
+def _format_merge_subsample(entry: dict[str, Any]) -> str:
+    ids = entry.get("rlm_merge_subsample_ids")
+    if isinstance(ids, list | tuple):
+        return str(len(ids))
+    scores = entry.get("new_program_subsample_scores")
+    if isinstance(scores, list | tuple | dict):
+        return str(len(scores))
+    return "-"
+
+
+def _format_merge_score(entry: dict[str, Any]) -> str:
+    new_sum = entry.get("rlm_merge_new_sum")
+    parent_sums = entry.get("rlm_merge_parent_sums")
+    if new_sum is None and "new_program_subsample_scores" in entry:
+        new_sum = sum(_score_values(entry.get("new_program_subsample_scores") or []))
+    if parent_sums is None and "id1_subsample_scores" in entry and "id2_subsample_scores" in entry:
+        parent_sums = [
+            sum(_score_values(entry.get("id1_subsample_scores") or [])),
+            sum(_score_values(entry.get("id2_subsample_scores") or [])),
+        ]
+    if new_sum is None or not isinstance(parent_sums, list | tuple) or not parent_sums:
+        return "-"
+    new_value = float(new_sum)
+    best_parent = max(float(value) for value in parent_sums)
+    delta = new_value - best_parent
+    return f"{new_value:.3f} {_format_delta(delta)}"
+
+
+def _format_merge_detail(entry: dict[str, Any], status: str) -> str:
+    if status == "accepted" and "new_program_idx" in entry:
+        return f"→ cand {entry['new_program_idx']}"
+    if entry.get("rlm_merge_reject_reason"):
+        return str(entry["rlm_merge_reject_reason"])
+    if entry.get("rlm_merge_error_type"):
+        return str(entry["rlm_merge_error_type"])
+    return "-"
 
 
 def _cost_breakdowns(
@@ -716,11 +834,31 @@ def render_stats(run_dir: str | Path, table: str = "all", output_format: str = "
     sections: list[str] = [header_summary(run_dir)]
     if table in {"all", "iterations"}:
         sections.extend(["", "iterations:", render_table(iteration_rows(run_dir), output_format)])
+    if table == "merges":
+        _append_merge_section(sections, run_dir, output_format)
+    elif table == "all":
+        merges = merge_rows(run_dir)
+        if merges:
+            _append_merge_section(sections, run_dir, output_format, rows=merges)
     if table in {"all", "candidates"}:
         sections.extend(["", "candidates:", render_table(candidate_rows(run_dir), output_format)])
     if table in {"all", "costs"}:
         sections.extend(["", "costs:", render_table(cost_rows(run_dir), output_format)])
     return "\n".join(sections)
+
+
+def _append_merge_section(
+    sections: list[str],
+    run_dir: str | Path,
+    output_format: str,
+    *,
+    rows: list[dict[str, Any]] | None = None,
+) -> None:
+    rows = merge_rows(run_dir) if rows is None else rows
+    sections.extend(["", "merges:", render_table(rows, output_format)])
+    details = merge_detail_lines(run_dir)
+    if details:
+        sections.extend(["", "merge details:", *details])
 
 
 def render_eval_stats(run_dir: str | Path, table: str = "all", output_format: str = "terminal") -> str:
@@ -729,7 +867,7 @@ def render_eval_stats(run_dir: str | Path, table: str = "all", output_format: st
         sections.extend(["", "tasks:", render_table(eval_task_rows(run_dir), output_format)])
     if table in {"all", "costs"}:
         sections.extend(["", "costs:", render_table(eval_cost_rows(run_dir), output_format)])
-    if table in {"iterations", "candidates"}:
+    if table in {"iterations", "candidates", "merges"}:
         sections.extend(["", f"{table}: not available for eval runs"])
     return "\n".join(sections)
 

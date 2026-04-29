@@ -109,7 +109,7 @@ def build_parser(
     stats.add_argument("run_dir", type=Path)
     stats.add_argument(
         "--table",
-        choices=["all", "iterations", "candidates", "tasks", "costs"],
+        choices=["all", "iterations", "merges", "candidates", "tasks", "costs"],
         default="all",
     )
     stats.add_argument("--format", choices=["terminal", "markdown"], default="terminal")
