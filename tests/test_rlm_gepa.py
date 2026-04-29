@@ -32,6 +32,7 @@ from rlm_gepa.reporting.stats import (
     eval_cost_rows,
     eval_task_rows,
     iteration_rows,
+    merge_rows,
     render_stats,
     render_table,
 )
@@ -312,6 +313,8 @@ def test_rlm_merge_scores_candidate_without_merge_only_post_checks(tmp_path: Pat
 
     assert proposal is None
     assert state.full_program_trace[-1]["rlm_merge_status"] == "subsample_rejected"
+    assert state.full_program_trace[-1]["rlm_merge_preflight_a_wins"] == 1
+    assert state.full_program_trace[-1]["rlm_merge_preflight_b_wins"] == 1
     assert state.full_program_trace[-1]["new_program_subsample_scores"] == [1.0, 0.0]
     assert "rlm_merge_reject_reason" not in state.full_program_trace[-1]
 
@@ -581,9 +584,15 @@ def test_reporting_tables_from_artifacts(tmp_path: Path):
             {
                 "i": 1,
                 "rlm_merge_candidate_pair": (0, 1),
+                "rlm_merge_ancestor": 0,
+                "rlm_merge_attempt_idx": 0,
+                "rlm_merge_status": "subsample_rejected",
+                "rlm_merge_preflight_a_wins": 3,
+                "rlm_merge_preflight_b_wins": 2,
+                "rlm_merge_reject_reason": "not better than best parent",
                 "id1_subsample_scores": [0.0, 1.0],
                 "id2_subsample_scores": [1.0, 0.0],
-                "new_program_subsample_scores": [1.0, 1.0],
+                "new_program_subsample_scores": [1.0, 0.0],
             },
         ],
     }
@@ -640,6 +649,16 @@ def test_reporting_tables_from_artifacts(tmp_path: Path):
     assert rows[0]["iter"] == "0 [0]"
     assert rows[0]["_highlight"] is True
     assert rows[1]["iter"] == "1 [0, 1]"
+    merges = merge_rows(tmp_path)
+    assert merges[0] == {
+        "iter": "1",
+        "pair@anc": "0+1@0",
+        "status": "subsample_rejected",
+        "pre": "3/2",
+        "n": "2",
+        "score Δ": "1.000 +0.000",
+        "_detail": "not better than best parent",
+    }
     candidates = candidate_rows(tmp_path)
     assert candidates[0]["cand [par]"] == "0 [seed]"
     assert candidates[0]["hard"] == "0.500 (1/2)"
@@ -670,9 +689,14 @@ def test_reporting_tables_from_artifacts(tmp_path: Path):
     assert costs[-1]["effective_cost"] == "$0.01"
     rendered = render_stats(tmp_path, output_format="markdown")
     assert "iterations:" in rendered
+    assert "merges:" in rendered
     assert "| iter" in rendered
     assert "| soft: par → child" in rendered
     assert "| hard: par → child" in rendered
+    assert "| pair@anc" in rendered
+    assert "subsample_rejected" in rendered
+    assert "merge details:" in rendered
+    assert "iter 1 0+1@0: not better than best parent" in rendered
     assert "| cand [par]" in rendered
     assert "| Δ-seed" in rendered
     assert "| ----" in rendered

@@ -256,6 +256,8 @@ class RlmMergeProposer(MergeProposer):
                     attempt_idx,
                     rlm_merge_candidate_pair=(id1, id2),
                     rlm_merge_ancestor=ancestor,
+                    rlm_merge_preflight_a_wins=a_wins,
+                    rlm_merge_preflight_b_wins=b_wins,
                     rlm_merge_reject_reason="empty subsample",
                 )
                 self.logger.log(f"Iteration {i}: RLM merge subsample empty")
@@ -293,6 +295,8 @@ class RlmMergeProposer(MergeProposer):
                     rlm_merge_subsample_ids=list(subsample_ids),
                     rlm_merge_candidate_pair=(id1, id2),
                     rlm_merge_ancestor=ancestor,
+                    rlm_merge_preflight_a_wins=a_wins,
+                    rlm_merge_preflight_b_wins=b_wins,
                     rlm_merge_new_sum=new_sum,
                     rlm_merge_parent_sums=parent_sums,
                 )
@@ -323,6 +327,8 @@ class RlmMergeProposer(MergeProposer):
                 rlm_merge_subsample_ids=list(subsample_ids),
                 rlm_merge_candidate_pair=(id1, id2),
                 rlm_merge_ancestor=ancestor,
+                rlm_merge_preflight_a_wins=a_wins,
+                rlm_merge_preflight_b_wins=b_wins,
                 rlm_merge_new_sum=new_sum,
                 rlm_merge_parent_sums=parent_sums,
             )
