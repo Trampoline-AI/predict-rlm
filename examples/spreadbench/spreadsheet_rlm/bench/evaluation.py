@@ -24,15 +24,16 @@ from typing import Any
 
 import dspy
 import nest_asyncio
-from spreadsheet_rlm.recalculate import recalculate
-from spreadsheet_rlm.signature import ManipulateSpreadsheet
-from spreadsheet_rlm.skills import libreoffice_spreadsheet_skill
 from tqdm import tqdm
 
 from predict_rlm import File, PredictRLM, Skill
+from rlm_gepa.runtime.lm_config import get_lm_config, get_sub_lm_config
 
+from ..agent.signature import ManipulateSpreadsheet
+from ..agent.skills import libreoffice_spreadsheet_skill
+from ..tools.recalculate import recalculate
+from .config import EvalConfig
 from .dataset import SpreadsheetTask, load_dataset
-from .lm_config import SUB_LM, compute_lm_cost, get_lm_config, get_sub_lm_config
 from .scoring import score_workbooks
 
 nest_asyncio.apply()
@@ -90,35 +91,6 @@ def _install_log_handler() -> _TaskFileHandler:
 
 
 @dataclass
-class EvalConfig:
-    """Knobs for a single eval run."""
-
-    lm: str = "openai/gpt-5.4"
-    sub_lm: str = SUB_LM
-    reasoning_effort: str | None = "low"
-    thinking_budget: int | None = None
-    dataset: str = "testset"
-    run_dir: str | None = None
-    # When `run_dir` is set, by default both evolved components (signature
-    # docstring + skill instructions) are loaded from the GEPA state and
-    # applied. Pass ``only="signature"`` or ``only="skill"`` to apply just
-    # one and use the seed value for the other — useful for A/B'ing each
-    # component's individual contribution.
-    only: str | None = None
-    cand_idx: int | None = None
-    """When set with ``run_dir``, use this specific candidate index instead of best-by-mean."""
-    limit: int | None = None
-    task_ids: tuple[str, ...] | None = None
-    cases_per_task: int = 0
-    """Cap on test cases per task (0 = all cases, matching the dataset loader default)."""
-    concurrency: int = 30
-    max_iterations: int = 50
-    task_timeout: int = 300
-    cache: bool = False
-    log_dir: Path | None = None
-
-
-@dataclass
 class LMCost:
     """Aggregate cost + token usage for a single ``dspy.LM``."""
 
@@ -149,10 +121,8 @@ def summarize_lm_cost(role: str, lm: dspy.LM) -> LMCost:
 
     DSPy's ``LM.history`` records one dict per call (via LiteLLM), with
     ``cost`` and ``usage.prompt_tokens`` / ``usage.completion_tokens``.
-    Models that LiteLLM doesn't have pricing for (e.g. mercury-2 via
-    Inception Labs) report ``cost = None`` per call; for those models we
-    fall back to :func:`compute_lm_cost`, which applies the per-model
-    USD/MTok overrides declared in ``lm_config``.
+    DSPy/LiteLLM supplies costs for the OpenAI and Anthropic models used
+    in the reported SpreadsheetBench runs.
 
     Note: unreliable under ``gepa.optimize(use_cloudpickle=True)``. GEPA
     forks candidate-eval workers that get their own ``dspy.LM`` copies;
@@ -173,16 +143,13 @@ def summarize_lm_cost(role: str, lm: dspy.LM) -> LMCost:
         cost_from_litellm += float(entry.get("cost") or 0.0)
 
     model = getattr(lm, "model", "unknown")
-    override_cost = compute_lm_cost(model, prompt_tokens, completion_tokens)
-    cost = override_cost if override_cost is not None else cost_from_litellm
-
     return LMCost(
         role=role,
         model=model,
         calls=calls,
         prompt_tokens=prompt_tokens,
         completion_tokens=completion_tokens,
-        cost_usd=cost,
+        cost_usd=cost_from_litellm,
     )
 
 
@@ -414,8 +381,10 @@ class TaskResult:
 class EvalReport:
     config: EvalConfig
     signature_source: str
+    signature_id: str | None
     signature_length: int
     skill_source: str
+    skill_id: str | None
     skill_length: int
     total_tasks: int
     soft_restriction_avg: float
@@ -445,8 +414,10 @@ class EvalReport:
                 "cache": self.config.cache,
             },
             "signature_source": self.signature_source,
+            "signature_id": self.signature_id,
             "signature_length": self.signature_length,
             "skill_source": self.skill_source,
+            "skill_id": self.skill_id,
             "skill_length": self.skill_length,
             "total_tasks": self.total_tasks,
             "soft_restriction_avg": self.soft_restriction_avg,
@@ -569,6 +540,13 @@ def extract_best_candidate(
     ``skill_instructions``; for single-component (legacy) runs only
     ``signature_docstring`` is present.
     """
+    candidate, _candidate_idx = extract_candidate(run_dir, cand_idx=cand_idx)
+    return candidate
+
+
+def extract_candidate(
+    run_dir: str | Path, cand_idx: int | None = None
+) -> tuple[dict[str, str], int]:
     state_path = Path(run_dir) / "gepa_state.bin"
     with state_path.open("rb") as f:
         state = pickle.load(f)
@@ -578,13 +556,13 @@ def extract_best_candidate(
             raise ValueError(
                 f"cand_idx={cand_idx} out of range; run has {len(cands)} candidates"
             )
-        return cands[cand_idx]
+        return cands[cand_idx], cand_idx
     subs = state["prog_candidate_val_subscores"]
     best_idx = max(
         range(len(cands)),
         key=lambda i: (sum(subs[i].values()) / len(subs[i])) if subs[i] else 0.0,
     )
-    return cands[best_idx]
+    return cands[best_idx], best_idx
 
 
 def extract_best_prompt(run_dir: str | Path) -> tuple[str, int, float]:
@@ -783,8 +761,8 @@ async def _run_tasks_async(
 
 def _resolve_components(
     config: EvalConfig,
-) -> tuple[str, str, str, str]:
-    """Resolve (sig_text, sig_source, skill_text, skill_source) for an eval run.
+) -> tuple[str, str, str | None, str, str, str | None]:
+    """Resolve component text, display source, and selected candidate ids.
 
     Default: load both components from ``config.run_dir`` if set, fall
     back to seed for either component that the run_dir doesn't contain
@@ -810,25 +788,36 @@ def _resolve_components(
         raise ValueError("--only requires --run_dir")
 
     if not config.run_dir:
-        return seed_sig, "seed", seed_skill, "seed"
+        return seed_sig, "seed", None, seed_skill, "seed", None
 
-    candidate = extract_best_candidate(config.run_dir, cand_idx=config.cand_idx)
+    candidate, candidate_idx = extract_candidate(config.run_dir, cand_idx=config.cand_idx)
     run_basename = Path(config.run_dir).name
     cand_tag = f"cand{config.cand_idx}" if config.cand_idx is not None else "best"
+    candidate_id = f"cand{candidate_idx}"
 
     sig_text = seed_sig
     sig_source = "seed"
+    sig_id = None
     if config.only != "skill" and GEPA_COMPONENT_SIGNATURE in candidate:
         sig_text = candidate[GEPA_COMPONENT_SIGNATURE]
-        sig_source = f"{run_basename}#{cand_tag}#sig"
+        sig_source = f"{run_basename}#{cand_tag}-signature"
+        sig_id = candidate_id
 
     skill_text = seed_skill
     skill_source = "seed"
+    skill_id = None
     if config.only != "signature" and GEPA_COMPONENT_SKILL in candidate:
         skill_text = candidate[GEPA_COMPONENT_SKILL]
-        skill_source = f"{run_basename}#{cand_tag}#skill"
+        skill_source = f"{run_basename}#{cand_tag}-skill"
+        skill_id = candidate_id
 
-    return sig_text, sig_source, skill_text, skill_source
+    return sig_text, sig_source, sig_id, skill_text, skill_source, skill_id
+
+
+def format_component_source(source: str, length: int, source_id: str | None = None) -> str:
+    if source_id is None:
+        return f"{source} ({length} chars)"
+    return f"{source} ({source_id}; {length} chars)"
 
 
 def run_evaluation(config: EvalConfig) -> EvalReport:
@@ -841,10 +830,10 @@ def run_evaluation(config: EvalConfig) -> EvalReport:
     against ground truth. ``config.only`` selectively applies just one
     of the two evolved components.
     """
-    sig_text, sig_source, skill_text, skill_source = _resolve_components(config)
+    sig_text, sig_source, sig_id, skill_text, skill_source, skill_id = _resolve_components(config)
     print(
-        f"Signature: {sig_source} ({len(sig_text)} chars)\n"
-        f"Skill:     {skill_source} ({len(skill_text)} chars)"
+        f"Signature: {format_component_source(sig_source, len(sig_text), sig_id)}\n"
+        f"Skill:     {format_component_source(skill_source, len(skill_text), skill_id)}"
     )
 
     sig_cls = make_dynamic_signature(sig_text)
@@ -928,8 +917,10 @@ def run_evaluation(config: EvalConfig) -> EvalReport:
     return EvalReport(
         config=config,
         signature_source=sig_source,
+        signature_id=sig_id,
         signature_length=len(sig_text),
         skill_source=skill_source,
+        skill_id=skill_id,
         skill_length=len(skill_text),
         total_tasks=total,
         soft_restriction_avg=soft_avg,

@@ -1,4 +1,4 @@
-"""Tests for the spreadsheet_rlm.recalculate pipeline."""
+"""Tests for the spreadsheet_rlm.tools.recalculate pipeline."""
 
 from __future__ import annotations
 
@@ -12,10 +12,10 @@ if str(_EXAMPLE_DIR) not in sys.path:
 
 import openpyxl  # noqa: E402
 import pytest  # noqa: E402
+import spreadsheet_rlm.tools.recalculate as recalc_mod  # noqa: E402
 from openpyxl import Workbook  # noqa: E402
 from openpyxl.styles import Font  # noqa: E402
-from spreadsheet_rlm import recalculate as recalc_mod  # noqa: E402
-from spreadsheet_rlm.recalculate import (  # noqa: E402
+from spreadsheet_rlm.tools.recalculate import (  # noqa: E402
     RecalcResult,
     _count_resolved,
     _find_libreoffice,
