@@ -147,6 +147,68 @@ from predict_rlm.skills import pdf, spreadsheet
 rlm = PredictRLM(ProcessInvoices, skills=[pdf, spreadsheet])
 ```
 
+## Lifecycle callbacks
+
+Hook into the RLM iteration loop to broadcast progress to a UI, write
+structured logs, or feed an observability pipeline. `PredictRLM` extends
+DSPy's existing callback contract (`dspy.utils.callback.BaseCallback`)
+with two RLM-specific handlers:
+
+| Handler | Fires | Receives |
+|---|---|---|
+| `on_rlm_iteration_start` | Before the action LM is called for iteration N | `call_id`, `instance`, `iteration`, `max_iterations` |
+| `on_rlm_iteration_end` | After iteration N finishes (code executed, `IterationStep` built — or an error was raised) | `call_id`, `instance`, `iteration`, `step: IterationStep \| None`, `is_final: bool`, `exception: Exception \| None` |
+
+`call_id` matches the parent module's `on_module_start/end` ID, so events
+correlate cleanly with DSPy's own callback events. Existing
+`BaseCallback` subclasses keep working unchanged — handlers we call are
+opt-in via `getattr`.
+
+**Async-aware.** If you use `aforward()` your handlers may be coroutines
+and they will be awaited. Sync `forward()` calls sync handlers; if it
+encounters an async handler the coroutine is closed and a warning is
+logged.
+
+**Failure-isolated.** Handler exceptions are logged and swallowed — a
+broken callback can never break the run.
+
+### Broadcasting a "loading" status to a websocket
+
+```python
+import json
+from dspy.utils.callback import BaseCallback
+from predict_rlm import IterationStep, PredictRLM
+
+class ProgressBroadcaster(BaseCallback):
+    def __init__(self, websocket):
+        self.ws = websocket
+
+    async def on_rlm_iteration_start(self, *, iteration, max_iterations, **_):
+        await self.ws.send_json({
+            "type": "iteration_start",
+            "iteration": iteration,
+            "max_iterations": max_iterations,
+        })
+
+    async def on_rlm_iteration_end(
+        self, *, iteration, step: IterationStep | None, is_final, exception, **_
+    ):
+        await self.ws.send_json({
+            "type": "iteration_end",
+            "iteration": iteration,
+            "is_final": is_final,
+            "step": step.model_dump(mode="json") if step else None,
+            "error": str(exception) if exception else None,
+        })
+
+rlm = PredictRLM("query -> answer")
+rlm.callbacks = [ProgressBroadcaster(ws)]
+result = await rlm.aforward(query="…")
+```
+
+Register globally instead with `dspy.configure(callbacks=[...])` and the
+same handlers fire for every `PredictRLM` instance.
+
 ## Next steps
 
 - [How it works](docs/how-it-works.md) — understand the sandbox, REPL loop, signatures, and file I/O

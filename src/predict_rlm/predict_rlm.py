@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import inspect
+import logging
 import os
 import re
 import time
@@ -12,6 +13,7 @@ from typing import TYPE_CHECKING, Any, Callable, Iterator, List, Literal, Option
 
 import dspy
 from dspy.primitives.code_interpreter import CodeInterpreter
+from dspy.utils.callback import ACTIVE_CALL_ID
 from pydantic import create_model
 
 from ._shared import build_rlm_signatures, format_tool_docs_full
@@ -34,6 +36,8 @@ from .trace import (
     snapshot_lm_history_len,
     usage_since,
 )
+
+_CB_LOGGER = logging.getLogger("predict_rlm.callbacks")
 
 # Capture the real dspy.Image class at import time so type comparisons
 # work even when tests patch predict_rlm.dspy.Image to a mock.
@@ -1007,6 +1011,68 @@ class PredictRLM(dspy.RLM):
             finally:
                 self._context_lm = None
 
+    def _active_callbacks(self) -> list:
+        """Return active callbacks (global + instance-level), in dispatch order.
+
+        Mirrors ``dspy.utils.callback._get_active_callbacks`` so that any
+        ``BaseCallback`` registered via ``dspy.configure(callbacks=[...])``
+        or ``rlm.callbacks = [...]`` automatically receives RLM iteration
+        events alongside the standard module/lm/tool events.
+        """
+        global_cbs = dspy.settings.get("callbacks", []) or []
+        instance_cbs = getattr(self, "callbacks", []) or []
+        return list(global_cbs) + list(instance_cbs)
+
+    def _dispatch_sync(self, method: str, /, **kwargs: Any) -> None:
+        """Invoke ``method`` on each active callback. Sync-only path.
+
+        Handler exceptions are logged and swallowed so a misbehaving
+        callback can never break the run (matches DSPy's own behavior in
+        ``_execute_end_callbacks``). If a handler returns a coroutine the
+        coroutine is closed and a warning is logged — sync ``forward()``
+        cannot await it. Use ``aforward()`` for async handlers.
+        """
+        callbacks = self._active_callbacks()
+        if not callbacks:
+            return
+        for cb in callbacks:
+            handler = getattr(cb, method, None)
+            if handler is None:
+                continue
+            try:
+                result = handler(**kwargs)
+            except Exception as e:
+                _CB_LOGGER.warning(
+                    "Error in RLM callback %s.%s: %s", type(cb).__name__, method, e
+                )
+                continue
+            if inspect.iscoroutine(result):
+                _CB_LOGGER.warning(
+                    "Async callback %s.%s invoked from sync forward(); "
+                    "coroutine was not awaited. Use aforward() for async handlers.",
+                    type(cb).__name__,
+                    method,
+                )
+                result.close()
+
+    async def _dispatch_async(self, method: str, /, **kwargs: Any) -> None:
+        """Async variant of ``_dispatch_sync`` that awaits coroutine handlers."""
+        callbacks = self._active_callbacks()
+        if not callbacks:
+            return
+        for cb in callbacks:
+            handler = getattr(cb, method, None)
+            if handler is None:
+                continue
+            try:
+                result = handler(**kwargs)
+                if inspect.iscoroutine(result):
+                    await result
+            except Exception as e:
+                _CB_LOGGER.warning(
+                    "Error in RLM callback %s.%s: %s", type(cb).__name__, method, e
+                )
+
     def forward(self, **kwargs: Any) -> dspy.Prediction:
         """Execute the RLM with captured context LM for thread-safe predict calls.
 
@@ -1283,53 +1349,83 @@ class PredictRLM(dspy.RLM):
                 try:
                     status = "max_iterations"
                     history = REPLHistory()
+                    call_id = ACTIVE_CALL_ID.get()
 
                     for iteration in range(self.max_iterations):
                         iter_start = time.perf_counter()
-                        result = self._execute_iteration(
-                            repl, variables, history, iteration, input_args, output_field_names
-                        )
-
-                        # Extract step data from the new history entry
-                        new_history = result if isinstance(result, REPLHistory) else None
-                        if new_history and len(new_history.entries) > len(history.entries):
-                            entry = new_history.entries[-1]
-                        elif isinstance(result, dspy.Prediction) and hasattr(result, "trajectory"):
-                            traj = result.trajectory
-                            entry_data = traj[-1] if traj else {}
-                            from dspy.primitives.repl_types import REPLEntry
-
-                            entry = REPLEntry(
-                                reasoning=entry_data.get("reasoning", ""),
-                                code=entry_data.get("code", ""),
-                                output=entry_data.get("output", ""),
-                            )
-                        else:
-                            entry = None
-
-                        full_output = entry.output if entry else ""
-                        if len(full_output) > 5000:
-                            prompt_output = (
-                                full_output[:5000]
-                                + f"\n... (truncated to 5000/{len(full_output):,} chars)"
-                            )
-                        else:
-                            prompt_output = full_output
-
-                        step = IterationStep(
+                        step: IterationStep | None = None
+                        is_final = False
+                        iter_exception: Exception | None = None
+                        self._dispatch_sync(
+                            "on_rlm_iteration_start",
+                            call_id=call_id,
+                            instance=self,
                             iteration=iteration + 1,
-                            reasoning=entry.reasoning if entry else "",
-                            code=entry.code if entry else "",
-                            output=prompt_output,
-                            untruncated_output=full_output,
-                            error=full_output.startswith(("[Error]", "[Type Error]")),
-                            duration_ms=ms_since(iter_start),
-                            tool_calls=drain_tool_calls(),
-                            predict_calls=drain_predict_calls(),
+                            max_iterations=self.max_iterations,
                         )
-                        steps.append(step)
+                        try:
+                            result = self._execute_iteration(
+                                repl, variables, history, iteration, input_args,
+                                output_field_names,
+                            )
 
-                        if isinstance(result, dspy.Prediction):
+                            # Extract step data from the new history entry
+                            new_history = result if isinstance(result, REPLHistory) else None
+                            if new_history and len(new_history.entries) > len(history.entries):
+                                entry = new_history.entries[-1]
+                            elif (
+                                isinstance(result, dspy.Prediction)
+                                and hasattr(result, "trajectory")
+                            ):
+                                traj = result.trajectory
+                                entry_data = traj[-1] if traj else {}
+                                from dspy.primitives.repl_types import REPLEntry
+
+                                entry = REPLEntry(
+                                    reasoning=entry_data.get("reasoning", ""),
+                                    code=entry_data.get("code", ""),
+                                    output=entry_data.get("output", ""),
+                                )
+                            else:
+                                entry = None
+
+                            full_output = entry.output if entry else ""
+                            if len(full_output) > 5000:
+                                prompt_output = (
+                                    full_output[:5000]
+                                    + f"\n... (truncated to 5000/{len(full_output):,} chars)"
+                                )
+                            else:
+                                prompt_output = full_output
+
+                            step = IterationStep(
+                                iteration=iteration + 1,
+                                reasoning=entry.reasoning if entry else "",
+                                code=entry.code if entry else "",
+                                output=prompt_output,
+                                untruncated_output=full_output,
+                                error=full_output.startswith(("[Error]", "[Type Error]")),
+                                duration_ms=ms_since(iter_start),
+                                tool_calls=drain_tool_calls(),
+                                predict_calls=drain_predict_calls(),
+                            )
+                            steps.append(step)
+                            is_final = isinstance(result, dspy.Prediction)
+                        except Exception as e:
+                            iter_exception = e
+                            raise
+                        finally:
+                            self._dispatch_sync(
+                                "on_rlm_iteration_end",
+                                call_id=call_id,
+                                instance=self,
+                                iteration=iteration + 1,
+                                step=step,
+                                is_final=is_final,
+                                exception=iter_exception,
+                            )
+
+                        if is_final:
                             status = "completed"
                             prediction = result
                             if output_file_fields:
@@ -1417,52 +1513,82 @@ class PredictRLM(dspy.RLM):
                 try:
                     status = "max_iterations"
                     history = REPLHistory()
+                    call_id = ACTIVE_CALL_ID.get()
 
                     for iteration in range(self.max_iterations):
                         iter_start = time.perf_counter()
-                        result = await self._aexecute_iteration(
-                            repl, variables, history, iteration, input_args, output_field_names
-                        )
-
-                        new_history = result if isinstance(result, REPLHistory) else None
-                        if new_history and len(new_history.entries) > len(history.entries):
-                            entry = new_history.entries[-1]
-                        elif isinstance(result, dspy.Prediction) and hasattr(result, "trajectory"):
-                            traj = result.trajectory
-                            entry_data = traj[-1] if traj else {}
-                            from dspy.primitives.repl_types import REPLEntry
-
-                            entry = REPLEntry(
-                                reasoning=entry_data.get("reasoning", ""),
-                                code=entry_data.get("code", ""),
-                                output=entry_data.get("output", ""),
-                            )
-                        else:
-                            entry = None
-
-                        full_output = entry.output if entry else ""
-                        if len(full_output) > 5000:
-                            prompt_output = (
-                                full_output[:5000]
-                                + f"\n... (truncated to 5000/{len(full_output):,} chars)"
-                            )
-                        else:
-                            prompt_output = full_output
-
-                        step = IterationStep(
+                        step: IterationStep | None = None
+                        is_final = False
+                        iter_exception: Exception | None = None
+                        await self._dispatch_async(
+                            "on_rlm_iteration_start",
+                            call_id=call_id,
+                            instance=self,
                             iteration=iteration + 1,
-                            reasoning=entry.reasoning if entry else "",
-                            code=entry.code if entry else "",
-                            output=prompt_output,
-                            untruncated_output=full_output,
-                            error=full_output.startswith(("[Error]", "[Type Error]")),
-                            duration_ms=ms_since(iter_start),
-                            tool_calls=drain_tool_calls(),
-                            predict_calls=drain_predict_calls(),
+                            max_iterations=self.max_iterations,
                         )
-                        steps.append(step)
+                        try:
+                            result = await self._aexecute_iteration(
+                                repl, variables, history, iteration, input_args,
+                                output_field_names,
+                            )
 
-                        if isinstance(result, dspy.Prediction):
+                            new_history = result if isinstance(result, REPLHistory) else None
+                            if new_history and len(new_history.entries) > len(history.entries):
+                                entry = new_history.entries[-1]
+                            elif (
+                                isinstance(result, dspy.Prediction)
+                                and hasattr(result, "trajectory")
+                            ):
+                                traj = result.trajectory
+                                entry_data = traj[-1] if traj else {}
+                                from dspy.primitives.repl_types import REPLEntry
+
+                                entry = REPLEntry(
+                                    reasoning=entry_data.get("reasoning", ""),
+                                    code=entry_data.get("code", ""),
+                                    output=entry_data.get("output", ""),
+                                )
+                            else:
+                                entry = None
+
+                            full_output = entry.output if entry else ""
+                            if len(full_output) > 5000:
+                                prompt_output = (
+                                    full_output[:5000]
+                                    + f"\n... (truncated to 5000/{len(full_output):,} chars)"
+                                )
+                            else:
+                                prompt_output = full_output
+
+                            step = IterationStep(
+                                iteration=iteration + 1,
+                                reasoning=entry.reasoning if entry else "",
+                                code=entry.code if entry else "",
+                                output=prompt_output,
+                                untruncated_output=full_output,
+                                error=full_output.startswith(("[Error]", "[Type Error]")),
+                                duration_ms=ms_since(iter_start),
+                                tool_calls=drain_tool_calls(),
+                                predict_calls=drain_predict_calls(),
+                            )
+                            steps.append(step)
+                            is_final = isinstance(result, dspy.Prediction)
+                        except Exception as e:
+                            iter_exception = e
+                            raise
+                        finally:
+                            await self._dispatch_async(
+                                "on_rlm_iteration_end",
+                                call_id=call_id,
+                                instance=self,
+                                iteration=iteration + 1,
+                                step=step,
+                                is_final=is_final,
+                                exception=iter_exception,
+                            )
+
+                        if is_final:
                             status = "completed"
                             prediction = result
                             if output_file_fields:
