@@ -4,6 +4,7 @@ import json
 import math
 import pickle
 import re
+import shutil
 import textwrap
 from pathlib import Path
 from statistics import mean
@@ -21,6 +22,15 @@ ALL_CELLS_MATCH_RE = re.compile(r"All\s+(\d+)\s+cells?\s+match")
 DECIMAL_RE = re.compile(r"(?<![\w.])(?P<sign>[+-]?)(?P<whole>\d+)\.(?P<fraction>\d+)")
 LEADING_ZERO_DECIMAL_RE = re.compile(r"(?<![\w.])(?P<sign>[+-]?)0\.(?P<fraction>\d+)")
 TEXT_COLUMNS = {"model", "outcome", "parent", "scope", "task"}
+TERMINAL_HEADER_ALIASES = {
+    "prompt_tok": "in_tok",
+    "completion_tok": "out_tok",
+    "total_cost": "total",
+    "repeat_cost": "repeat",
+    "effective_cost": "eff",
+    "cost_usd": "cost",
+}
+TERMINAL_WRAP_COLUMNS = {"scope", "model"}
 COST_GROUPS = [
     ("executor", [("main", {"executor", "main"}), ("sub", {"sub_lm", "sub"})]),
     (
@@ -175,7 +185,8 @@ def merge_rows(run_dir: str | Path) -> list[dict[str, Any]]:
                 "pre": _format_merge_preflight(entry),
                 "n": _format_merge_subsample(entry),
                 "score Δ": _format_merge_score(entry),
-                "_detail": _format_merge_detail(entry, status),
+                "val Δ": _format_merge_val_score(state, entry),
+                "_detail": _format_merge_detail(state, entry, status),
             }
         )
     return rows
@@ -460,14 +471,101 @@ def _format_merge_score(entry: dict[str, Any]) -> str:
     return f"{new_value:.3f} {_format_delta(delta)}"
 
 
-def _format_merge_detail(entry: dict[str, Any], status: str) -> str:
+def _format_merge_val_score(state: dict[str, Any], entry: dict[str, Any]) -> str:
+    child_idx = entry.get("new_program_idx")
+    parent_ids = _merge_parent_ids(entry)
+    subscores = state.get("prog_candidate_val_subscores") or []
+    if child_idx is None or not parent_ids or not _has_candidate_scores(subscores, child_idx):
+        return "-"
+    child_mean = _mean_scores(subscores[int(child_idx)])
+    parent_means = [
+        (parent_id, _mean_scores(subscores[parent_id]))
+        for parent_id in parent_ids
+        if _has_candidate_scores(subscores, parent_id)
+    ]
+    if not parent_means:
+        return "-"
+    best_parent_id, best_parent_mean = max(parent_means, key=lambda item: item[1])
+    return f"{child_mean:.3f} {_format_delta(child_mean - best_parent_mean)} vs {best_parent_id}"
+
+
+def _format_merge_detail(state: dict[str, Any], entry: dict[str, Any], status: str) -> str:
     if status == "accepted" and "new_program_idx" in entry:
-        return f"→ cand {entry['new_program_idx']}"
+        details = [f"→ cand {entry['new_program_idx']}"]
+        val_detail = _format_merge_val_detail(state, entry)
+        if val_detail != "-":
+            details.append(val_detail)
+        return "; ".join(details)
     if entry.get("rlm_merge_reject_reason"):
         return str(entry["rlm_merge_reject_reason"])
     if entry.get("rlm_merge_error_type"):
         return str(entry["rlm_merge_error_type"])
     return "-"
+
+
+def _format_merge_val_detail(state: dict[str, Any], entry: dict[str, Any]) -> str:
+    child_idx = entry.get("new_program_idx")
+    parent_ids = _merge_parent_ids(entry)
+    subscores = state.get("prog_candidate_val_subscores") or []
+    if child_idx is None or not parent_ids or not _has_candidate_scores(subscores, child_idx):
+        return "-"
+    child_scores = subscores[int(child_idx)]
+    parts: list[str] = []
+    for parent_id in parent_ids:
+        if not _has_candidate_scores(subscores, parent_id):
+            continue
+        parent_values, child_values = _aligned_score_values(subscores[parent_id], child_scores)
+        if not parent_values or not child_values:
+            continue
+        gains, losses = _hard_flips(parent_values, child_values)
+        parent_mean = _mean_list(parent_values)
+        child_mean = _mean_list(child_values)
+        parts.append(
+            f"vs {parent_id}: "
+            f"{parent_mean:.3f}→{child_mean:.3f} {_format_delta(child_mean - parent_mean)}, "
+            f"hard {_hard_count(parent_values)}→{_hard_count(child_values)}/{len(child_values)}, "
+            f"flips +{gains}/-{losses}"
+        )
+    if not parts:
+        return "-"
+    return "full val " + "; ".join(parts)
+
+
+def _merge_parent_ids(entry: dict[str, Any]) -> list[int]:
+    raw_ids: list[Any] = []
+    if entry.get("rlm_merge_base_parent") is not None:
+        raw_ids.append(entry.get("rlm_merge_base_parent"))
+    if entry.get("rlm_merge_patch_source_parent") is not None:
+        raw_ids.append(entry.get("rlm_merge_patch_source_parent"))
+    if not raw_ids:
+        pair = _coerce_sequence(entry.get("rlm_merge_candidate_pair") or entry.get("merged_entities"))
+        if pair is not None:
+            raw_ids.extend(pair[:2])
+    parent_ids: list[int] = []
+    for raw_id in raw_ids:
+        try:
+            parent_id = int(raw_id)
+        except (TypeError, ValueError):
+            continue
+        if parent_id not in parent_ids:
+            parent_ids.append(parent_id)
+    return parent_ids
+
+
+def _has_candidate_scores(subscores: Any, candidate_idx: Any) -> bool:
+    try:
+        index = int(candidate_idx)
+    except (TypeError, ValueError):
+        return False
+    return isinstance(subscores, list | tuple) and 0 <= index < len(subscores) and bool(subscores[index])
+
+
+def _aligned_score_values(parent_scores: Any, child_scores: Any) -> tuple[list[float], list[float]]:
+    if isinstance(parent_scores, dict) and isinstance(child_scores, dict):
+        keys = [key for key in parent_scores if key in child_scores]
+        return [float(parent_scores[key]) for key in keys], [float(child_scores[key]) for key in keys]
+    pairs = list(zip(_score_values(parent_scores), _score_values(child_scores), strict=False))
+    return [parent for parent, _child in pairs], [child for _parent, child in pairs]
 
 
 def _cost_breakdowns(
@@ -714,31 +812,170 @@ def _render_markdown_table(rows: list[dict[str, Any]]) -> str:
 def _render_terminal_table(rows: list[dict[str, Any]]) -> str:
     headers = [header for header in rows[0] if not str(header).startswith("_")]
     rendered_rows = [_render_terminal_row(row, headers) for row in rows]
-    widths = {
-        header: max(len(str(header)), *(len(row[header]) for row in rendered_rows))
-        for header in headers
-    }
+    header_labels = {header: TERMINAL_HEADER_ALIASES.get(header, str(header)) for header in headers}
+    terminal_width = shutil.get_terminal_size(fallback=(120, 24)).columns
+    widths = _terminal_widths(headers, rendered_rows, header_labels)
+    if _terminal_table_width(headers, widths) > terminal_width:
+        rendered_rows = _compact_terminal_count_columns(headers, rendered_rows)
+        widths = _terminal_widths(headers, rendered_rows, header_labels)
+    rendered_rows, widths = _wrap_terminal_rows_to_width(
+        headers,
+        rendered_rows,
+        widths,
+        terminal_width=terminal_width,
+    )
+    body = [
+        line
+        for source_row, row in zip(rows, rendered_rows, strict=True)
+        for line in _terminal_row_lines(
+            row,
+            headers,
+            widths,
+            align="right",
+            column_align=source_row.get("_align", {}),
+            highlight=source_row.get("_highlight", False),
+            category=source_row.get("_category", False),
+            muted_prefix=source_row.get("_muted_prefix", {}),
+            muted_suffix=source_row.get("_muted_suffix", {}),
+        )
+    ]
     return "\n".join(
         [
             _terminal_rule("┌", "┬", "┐", headers, widths),
-            _terminal_row({header: str(header) for header in headers}, headers, widths, align="left"),
+            _terminal_row(header_labels, headers, widths, align="left"),
             _terminal_rule("├", "┼", "┤", headers, widths),
-            *[
-                _terminal_row(
-                    row,
-                    headers,
-                    widths,
-                    align="right",
-                    column_align=source_row.get("_align", {}),
-                    highlight=source_row.get("_highlight", False),
-                    category=source_row.get("_category", False),
-                    muted_prefix=source_row.get("_muted_prefix", {}),
-                    muted_suffix=source_row.get("_muted_suffix", {}),
-                )
-                for source_row, row in zip(rows, rendered_rows, strict=True)
-            ],
+            *body,
             _terminal_rule("└", "┴", "┘", headers, widths),
         ]
+    )
+
+
+def _terminal_widths(
+    headers: list[str],
+    rendered_rows: list[dict[str, str]],
+    header_labels: dict[str, str],
+) -> dict[str, int]:
+    return {
+        header: max(
+            _max_line_len(header_labels[header]),
+            *(_max_line_len(row[header]) for row in rendered_rows),
+        )
+        for header in headers
+    }
+
+
+def _compact_terminal_count_columns(
+    headers: list[str], rendered_rows: list[dict[str, str]]
+) -> list[dict[str, str]]:
+    compact_headers = {"calls", "prompt_tok", "completion_tok"}.intersection(headers)
+    if not compact_headers:
+        return rendered_rows
+    return [
+        {
+            header: value.replace(",", "") if header in compact_headers else value
+            for header, value in row.items()
+        }
+        for row in rendered_rows
+    ]
+
+
+def _wrap_terminal_rows_to_width(
+    headers: list[str],
+    rendered_rows: list[dict[str, str]],
+    widths: dict[str, int],
+    *,
+    terminal_width: int,
+) -> tuple[list[dict[str, str]], dict[str, int]]:
+    if _terminal_table_width(headers, widths) <= terminal_width:
+        return rendered_rows, widths
+
+    wrap_headers = [header for header in headers if header in TERMINAL_WRAP_COLUMNS]
+    if not wrap_headers:
+        return rendered_rows, widths
+
+    fixed_width = sum(width for header, width in widths.items() if header not in wrap_headers)
+    available = terminal_width - fixed_width - (3 * len(headers) + 1)
+    min_wrap_width = sum(len(header) for header in wrap_headers)
+    available = max(available, min_wrap_width)
+    per_column = max(1, available // len(wrap_headers))
+
+    wrapped_widths = dict(widths)
+    for header in wrap_headers:
+        wrapped_widths[header] = min(widths[header], max(len(header), per_column))
+
+    wrapped_rows: list[dict[str, str]] = []
+    for row in rendered_rows:
+        wrapped_row = dict(row)
+        for header in wrap_headers:
+            wrapped_row[header] = _wrap_terminal_cell(row[header], wrapped_widths[header])
+        wrapped_rows.append(wrapped_row)
+    return wrapped_rows, wrapped_widths
+
+
+def _terminal_widths(
+    headers: list[str],
+    rendered_rows: list[dict[str, str]],
+    header_labels: dict[str, str],
+) -> dict[str, int]:
+    return {
+        header: max(
+            len(header_labels[header]),
+            *(_max_line_len(row[header]) for row in rendered_rows),
+        )
+        for header in headers
+    }
+
+
+def _compact_terminal_count_columns(
+    headers: list[str],
+    rendered_rows: list[dict[str, str]],
+) -> list[dict[str, str]]:
+    count_columns = {"calls", "prompt_tok", "completion_tok"}.intersection(headers)
+    if not count_columns:
+        return rendered_rows
+    return [
+        {
+            header: _compact_count_cell(value) if header in count_columns else value
+            for header, value in row.items()
+        }
+        for row in rendered_rows
+    ]
+
+
+def _compact_count_cell(value: str) -> str:
+    value = value.strip()
+    if value == "-":
+        return value
+    try:
+        count = int(value.replace(",", ""))
+    except ValueError:
+        return value
+    if abs(count) >= 1_000_000:
+        return f"{count / 1_000_000:.1f}M"
+    if abs(count) >= 1_000:
+        return f"{count / 1_000:.1f}K"
+    return str(count)
+
+
+def _terminal_table_width(headers: list[str], widths: dict[str, int]) -> int:
+    return sum(widths[header] for header in headers) + (3 * len(headers) + 1)
+
+
+def _max_line_len(value: str) -> int:
+    return max((len(line) for line in str(value).splitlines()), default=0)
+
+
+def _wrap_terminal_cell(value: str, width: int) -> str:
+    text = str(value)
+    if not text.strip() or len(text) <= width:
+        return text
+    return "\n".join(
+        textwrap.wrap(
+            text,
+            width=width,
+            break_long_words=True,
+            break_on_hyphens=True,
+        )
     )
 
 
@@ -785,16 +1022,76 @@ def _terminal_row(
     muted_prefix: dict[str, str] | None = None,
     muted_suffix: dict[str, str] | None = None,
 ) -> str:
+    return _terminal_row_lines(
+        row,
+        headers,
+        widths,
+        align=align,
+        column_align=column_align,
+        highlight=highlight,
+        category=category,
+        muted_prefix=muted_prefix,
+        muted_suffix=muted_suffix,
+    )[0]
+
+
+def _terminal_row_lines(
+    row: dict[str, str],
+    headers: list[str],
+    widths: dict[str, int],
+    *,
+    align: str,
+    column_align: dict[str, str] | None = None,
+    highlight: bool = False,
+    category: bool = False,
+    muted_prefix: dict[str, str] | None = None,
+    muted_suffix: dict[str, str] | None = None,
+) -> list[str]:
+    cell_lines = {header: row[header].splitlines() or [""] for header in headers}
+    height = max(len(lines) for lines in cell_lines.values())
+    return [
+        _terminal_row_line(
+            row,
+            cell_lines,
+            line_index,
+            headers,
+            widths,
+            align=align,
+            column_align=column_align,
+            highlight=highlight,
+            category=category,
+            muted_prefix=muted_prefix,
+            muted_suffix=muted_suffix,
+        )
+        for line_index in range(height)
+    ]
+
+
+def _terminal_row_line(
+    row: dict[str, str],
+    cell_lines: dict[str, list[str]],
+    line_index: int,
+    headers: list[str],
+    widths: dict[str, int],
+    *,
+    align: str,
+    column_align: dict[str, str] | None = None,
+    highlight: bool = False,
+    category: bool = False,
+    muted_prefix: dict[str, str] | None = None,
+    muted_suffix: dict[str, str] | None = None,
+) -> str:
     cells = []
     for header in headers:
-        value = row[header]
+        value = cell_lines[header][line_index] if line_index < len(cell_lines[header]) else ""
         cell_align = (column_align or {}).get(header, align)
         if header == headers[0] or cell_align == "left":
             value = value.ljust(widths[header])
         else:
             value = value.rjust(widths[header])
-        value = _mute_terminal_prefix(value, row[header], (muted_prefix or {}).get(header, ""))
-        value = _mute_terminal_suffix(value, row[header], (muted_suffix or {}).get(header, ""))
+        raw_line = cell_lines[header][line_index] if line_index < len(cell_lines[header]) else ""
+        value = _mute_terminal_prefix(value, raw_line, (muted_prefix or {}).get(header, ""))
+        value = _mute_terminal_suffix(value, raw_line, (muted_suffix or {}).get(header, ""))
         if highlight and value.strip():
             value = f"{ANSI_BOLD_GOLD}{_restore_terminal_style(value, ANSI_BOLD_GOLD)}{ANSI_RESET}"
         elif category and header == headers[0] and value.strip():
@@ -955,7 +1252,7 @@ def _iteration_scores(entry: dict[str, Any]) -> tuple[list[float], list[float], 
     if "id1_subsample_scores" in entry and "new_program_subsample_scores" in entry:
         id1_scores = _score_values(entry.get("id1_subsample_scores") or [])
         id2_scores = _score_values(entry.get("id2_subsample_scores") or [])
-        parent_scores = [max(a, b) for a, b in zip(id1_scores, id2_scores, strict=False)]
+        parent_scores = id1_scores if sum(id1_scores) >= sum(id2_scores) else id2_scores
         pair = entry.get("rlm_merge_candidate_pair") or entry.get("merged_entities") or "merge"
         return parent_scores, _score_values(entry.get("new_program_subsample_scores") or []), pair
     return None

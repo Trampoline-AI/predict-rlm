@@ -1346,7 +1346,7 @@ def test_reporting_tables_from_artifacts(tmp_path: Path):
     assert "costs:" in terminal
     assert "total" in terminal
     assert "repeat" in terminal
-    assert "effective" in terminal
+    assert "eff" in terminal
     assert "costs (raw spend: all logged LM calls):" not in terminal
     assert "costs (deduped spend: stable operation ids only; legacy rows counted raw):" not in terminal
 
@@ -1377,7 +1377,7 @@ def test_terminal_cost_table_wraps_scope_and_model_to_terminal_width(monkeypatch
     assert "in_tok" in rendered
     assert "out_tok" in rendered
     assert "total_cost" not in rendered
-    assert "tch_me" in rendered
+    assert "patch" in rendered
     assert "oposer" in rendered
 
 
