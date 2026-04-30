@@ -1351,6 +1351,61 @@ def test_reporting_tables_from_artifacts(tmp_path: Path):
     assert "costs (deduped spend: stable operation ids only; legacy rows counted raw):" not in terminal
 
 
+def test_cost_rows_group_patch_merge_roles(tmp_path: Path):
+    (tmp_path / "run_metadata.json").write_text(
+        json.dumps(
+            {
+                "resolved_config": {
+                    "proposer_reasoning_effort": "medium",
+                    "proposer_sub_lm_reasoning_effort": "low",
+                }
+            }
+        )
+    )
+    append_cost_rows(
+        tmp_path / "cost_log.jsonl",
+        [
+            CostRow(
+                event_id="e",
+                operation_id="op",
+                attempt_id="a",
+                event="patch_merge",
+                role="patch_merge_proposer",
+                model="dummy-patch",
+                calls=1,
+                input_tokens=10,
+                output_tokens=2,
+                cost_usd=0.01,
+            ),
+            CostRow(
+                event_id="e-sub",
+                operation_id="op-sub",
+                attempt_id="a-sub",
+                event="patch_merge",
+                role="patch_merge_proposer_sub_lm",
+                model="dummy-patch-sub",
+                calls=1,
+                input_tokens=11,
+                output_tokens=3,
+                cost_usd=0.02,
+            ),
+        ],
+    )
+
+    rows = cost_rows(tmp_path)
+
+    assert any(row.get("scope") == "patch-merge" and row.get("_category") for row in rows)
+    assert any(
+        row.get("scope") == "  - main" and row.get("model") == "dummy-patch-medium"
+        for row in rows
+    )
+    assert any(
+        row.get("scope") == "  - sub" and row.get("model") == "dummy-patch-sub-low"
+        for row in rows
+    )
+    assert not any(row.get("scope") == "other" for row in rows)
+
+
 def test_terminal_cost_table_wraps_scope_and_model_to_terminal_width(monkeypatch):
     monkeypatch.setattr(
         stats_report.shutil,
@@ -1377,8 +1432,9 @@ def test_terminal_cost_table_wraps_scope_and_model_to_terminal_width(monkeypatch
     assert "in_tok" in rendered
     assert "out_tok" in rendered
     assert "total_cost" not in rendered
-    assert "patch" in rendered
-    assert "oposer" in rendered
+    assert "  - patch" in rendered
+    assert "│     _merg" in rendered
+    assert "poser" in rendered
 
 
 def test_eval_stats_from_eval_artifact(tmp_path: Path):

@@ -49,6 +49,13 @@ COST_GROUPS = [
             ("proposer sub", {"merge_proposer_sub_lm", "merge_proposer_sub"}),
         ],
     ),
+    (
+        "patch-merge",
+        [
+            ("main", {"patch_merge_proposer"}),
+            ("sub", {"patch_merge_proposer_sub_lm", "patch_merge_proposer_sub"}),
+        ],
+    ),
 ]
 
 
@@ -348,10 +355,13 @@ def _optimize_role_efforts(run_dir: str | Path) -> dict[str, str | None]:
         "proposer": proposer,
         "reflection": proposer,
         "merge_proposer": proposer,
+        "patch_merge_proposer": proposer,
         "proposer_sub_lm": proposer_sub,
         "proposer_sub": proposer_sub,
         "merge_proposer_sub_lm": proposer_sub,
         "merge_proposer_sub": proposer_sub,
+        "patch_merge_proposer_sub_lm": proposer_sub,
+        "patch_merge_proposer_sub": proposer_sub,
     }
 
 
@@ -850,35 +860,6 @@ def _render_terminal_table(rows: list[dict[str, Any]]) -> str:
     )
 
 
-def _terminal_widths(
-    headers: list[str],
-    rendered_rows: list[dict[str, str]],
-    header_labels: dict[str, str],
-) -> dict[str, int]:
-    return {
-        header: max(
-            _max_line_len(header_labels[header]),
-            *(_max_line_len(row[header]) for row in rendered_rows),
-        )
-        for header in headers
-    }
-
-
-def _compact_terminal_count_columns(
-    headers: list[str], rendered_rows: list[dict[str, str]]
-) -> list[dict[str, str]]:
-    compact_headers = {"calls", "prompt_tok", "completion_tok"}.intersection(headers)
-    if not compact_headers:
-        return rendered_rows
-    return [
-        {
-            header: value.replace(",", "") if header in compact_headers else value
-            for header, value in row.items()
-        }
-        for row in rendered_rows
-    ]
-
-
 def _wrap_terminal_rows_to_width(
     headers: list[str],
     rendered_rows: list[dict[str, str]],
@@ -907,7 +888,7 @@ def _wrap_terminal_rows_to_width(
     for row in rendered_rows:
         wrapped_row = dict(row)
         for header in wrap_headers:
-            wrapped_row[header] = _wrap_terminal_cell(row[header], wrapped_widths[header])
+            wrapped_row[header] = _wrap_terminal_cell(row[header], wrapped_widths[header], header)
         wrapped_rows.append(wrapped_row)
     return wrapped_rows, wrapped_widths
 
@@ -919,7 +900,7 @@ def _terminal_widths(
 ) -> dict[str, int]:
     return {
         header: max(
-            len(header_labels[header]),
+            _max_line_len(header_labels[header]),
             *(_max_line_len(row[header]) for row in rendered_rows),
         )
         for header in headers
@@ -965,10 +946,24 @@ def _max_line_len(value: str) -> int:
     return max((len(line) for line in str(value).splitlines()), default=0)
 
 
-def _wrap_terminal_cell(value: str, width: int) -> str:
+def _wrap_terminal_cell(value: str, width: int, header: str) -> str:
     text = str(value)
     if not text.strip() or len(text) <= width:
         return text
+    if header == "scope":
+        bullet_match = re.match(r"^(\s*-\s+)(.*)$", text)
+        if bullet_match and len(bullet_match.group(1)) < width:
+            prefix = bullet_match.group(1)
+            return "\n".join(
+                textwrap.wrap(
+                    bullet_match.group(2),
+                    width=width,
+                    initial_indent=prefix,
+                    subsequent_indent=" " * len(prefix),
+                    break_long_words=True,
+                    break_on_hyphens=True,
+                )
+            )
     return "\n".join(
         textwrap.wrap(
             text,
