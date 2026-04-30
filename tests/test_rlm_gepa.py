@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import os
 import pickle
 import random
 from pathlib import Path
@@ -16,6 +17,7 @@ from rlm_gepa import (
     RLMGepaProject,
     agent_spec_from_rlm,
     build_merge_signature,
+    build_patch_merge_signature,
     build_proposer_for_rlm,
     build_proposer_signature,
     check_optimization,
@@ -23,7 +25,11 @@ from rlm_gepa import (
 )
 from rlm_gepa.cli import apply_optimize_args, run_project_cli
 from rlm_gepa.proposer.merge import VALID_STATUSES, RlmMergeProposer
-from rlm_gepa.proposer.selection import pick_merge_triplet, walk_ancestors
+from rlm_gepa.proposer.selection import (
+    PatchMergePair,
+    pick_patch_merge_pair,
+)
+from rlm_gepa.reporting import stats as stats_report
 from rlm_gepa.reporting.cost import CostRow, aggregate_costs_from_log, append_cost_rows
 from rlm_gepa.reporting.plots import resolve_plot_output_paths
 from rlm_gepa.reporting.stats import (
@@ -90,7 +96,44 @@ def test_build_signatures_render_agent_spec():
 
     assert "test agent" in proposer.instructions
     assert "{{" not in proposer.instructions
-    assert "paired_traces_file" in merge.input_fields
+    assert "paired_disagreement_traces_file" in merge.input_fields
+
+
+def test_patch_merge_signature_uses_base_and_patch_source_without_ancestor():
+    patch = build_patch_merge_signature(_spec())
+
+    assert "base_parent_id" in patch.input_fields
+    assert "base_parent_instructions" in patch.input_fields
+    assert "patch_source_parent_id" in patch.input_fields
+    assert "patch_source_parent_instructions" in patch.input_fields
+    assert "paired_disagreement_traces_file" in patch.input_fields
+    assert "common_ancestor_instructions" not in patch.input_fields
+    assert "common ancestor" not in patch.instructions.lower()
+
+
+def test_patch_merge_prompt_contract_is_surgical_patch_not_synthesis():
+    prompt = build_patch_merge_signature(_spec()).instructions.lower()
+
+    assert "start from `base_parent_instructions`" in prompt
+    assert "preserve base behavior by default" in prompt
+    assert "import at most 1-3 clauses" in prompt
+    assert "structured metadata" in prompt
+    assert "task ids" in prompt
+    assert "do not summarize" in prompt
+    assert "compress" in prompt
+    assert "concatenate" in prompt
+    assert "globally rewrite" in prompt
+    assert "return base unchanged" in prompt
+
+
+def test_merge_signature_is_evidence_backed_patch_contract():
+    merge = build_merge_signature(_spec())
+
+    assert set(merge.input_fields) == set(build_patch_merge_signature(_spec()).input_fields)
+    assert "base_parent_id" in merge.input_fields
+    assert "paired_disagreement_traces_file" in merge.input_fields
+    assert "common_ancestor_instructions" not in merge.input_fields
+    assert "synthesize" not in merge.instructions.lower()
 
 
 def test_validate_project_accepts_minimal_project():
@@ -109,79 +152,268 @@ def test_validate_project_rejects_seed_key_mismatch():
         validate_project(BadProject())
 
 
-def test_pick_merge_triplet_finds_divergent_siblings():
+def test_pick_patch_merge_pair_rejects_when_oracle_does_not_beat_current_best():
     parents = [[None], [0], [0]]
     candidates = [
         {"skill_instructions": "seed"},
-        {"skill_instructions": "a"},
-        {"skill_instructions": "b"},
+        {"skill_instructions": "base"},
+        {"skill_instructions": "patch"},
     ]
-    scores_a = {f"t{i}": 1.0 if i % 2 else 0.0 for i in range(12)}
-    scores_b = {f"t{i}": 0.0 if i % 2 else 1.0 for i in range(12)}
+    scores_a = {f"t{i}": 1.0 if i % 2 else 0.0 for i in range(6)}
+    scores_b = {f"t{i}": 0.0 if i % 2 else 1.0 for i in range(6)}
 
-    assert walk_ancestors(parents, 2) == {0}
-    triplet = pick_merge_triplet(
+    pair = pick_patch_merge_pair(
         merge_candidates=[1, 2],
         program_candidates=candidates,
         parent_program_for_candidate=parents,
         prog_candidate_val_subscores=[{}, scores_a, scores_b],
-        tracked_scores=[0.3, 0.5, 0.5],
+        tracked_scores=[0.0, 1.0, 0.5],
         merges_performed=[],
         rng=random.Random(0),
         component_name="skill_instructions",
-        min_each=3,
+        min_each=2,
     )
-    assert triplet == (1, 2, 0)
+
+    assert pair is None
 
 
-def test_pick_merge_triplet_dedups_previously_attempted_triplets():
+def test_pick_patch_merge_pair_rejects_when_one_parent_lacks_unique_wins():
     parents = [[None], [0], [0]]
     candidates = [
         {"skill_instructions": "seed"},
-        {"skill_instructions": "a"},
-        {"skill_instructions": "b"},
+        {"skill_instructions": "base"},
+        {"skill_instructions": "patch"},
     ]
-    scores_a = {f"t{i}": 1.0 if i % 2 else 0.0 for i in range(12)}
-    scores_b = {f"t{i}": 0.0 if i % 2 else 1.0 for i in range(12)}
+    scores_a = {f"t{i}": 1.0 for i in range(6)}
+    scores_b = {f"t{i}": 0.0 for i in range(6)}
 
-    triplet = pick_merge_triplet(
+    pair = pick_patch_merge_pair(
         merge_candidates=[1, 2],
         program_candidates=candidates,
         parent_program_for_candidate=parents,
         prog_candidate_val_subscores=[{}, scores_a, scores_b],
-        tracked_scores=[0.3, 0.5, 0.5],
-        merges_performed=[(1, 2, 0)],
-        rng=random.Random(0),
-        component_name="skill_instructions",
-        min_each=3,
-    )
-
-    assert triplet is None
-
-
-def test_pick_merge_triplet_skips_identical_candidate_text():
-    parents = [[None], [0], [0]]
-    candidates = [
-        {"skill_instructions": "seed"},
-        {"skill_instructions": "same"},
-        {"skill_instructions": "same"},
-    ]
-    scores_a = {f"t{i}": 1.0 if i % 2 else 0.0 for i in range(12)}
-    scores_b = {f"t{i}": 0.0 if i % 2 else 1.0 for i in range(12)}
-
-    triplet = pick_merge_triplet(
-        merge_candidates=[1, 2],
-        program_candidates=candidates,
-        parent_program_for_candidate=parents,
-        prog_candidate_val_subscores=[{}, scores_a, scores_b],
-        tracked_scores=[0.3, 0.5, 0.5],
+        tracked_scores=[0.0, 0.4, 0.3],
         merges_performed=[],
         rng=random.Random(0),
         component_name="skill_instructions",
-        min_each=3,
+        min_each=2,
     )
 
-    assert triplet is None
+    assert pair is None
+
+
+def test_pick_patch_merge_pair_dedups_sorted_pair_across_ancestors():
+    parents = [[None], [None], [0, 1], [0, 1]]
+    candidates = [
+        {"skill_instructions": "seed a"},
+        {"skill_instructions": "seed b"},
+        {"skill_instructions": "base"},
+        {"skill_instructions": "patch"},
+    ]
+    scores_a = {f"t{i}": 1.0 if i % 2 else 0.0 for i in range(6)}
+    scores_b = {f"t{i}": 0.0 if i % 2 else 1.0 for i in range(6)}
+
+    pair = pick_patch_merge_pair(
+        merge_candidates=[2, 3],
+        program_candidates=candidates,
+        parent_program_for_candidate=parents,
+        prog_candidate_val_subscores=[{}, {}, scores_a, scores_b],
+        tracked_scores=[0.1, 0.2, 0.4, 0.3],
+        merges_performed=[(2, 3, 0)],
+        rng=random.Random(0),
+        component_name="skill_instructions",
+        min_each=2,
+    )
+
+    assert pair is None
+
+
+def test_pick_patch_merge_pair_weighted_sampling_is_not_pure_argmax():
+    class FakeRng:
+        def __init__(self):
+            self.population = []
+            self.weights = []
+
+        def choices(self, population, weights, k):
+            assert k == 1
+            self.population = list(population)
+            self.weights = list(weights)
+            return [self.population[1]]
+
+    parents = [[None], [0], [0], [0]]
+    candidates = [
+        {"skill_instructions": "seed"},
+        {"skill_instructions": "parent one"},
+        {"skill_instructions": "parent two"},
+        {"skill_instructions": "parent three"},
+    ]
+    scores_1 = {"t0": 1.0, "t1": 1.0, "t2": 0.0, "t3": 0.0}
+    scores_2 = {"t0": 0.0, "t1": 0.0, "t2": 1.0, "t3": 1.0}
+    scores_3 = {"t0": 0.3, "t1": 0.3, "t2": 0.9, "t3": 0.9}
+    rng = FakeRng()
+
+    pair = pick_patch_merge_pair(
+        merge_candidates=[1, 2, 3],
+        program_candidates=candidates,
+        parent_program_for_candidate=parents,
+        prog_candidate_val_subscores=[{}, scores_1, scores_2, scores_3],
+        tracked_scores=[0.0, 0.4, 0.4, 0.4],
+        merges_performed=[],
+        rng=rng,
+        component_name="skill_instructions",
+        min_each=2,
+    )
+
+    assert pair == rng.population[1]
+    assert len(rng.population) > 1
+    weights_by_pair = {
+        (item.parent_a_id, item.parent_b_id): weight
+        for item, weight in zip(rng.population, rng.weights, strict=True)
+    }
+    assert weights_by_pair[(1, 2)] > weights_by_pair[(1, 3)]
+    assert (pair.parent_a_id, pair.parent_b_id) != (1, 2)
+
+
+def test_pick_patch_merge_pair_ties_pair_weights_deterministically():
+    class NoChoiceRng:
+        def choices(self, *_args, **_kwargs):
+            raise AssertionError("equal-weight selector should not call rng.choices")
+
+    parents = [[None], [0], [0], [0]]
+    candidates = [
+        {"skill_instructions": "seed"},
+        {"skill_instructions": "parent one"},
+        {"skill_instructions": "parent two"},
+        {"skill_instructions": "parent three"},
+    ]
+    scores_1 = {"t0": 1.0, "t1": 1.0, "t2": 0.0, "t3": 0.0}
+    scores_2 = {"t0": 0.0, "t1": 0.0, "t2": 1.0, "t3": 1.0}
+    scores_3 = dict(scores_2)
+
+    pair = pick_patch_merge_pair(
+        merge_candidates=[3, 2, 1],
+        program_candidates=candidates,
+        parent_program_for_candidate=parents,
+        prog_candidate_val_subscores=[{}, scores_1, scores_2, scores_3],
+        tracked_scores=[0.0, 0.4, 0.4, 0.4],
+        merges_performed=[],
+        rng=NoChoiceRng(),
+        component_name="skill_instructions",
+        min_each=2,
+    )
+
+    assert pair is not None
+    assert (pair.parent_a_id, pair.parent_b_id) == (1, 2)
+
+
+def test_pick_patch_merge_pair_chooses_higher_tracked_parent_as_base():
+    parents = [[None], [0], [0]]
+    candidates = [
+        {"skill_instructions": "seed"},
+        {"skill_instructions": "stronger"},
+        {"skill_instructions": "patch source"},
+    ]
+    scores_a = {f"t{i}": 1.0 if i % 2 else 0.0 for i in range(6)}
+    scores_b = {f"t{i}": 0.0 if i % 2 else 1.0 for i in range(6)}
+
+    pair = pick_patch_merge_pair(
+        merge_candidates=[1, 2],
+        program_candidates=candidates,
+        parent_program_for_candidate=parents,
+        prog_candidate_val_subscores=[{}, scores_a, scores_b],
+        tracked_scores=[0.0, 0.6, 0.5],
+        merges_performed=[],
+        rng=random.Random(0),
+        component_name="skill_instructions",
+        min_each=2,
+    )
+
+    assert pair is not None
+    assert pair.base_parent_id == 1
+    assert pair.patch_source_parent_id == 2
+
+
+def test_pick_patch_merge_pair_ties_base_parent_deterministically():
+    parents = [[None], [0], [0]]
+    candidates = [
+        {"skill_instructions": "seed"},
+        {"skill_instructions": "lower id"},
+        {"skill_instructions": "higher id"},
+    ]
+    scores_a = {f"t{i}": 1.0 if i % 2 else 0.0 for i in range(6)}
+    scores_b = {f"t{i}": 0.0 if i % 2 else 1.0 for i in range(6)}
+
+    pair = pick_patch_merge_pair(
+        merge_candidates=[2, 1],
+        program_candidates=candidates,
+        parent_program_for_candidate=parents,
+        prog_candidate_val_subscores=[{}, scores_a, scores_b],
+        tracked_scores=[0.0, 0.5, 0.5],
+        merges_performed=[],
+        rng=random.Random(0),
+        component_name="skill_instructions",
+        min_each=2,
+    )
+
+    assert pair is not None
+    assert pair.base_parent_id == 1
+    assert pair.patch_source_parent_id == 2
+
+
+def test_rlm_merge_proposer_uses_patch_selector_by_default(tmp_path: Path, monkeypatch):
+    from gepa.core.data_loader import ensure_loader
+
+    import rlm_gepa.proposer.merge as merge_module
+
+    calls = {"patch": 0}
+
+    def fake_find_dominators(*_args):
+        return [1, 2]
+
+    def fake_patch_selector(**_kwargs):
+        calls["patch"] += 1
+        return None
+
+    def evaluator(_inputs, _candidate):
+        return [], [], None
+
+    monkeypatch.setattr(merge_module, "find_dominator_programs", fake_find_dominators)
+    monkeypatch.setattr(merge_module, "pick_patch_merge_pair", fake_patch_selector)
+
+    state = SimpleNamespace(
+        i=0,
+        full_program_trace=[{}],
+        program_candidates=[
+            {"skill_instructions": "ancestor"},
+            {"skill_instructions": "parent a"},
+            {"skill_instructions": "parent b"},
+        ],
+        parent_program_for_candidate=[[None], [0], [0]],
+        prog_candidate_val_subscores=[{}, {"v1": 1.0}, {"v1": 0.0}],
+        program_full_scores_val_set=[0.0, 0.5, 0.4],
+        per_program_tracked_scores=[0.0, 0.5, 0.4],
+        total_num_evals=0,
+    )
+    state.get_pareto_front_mapping = lambda: {}
+    proposer = RlmMergeProposer(
+        logger=_Logger(),
+        valset=ensure_loader(["val"]),
+        evaluator=evaluator,
+        adapter=SimpleNamespace(),
+        trainset=ensure_loader(["train"]),
+        use_merge=True,
+        max_merge_invocations=1,
+        max_rlm_merge_attempts=5,
+        min_each=1,
+        merge_minibatch_size=1,
+        rlm_merge_state_path=tmp_path / "state.json",
+        rng=random.Random(0),
+    )
+    proposer.last_iter_found_new_program = True
+    proposer.merges_due = 1
+
+    assert proposer.propose(state) is None
+    assert calls == {"patch": 1}
 
 
 def _make_merge_helper(tmp_path: Path) -> RlmMergeProposer:
@@ -220,49 +452,415 @@ def test_rlm_merge_status_helpers_validate_status_and_namespace(tmp_path: Path):
         proposer._record_merge_status(state, "not_real", attempt_idx=None)
     with pytest.raises(ValueError, match="must start with 'rlm_merge_'"):
         proposer._record_merge_status(state, "accepted", attempt_idx=0, bad_field="value")
-def test_rlm_merge_scores_candidate_without_merge_only_post_checks(tmp_path: Path, monkeypatch):
+class _FirstKRng(random.Random):
+    def sample(self, population, k):
+        return list(population)[:k]
+
+
+class _PatchEvidenceAdapter:
+    proposer_trace_dir: Path
+    run_id = "run_test"
+
+    def __init__(self, tmp_path: Path, base_scores: list[float], source_scores: list[float]):
+        self.proposer_trace_dir = tmp_path
+        self.base_scores = base_scores
+        self.source_scores = source_scores
+        self.evaluate_calls = 0
+
+    def progress_label(self, _label):
+        class NoopContext:
+            def __enter__(self):
+                return None
+
+            def __exit__(self, *_args):
+                return False
+
+        return NoopContext()
+
+    def evaluate(self, batch, _candidate, *, capture_traces, kind):
+        scores = self.base_scores if self.evaluate_calls == 0 else self.source_scores
+        self.evaluate_calls += 1
+        selected_scores = scores[: len(batch)]
+        trajectories = [
+            {
+                "task_id": str(item).replace(" ", "_"),
+                "record": {
+                    "Inputs": f"input for {item}",
+                    "Generated Outputs": f"trace for {item}",
+                    "Feedback": f"score {score}",
+                },
+            }
+            for item, score in zip(batch, selected_scores, strict=False)
+        ]
+        return SimpleNamespace(scores=selected_scores, trajectories=trajectories)
+
+    def make_reflective_dataset(self, _candidate, eval_batch, components):
+        records = [trajectory["record"] for trajectory in eval_batch.trajectories]
+        return {component: records for component in components}
+
+    def _reserve_merge_proposer_call_idx(self):
+        return 1
+
+    def queue_valset_progress_label(self, _label):
+        pass
+
+
+def _patch_evidence_state():
+    return SimpleNamespace(
+        i=0,
+        full_program_trace=[{}],
+        program_candidates=[
+            {"skill_instructions": "ancestor"},
+            {"skill_instructions": "base"},
+            {"skill_instructions": "source"},
+        ],
+        total_num_evals=0,
+    )
+
+
+def _make_patch_evidence_proposer(
+    tmp_path: Path,
+    *,
+    base_scores: list[float],
+    source_scores: list[float],
+    merge_minibatch_size: int = 4,
+    min_each: int = 1,
+) -> RlmMergeProposer:
+    from gepa.core.data_loader import ensure_loader
+
+    def evaluator(_inputs, _candidate):
+        return [], [], None
+
+    proposer = RlmMergeProposer(
+        logger=_Logger(),
+        valset=ensure_loader(["val"]),
+        evaluator=evaluator,
+        adapter=_PatchEvidenceAdapter(tmp_path, base_scores, source_scores),
+        trainset=ensure_loader([f"train {index}" for index in range(len(base_scores))]),
+        use_merge=True,
+        max_merge_invocations=1,
+        max_rlm_merge_attempts=5,
+        min_each=min_each,
+        merge_minibatch_size=merge_minibatch_size,
+        rlm_merge_state_path=tmp_path / "state.json",
+        rng=_FirstKRng(),
+    )
+    return proposer
+
+
+def test_patch_evidence_oversamples_two_minibatches_before_selecting_records(tmp_path: Path):
+    proposer = _make_patch_evidence_proposer(
+        tmp_path,
+        base_scores=[1.0, 0.9, 0.8, 0.7, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6],
+        source_scores=[0.1, 0.2, 0.3, 0.4, 1.0, 0.9, 0.8, 0.7, 0.6, 0.5],
+        merge_minibatch_size=4,
+    )
+
+    evidence = proposer._build_patch_disagreement_evidence(
+        state=_patch_evidence_state(),
+        iteration=1,
+        attempt_idx=0,
+        base_parent_id=1,
+        patch_source_parent_id=2,
+    )
+
+    assert len(evidence.sampled_train_ids) == 8
+    assert len(evidence.records) == 4
+
+
+def test_patch_evidence_prefers_larger_disagreements_and_caps_records(tmp_path: Path):
+    proposer = _make_patch_evidence_proposer(
+        tmp_path,
+        base_scores=[1.0, 0.9, 0.6, 0.1, 0.3, 0.5],
+        source_scores=[0.1, 0.2, 0.4, 0.9, 0.9, 0.6],
+        merge_minibatch_size=4,
+    )
+
+    evidence = proposer._build_patch_disagreement_evidence(
+        state=_patch_evidence_state(),
+        iteration=1,
+        attempt_idx=0,
+        base_parent_id=1,
+        patch_source_parent_id=2,
+    )
+
+    assert len(evidence.records) == 4
+    assert [record["abs_delta"] for record in evidence.records] == sorted(
+        [record["abs_delta"] for record in evidence.records],
+        reverse=True,
+    )
+    assert {record["task_id"] for record in evidence.records} == {
+        "train_0",
+        "train_1",
+        "train_3",
+        "train_4",
+    }
+
+
+def test_patch_evidence_balances_base_and_patch_source_win_directions(tmp_path: Path):
+    proposer = _make_patch_evidence_proposer(
+        tmp_path,
+        base_scores=[1.0, 0.9, 0.8, 0.7, 0.1, 0.2],
+        source_scores=[0.1, 0.1, 0.1, 0.1, 0.3, 0.3],
+        merge_minibatch_size=4,
+    )
+
+    evidence = proposer._build_patch_disagreement_evidence(
+        state=_patch_evidence_state(),
+        iteration=1,
+        attempt_idx=0,
+        base_parent_id=1,
+        patch_source_parent_id=2,
+    )
+
+    winners = [record["winner"] for record in evidence.records]
+    assert winners.count("base") == 2
+    assert winners.count("patch_source") == 2
+
+
+def test_patch_evidence_tops_up_with_both_success_records(tmp_path: Path):
+    proposer = _make_patch_evidence_proposer(
+        tmp_path,
+        base_scores=[1.0, 0.0, 1.0, 1.0, 1.0, 1.0],
+        source_scores=[0.0, 1.0, 1.0, 1.0, 1.0, 1.0],
+        merge_minibatch_size=6,
+    )
+
+    evidence = proposer._build_patch_disagreement_evidence(
+        state=_patch_evidence_state(),
+        iteration=1,
+        attempt_idx=0,
+        base_parent_id=1,
+        patch_source_parent_id=2,
+    )
+
+    winners = [record["winner"] for record in evidence.records]
+    assert winners.count("base") == 1
+    assert winners.count("patch_source") == 1
+    assert winners.count("both_success") == 4
+    assert len(evidence.records) == 6
+
+
+def test_patch_merge_preflight_fails_without_balanced_disagreement_evidence(
+    tmp_path: Path,
+    monkeypatch,
+):
     from gepa.core.data_loader import ensure_loader
 
     import rlm_gepa.proposer.merge as merge_module
 
-    monkeypatch.setattr(merge_module, "find_dominator_programs", lambda *_args: [1, 2])
-    monkeypatch.setattr(merge_module, "pick_merge_triplet", lambda **_kwargs: (1, 2, 0))
-
-    class FakeAdapter:
-        proposer_trace_dir = tmp_path
-        run_id = "run_test"
-
+    class FakeAdapter(_PatchEvidenceAdapter):
         def __init__(self):
-            self.evaluate_calls = 0
+            super().__init__(tmp_path, base_scores=[1.0, 1.0], source_scores=[0.0, 0.0])
+            self.patch_calls = 0
 
-        def evaluate(self, _batch, _candidate, *, capture_traces, kind):
-            self.evaluate_calls += 1
-            scores = [1.0, 0.0] if self.evaluate_calls == 1 else [0.0, 1.0]
-            trajectories = [
-                {"task_id": "task_1", "record": {"Feedback": "a wins"}},
-                {"task_id": "task_2", "record": {"Feedback": "b wins"}},
-            ]
-            return SimpleNamespace(scores=scores, trajectories=trajectories)
+        def _rlm_propose_patch_merge_texts(self, **_kwargs):
+            self.patch_calls += 1
+            return "should not be called", {}
 
-        def make_reflective_dataset(self, _candidate, eval_batch, components):
-            records = [trajectory["record"] for trajectory in eval_batch.trajectories]
-            return {component: records for component in components}
+    def evaluator(_inputs, _candidate):
+        return [], [], None
+
+    adapter = FakeAdapter()
+    monkeypatch.setattr(merge_module, "find_dominator_programs", lambda *_args: [1, 2])
+    monkeypatch.setattr(
+        merge_module,
+        "pick_patch_merge_pair",
+        lambda **_kwargs: PatchMergePair(
+            parent_a_id=1,
+            parent_b_id=2,
+            base_parent_id=1,
+            patch_source_parent_id=2,
+            ancestor=0,
+            common_ancestors=(0,),
+            oracle_score=1.0,
+            oracle_gain=0.5,
+            base_wins=("v1",),
+            patch_source_wins=("v2",),
+            weight=0.5,
+        ),
+    )
+    proposer = RlmMergeProposer(
+        logger=_Logger(),
+        valset=ensure_loader(["v1", "v2"]),
+        evaluator=evaluator,
+        adapter=adapter,
+        trainset=ensure_loader(["train_1", "train_2"]),
+        use_merge=True,
+        max_merge_invocations=1,
+        max_rlm_merge_attempts=5,
+        min_each=1,
+        merge_minibatch_size=2,
+        rlm_merge_state_path=tmp_path / "state.json",
+        rng=_FirstKRng(),
+    )
+    proposer.last_iter_found_new_program = True
+    proposer.merges_due = 1
+    state = SimpleNamespace(
+        i=0,
+        full_program_trace=[{}],
+        program_candidates=[
+            {"skill_instructions": "ancestor"},
+            {"skill_instructions": "base"},
+            {"skill_instructions": "source"},
+        ],
+        parent_program_for_candidate=[[None], [0], [0]],
+        prog_candidate_val_subscores=[{}, {"v1": 1.0, "v2": 0.0}, {"v1": 0.0, "v2": 1.0}],
+        program_full_scores_val_set=[0.0, 0.5, 0.5],
+        per_program_tracked_scores=[0.0, 0.5, 0.5],
+        total_num_evals=0,
+    )
+    state.get_pareto_front_mapping = lambda: {}
+
+    proposal = proposer.propose(state)
+
+    assert proposal is None
+    assert adapter.patch_calls == 0
+    assert state.full_program_trace[-1]["rlm_merge_status"] == "preflight_failed"
+    assert state.full_program_trace[-1]["rlm_merge_reject_reason"].startswith(
+        "insufficient patch disagreement evidence"
+    )
+    assert state.full_program_trace[-1]["rlm_merge_preflight_base_wins"] == 2
+    assert state.full_program_trace[-1]["rlm_merge_preflight_patch_source_wins"] == 0
+
+
+def test_patch_merge_preflight_fails_when_prompt_cap_cannot_carry_min_each(
+    tmp_path: Path,
+    monkeypatch,
+):
+    from gepa.core.data_loader import ensure_loader
+
+    import rlm_gepa.proposer.merge as merge_module
+
+    class FakeAdapter(_PatchEvidenceAdapter):
+        def __init__(self):
+            super().__init__(
+                tmp_path,
+                base_scores=[1.0, 1.0, 0.0, 0.0],
+                source_scores=[0.0, 0.0, 1.0, 1.0],
+            )
+            self.patch_calls = 0
+
+        def _rlm_propose_patch_merge_texts(self, **_kwargs):
+            self.patch_calls += 1
+            return "should not be called", {}
+
+    def evaluator(_inputs, _candidate):
+        return [], [], None
+
+    adapter = FakeAdapter()
+    monkeypatch.setattr(merge_module, "find_dominator_programs", lambda *_args: [1, 2])
+    monkeypatch.setattr(
+        merge_module,
+        "pick_patch_merge_pair",
+        lambda **_kwargs: PatchMergePair(
+            parent_a_id=1,
+            parent_b_id=2,
+            base_parent_id=1,
+            patch_source_parent_id=2,
+            ancestor=0,
+            common_ancestors=(0,),
+            oracle_score=1.0,
+            oracle_gain=0.5,
+            base_wins=("v1", "v2"),
+            patch_source_wins=("v3", "v4"),
+            weight=0.5,
+        ),
+    )
+    proposer = RlmMergeProposer(
+        logger=_Logger(),
+        valset=ensure_loader(["v1", "v2", "v3", "v4"]),
+        evaluator=evaluator,
+        adapter=adapter,
+        trainset=ensure_loader(["train_1", "train_2", "train_3", "train_4"]),
+        use_merge=True,
+        max_merge_invocations=1,
+        max_rlm_merge_attempts=5,
+        min_each=2,
+        merge_minibatch_size=2,
+        rlm_merge_state_path=tmp_path / "state.json",
+        rng=_FirstKRng(),
+    )
+    proposer.last_iter_found_new_program = True
+    proposer.merges_due = 1
+    state = SimpleNamespace(
+        i=0,
+        full_program_trace=[{}],
+        program_candidates=[
+            {"skill_instructions": "ancestor"},
+            {"skill_instructions": "base"},
+            {"skill_instructions": "source"},
+        ],
+        parent_program_for_candidate=[[None], [0], [0]],
+        prog_candidate_val_subscores=[
+            {},
+            {"v1": 1.0, "v2": 1.0, "v3": 0.0, "v4": 0.0},
+            {"v1": 0.0, "v2": 0.0, "v3": 1.0, "v4": 1.0},
+        ],
+        program_full_scores_val_set=[0.0, 0.5, 0.5],
+        per_program_tracked_scores=[0.0, 0.5, 0.5],
+        total_num_evals=0,
+    )
+    state.get_pareto_front_mapping = lambda: {}
+
+    proposal = proposer.propose(state)
+
+    assert proposal is None
+    assert adapter.patch_calls == 0
+    assert state.full_program_trace[-1]["rlm_merge_status"] == "preflight_failed"
+    assert state.full_program_trace[-1]["rlm_merge_preflight_base_wins"] == 2
+    assert state.full_program_trace[-1]["rlm_merge_preflight_patch_source_wins"] == 2
+    assert state.full_program_trace[-1]["rlm_merge_selected_base_wins"] == 1
+    assert state.full_program_trace[-1]["rlm_merge_selected_patch_source_wins"] == 1
+
+
+def test_patch_disagreement_trace_jsonl_contains_patch_schema(tmp_path: Path):
+    proposer = _make_patch_evidence_proposer(
+        tmp_path,
+        base_scores=[1.0, 0.0],
+        source_scores=[0.0, 1.0],
+        merge_minibatch_size=2,
+    )
+
+    evidence = proposer._build_patch_disagreement_evidence(
+        state=_patch_evidence_state(),
+        iteration=1,
+        attempt_idx=0,
+        base_parent_id=1,
+        patch_source_parent_id=2,
+    )
+    records = [json.loads(line) for line in Path(evidence.paired_trace_path).read_text().splitlines()]
+
+    assert len(records) == 2
+    assert records[0]["schema_version"] == 1
+    assert records[0]["winner"] in {"base", "patch_source"}
+    assert records[0]["evidence_role"] in {"base_win", "patch_source_win"}
+    assert records[0]["abs_delta"] == pytest.approx(1.0)
+    assert records[0]["base_parent_id"] == 1
+    assert records[0]["patch_source_parent_id"] == 2
+    assert records[0]["base_parent"]["generated_outputs"]
+    assert records[0]["patch_source_parent"]["feedback"]
+
+
+def test_patch_mode_proposer_wires_base_source_fields_without_ancestor(
+    tmp_path: Path,
+    monkeypatch,
+):
+    from gepa.core.data_loader import ensure_loader
+
+    import rlm_gepa.proposer.merge as merge_module
+
+    class FakeAdapter(_PatchEvidenceAdapter):
+        def __init__(self):
+            super().__init__(tmp_path, base_scores=[1.0, 0.0], source_scores=[0.0, 1.0])
+            self.patch_kwargs = None
 
         def _reserve_merge_proposer_call_idx(self):
-            return 7
+            return 9
 
-        def _rlm_propose_merge_texts(self, **_kwargs):
-            return "merged instructions " * 200, ["[NEW] missing task_id citation"]
-
-        def progress_label(self, _label):
-            class NoopContext:
-                def __enter__(self):
-                    return None
-
-                def __exit__(self, *_args):
-                    return False
-
-            return NoopContext()
+        def _rlm_propose_patch_merge_texts(self, **kwargs):
+            self.patch_kwargs = kwargs
+            return "patched instructions", {"patch_summary": "imported one clause"}
 
         def queue_valset_progress_label(self, _label):
             pass
@@ -270,105 +868,77 @@ def test_rlm_merge_scores_candidate_without_merge_only_post_checks(tmp_path: Pat
     def evaluator(_inputs, _candidate):
         return [], [], None
 
+    adapter = FakeAdapter()
+    monkeypatch.setattr(merge_module, "find_dominator_programs", lambda *_args: [1, 2])
+    monkeypatch.setattr(
+        merge_module,
+        "pick_patch_merge_pair",
+        lambda **_kwargs: PatchMergePair(
+            parent_a_id=1,
+            parent_b_id=2,
+            base_parent_id=1,
+            patch_source_parent_id=2,
+            ancestor=0,
+            common_ancestors=(0,),
+            oracle_score=1.0,
+            oracle_gain=0.5,
+            base_wins=("v1",),
+            patch_source_wins=("v2",),
+            weight=0.5,
+        ),
+    )
     proposer = RlmMergeProposer(
         logger=_Logger(),
         valset=ensure_loader(["v1", "v2"]),
         evaluator=evaluator,
-        adapter=FakeAdapter(),
+        adapter=adapter,
         trainset=ensure_loader(["train_1", "train_2"]),
         use_merge=True,
         max_merge_invocations=1,
         max_rlm_merge_attempts=5,
         min_each=1,
         merge_minibatch_size=2,
-        rlm_merge_state_path=tmp_path / "rlm_merge_state.json",
-        rng=random.Random(0),
+        rlm_merge_state_path=tmp_path / "state.json",
+        rng=_FirstKRng(),
     )
     proposer.last_iter_found_new_program = True
     proposer.merges_due = 1
-    proposer.select_eval_subsample_for_merged_program = lambda *_args, **_kwargs: ["v1", "v2"]
-
+    captured_child = {}
     state = SimpleNamespace(
         i=0,
         full_program_trace=[{}],
         program_candidates=[
-            {"skill_instructions": "ancestor"},
-            {"skill_instructions": "parent a"},
-            {"skill_instructions": "parent b"},
+            {"skill_instructions": "ancestor", "other": "ancestor kept"},
+            {"skill_instructions": "base", "other": "base kept"},
+            {"skill_instructions": "source", "other": "source ignored"},
         ],
         parent_program_for_candidate=[[None], [0], [0]],
-        prog_candidate_val_subscores=[
-            {},
-            {"v1": 1.0, "v2": 0.0},
-            {"v1": 0.0, "v2": 1.0},
-        ],
+        prog_candidate_val_subscores=[{}, {"v1": 1.0, "v2": 0.0}, {"v1": 0.0, "v2": 1.0}],
         program_full_scores_val_set=[0.0, 0.5, 0.5],
         per_program_tracked_scores=[0.0, 0.5, 0.5],
         total_num_evals=0,
     )
     state.get_pareto_front_mapping = lambda: {}
-    state.cached_evaluate = lambda *_args, **_kwargs: ([1.0, 0.0], 2)
+
+    def cached_evaluate(candidate, ids, fetch, _evaluator):
+        captured_child.update(candidate)
+        assert list(ids) == [0, 1]
+        assert fetch(list(ids)) == ["train_1", "train_2"]
+        return [0.0, 0.0], 2
+
+    state.cached_evaluate = cached_evaluate
 
     proposal = proposer.propose(state)
 
     assert proposal is None
-    assert state.full_program_trace[-1]["rlm_merge_status"] == "subsample_rejected"
-    assert state.full_program_trace[-1]["rlm_merge_preflight_a_wins"] == 1
-    assert state.full_program_trace[-1]["rlm_merge_preflight_b_wins"] == 1
-    assert state.full_program_trace[-1]["new_program_subsample_scores"] == [1.0, 0.0]
-    assert "rlm_merge_reject_reason" not in state.full_program_trace[-1]
-
-
-def test_rlm_merge_paired_trace_file_contains_rich_records(tmp_path: Path):
-    proposer = _make_merge_helper(tmp_path)
-    proposer.adapter = SimpleNamespace(proposer_trace_dir=tmp_path, run_id="run_test")
-    eval_a = SimpleNamespace(scores=[1.0, 0.0])
-    eval_b = SimpleNamespace(scores=[0.0, 1.0])
-
-    path = proposer._write_paired_trace_file(
-        id1=1,
-        id2=2,
-        ancestor=0,
-        attempt_idx=0,
-        task_data_ids=["data_0", "data_1"],
-        trace_task_ids=["task_a", "task_b"],
-        reflective_a=[
-            {
-                "Inputs": "Instruction: do A",
-                "Generated Outputs": "parent A trace full reasoning + code",
-                "Feedback": "Task score: 1.000",
-            },
-            {
-                "Inputs": "Instruction: do B",
-                "Generated Outputs": "parent A trace for task_b, failed",
-                "Feedback": "Task score: 0.000",
-            },
-        ],
-        reflective_b=[
-            {
-                "Inputs": "Instruction: do A",
-                "Generated Outputs": "parent B trace, failed",
-                "Feedback": "Task score: 0.000",
-            },
-            {
-                "Inputs": "Instruction: do B",
-                "Generated Outputs": "parent B trace, worked",
-                "Feedback": "Task score: 1.000",
-            },
-        ],
-        eval_a=eval_a,
-        eval_b=eval_b,
-        eps=1e-6,
-    )
-
-    records = [json.loads(line) for line in Path(path).read_text().splitlines()]
-
-    assert records[0]["winner"] == "a"
-    assert records[1]["winner"] == "b"
-    assert records[0]["task_id"] == "task_a"
-    assert records[0]["parent_a"]["generated_outputs"].startswith("parent A trace")
-    assert records[0]["parent_b"]["feedback"] == "Task score: 0.000"
-    assert "trajectory_summary" not in records[0]["parent_a"]
+    assert adapter.patch_kwargs is not None
+    assert adapter.patch_kwargs["base_parent_id"] == 1
+    assert adapter.patch_kwargs["base_parent_instructions"] == "base"
+    assert adapter.patch_kwargs["patch_source_parent_id"] == 2
+    assert adapter.patch_kwargs["patch_source_parent_instructions"] == "source"
+    assert "paired_disagreement_traces_file" in adapter.patch_kwargs
+    assert "common_ancestor_instructions" not in adapter.patch_kwargs
+    assert captured_child == {"skill_instructions": "patched instructions", "other": "base kept"}
 
 
 def test_reflection_lm_text_normalization_accepts_common_payloads():
@@ -562,6 +1132,68 @@ def test_logical_cost_does_not_collapse_legacy_rows_without_operation_ids(tmp_pa
     assert logical[0].cost_usd == pytest.approx(0.3)
 
 
+def test_merge_iteration_rows_use_best_actual_parent_instead_of_oracle(tmp_path: Path):
+    state = {
+        "full_program_trace": [
+            {
+                "i": 12,
+                "rlm_merge_candidate_pair": (2, 5),
+                "rlm_merge_status": "accepted",
+                "new_program_idx": 6,
+                "id1_subsample_scores": [1.0, 0.8, 0.0, 0.0],
+                "id2_subsample_scores": [0.0, 0.0, 1.0, 0.0],
+                "new_program_subsample_scores": [0.0, 0.8, 0.0, 0.0],
+            }
+        ],
+    }
+    with (tmp_path / "gepa_state.bin").open("wb") as f:
+        pickle.dump(state, f)
+
+    rows = iteration_rows(tmp_path)
+
+    assert rows[0]["iter"] == "12 [2, 5]"
+    assert rows[0]["soft: par → child"] == "0.450 → 0.200 -0.250"
+    assert rows[0]["hard: par → child"] == "0.250 → 0.000 -0.250; 1 → 0 /4"
+    assert rows[0]["flips"] == "+0/-1 -1"
+    assert rows[0]["p"] == "1.00"
+
+
+def test_merge_rows_report_accepted_child_full_val_against_both_parents(tmp_path: Path):
+    state = {
+        "prog_candidate_val_subscores": [
+            {"a": 0.0, "b": 1.0, "c": 0.0},
+            {"a": 1.0, "b": 1.0, "c": 0.0},
+            {"a": 0.0, "b": 1.0, "c": 1.0},
+            {"a": 1.0, "b": 1.0, "c": 1.0},
+        ],
+        "full_program_trace": [
+            {
+                "i": 8,
+                "rlm_merge_candidate_pair": (1, 2),
+                "rlm_merge_ancestor": 0,
+                "rlm_merge_status": "accepted",
+                "rlm_merge_base_parent": 1,
+                "rlm_merge_patch_source_parent": 2,
+                "new_program_idx": 3,
+                "id1_subsample_scores": [1.0, 0.0],
+                "id2_subsample_scores": [0.0, 1.0],
+                "new_program_subsample_scores": [1.0, 1.0],
+            }
+        ],
+    }
+    with (tmp_path / "gepa_state.bin").open("wb") as f:
+        pickle.dump(state, f)
+
+    rows = merge_rows(tmp_path)
+
+    assert rows[0]["val Δ"] == "1.000 +0.333 vs 1"
+    assert rows[0]["_detail"] == (
+        "→ cand 3; full val "
+        "vs 1: 0.667→1.000 +0.333, hard 2→3/3, flips +1/-0; "
+        "vs 2: 0.667→1.000 +0.333, hard 2→3/3, flips +1/-0"
+    )
+
+
 def test_reporting_tables_from_artifacts(tmp_path: Path):
     state = {
         "i": 1,
@@ -657,6 +1289,7 @@ def test_reporting_tables_from_artifacts(tmp_path: Path):
         "pre": "3/2",
         "n": "2",
         "score Δ": "1.000 +0.000",
+        "val Δ": "-",
         "_detail": "not better than best parent",
     }
     candidates = candidate_rows(tmp_path)
@@ -711,11 +1344,41 @@ def test_reporting_tables_from_artifacts(tmp_path: Path):
     assert "\033[1;38;5;220m" in terminal
     assert "**1**" not in terminal
     assert "costs:" in terminal
-    assert "total_cost" in terminal
-    assert "repeat_cost" in terminal
-    assert "effective_cost" in terminal
+    assert "total" in terminal
+    assert "repeat" in terminal
+    assert "effective" in terminal
     assert "costs (raw spend: all logged LM calls):" not in terminal
     assert "costs (deduped spend: stable operation ids only; legacy rows counted raw):" not in terminal
+
+
+def test_terminal_cost_table_wraps_scope_and_model_to_terminal_width(monkeypatch):
+    monkeypatch.setattr(
+        stats_report.shutil,
+        "get_terminal_size",
+        lambda fallback=(120, 24): os.terminal_size((82, 24)),
+    )
+    rows = [
+        {
+            "scope": "  - patch_merge_proposer_sub_lm",
+            "model": "openai/gpt-5.4-mini-medium",
+            "calls": "1,234",
+            "prompt_tok": "12,345,678",
+            "completion_tok": "123,456",
+            "total_cost": "$123.45",
+            "repeat_cost": "$0.00",
+            "effective_cost": "$123.45",
+        }
+    ]
+
+    rendered = render_table(rows)
+    plain_lines = [stats_report.re.sub(r"\033\[[0-9;]*m", "", line) for line in rendered.splitlines()]
+
+    assert max(len(line) for line in plain_lines) <= 82
+    assert "in_tok" in rendered
+    assert "out_tok" in rendered
+    assert "total_cost" not in rendered
+    assert "tch_me" in rendered
+    assert "oposer" in rendered
 
 
 def test_eval_stats_from_eval_artifact(tmp_path: Path):
@@ -1148,7 +1811,10 @@ def test_resume_uses_unique_event_namespace_for_write_once_artifacts(tmp_path: P
     assert new_trace.exists()
 
 
-def test_merge_proposer_uses_configured_proposer_lms(tmp_path: Path, monkeypatch):
+def test_patch_merge_adapter_uses_patch_signature_and_persists_metadata(
+    tmp_path: Path,
+    monkeypatch,
+):
     import rlm_gepa.proposer.rlm as proposer_module
     import rlm_gepa.runtime.adapter as adapter_module
 
@@ -1173,8 +1839,17 @@ def test_merge_proposer_uses_configured_proposer_lms(tmp_path: Path, monkeypatch
         async def acall(self, **kwargs):
             captured["inputs"] = kwargs
             return SimpleNamespace(
-                new_instructions="merged instructions",
-                generalization_check=["task-a: combines both parents"],
+                base_parent_id=10,
+                patch_summary="imported one clause",
+                imported_from_other=[
+                    {
+                        "clause": "Use the tool only after validating inputs.",
+                        "evidence_task_ids": ["train-a"],
+                        "reason": "source wins train-a",
+                    }
+                ],
+                rejected_from_other=["Do not copy unrelated formatting advice."],
+                new_instructions="base plus patch",
                 trace=None,
                 trajectory=[],
             )
@@ -1183,7 +1858,7 @@ def test_merge_proposer_uses_configured_proposer_lms(tmp_path: Path, monkeypatch
     monkeypatch.setattr(adapter_module, "progress_write", lambda _message: None)
     monkeypatch.setattr(proposer_module, "progress_write", lambda _message: None)
     (tmp_path / "proposer_traces").mkdir()
-    paired_trace = tmp_path / "paired.jsonl"
+    paired_trace = tmp_path / "paired_patch.jsonl"
     paired_trace.write_text("{}\n")
     adapter = RLMGepaAdapter(
         project=_Project(),
@@ -1199,22 +1874,31 @@ def test_merge_proposer_uses_configured_proposer_lms(tmp_path: Path, monkeypatch
         proposer_max_iterations=17,
     )
 
-    new_text, audit = adapter._rlm_propose_merge_texts(
-        call_idx=3,
+    new_text, metadata = adapter._rlm_propose_patch_merge_texts(
+        call_idx=4,
         attempt_idx=2,
-        id1=10,
-        id2=11,
-        ancestor=4,
-        current_instructions_a="parent a",
-        current_instructions_b="parent b",
-        common_ancestor_instructions="ancestor",
-        paired_traces_file=SimpleNamespace(path=str(paired_trace)),
-        trace_task_ids=["task-a"],
+        base_parent_id=10,
+        patch_source_parent_id=11,
+        base_parent_instructions="base",
+        patch_source_parent_instructions="source",
+        paired_disagreement_traces_file=SimpleNamespace(path=str(paired_trace)),
+        trace_task_ids=["train-a"],
     )
 
-    assert new_text == "merged instructions"
-    assert audit == ["task-a: combines both parents"]
-    assert captured["lm"] is proposer_lm
-    assert captured["sub_lm"] is proposer_sub_lm
-    assert captured["max_iterations"] == 17
-    assert captured["skills"] == []
+    assert new_text == "base plus patch"
+    assert metadata["patch_summary"] == "imported one clause"
+    assert captured["signature"].input_fields.keys() >= {
+        "base_parent_id",
+        "base_parent_instructions",
+        "patch_source_parent_id",
+        "patch_source_parent_instructions",
+        "paired_disagreement_traces_file",
+    }
+    assert "common_ancestor_instructions" not in captured["inputs"]
+    assert captured["inputs"]["base_parent_id"] == 10
+    assert captured["inputs"]["patch_source_parent_id"] == 11
+    artifacts = list((tmp_path / "proposer_traces").glob("*_patch_from_cand_10_using_cand_11.json"))
+    assert len(artifacts) == 1
+    payload = json.loads(artifacts[0].read_text())
+    assert payload["kind"] == "patch_merge_proposer"
+    assert payload["patch_output"]["imported_from_other"][0]["evidence_task_ids"] == ["train-a"]

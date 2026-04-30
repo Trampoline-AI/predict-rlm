@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any
 
 import dspy
+from pydantic import BaseModel, Field
 
 from predict_rlm import File, PredictRLM
 from predict_rlm.trace import extract_trace_from_exc
@@ -95,13 +96,19 @@ Every proposed rule must pass all structural tests:
 """
 
 
-MERGE_PROPOSER_TEMPLATE = """\
-Synthesize one merged skill-instructions text for {{AGENT_TYPE}} from two
-parents that evolved from a common ancestor.
+PATCH_MERGE_PROPOSER_TEMPLATE = """\
+Patch one base skill-instructions text for {{AGENT_TYPE}} using only
+evidence-backed clauses from a patch-source parent.
 
-The merged skill must inherit branch-specific strengths without concatenating
-both parents. It must remain a surgical, length-disciplined edit and must work
-across these use cases:
+Start from `base_parent_instructions`. Preserve base behavior by default.
+Import only clauses from `patch_source_parent_instructions` that explain
+patch-source wins in the train disagreement traces. Import at most 1-3 clauses.
+Every import must cite task IDs in structured metadata, not final skill prose.
+Do not summarize, compress, concatenate, or globally rewrite. If no import is
+strongly supported, return base unchanged as a no-op signal.
+
+The patched skill must remain a surgical edit and must work across these use
+cases:
 {{USE_CASES_BULLETED}}
 
 # Tools Available To The Agent
@@ -124,37 +131,40 @@ across these use cases:
 
 # Inputs
 
-- `current_instructions_a` and `current_instructions_b`: full parent skill texts.
-- `common_ancestor_instructions`: common ancestor text; use it to identify
-  inherited text, branch-unique text, and differently rewritten text.
-- `paired_traces_file`, mounted at {{PAIRED_TRACES_FILE_MOUNT}}: JSONL where each
-  row contains the same task for both parents, both rendered traces, both
-  feedback fields, both scores, and `winner` set to `a`, `b`, or `tie`.
+- `base_parent_id`: integer identifier for the base parent.
+- `base_parent_instructions`: full base skill text.
+- `patch_source_parent_id`: integer identifier for the patch-source parent.
+- `patch_source_parent_instructions`: full source skill text.
+- `paired_disagreement_traces_file`, mounted at {{PAIRED_TRACES_FILE_MOUNT}}:
+  JSONL from train examples only. Each row contains `task_id`, `winner`,
+  `evidence_role`, `abs_delta`, base-parent trace/feedback/score, and
+  patch-source-parent trace/feedback/score. Rows with `winner="both_success"`
+  are guardrails: both parents solved them, so preserve that behavior rather
+  than using them as import evidence.
 
-# Merge Method
+# Patch Method
 
-1. Identify verbatim text shared by A and B and confirm whether it came from the
-   ancestor. This is `[COMMON]` text.
-2. Identify text present in the ancestor but rewritten differently by A and B.
-   Reconcile it as `[MERGED]` text using paired trace evidence.
-3. Identify text unique to A (`[A_ONLY]`) and B (`[B_ONLY]`). Keep it only when
-   the paired traces show that branch winning or avoiding a concrete failure.
-4. For tasks where both parents fail, add `[NEW]` text only when the trace names
-   a concrete actionable runtime fact. `[NEW]` audit lines must cite a `task_id`
-   from the paired trace file.
-5. Do not exceed `1.10 * max(len(A), len(B))` characters.
-
-# Audit Contract
-
-Every `generalization_check` line starts with exactly one tag:
-`[COMMON]`, `[A_ONLY]`, `[B_ONLY]`, `[MERGED]`, or `[NEW]`.
-
-After the tag, include grounding, use case, principle, counterfactual_1, and
-counterfactual_2. Counterfactuals must span different {{COUNTERFACTUAL_AXIS_NAME}}.
+1. Load the disagreement JSONL with structured parsing.
+2. Identify source clauses that directly explain patch-source wins.
+3. Use `both_success` rows as preservation guardrails for the base edit; do not
+   cite them as evidence for importing source-only clauses.
+4. Reject source clauses that are unsupported, redundant with the base, or only
+   explain base wins/failures.
+5. Apply only the smallest local edit needed to import the supported clauses.
+6. Keep all task IDs inside `imported_from_other.evidence_task_ids` metadata.
+   Do not place task IDs or audit labels in `new_instructions`.
 """
 
 
 _AXIS_SINGULAR = COUNTERFACTUAL_AXIS_SINGULAR
+
+
+class ImportedClause(BaseModel):
+    clause: str = Field(description="Clause imported from the patch-source parent")
+    evidence_task_ids: list[str] = Field(
+        description="Train task IDs supporting this imported clause"
+    )
+    reason: str = Field(description="Why the imported clause is supported")
 
 
 def render_template(template: str, spec: AgentSpec) -> str:
@@ -188,17 +198,27 @@ class ImproveInstructionsGeneric(dspy.Signature):
     generalization_check: list[str] = dspy.OutputField(desc="Audit lines for every rule")
 
 
-class MergeInstructionsGeneric(dspy.Signature):
-    current_instructions_a: str = dspy.InputField(desc="Full skill instructions for parent A")
-    current_instructions_b: str = dspy.InputField(desc="Full skill instructions for parent B")
-    common_ancestor_instructions: str = dspy.InputField(
-        desc="Full skill instructions for the common ancestor"
+
+class PatchMergeInstructionsGeneric(dspy.Signature):
+    base_parent_id: int = dspy.InputField(desc="Candidate ID for the base parent")
+    base_parent_instructions: str = dspy.InputField(desc="Full base parent skill text")
+    patch_source_parent_id: int = dspy.InputField(
+        desc="Candidate ID for the parent providing possible imports"
     )
-    paired_traces_file: File = dspy.InputField(
-        desc="JSONL file carrying both parents' trajectories side by side"
+    patch_source_parent_instructions: str = dspy.InputField(
+        desc="Full patch-source parent skill text"
     )
-    new_instructions: str = dspy.OutputField(desc="Full merged skill instructions text")
-    generalization_check: list[str] = dspy.OutputField(desc="Merge audit lines")
+    paired_disagreement_traces_file: File = dspy.InputField(
+        desc="JSONL file carrying train disagreement traces for the two parents"
+    )
+    patch_summary: str = dspy.OutputField(desc="Short summary of the patch decision")
+    imported_from_other: list[ImportedClause] = dspy.OutputField(
+        desc="Evidence-backed clauses imported from the patch-source parent"
+    )
+    rejected_from_other: list[str] = dspy.OutputField(
+        desc="Patch-source clauses or themes intentionally rejected"
+    )
+    new_instructions: str = dspy.OutputField(desc="Full patched skill instructions text")
 
 
 def build_proposer_signature(spec: AgentSpec) -> type[dspy.Signature]:
@@ -208,7 +228,13 @@ def build_proposer_signature(spec: AgentSpec) -> type[dspy.Signature]:
 
 
 def build_merge_signature(spec: AgentSpec) -> type[dspy.Signature]:
-    return MergeInstructionsGeneric.with_instructions(render_template(MERGE_PROPOSER_TEMPLATE, spec))
+    return PatchMergeInstructionsGeneric.with_instructions(
+        render_template(PATCH_MERGE_PROPOSER_TEMPLATE, spec)
+    )
+
+
+def build_patch_merge_signature(spec: AgentSpec) -> type[dspy.Signature]:
+    return build_merge_signature(spec)
 
 
 _INFRA_TOOL_NAMES = frozenset({"predict", "SUBMIT", "print"})

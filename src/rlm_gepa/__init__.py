@@ -4,6 +4,7 @@ from .cli import run_project_cli
 from .proposer.rlm import (
     agent_spec_from_rlm,
     build_merge_signature,
+    build_patch_merge_signature,
     build_proposer_for_rlm,
     build_proposer_signature,
 )
@@ -26,6 +27,7 @@ __all__ = [
     "RLMGepaProject",
     "agent_spec_from_rlm",
     "build_merge_signature",
+    "build_patch_merge_signature",
     "build_proposer_for_rlm",
     "build_proposer_signature",
     "check_optimization",

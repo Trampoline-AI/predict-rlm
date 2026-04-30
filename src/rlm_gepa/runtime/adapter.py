@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import traceback
 from collections.abc import Mapping, Sequence
 from contextlib import contextmanager
 from pathlib import Path
@@ -320,27 +319,28 @@ class RLMGepaAdapter:
         self._merge_proposer_call_count += 1
         return self._merge_proposer_call_count
 
-    def _rlm_propose_merge_texts(
+    def _rlm_propose_patch_merge_texts(
         self,
         *,
         call_idx: int,
         attempt_idx: int,
-        id1: int,
-        id2: int,
-        ancestor: int,
-        current_instructions_a: str,
-        current_instructions_b: str,
-        common_ancestor_instructions: str,
-        paired_traces_file: Any,
+        base_parent_id: int,
+        patch_source_parent_id: int,
+        base_parent_instructions: str,
+        patch_source_parent_instructions: str,
+        paired_disagreement_traces_file: Any,
         trace_task_ids: list[str],
-    ) -> tuple[str, list[str]]:
+    ) -> tuple[str, dict[str, Any]]:
         if self.proposer_lm is None:
-            raise ValueError("merge proposer requires proposer_lm")
+            raise ValueError("patch merge proposer requires proposer_lm")
         event_id = (
-            f"{self.run_id}_merge_attempt_{attempt_idx:04d}_"
-            f"cand_{id1}_cand_{id2}_ancestor_{ancestor}"
+            f"{self.run_id}_patch_merge_attempt_{attempt_idx:04d}_"
+            f"base_{base_parent_id}_source_{patch_source_parent_id}"
         )
-        operation_id = f"merge_proposer_cand_{id1}_cand_{id2}_{call_idx:04d}"
+        operation_id = (
+            f"patch_merge_proposer_base_{base_parent_id}_"
+            f"source_{patch_source_parent_id}_{call_idx:04d}"
+        )
         signature = build_merge_signature(self.project.agent_spec)
         predictor = PredictRLM(
             signature,
@@ -352,19 +352,20 @@ class RLMGepaAdapter:
             debug=False,
         )
         progress_write("\n" + "=" * 80)
-        progress_write(f"RLM MERGE PROPOSER STARTING (call {call_idx})")
+        progress_write(f"RLM PATCH MERGE PROPOSER STARTING (call {call_idx})")
         progress_write("=" * 80)
-        log_stream = install_rlm_log_stream(f"MERGE PROPOSER {call_idx:04d}")
+        log_stream = install_rlm_log_stream(f"PATCH MERGE PROPOSER {call_idx:04d}")
         try:
             result = run_coro_sync(
                 _acall_with_heartbeat(
                     predictor.acall(
-                        current_instructions_a=current_instructions_a,
-                        current_instructions_b=current_instructions_b,
-                        common_ancestor_instructions=common_ancestor_instructions,
-                        paired_traces_file=paired_traces_file,
+                        base_parent_id=base_parent_id,
+                        base_parent_instructions=base_parent_instructions,
+                        patch_source_parent_id=patch_source_parent_id,
+                        patch_source_parent_instructions=patch_source_parent_instructions,
+                        paired_disagreement_traces_file=paired_disagreement_traces_file,
                     ),
-                    tag=f"MERGE-PROPOSER {event_id}",
+                    tag=f"PATCH-MERGE-PROPOSER {event_id}",
                     timeout=self.proposer_timeout,
                     heartbeat_interval_seconds=self.heartbeat_interval_seconds,
                 )
@@ -373,24 +374,33 @@ class RLMGepaAdapter:
             restore_rlm_log_stream(log_stream)
         progress_write("=" * 80)
         progress_write(
-            f"RLM MERGE PROPOSER DONE (call {call_idx}, "
+            f"RLM PATCH MERGE PROPOSER DONE (call {call_idx}, "
             f"{len(getattr(result, 'trajectory', []))} iterations)"
         )
         progress_write("=" * 80 + "\n")
         new_text = getattr(result, "new_instructions", None)
         if not isinstance(new_text, str) or not new_text.strip():
-            exc = RuntimeError(f"RLM merge proposer returned empty new_instructions for {call_idx}")
+            exc = RuntimeError(
+                f"RLM patch merge proposer returned empty new_instructions for {call_idx}"
+            )
             exc.trace = getattr(result, "trace", None)  # type: ignore[attr-defined]
             raise exc
-        audit = list(getattr(result, "generalization_check", None) or [])
+
+        patch_output = {
+            "base_parent_id": getattr(result, "base_parent_id", base_parent_id),
+            "patch_summary": getattr(result, "patch_summary", ""),
+            "imported_from_other": _jsonable(getattr(result, "imported_from_other", []) or []),
+            "rejected_from_other": _jsonable(getattr(result, "rejected_from_other", []) or []),
+            "new_instructions": new_text,
+        }
         trace = getattr(result, "trace", None)
         self._write_trace_cost(
-            event="merge_proposer_call",
+            event="patch_merge_proposer_call",
             event_id=event_id,
             operation_id=operation_id,
             attempt_id=f"attempt_{attempt_idx:04d}",
-            main_role="merge_proposer",
-            sub_role="merge_proposer_sub_lm",
+            main_role="patch_merge_proposer",
+            sub_role="patch_merge_proposer_sub_lm",
             trace=trace,
         )
         payload = {
@@ -398,82 +408,29 @@ class RLMGepaAdapter:
             "event_id": event_id,
             "operation_id": operation_id,
             "status": "completed",
-            "kind": "merge_proposer",
+            "kind": "patch_merge_proposer",
             "call_idx": call_idx,
             "attempt_idx": attempt_idx,
-            "cand_ids": [id1, id2],
-            "ancestor_id": ancestor,
+            "base_parent_id": base_parent_id,
+            "patch_source_parent_id": patch_source_parent_id,
             "trace_task_ids": trace_task_ids,
-            "paired_trace_path": str(getattr(paired_traces_file, "path", paired_traces_file)),
-            "current_instructions_a": current_instructions_a,
-            "current_instructions_b": current_instructions_b,
-            "common_ancestor_instructions": common_ancestor_instructions,
+            "paired_disagreement_trace_path": str(
+                getattr(paired_disagreement_traces_file, "path", paired_disagreement_traces_file)
+            ),
+            "base_parent_instructions": base_parent_instructions,
+            "patch_source_parent_instructions": patch_source_parent_instructions,
+            "patch_output": patch_output,
             "new_instructions": new_text,
-            "generalization_check": audit,
             "rlm_trajectory": getattr(result, "trajectory", []),
             "run_trace": trace_to_json(trace),
             "error": None,
         }
         atomic_write_json(
-            self.proposer_trace_dir / f"{event_id}_merge_from_cand_{id1}_and_cand_{id2}.json",
-            payload,
-        )
-        return new_text, audit
-
-    def _persist_merge_proposer_error(
-        self,
-        *,
-        call_idx: int | None,
-        attempt_idx: int,
-        id1: int,
-        id2: int,
-        ancestor: int,
-        instructions_a: str,
-        instructions_b: str,
-        instructions_ancestor: str,
-        trace_task_ids: list[str],
-        exc: BaseException,
-    ) -> None:
-        trace = extract_trace_from_exc(exc)
-        event_id = (
-            f"{self.run_id}_merge_attempt_{attempt_idx:04d}_"
-            f"cand_{id1}_cand_{id2}_ancestor_{ancestor}"
-        )
-        operation_id = f"merge_proposer_cand_{id1}_cand_{id2}_{attempt_idx:04d}"
-        self._write_trace_cost(
-            event="merge_proposer_error",
-            event_id=event_id,
-            operation_id=operation_id,
-            attempt_id=f"attempt_{attempt_idx:04d}",
-            main_role="merge_proposer",
-            sub_role="merge_proposer_sub_lm",
-            trace=trace,
-        )
-        payload = {
-            "schema_version": 1,
-            "event_id": event_id,
-            "operation_id": operation_id,
-            "status": "error",
-            "kind": "merge_proposer_error",
-            "cand_ids": [id1, id2],
-            "ancestor_id": ancestor,
-            "trace_task_ids": trace_task_ids,
-            "current_instructions_a": instructions_a,
-            "current_instructions_b": instructions_b,
-            "common_ancestor_instructions": instructions_ancestor,
-            "new_instructions": None,
-            "generalization_check": None,
-            "run_trace": trace_to_json(trace),
-            "error": str(exc),
-            "error_type": type(exc).__name__,
-            "traceback": "".join(traceback.format_exception(type(exc), exc, exc.__traceback__)),
-        }
-        suffix = "ERROR"
-        atomic_write_json(
             self.proposer_trace_dir
-            / f"{event_id}_merge_from_cand_{id1}_and_cand_{id2}_{suffix}.json",
+            / f"{event_id}_patch_from_cand_{base_parent_id}_using_cand_{patch_source_parent_id}.json",
             payload,
         )
+        return new_text, patch_output
 
     def _write_eval_cost(
         self,
@@ -570,6 +527,16 @@ def _example_id(example: Any) -> str | None:
 
 def _batch_signature(batch: Sequence[Any]) -> tuple[str, ...]:
     return tuple(_example_id(example) or repr(example) for example in batch)
+
+
+def _jsonable(value: Any) -> Any:
+    if hasattr(value, "model_dump"):
+        return value.model_dump()
+    if isinstance(value, Mapping):
+        return {key: _jsonable(item) for key, item in value.items()}
+    if isinstance(value, list | tuple):
+        return [_jsonable(item) for item in value]
+    return value
 
 
 def _progress_label(eval_kind: str, eval_idx: int) -> str:
