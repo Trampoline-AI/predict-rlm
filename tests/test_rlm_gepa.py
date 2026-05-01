@@ -46,7 +46,11 @@ from rlm_gepa.reporting.stats import (
 )
 from rlm_gepa.runtime.adapter import RLMGepaAdapter
 from rlm_gepa.schema import RLMGepaExampleResult, validate_project
-from rlm_gepa.service import _coerce_reflection_lm_text, prepare_run_dir
+from rlm_gepa.service import (
+    _coerce_reflection_lm_text,
+    _ProgressCandidateSelector,
+    prepare_run_dir,
+)
 
 
 class _DummyLM:
@@ -521,8 +525,11 @@ class _PatchEvidenceAdapter:
         self.base_scores = base_scores
         self.source_scores = source_scores
         self.evaluate_calls = 0
+        self.progress_labels: list[str] = []
 
-    def progress_label(self, _label):
+    def progress_label(self, label):
+        self.progress_labels.append(label)
+
         class NoopContext:
             def __enter__(self):
                 return None
@@ -621,6 +628,28 @@ def test_patch_evidence_oversamples_two_minibatches_before_selecting_records(tmp
 
     assert len(evidence.sampled_train_ids) == 8
     assert len(evidence.records) == 4
+
+
+def test_patch_evidence_progress_labels_use_zero_indexed_iteration(tmp_path: Path):
+    proposer = _make_patch_evidence_proposer(
+        tmp_path,
+        base_scores=[1.0, 0.0],
+        source_scores=[0.0, 1.0],
+        merge_minibatch_size=2,
+    )
+
+    proposer._build_patch_disagreement_evidence(
+        state=_patch_evidence_state(),
+        iteration=4,
+        attempt_idx=0,
+        base_parent_id=1,
+        patch_source_parent_id=2,
+    )
+
+    assert proposer.adapter.progress_labels == [
+        "Iteration 4 Patch Base Parent #1 Trace",
+        "Iteration 4 Patch Source Parent #2 Trace",
+    ]
 
 
 def test_patch_evidence_prefers_larger_disagreements_and_caps_records(tmp_path: Path):
@@ -1016,6 +1045,25 @@ def test_reflection_lm_text_normalization_accepts_common_payloads():
     assert _coerce_reflection_lm_text({"choices": [{"message": {"content": "chat"}}]}) == "chat"
     with pytest.raises(TypeError, match="non-text response"):
         _coerce_reflection_lm_text({"usage": {"input_tokens": 10}})
+
+
+def test_progress_candidate_selector_uses_zero_indexed_iteration():
+    class Selector:
+        def select_candidate_idx(self, _state):
+            return 4
+
+    class Adapter:
+        def __init__(self):
+            self.context = None
+
+        def set_reflective_progress_context(self, **kwargs):
+            self.context = kwargs
+
+    adapter = Adapter()
+    selector = _ProgressCandidateSelector(Selector(), adapter)
+
+    assert selector.select_candidate_idx(SimpleNamespace(i=5, program_candidates=[{}, {}, {}])) == 4
+    assert adapter.context == {"iteration": 5, "parent_idx": 4, "child_idx": 3}
 
 
 def _make_merge_proposer(tmp_path: Path, state_payload: dict | None = None) -> RlmMergeProposer:

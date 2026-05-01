@@ -328,7 +328,7 @@ class _ProgressCandidateSelector:
     def select_candidate_idx(self, state: Any) -> int:
         candidate_idx = self.selector.select_candidate_idx(state)
         self.adapter.set_reflective_progress_context(
-            iteration=state.i + 1,
+            iteration=state.i,
             parent_idx=candidate_idx,
             child_idx=len(state.program_candidates),
         )
