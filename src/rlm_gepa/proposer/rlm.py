@@ -156,8 +156,8 @@ inside `new_instructions`.
 
 
 PATCH_MERGE_PROPOSER_TEMPLATE = """\
-Patch one base skill-instructions text for {{AGENT_TYPE}} by grafting at most
-one bounded behavioral capability from a patch-source parent.
+Patch one base skill-instructions text for {{AGENT_TYPE}} by adding at most
+one verified missing behavioral capability supported by a patch-source parent.
 
 Start from `base_parent_instructions`. Preserve base behavior by default.
 Compare the two parents as policies over the paired train traces. Your job is
@@ -167,13 +167,17 @@ while preserving base wins and both-success behavior.
 
 Do not copy, summarize, concatenate, average, or globally rewrite parent
 instructions. Source text is evidence, not the unit of transfer. The unit of
-transfer is a behavioral capability with a clear trigger, action, and
-non-application boundary.
+transfer is a proposer-authored behavioral rule with a clear trigger, action,
+non-application boundary, preservation boundary, and verification signal.
 
 The selected capability must cite supporting task IDs in structured metadata,
 not final skill prose. Do not broaden the capability to cover unrelated source
 behavior. If evidence is mixed, narrow the trigger and non-application boundary
 until the patch preserves base wins and both-success behavior.
+If the base already contains an equivalent rule, do not graft it; either narrow
+to a missing facet with concrete source-win support or leave the base
+effectively unchanged. The final graft invariant is: "This patch changes
+behavior only when T; outside T, base behavior remains unchanged."
 
 The patched skill must remain a surgical edit and must work across these use
 cases:
@@ -214,38 +218,98 @@ cases:
 
 1. Load the disagreement JSONL with structured parsing. Separate rows into
    source wins, base wins, and both-success guardrails.
-2. Compare the two parents as policies: identify what behavioral differences
+2. Use one or more `predict()` helper calls over paired base and patch-source
+   raw trace slices when the raw execution details matter. Give helpers paired
+   base/source slices, source-win rows, base-win rows, both-success guardrails,
+   and relevant parent instruction slices. Helpers are evidence, guardrail, and
+   support-filter workers; you own final capability selection, deduplication,
+   the local splice, and the audit.
+   - Each helper output must include exactly one candidate capability or
+     `none`, trigger, action, non-application boundary, preservation boundary,
+     supported source-win IDs, unsupported source-win IDs, base-win hazards,
+     both-success invariants, exact evidence spans or trace facts,
+     verification signal, and whether the base already contains equivalent
+     behavior.
+   - If a helper proposes multiple capability families, broad rewrites, or
+     copied source wording, split into smaller helper calls or run a focused
+     support-filter call.
+   - For local wording, pass only the selected capability brief and relevant
+     base section. Ask for bounded wording alternatives, not a whole-instruction
+     rewrite.
+3. Compare the two parents as policies: identify what behavioral differences
    explain patch-source wins vs. base wins. Do not begin by selecting text to
    copy.
-3. For each source-win pattern, describe the capability the source has that the
+4. For each source-win pattern, describe the capability the source has that the
    base lacks. For each candidate capability, ask:
    - What source-win rows does this explain?
    - Which base-win rows could this harm if phrased too broadly?
    - Which both-success rows define invariants that must not change?
-4. Select exactly one capability family. Choose the one with the cleanest
+5. Select exactly one capability family. Choose the one with the cleanest
    source-win support and clearest preservation boundary. Multiple bullets are
    allowed only when they are facets of the same capability family.
-5. Reject capabilities that are unsupported, redundant with the base, overly
-   broad, or only explain base wins/failures.
-6. Apply the capability as the smallest local edit to the base. When the base
+6. Reject capabilities that are unsupported, redundant with the base, overly
+   broad, or only explain base wins/failures. Before finalizing, support-filter
+   every source-win row: classify it as supported or not-supported by the
+   selected capability, and do not cite generally related rows as evidence.
+7. Apply the capability as the smallest local edit to the base. When the base
    already has a related section, tighten or extend it rather than appending a
-   new block. The patched instructions should not be materially longer than the
-   base.
-7. Keep all task IDs inside `imported_from_other.evidence_task_ids` and
-   `selected_capability.evidence_task_ids` metadata.
-   Do not place task IDs or audit labels in `new_instructions`.
+   new block. Do not add a tool, API, code, or protocol detail unless it is
+   supported by a trace span, parent instruction, or documented runtime/tool
+   contract. Prove preservation separately from source-win evidence using
+   base-win and both-success guardrails. Do not copy or renumber source bullets:
+   changed prose must be original, local to the nearest relevant base section,
+   and no broader than the verified capability. The patched instructions should
+   not be materially longer than the base.
+8. Keep all task IDs inside `behavioral_rules.evidence_task_ids`,
+   `selected_capability.evidence_task_ids`, and `patch_merge_audit` metadata.
+   Keep task IDs and audit metadata out of `new_instructions`.
 """
 
 
 _AXIS_SINGULAR = COUNTERFACTUAL_AXIS_SINGULAR
 
 
-class ImportedClause(BaseModel):
-    clause: str = Field(description="Clause imported from the patch-source parent")
-    evidence_task_ids: list[str] = Field(
-        description="Train task IDs supporting this imported clause"
+class BehavioralRule(BaseModel):
+    behavioral_rule: str = Field(
+        description=(
+            "Proposer-authored behavioral rule backed by patch-source evidence; "
+            "not copied source wording"
+        )
     )
-    reason: str = Field(description="Why the imported clause is supported")
+    evidence_task_ids: list[str] = Field(
+        description="Train task IDs supporting this behavioral rule"
+    )
+    reason: str = Field(description="Why this behavioral rule is supported")
+
+
+class PatchMergeAudit(BaseModel):
+    helper_purpose_or_call_reference: str = Field(
+        description="Compact description of helper call purpose or reference"
+    )
+    supported_source_win_ids: list[str] = Field(
+        description="Source-win task IDs actually supported by the selected capability"
+    )
+    unsupported_source_win_ids: list[str] = Field(
+        description="Source-win task IDs reviewed but not supported by the selected capability"
+    )
+    base_win_hazards: list[str] = Field(
+        description="Base-win hazards the patch must avoid"
+    )
+    both_success_invariants: list[str] = Field(
+        description="Both-success behavior that must remain unchanged"
+    )
+    base_duplicate_check: str = Field(
+        description="Whether the base already has equivalent behavior and any missing facet"
+    )
+    guardrail_conflicts: list[str] = Field(
+        description="Conflicts with base-win or both-success guardrails, if any"
+    )
+    verification_signal: str = Field(
+        description="Trace-observable signal that the selected capability worked"
+    )
+    outer_proposer_narrowed_or_overrode_helper: str = Field(
+        description="Whether and how the outer proposer narrowed or overrode helper output"
+    )
 
 
 class SelectedCapability(BaseModel):
@@ -260,6 +324,9 @@ class SelectedCapability(BaseModel):
     )
     preservation_note: str = Field(
         description="How base wins and both-success behavior are preserved"
+    )
+    verification_signal: str = Field(
+        description="Trace-observable signal that this capability applied correctly"
     )
 
 
@@ -307,7 +374,7 @@ class PatchMergeInstructionsGeneric(dspy.Signature):
     base_parent_id: int = dspy.InputField(desc="Candidate ID for the base parent")
     base_parent_instructions: str = dspy.InputField(desc="Full base parent skill text")
     patch_source_parent_id: int = dspy.InputField(
-        desc="Candidate ID for the parent providing possible imports"
+        desc="Candidate ID for the parent providing patch-source evidence"
     )
     patch_source_parent_instructions: str = dspy.InputField(
         desc="Full patch-source parent skill text"
@@ -319,8 +386,16 @@ class PatchMergeInstructionsGeneric(dspy.Signature):
     selected_capability: SelectedCapability = dspy.OutputField(
         desc="The one behavioral capability grafted onto the base"
     )
-    imported_from_other: list[ImportedClause] = dspy.OutputField(
-        desc="Evidence-backed clauses imported from the patch-source parent"
+    behavioral_rules: list[BehavioralRule] = dspy.OutputField(
+        desc=(
+            "Proposer-authored behavioral rules backed by patch-source evidence"
+        )
+    )
+    patch_merge_audit: PatchMergeAudit = dspy.OutputField(
+        desc=(
+            "Compact audit of helper discipline, support filtering, duplicate "
+            "check, guardrails, verification, and any outer-proposer narrowing"
+        )
     )
     rejected_from_other: list[str] = dspy.OutputField(
         desc="Patch-source clauses or themes intentionally rejected"

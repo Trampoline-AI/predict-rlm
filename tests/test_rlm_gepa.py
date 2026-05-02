@@ -18,16 +18,12 @@ from rlm_gepa import (
     OptimizeConfig,
     RLMGepaProject,
     agent_spec_from_rlm,
-    build_merge_signature,
-    build_patch_merge_signature,
     build_proposer_for_rlm,
-    build_proposer_signature,
     check_optimization,
     run_optimization,
 )
 from rlm_gepa.cli import apply_optimize_args, run_project_cli
 from rlm_gepa.proposer.merge import VALID_STATUSES, RlmMergeProposer
-from rlm_gepa.proposer.rlm import SelectedCapability
 from rlm_gepa.proposer.selection import (
     PatchMergePair,
     pick_patch_merge_pair,
@@ -2389,14 +2385,26 @@ def test_patch_merge_adapter_uses_patch_signature_and_persists_metadata(
                     "action": "validate inputs before invoking the tool",
                     "non_application_boundary": "do not apply to unrelated formatting tasks",
                     "preservation_note": "preserves base wins by only applying to tool-use rows",
+                    "verification_signal": "tool call follows validated inputs",
                 },
-                imported_from_other=[
+                behavioral_rules=[
                     {
-                        "clause": "Use the tool only after validating inputs.",
+                        "behavioral_rule": "Use the tool only after validating inputs.",
                         "evidence_task_ids": ["train-a"],
                         "reason": "source wins train-a",
                     }
                 ],
+                patch_merge_audit={
+                    "helper_purpose_or_call_reference": "support-filter helper",
+                    "supported_source_win_ids": ["train-a"],
+                    "unsupported_source_win_ids": [],
+                    "base_win_hazards": [],
+                    "both_success_invariants": [],
+                    "base_duplicate_check": "base lacks this validated-input facet",
+                    "guardrail_conflicts": [],
+                    "verification_signal": "tool call follows validated inputs",
+                    "outer_proposer_narrowed_or_overrode_helper": "kept one bounded rule",
+                },
                 rejected_from_other=["Do not copy unrelated formatting advice."],
                 new_instructions="base plus patch",
                 trace=None,
@@ -2448,6 +2456,8 @@ def test_patch_merge_adapter_uses_patch_signature_and_persists_metadata(
         "paired_disagreement_traces_file",
     }
     assert "selected_capability" in captured["signature"].output_fields
+    assert "behavioral_rules" in captured["signature"].output_fields
+    assert "imported_from_other" not in captured["signature"].output_fields
     assert "common_ancestor_instructions" not in captured["inputs"]
     assert captured["inputs"]["base_parent_id"] == 10
     assert captured["inputs"]["patch_source_parent_id"] == 11
@@ -2462,7 +2472,7 @@ def test_patch_merge_adapter_uses_patch_signature_and_persists_metadata(
         base_instructions="base",
         new_instructions="base plus patch",
     )
-    assert patch_output["imported_from_other"][0]["evidence_task_ids"] == ["train-a"]
+    assert patch_output["behavioral_rules"][0]["evidence_task_ids"] == ["train-a"]
 
 
 def _assert_valid_patch_output(
@@ -2481,6 +2491,7 @@ def _assert_valid_patch_output(
         "action",
         "non_application_boundary",
         "preservation_note",
+        "verification_signal",
     }
     assert set(selected_capability["evidence_task_ids"]) <= set(trace_task_ids)
     assert patch_output["base_instruction_chars"] == len(base_instructions)
