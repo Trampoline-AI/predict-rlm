@@ -385,12 +385,23 @@ class RLMGepaAdapter:
             )
             exc.trace = getattr(result, "trace", None)  # type: ignore[attr-defined]
             raise exc
+        selected_capability = getattr(result, "selected_capability", None)
+        if selected_capability is None:
+            exc = RuntimeError(
+                f"RLM patch merge proposer returned no selected_capability for {call_idx}"
+            )
+            exc.trace = getattr(result, "trace", None)  # type: ignore[attr-defined]
+            raise exc
 
         patch_output = {
             "base_parent_id": getattr(result, "base_parent_id", base_parent_id),
             "patch_summary": getattr(result, "patch_summary", ""),
+            "selected_capability": _jsonable(selected_capability),
             "imported_from_other": _jsonable(getattr(result, "imported_from_other", []) or []),
             "rejected_from_other": _jsonable(getattr(result, "rejected_from_other", []) or []),
+            "base_instruction_chars": len(base_parent_instructions),
+            "new_instruction_chars": len(new_text),
+            "instruction_char_delta": len(new_text) - len(base_parent_instructions),
             "new_instructions": new_text,
         }
         trace = getattr(result, "trace", None)

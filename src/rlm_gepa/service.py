@@ -204,7 +204,6 @@ def _run_gepa_engine(
     import random
 
     from gepa.core.data_loader import ensure_loader
-    from gepa.core.engine import GEPAEngine
     from gepa.logging.experiment_tracker import create_experiment_tracker
     from gepa.logging.logger import StdOutLogger
     from gepa.proposer.reflective_mutation.reflective_mutation import ReflectiveMutationProposer
@@ -220,6 +219,8 @@ def _run_gepa_engine(
     )
     from gepa.strategies.eval_policy import FullEvaluationPolicy
     from gepa.utils import CompositeStopper, FileStopper, MaxMetricCallsStopper
+
+    from .runtime.engine import RLMGepaEngine
 
     rng = random.Random(seed)
     logger = StdOutLogger()
@@ -289,7 +290,7 @@ def _run_gepa_engine(
             rng=rng,
         )
 
-    engine = GEPAEngine(
+    engine = RLMGepaEngine(
         adapter=adapter,
         run_dir=str(run_dir),
         valset=val_loader,

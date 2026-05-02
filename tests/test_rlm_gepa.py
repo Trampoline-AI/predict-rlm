@@ -27,6 +27,7 @@ from rlm_gepa import (
 )
 from rlm_gepa.cli import apply_optimize_args, run_project_cli
 from rlm_gepa.proposer.merge import VALID_STATUSES, RlmMergeProposer
+from rlm_gepa.proposer.rlm import SelectedCapability
 from rlm_gepa.proposer.selection import (
     PatchMergePair,
     pick_patch_merge_pair,
@@ -44,6 +45,7 @@ from rlm_gepa.reporting.stats import (
     render_stats,
     render_table,
 )
+from rlm_gepa.runtime.acceptance import should_accept_reflective_candidate
 from rlm_gepa.runtime.adapter import RLMGepaAdapter
 from rlm_gepa.schema import RLMGepaExampleResult, validate_project
 from rlm_gepa.service import (
@@ -109,6 +111,33 @@ class _Project(RLMGepaProject):
         raise NotImplementedError
 
 
+def test_reflective_candidate_accepts_bounded_dense_loss_with_hard_flip_signal():
+    decision = should_accept_reflective_candidate(
+        before_scores=[0.99, 0.99, 0.99, 0.50],
+        after_scores=[1.00, 1.00, 1.00, 0.45],
+    )
+
+    assert decision.accepted
+    assert decision.reason == "hard_flip_signal"
+    assert decision.dense_delta < 0.0
+    assert decision.hard_wins == 3
+    assert decision.hard_losses == 0
+    assert decision.hard_flip_p_value <= 0.30
+
+
+def test_reflective_candidate_rejects_bounded_dense_loss_without_significant_hard_flips():
+    decision = should_accept_reflective_candidate(
+        before_scores=[0.99, 0.80],
+        after_scores=[1.00, 0.77],
+    )
+
+    assert not decision.accepted
+    assert decision.reason == "not_improved"
+    assert decision.hard_wins == 1
+    assert decision.hard_losses == 0
+    assert decision.hard_flip_p_value > 0.30
+
+
 def test_build_signatures_render_agent_spec():
     spec = _spec()
     proposer = build_proposer_signature(spec)
@@ -158,6 +187,16 @@ def test_agent_spec_from_rlm_can_omit_agent_type():
     assert "lookup" in spec.tool_signatures
 
 
+def test_proposer_signature_allows_multiple_async_predict_passes_for_concrete_edits():
+    proposer = build_proposer_signature(_spec())
+    instructions = " ".join(proposer.instructions.split())
+
+    assert "one or more `predict()` calls" in instructions
+    assert "asyncio.gather" in instructions
+    assert "structured brief containing root causes and edit decisions" in instructions
+    assert "must not draft the substantive wording from scratch" in instructions
+
+
 def test_patch_merge_signature_uses_base_and_patch_source_without_ancestor():
     patch = build_patch_merge_signature(_spec())
 
@@ -170,19 +209,21 @@ def test_patch_merge_signature_uses_base_and_patch_source_without_ancestor():
     assert "common ancestor" not in patch.instructions.lower()
 
 
-def test_patch_merge_prompt_contract_is_surgical_patch_not_synthesis():
-    prompt = build_patch_merge_signature(_spec()).instructions.lower()
+def test_patch_merge_signature_exposes_selected_capability_contract():
+    patch = build_patch_merge_signature(_spec())
 
-    assert "start from `base_parent_instructions`" in prompt
-    assert "preserve base behavior by default" in prompt
-    assert "import at most 1-3 clauses" in prompt
-    assert "structured metadata" in prompt
-    assert "task ids" in prompt
-    assert "do not summarize" in prompt
-    assert "compress" in prompt
-    assert "concatenate" in prompt
-    assert "globally rewrite" in prompt
-    assert "return base unchanged" in prompt
+    assert "selected_capability" in patch.output_fields
+    assert "imported_from_other" in patch.output_fields
+    assert "rejected_from_other" in patch.output_fields
+    assert "new_instructions" in patch.output_fields
+    assert set(SelectedCapability.model_fields) == {
+        "name",
+        "evidence_task_ids",
+        "trigger",
+        "action",
+        "non_application_boundary",
+        "preservation_note",
+    }
 
 
 def test_merge_signature_is_evidence_backed_patch_contract():
@@ -2012,6 +2053,14 @@ def test_patch_merge_adapter_uses_patch_signature_and_persists_metadata(
             return SimpleNamespace(
                 base_parent_id=10,
                 patch_summary="imported one clause",
+                selected_capability={
+                    "name": "validated tool usage",
+                    "evidence_task_ids": ["train-a"],
+                    "trigger": "inputs require tool use",
+                    "action": "validate inputs before invoking the tool",
+                    "non_application_boundary": "do not apply to unrelated formatting tasks",
+                    "preservation_note": "preserves base wins by only applying to tool-use rows",
+                },
                 imported_from_other=[
                     {
                         "clause": "Use the tool only after validating inputs.",
@@ -2058,6 +2107,10 @@ def test_patch_merge_adapter_uses_patch_signature_and_persists_metadata(
 
     assert new_text == "base plus patch"
     assert metadata["patch_summary"] == "imported one clause"
+    assert metadata["selected_capability"]["name"] == "validated tool usage"
+    assert metadata["base_instruction_chars"] == len("base")
+    assert metadata["new_instruction_chars"] == len("base plus patch")
+    assert metadata["instruction_char_delta"] == len("base plus patch") - len("base")
     assert captured["signature"].input_fields.keys() >= {
         "base_parent_id",
         "base_parent_instructions",
@@ -2065,6 +2118,7 @@ def test_patch_merge_adapter_uses_patch_signature_and_persists_metadata(
         "patch_source_parent_instructions",
         "paired_disagreement_traces_file",
     }
+    assert "selected_capability" in captured["signature"].output_fields
     assert "common_ancestor_instructions" not in captured["inputs"]
     assert captured["inputs"]["base_parent_id"] == 10
     assert captured["inputs"]["patch_source_parent_id"] == 11
@@ -2072,4 +2126,41 @@ def test_patch_merge_adapter_uses_patch_signature_and_persists_metadata(
     assert len(artifacts) == 1
     payload = json.loads(artifacts[0].read_text())
     assert payload["kind"] == "patch_merge_proposer"
-    assert payload["patch_output"]["imported_from_other"][0]["evidence_task_ids"] == ["train-a"]
+    patch_output = payload["patch_output"]
+    _assert_valid_patch_output(
+        patch_output,
+        trace_task_ids=["train-a"],
+        base_instructions="base",
+        new_instructions="base plus patch",
+    )
+    assert patch_output["imported_from_other"][0]["evidence_task_ids"] == ["train-a"]
+
+
+def _assert_valid_patch_output(
+    patch_output: dict[str, object],
+    *,
+    trace_task_ids: list[str],
+    base_instructions: str,
+    new_instructions: str,
+) -> None:
+    selected_capability = patch_output["selected_capability"]
+    assert isinstance(selected_capability, dict)
+    assert set(selected_capability) >= {
+        "name",
+        "evidence_task_ids",
+        "trigger",
+        "action",
+        "non_application_boundary",
+        "preservation_note",
+    }
+    assert set(selected_capability["evidence_task_ids"]) <= set(trace_task_ids)
+    assert patch_output["base_instruction_chars"] == len(base_instructions)
+    assert patch_output["new_instruction_chars"] == len(new_instructions)
+    assert patch_output["instruction_char_delta"] == len(new_instructions) - len(
+        base_instructions
+    )
+    for task_id in trace_task_ids:
+        if len(task_id) >= 4:
+            assert task_id not in new_instructions
+    for audit_label in ("base_win", "patch_source_win", "both_success_guardrail"):
+        assert audit_label not in new_instructions

@@ -80,32 +80,100 @@ Every proposed rule must pass all structural tests:
 - It states a principle, not a literal trace token.
 - Any code example is short, abstract, and trace-agnostic.
 
-# Workflow
+# Required Proposer Workflow
 
-1. Load {{TRACES_FILE_MOUNT}} with JSON parsing, not broad regex over raw text.
-2. Bucket records by score into bottom, middle, and top groups.
-3. Read bottom records for corrective rules, top records for strategic rules,
-   and middle records for directional rules.
-4. Scan tools and target signature for novel capabilities that would help across
-   the use-case list.
-5. Keep the edit surgical: identify kept, modified, added, and removed rules.
-6. Emit one `generalization_check` audit line per rule. Each line starts with
-   `[KEPT|MODIFIED|NEW|REMOVED]` and includes: grounding, use case, principle,
-   counterfactual_1, counterfactual_2. The counterfactuals must span different
-   {{COUNTERFACTUAL_AXIS_NAME}}.
+Before emitting `new_instructions`, follow this procedure:
+
+1. Load {{TRACES_FILE_MOUNT}} with structured JSON parsing. Do not rely on
+   broad regex over raw file text; regex is acceptable only inside parsed
+   fields such as `Feedback` or `Generated Outputs`.
+2. Parse scores and separate records into bottom failures, middle partials or
+   near-misses, top successes, and unscored or crashed records.
+3. Inspect bottom records for corrective rules, top records for strategies
+   worth preserving, and middle records for directional rules that could push
+   near-misses over the threshold. Also check whether top traces solved tasks
+   by ignoring or contradicting a current rule; success despite violating a
+   rule is evidence that the rule may be harmful or over-broad.
+4. Build compact evidence packets for representative records: task cue, score,
+   observed behavior, expected behavior or feedback mismatch, failure mode, and
+   any current-instruction rule implicated.
+5. Use one or more `predict()` calls after compact evidence packets when
+   packets may share latent causes. If evidence separates into independent
+   clusters, call `predict()` for those clusters concurrently with
+   `asyncio.gather(...)` rather than forcing one serial mega-call. Synthesize
+   cross-cutting failure modes, root causes, and candidate rule changes, not
+   full instruction rewrites.
+6. Compare proposed changes against `current_instructions`; explicitly decide
+   which rules are kept, modified, added, or removed. After making these
+   decisions, use one or more `predict()` calls to draft concrete edits from a
+   structured brief containing root causes and edit decisions plus only the
+   relevant current-instruction sections. Use multiple edit-drafting calls when
+   independent sections or rule families can be drafted separately, and run
+   independent calls concurrently with `asyncio.gather(...)`. The outer proposer
+   may splice, consolidate, and audit the result, but must not draft the
+   substantive wording from scratch unless the edit-drafting call fails. Do not
+   use `predict()` as an unconstrained whole-instruction rewriter.
+7. Splice edits into the current instruction structure. Emit the full revised
+   instructions, not a diff. Preserve useful behavior unless trace evidence
+   shows a rule is harmful. Treat about 10K characters as a soft budget, not a
+   hard cap; if the revised instructions would exceed about 10-11K characters,
+   consolidate redundant rules and drop low-evidence additions before appending
+   more.
+8. Emit `generalization_check` audit lines for every material rule decision,
+   including kept, modified, new, and removed rules, especially removals and
+   default inversions.
+
+# Contradictory Seed Axioms and Default Inversions
+
+Actively search for current-instruction rules that are contradicted by repeated
+trace evidence. If a seed rule causes a repeated failure pattern, do not only
+add narrow exceptions around it. You may remove the rule or invert the default
+policy when the evidence supports that change.
+
+A `[REMOVED]` or `[MODIFIED]` default inversion is appropriate only when:
+- multiple bottom or middle traces fail in the same way;
+- the failure can be tied to an existing rule, default, or decision boundary;
+- top traces do not show that the old rule must remain the broad default;
+- the replacement has a clear trigger and non-application boundary;
+- the edit preserves unrelated successful behavior.
+
+# Audit Requirements
+
+Emit one `generalization_check` audit line per material rule decision. Each line
+must start with one of `[KEPT]`, `[MODIFIED]`, `[NEW]`, or `[REMOVED]`.
+
+Every audit line should include: grounding, use case, principle,
+counterfactual_1, and counterfactual_2. The counterfactuals must span different
+{{COUNTERFACTUAL_AXIS_NAME}}.
+
+For `[REMOVED]` lines and `[MODIFIED]` default inversions, also include the old
+rule or default being changed, the repeated failure pattern that contradicted
+it, the replacement behavior, and the preservation or non-application boundary.
+
+Keep audit labels and task IDs inside `generalization_check`; do not place them
+inside `new_instructions`.
 """
 
 
 PATCH_MERGE_PROPOSER_TEMPLATE = """\
-Patch one base skill-instructions text for {{AGENT_TYPE}} using only
-evidence-backed clauses from a patch-source parent.
+Patch one base skill-instructions text for {{AGENT_TYPE}} by grafting at most
+one bounded behavioral capability from a patch-source parent.
 
 Start from `base_parent_instructions`. Preserve base behavior by default.
-Import only clauses from `patch_source_parent_instructions` that explain
-patch-source wins in the train disagreement traces. Import at most 1-3 clauses.
-Every import must cite task IDs in structured metadata, not final skill prose.
-Do not summarize, compress, concatenate, or globally rewrite. If no import is
-strongly supported, return base unchanged as a no-op signal.
+Compare the two parents as policies over the paired train traces. Your job is
+to select the single best-supported bounded capability family from
+patch-source wins that the base lacks, then graft that capability into the base
+while preserving base wins and both-success behavior.
+
+Do not copy, summarize, concatenate, average, or globally rewrite parent
+instructions. Source text is evidence, not the unit of transfer. The unit of
+transfer is a behavioral capability with a clear trigger, action, and
+non-application boundary.
+
+The selected capability must cite supporting task IDs in structured metadata,
+not final skill prose. Do not broaden the capability to cover unrelated source
+behavior. If evidence is mixed, narrow the trigger and non-application boundary
+until the patch preserves base wins and both-success behavior.
 
 The patched skill must remain a surgical edit and must work across these use
 cases:
@@ -144,14 +212,27 @@ cases:
 
 # Patch Method
 
-1. Load the disagreement JSONL with structured parsing.
-2. Identify source clauses that directly explain patch-source wins.
-3. Use `both_success` rows as preservation guardrails for the base edit; do not
-   cite them as evidence for importing source-only clauses.
-4. Reject source clauses that are unsupported, redundant with the base, or only
-   explain base wins/failures.
-5. Apply only the smallest local edit needed to import the supported clauses.
-6. Keep all task IDs inside `imported_from_other.evidence_task_ids` metadata.
+1. Load the disagreement JSONL with structured parsing. Separate rows into
+   source wins, base wins, and both-success guardrails.
+2. Compare the two parents as policies: identify what behavioral differences
+   explain patch-source wins vs. base wins. Do not begin by selecting text to
+   copy.
+3. For each source-win pattern, describe the capability the source has that the
+   base lacks. For each candidate capability, ask:
+   - What source-win rows does this explain?
+   - Which base-win rows could this harm if phrased too broadly?
+   - Which both-success rows define invariants that must not change?
+4. Select exactly one capability family. Choose the one with the cleanest
+   source-win support and clearest preservation boundary. Multiple bullets are
+   allowed only when they are facets of the same capability family.
+5. Reject capabilities that are unsupported, redundant with the base, overly
+   broad, or only explain base wins/failures.
+6. Apply the capability as the smallest local edit to the base. When the base
+   already has a related section, tighten or extend it rather than appending a
+   new block. The patched instructions should not be materially longer than the
+   base.
+7. Keep all task IDs inside `imported_from_other.evidence_task_ids` and
+   `selected_capability.evidence_task_ids` metadata.
    Do not place task IDs or audit labels in `new_instructions`.
 """
 
@@ -165,6 +246,21 @@ class ImportedClause(BaseModel):
         description="Train task IDs supporting this imported clause"
     )
     reason: str = Field(description="Why the imported clause is supported")
+
+
+class SelectedCapability(BaseModel):
+    name: str = Field(description="Short name for the bounded capability family")
+    evidence_task_ids: list[str] = Field(
+        description="Train task IDs supporting this capability"
+    )
+    trigger: str = Field(description="Condition that activates this capability")
+    action: str = Field(description="What the agent should do when triggered")
+    non_application_boundary: str = Field(
+        description="When this capability should NOT apply"
+    )
+    preservation_note: str = Field(
+        description="How base wins and both-success behavior are preserved"
+    )
 
 
 def render_template(template: str, spec: AgentSpec) -> str:
@@ -195,8 +291,15 @@ class ImproveInstructionsGeneric(dspy.Signature):
     current_instructions: str = dspy.InputField(desc="Current skill instructions text")
     component_focus: str = dspy.InputField(desc="Optional per-component focus text")
     traces_file: File = dspy.InputField(desc="JSON file containing rendered task traces")
-    new_instructions: str = dspy.OutputField(desc="Full revised skill instructions text")
-    generalization_check: list[str] = dspy.OutputField(desc="Audit lines for every rule")
+    new_instructions: str = dspy.OutputField(
+        desc="Full revised skill instructions text. Do not include audit labels or task IDs."
+    )
+    generalization_check: list[str] = dspy.OutputField(
+        desc=(
+            "Audit lines for kept/modified/new/removed rules, including evidence "
+            "and boundaries for removals/default inversions."
+        )
+    )
 
 
 
@@ -213,6 +316,9 @@ class PatchMergeInstructionsGeneric(dspy.Signature):
         desc="JSONL file carrying train disagreement traces for the two parents"
     )
     patch_summary: str = dspy.OutputField(desc="Short summary of the patch decision")
+    selected_capability: SelectedCapability = dspy.OutputField(
+        desc="The one behavioral capability grafted onto the base"
+    )
     imported_from_other: list[ImportedClause] = dspy.OutputField(
         desc="Evidence-backed clauses imported from the patch-source parent"
     )
