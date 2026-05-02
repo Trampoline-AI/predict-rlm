@@ -152,4 +152,5 @@ rlm = PredictRLM(ProcessInvoices, skills=[pdf, spreadsheet])
 - [How it works](docs/how-it-works.md) — understand the sandbox, REPL loop, signatures, and file I/O
 - [API reference](docs/api.md) — constructor params for `PredictRLM`, `File`, and `Skill`
 - [Skills](docs/skills.md) — define, compose, and mount custom skills
+- [RLM-GEPA](src/rlm_gepa/README.md) — optimize RLM skills from traces and configure `AgentSpec`
 - [Examples](examples/) — end-to-end demos with setup instructions

@@ -29,7 +29,7 @@ def run_project_cli(
     )
     args = parser.parse_args(argv)
 
-    if args.command == "stats":
+    if args.command in {"stats", "stat"}:
         print(render_stats(args.run_dir, table=args.table, output_format=args.format))
         return 0
     if args.command == "plot":
@@ -105,7 +105,7 @@ def build_parser(
     if add_project_args is not None:
         add_project_args(optimize)
 
-    stats = subparsers.add_parser("stats")
+    stats = subparsers.add_parser("stats", aliases=["stat"])
     stats.add_argument("run_dir", type=Path)
     stats.add_argument(
         "--table",

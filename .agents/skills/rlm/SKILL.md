@@ -218,6 +218,60 @@ required for every RLM.
 - **Full project**: agent, tools, benchmark/eval harness, and optimization
   wiring, like the SpreadBench example.
 
+### RLM-GEPA scoping interview
+
+When the user asks for optimization wiring but has not supplied enough context to
+write a concrete `AgentSpec`, run a short interview before writing the plan. Do
+not invent the AgentSpec from a vague task description. Gather enough to define:
+
+- the product or optimization goal GEPA should improve for;
+- the input distribution, scale, and examples that represent real work;
+- the output schema and the failure modes users care about most;
+- the train/validation data source and whether labels or reference outputs exist;
+- the scoring rule, partial-credit feedback, and anti-overfitting boundaries;
+- the tools, sandbox constraints, file conventions, and runtime facts the
+  proposer must preserve.
+
+The interview should scope the RLM that owns the real DSPy signature and tools;
+do not ask the user to restate `target_signature`, `tool_signatures`, or a broad
+agent description as separate prose artifacts. Generate the signature/tool fields
+from the constructed RLM with `agent_spec_from_rlm(...)`; omit `agent_type` unless
+the user volunteers a product or optimization anchor that adds useful context.
+
+If the user cannot answer everything, proceed with explicit assumptions and mark
+the generated `AgentSpec` fields that should be revisited before spending model
+calls.
+
+### Dataset and split hygiene
+
+When the user asks for evals or optimization, investigate the dataset before
+writing split or scoring code. Inspect enough examples to identify task types,
+input sizes, label/reference-output shape, duplicate or near-duplicate examples,
+leakage risks, missing labels, and failure buckets the scorer should expose.
+Capture those findings in the plan instead of treating the dataset as an opaque
+list of rows.
+
+Use split semantics consistently:
+
+- **Train**: examples the optimizer/proposer may use to generate and gate edits.
+- **Validation**: examples used for candidate selection and regression checks
+  during optimization.
+- **Test / held-out eval**: optional final reporting set. Do not create or spend
+  on it unless the user asks for a benchmark/eval harness or has enough labeled
+  data to justify it.
+
+Prefer deterministic splits. Put the random seed, split ratio/counts, grouping key
+(if examples share source documents/users/tasks), and any sampling limits in
+`bench/config.py` or `gepa/config.py`. Split by group when leakage is plausible;
+never let near-identical cases from the same source land in both train and
+validation without calling it out. If the dataset is tiny, prefer explicit
+hand-authored train/validation files over random splitting.
+
+For GEPA, the project-local `gepa/` code owns train/validation loading and the
+seed candidate text. The seed candidate means the initial mutable component, such
+as baseline skill instructions; it is separate from the random seed used for
+splits, sampling, or optimizer reproducibility.
+
 ## Feasibility Checklist
 
 Before producing the final plan, verify:
@@ -248,7 +302,10 @@ Write the plan to the Claude Code plan file with these sections:
    Stage1(documents) --[ExtractedData]--> Stage2(extracted) --[Report]--> Stage3(report)
    ```
 
-9. **Optional eval/optimization design** — only if requested
+9. **Optional eval/optimization design** — only if requested. Include dataset
+   audit findings, split policy, scoring feedback shape, and reproducibility seed.
+   For optimization, also include the `AgentSpec` interview summary, train/validation
+   source, seed candidate source, and the exact `gepa/` files to create.
 10. **Feasibility notes** — constraints, risks, alternatives
 11. **Estimated complexity** — iteration count, sub-LM calls, cost range, runtime
 12. **Smoke tests** — test files to create and commands to run. Every generated
@@ -336,19 +393,20 @@ features = ["agent"]
 ```
 
 If the project uses built-in example skills, add only the required extras or
-packages. If it uses GEPA, add the GEPA extras and `rlm-gepa` script. Do not
-include optimization dependencies for an agent-only or eval-only project.
+packages. If it uses GEPA, add the GEPA extras and project-local `rlm-gepa`
+script as the main UX. Do not include optimization dependencies for an agent-only
+or eval-only project.
 
 ```toml
 dependencies = [
-    "predict-rlm[examples,gepa,gepa-viz]>=0.3.0,<0.4",
+    "predict-rlm[examples,gepa,gepa-viz]>=0.4.0,<0.5",
 ]
 
 [project.scripts]
 rlm-gepa = "my_rlm.gepa:main"
 
 [tool.predict-rlm.generated]
-predict_rlm_version = "0.3.0"
+predict_rlm_version = "0.4.0"
 skill_version = "2.0"
 layout = "agent-tools-bench-gepa"
 features = ["agent", "tools", "bench", "rlm-gepa"]
@@ -563,7 +621,10 @@ flag so the default smoke suite remains deterministic and cheap.
 
 Create `bench/` only when the user wants evaluation. Keep it project-local:
 dataset loaders, scoring rules, fixtures, and reports belong here, not in
-`agent/`. Evals can exist without optimization.
+`agent/`. Evals can exist without optimization. The eval layer should make the
+dataset audit and split policy explicit: where examples come from, how labels or
+reference outputs are represented, which examples are train/validation/test, and
+which seed/grouping rules make the split reproducible.
 
 Suggested files when needed:
 
@@ -581,7 +642,22 @@ bench/
 
 Create optimization wiring only when the user asks for it. The shared
 `rlm_gepa` package provides generic orchestration; the generated project owns
-its task loading, metric, seed candidate, and defaults.
+its task loading, metric, seed candidate, and defaults. Import
+`agent_spec_from_rlm`, `OptimizeConfig`, `RLMGepaExampleResult`,
+`RLMGepaProject`, and `EvaluationContext` from `rlm_gepa` rather than copying
+optimizer internals into the project.
+
+The generated `AgentSpec` should be interview-backed, but it should not duplicate
+facts already present on the RLM. Define a single `build_rlm(...)` helper that
+constructs the PredictRLM with the real DSPy signature, skills, and tools. Use
+`agent_spec_from_rlm(build_rlm(seed_instructions), ...)` so GEPA derives
+`target_signature` and `tool_signatures` from that object. Omit `agent_type` by
+default; include it only when a short product or optimization anchor adds context
+not already present in the signature, tools, or output schema. The interview
+should supply only the extra GEPA brief: transfer use cases, runtime-grounding
+examples, scoring signal, and anti-overfitting boundary. If any of those are
+weakly specified, add a `TODO` in `config.py` and keep `optimize --check`
+available so the user can catch missing setup before spending model calls.
 
 Suggested files when needed:
 
@@ -594,8 +670,10 @@ gepa/
 └── __main__.py    # Optional `python -m my_rlm.gepa`
 ```
 
-Optimization can reuse helpers from `bench/` when evals exist, but do not create
-a held-out eval command just because GEPA is present. GEPA needs training and
+Optimization can reuse helpers from `bench/` when evals exist. If a `bench/`
+package is present, expose its seed/validation/held-out evaluation flow as an
+`eval` subcommand on the same `uv run rlm-gepa ...` surface. Do not create a
+held-out eval command just because GEPA is present: GEPA needs training and
 validation examples plus feedback; a separate benchmark/eval suite is optional.
 
 ---
