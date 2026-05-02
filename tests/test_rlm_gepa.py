@@ -1718,15 +1718,16 @@ def test_cost_rows_group_patch_merge_roles(tmp_path: Path):
 
     rows = cost_rows(tmp_path)
 
-    assert any(row.get("scope") == "patch-merge" and row.get("_category") for row in rows)
+    assert any(row.get("scope") == "merge" and row.get("_category") for row in rows)
     assert any(
-        row.get("scope") == "  - main" and row.get("model") == "dummy-patch-medium"
+        row.get("scope") == "  - proposer main" and row.get("model") == "dummy-patch-medium"
         for row in rows
     )
     assert any(
-        row.get("scope") == "  - sub" and row.get("model") == "dummy-patch-sub-low"
+        row.get("scope") == "  - proposer sub" and row.get("model") == "dummy-patch-sub-low"
         for row in rows
     )
+    assert not any(row.get("scope") == "patch-merge" for row in rows)
     assert not any(row.get("scope") == "other" for row in rows)
 
 
@@ -1772,8 +1773,8 @@ def test_terminal_cost_table_wraps_scope_and_model_to_terminal_width(monkeypatch
     assert "out_tok" in rendered
     assert "total_cost" not in rendered
     assert "  - patch" in rendered
-    assert "│     _merg" in rendered
-    assert "poser" in rendered
+    assert "│     merge_" in rendered
+    assert "propos" in rendered
 
 
 def test_terminal_merge_table_wraps_headers_and_status_to_terminal_width(monkeypatch):

@@ -410,8 +410,8 @@ class RLMGepaAdapter:
             event_id=event_id,
             operation_id=operation_id,
             attempt_id=f"attempt_{attempt_idx:04d}",
-            main_role="patch_merge_proposer",
-            sub_role="patch_merge_proposer_sub_lm",
+            main_role="merge_proposer",
+            sub_role="merge_proposer_sub_lm",
             trace=trace,
         )
         payload = {
