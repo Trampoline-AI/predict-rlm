@@ -652,12 +652,13 @@ facts already present on the RLM. Define a single `build_rlm(...)` helper that
 constructs the PredictRLM with the real DSPy signature, skills, and tools. Use
 `agent_spec_from_rlm(build_rlm(seed_instructions), ...)` so GEPA derives
 `target_signature` and `tool_signatures` from that object. Omit `agent_type` by
-default; include it only when a short product or optimization anchor adds context
-not already present in the signature, tools, or output schema. The interview
-should supply only the extra GEPA brief: transfer use cases, runtime-grounding
-examples, scoring signal, and anti-overfitting boundary. If any of those are
-weakly specified, add a `TODO` in `config.py` and keep `optimize --check`
-available so the user can catch missing setup before spending model calls.
+default; set it only for a short product or optimization anchor that adds
+non-duplicative framing beyond the signature, tools, or output schema. The
+interview should supply only the extra GEPA brief: transfer use cases,
+runtime-grounding examples, scoring signal, and anti-overfitting boundary. If
+any of those are weakly specified, add a `TODO` in `config.py` and keep
+`optimize --check` available so the user can catch missing setup before spending
+model calls.
 
 Suggested files when needed:
 
@@ -672,9 +673,9 @@ gepa/
 
 Optimization can reuse helpers from `bench/` when evals exist. If a `bench/`
 package is present, expose its seed/validation/held-out evaluation flow as an
-`eval` subcommand on the same `uv run rlm-gepa ...` surface. Do not create a
-held-out eval command just because GEPA is present: GEPA needs training and
-validation examples plus feedback; a separate benchmark/eval suite is optional.
+`eval` subcommand on the same GEPA CLI surface. Do not create a held-out eval
+command just because GEPA is present: GEPA needs training and validation
+examples plus feedback; a separate benchmark/eval suite is optional.
 
 ---
 
