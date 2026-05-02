@@ -9,8 +9,10 @@ import random
 from pathlib import Path
 from types import SimpleNamespace
 
+import dspy
 import pytest
 
+import rlm_gepa.cli as cli_module
 from rlm_gepa import (
     AgentSpec,
     OptimizeConfig,
@@ -71,6 +73,20 @@ def _spec() -> AgentSpec:
     )
 
 
+def _spec_without_agent_type() -> AgentSpec:
+    return AgentSpec(
+        use_cases=["case a", "case b"],
+        runtime_grounding_examples={
+            "tools": ["tool()"],
+            "env": ["sandbox timeout"],
+            "spec": ["protocol behavior"],
+        },
+        tool_signatures="tool() -> str",
+        target_signature="input: str -> output: str",
+        scoring_description="score is exact match",
+    )
+
+
 class _Project(RLMGepaProject):
     project_name = "test-project"
     components = ("skill_instructions",)
@@ -97,6 +113,45 @@ def test_build_signatures_render_agent_spec():
     assert "test agent" in proposer.instructions
     assert "{{" not in proposer.instructions
     assert "paired_disagreement_traces_file" in merge.input_fields
+
+
+def test_agent_spec_agent_type_is_optional():
+    proposer = build_proposer_signature(_spec_without_agent_type())
+    merge = build_merge_signature(_spec_without_agent_type())
+
+    assert "target RLM" in proposer.instructions
+    assert "target RLM" in merge.instructions
+    assert "for ." not in proposer.instructions
+    assert "{{" not in proposer.instructions
+
+
+def test_agent_spec_from_rlm_can_omit_agent_type():
+    class DemoSignature(dspy.Signature):
+        """Answer questions."""
+
+        question: str = dspy.InputField()
+        answer: str = dspy.OutputField()
+
+    def lookup(query: str) -> str:
+        """Look up a fact."""
+        return query
+
+    rlm = SimpleNamespace(signature=DemoSignature, tools=[lookup])
+
+    spec = agent_spec_from_rlm(
+        rlm,
+        use_cases=["case a", "case b"],
+        runtime_grounding_examples={
+            "tools": ["lookup(query)"],
+            "env": ["sandbox timeout"],
+            "spec": ["question answering"],
+        },
+        scoring_description="score is exact match",
+    )
+
+    assert spec.agent_type == ""
+    assert "DemoSignature" in spec.target_signature
+    assert "lookup" in spec.tool_signatures
 
 
 def test_patch_merge_signature_uses_base_and_patch_source_without_ancestor():
@@ -1550,6 +1605,18 @@ def test_project_cli_check_with_dummy_lms(capsys):
 
     assert status == 0
     assert "check ok" in capsys.readouterr().out
+
+
+def test_project_cli_accepts_stat_alias(monkeypatch, capsys, tmp_path: Path):
+    def render_stats(run_dir, table="all", output_format="terminal"):
+        return f"stats {Path(run_dir).name} {table} {output_format}"
+
+    monkeypatch.setattr(cli_module, "render_stats", render_stats)
+
+    status = run_project_cli(lambda: _Project(), OptimizeConfig(), argv=["stat", str(tmp_path)])
+
+    assert status == 0
+    assert f"stats {tmp_path.name} all terminal" in capsys.readouterr().out
 
 
 def test_public_api_exports_expected_helpers():

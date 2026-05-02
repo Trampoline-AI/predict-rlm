@@ -173,10 +173,11 @@ def render_template(template: str, spec: AgentSpec) -> str:
         f"  - {category}: {', '.join(surfaces)}"
         for category, surfaces in spec.runtime_grounding_examples.items()
     )
+    agent_type = spec.agent_type or "the target RLM"
     axis_name = spec.counterfactual_axis_name
     axis_singular = _AXIS_SINGULAR[axis_name]
     return (
-        template.replace("{{AGENT_TYPE}}", spec.agent_type)
+        template.replace("{{AGENT_TYPE}}", agent_type)
         .replace("{{USE_CASES_BULLETED}}", use_cases_bulleted)
         .replace("{{TOOL_SIGNATURES}}", spec.tool_signatures)
         .replace("{{TARGET_SIGNATURE}}", spec.target_signature)
@@ -243,10 +244,10 @@ _INFRA_TOOL_NAMES = frozenset({"predict", "SUBMIT", "print"})
 def agent_spec_from_rlm(
     rlm: dspy.Module,
     *,
-    agent_type: str,
     use_cases: list[str],
     runtime_grounding_examples: dict[str, list[str]],
     scoring_description: str,
+    agent_type: str = "",
     counterfactual_axis_name: str = "domains",
     domain_conventions_note: str = "",
     traces_file_mount: str = "/sandbox/input/traces_file/",

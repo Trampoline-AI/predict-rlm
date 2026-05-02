@@ -26,20 +26,19 @@ _PROJECT_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
 
 @dataclass
 class AgentSpec:
-    agent_type: str
     use_cases: list[str]
     runtime_grounding_examples: dict[str, list[str]]
     tool_signatures: str
     target_signature: str
     scoring_description: str
+    agent_type: str = ""
     counterfactual_axis_name: str = "domains"
     domain_conventions_note: str = ""
     traces_file_mount: str = "/sandbox/input/traces_file/"
     paired_traces_file_mount: str = "/sandbox/input/paired_traces_file/"
 
     def __post_init__(self) -> None:
-        if not self.agent_type.strip():
-            raise ValueError("AgentSpec.agent_type must be a non-empty string")
+        self.agent_type = self.agent_type.strip()
         if len(set(self.use_cases)) < 2:
             raise ValueError("AgentSpec.use_cases must list at least 2 distinct entries")
         if len(self.runtime_grounding_examples) < 3:
