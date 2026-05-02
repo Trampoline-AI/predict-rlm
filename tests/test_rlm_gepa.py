@@ -1330,12 +1330,84 @@ def test_merge_rows_report_accepted_child_full_val_against_both_parents(tmp_path
 
     rows = merge_rows(tmp_path)
 
-    assert rows[0]["val Δ"] == "1.000 +0.333 vs 1"
+    assert "pre" not in rows[0]
+    assert "n" not in rows[0]
+    assert "val Δ" not in rows[0]
+    assert rows[0]["score Δ"] == "1.000 → 2.000 +1.000"
+    assert rows[0]["_muted_prefix"] == {"score Δ": "1.000 → 2.000"}
     assert rows[0]["_detail"] == (
         "→ cand 3; full val "
         "vs 1: 0.667→1.000 +0.333, hard 2→3/3, flips +1/-0; "
         "vs 2: 0.667→1.000 +0.333, hard 2→3/3, flips +1/-0"
     )
+
+
+def test_merge_rows_do_not_use_normal_mutation_child_for_rejected_merge_val(tmp_path: Path):
+    state = {
+        "prog_candidate_val_subscores": [
+            {"a": 1.0, "b": 0.0, "c": 0.0},
+            {"a": 1.0, "b": 1.0, "c": 0.0},
+            {"a": 0.0, "b": 1.0, "c": 0.0},
+            {"a": 1.0, "b": 1.0, "c": 1.0},
+        ],
+        "full_program_trace": [
+            {
+                "i": 9,
+                "rlm_merge_candidate_pair": (1, 2),
+                "rlm_merge_ancestor": 0,
+                "rlm_merge_status": "subsample_rejected",
+                "rlm_merge_new_program_idx": None,
+                "new_program_idx": 3,
+                "rlm_merge_reject_reason": "not better than best parent",
+                "id1_subsample_scores": [1.0, 0.0],
+                "id2_subsample_scores": [0.0, 1.0],
+                "new_program_subsample_scores": [0.0, 1.0],
+            }
+        ],
+    }
+    with (tmp_path / "gepa_state.bin").open("wb") as f:
+        pickle.dump(state, f)
+
+    rows = merge_rows(tmp_path)
+
+    assert "val Δ" not in rows[0]
+    assert rows[0]["score Δ"] == "1.000 → 1.000 +0.000"
+    assert rows[0]["_muted_prefix"] == {"score Δ": "1.000 → 1.000"}
+    assert rows[0]["_detail"] == "not better than best parent"
+
+
+def test_merge_rows_use_explicit_merge_child_for_accepted_full_val(tmp_path: Path):
+    state = {
+        "prog_candidate_val_subscores": [
+            {"a": 0.0, "b": 1.0, "c": 0.0},
+            {"a": 1.0, "b": 1.0, "c": 0.0},
+            {"a": 0.0, "b": 1.0, "c": 1.0},
+            {"a": 0.0, "b": 0.0, "c": 0.0},
+            {"a": 1.0, "b": 1.0, "c": 1.0},
+        ],
+        "full_program_trace": [
+            {
+                "i": 10,
+                "rlm_merge_candidate_pair": (1, 2),
+                "rlm_merge_ancestor": 0,
+                "rlm_merge_status": "accepted",
+                "rlm_merge_new_program_idx": 4,
+                "new_program_idx": 3,
+                "id1_subsample_scores": [1.0, 0.0],
+                "id2_subsample_scores": [0.0, 1.0],
+                "new_program_subsample_scores": [1.0, 1.0],
+            }
+        ],
+    }
+    with (tmp_path / "gepa_state.bin").open("wb") as f:
+        pickle.dump(state, f)
+
+    rows = merge_rows(tmp_path)
+
+    assert "val Δ" not in rows[0]
+    assert rows[0]["score Δ"] == "1.000 → 2.000 +1.000"
+    assert rows[0]["_muted_prefix"] == {"score Δ": "1.000 → 2.000"}
+    assert rows[0]["_detail"].startswith("→ cand 4; full val vs 1:")
 
 
 def test_reporting_tables_from_artifacts(tmp_path: Path):
@@ -1430,11 +1502,9 @@ def test_reporting_tables_from_artifacts(tmp_path: Path):
         "iter": "1",
         "pair@anc": "0+1@0",
         "status": "subsample_rejected",
-        "pre": "3/2",
-        "n": "2",
-        "score Δ": "1.000 +0.000",
-        "val Δ": "-",
+        "score Δ": "1.000 → 1.000 +0.000",
         "_detail": "not better than best parent",
+        "_muted_prefix": {"score Δ": "1.000 → 1.000"},
     }
     candidates = candidate_rows(tmp_path)
     assert candidates[0]["cand [par]"] == "0 [seed]"
@@ -1485,6 +1555,7 @@ def test_reporting_tables_from_artifacts(tmp_path: Path):
     assert "\033[38;5;248m0.500 → 1.000\033[0m\033[1;38;5;220m +0.500" in terminal
     assert "\033[38;5;248m0.500 → 1.000\033[0m\033[1;38;5;220m +0.500; 1 → 2 /2" in terminal
     assert "\033[38;5;248m+1/-0\033[0m\033[1;38;5;220m +1" in terminal
+    assert "\033[38;5;248m1.000 → 1.000\033[0m +0.000" in terminal
     assert "\033[1;38;5;220m" in terminal
     assert "**1**" not in terminal
     assert "costs:" in terminal

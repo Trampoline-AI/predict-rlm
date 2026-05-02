@@ -184,16 +184,15 @@ def merge_rows(run_dir: str | Path) -> list[dict[str, Any]]:
         if not _is_merge_entry(entry):
             continue
         status = str(entry.get("rlm_merge_status") or ("accepted" if entry.get("merged") else "scored"))
+        score_change = _format_merge_score(entry)
         rows.append(
             {
                 "iter": str(entry.get("i", len(rows))),
                 "pair@anc": _format_merge_pair(entry),
                 "status": status,
-                "pre": _format_merge_preflight(entry),
-                "n": _format_merge_subsample(entry),
-                "score Δ": _format_merge_score(entry),
-                "val Δ": _format_merge_val_score(state, entry),
+                "score Δ": score_change,
                 "_detail": _format_merge_detail(state, entry, status),
+                "_muted_prefix": {"score Δ": _format_merge_score_prefix(score_change)},
             }
         )
     return rows
@@ -445,24 +444,6 @@ def _coerce_sequence(value: Any) -> list[Any] | None:
     return None
 
 
-def _format_merge_preflight(entry: dict[str, Any]) -> str:
-    a_wins = entry.get("rlm_merge_preflight_a_wins")
-    b_wins = entry.get("rlm_merge_preflight_b_wins")
-    if a_wins is None or b_wins is None:
-        return "-"
-    return f"{a_wins}/{b_wins}"
-
-
-def _format_merge_subsample(entry: dict[str, Any]) -> str:
-    ids = entry.get("rlm_merge_subsample_ids")
-    if isinstance(ids, list | tuple):
-        return str(len(ids))
-    scores = entry.get("new_program_subsample_scores")
-    if isinstance(scores, list | tuple | dict):
-        return str(len(scores))
-    return "-"
-
-
 def _format_merge_score(entry: dict[str, Any]) -> str:
     new_sum = entry.get("rlm_merge_new_sum")
     parent_sums = entry.get("rlm_merge_parent_sums")
@@ -478,30 +459,19 @@ def _format_merge_score(entry: dict[str, Any]) -> str:
     new_value = float(new_sum)
     best_parent = max(float(value) for value in parent_sums)
     delta = new_value - best_parent
-    return f"{new_value:.3f} {_format_delta(delta)}"
+    return f"{best_parent:.3f} → {new_value:.3f} {_format_delta(delta)}"
 
 
-def _format_merge_val_score(state: dict[str, Any], entry: dict[str, Any]) -> str:
-    child_idx = entry.get("new_program_idx")
-    parent_ids = _merge_parent_ids(entry)
-    subscores = state.get("prog_candidate_val_subscores") or []
-    if child_idx is None or not parent_ids or not _has_candidate_scores(subscores, child_idx):
-        return "-"
-    child_mean = _mean_scores(subscores[int(child_idx)])
-    parent_means = [
-        (parent_id, _mean_scores(subscores[parent_id]))
-        for parent_id in parent_ids
-        if _has_candidate_scores(subscores, parent_id)
-    ]
-    if not parent_means:
-        return "-"
-    best_parent_id, best_parent_mean = max(parent_means, key=lambda item: item[1])
-    return f"{child_mean:.3f} {_format_delta(child_mean - best_parent_mean)} vs {best_parent_id}"
+def _format_merge_score_prefix(score_change: str) -> str:
+    if score_change == "-" or " " not in score_change:
+        return ""
+    return score_change.rsplit(" ", 1)[0]
 
 
 def _format_merge_detail(state: dict[str, Any], entry: dict[str, Any], status: str) -> str:
-    if status == "accepted" and "new_program_idx" in entry:
-        details = [f"→ cand {entry['new_program_idx']}"]
+    child_idx = _merge_child_idx(entry)
+    if status == "accepted" and child_idx is not None:
+        details = [f"→ cand {child_idx}"]
         val_detail = _format_merge_val_detail(state, entry)
         if val_detail != "-":
             details.append(val_detail)
@@ -514,7 +484,7 @@ def _format_merge_detail(state: dict[str, Any], entry: dict[str, Any], status: s
 
 
 def _format_merge_val_detail(state: dict[str, Any], entry: dict[str, Any]) -> str:
-    child_idx = entry.get("new_program_idx")
+    child_idx = _merge_child_idx(entry)
     parent_ids = _merge_parent_ids(entry)
     subscores = state.get("prog_candidate_val_subscores") or []
     if child_idx is None or not parent_ids or not _has_candidate_scores(subscores, child_idx):
@@ -539,6 +509,14 @@ def _format_merge_val_detail(state: dict[str, Any], entry: dict[str, Any]) -> st
     if not parts:
         return "-"
     return "full val " + "; ".join(parts)
+
+
+def _merge_child_idx(entry: dict[str, Any]) -> Any:
+    if "rlm_merge_new_program_idx" in entry:
+        return entry.get("rlm_merge_new_program_idx")
+    if entry.get("rlm_merge_status") == "accepted":
+        return entry.get("new_program_idx")
+    return None
 
 
 def _merge_parent_ids(entry: dict[str, Any]) -> list[int]:
