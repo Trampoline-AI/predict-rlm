@@ -80,78 +80,31 @@ Every proposed rule must pass all structural tests:
 - It states a principle, not a literal trace token.
 - Any code example is short, abstract, and trace-agnostic.
 
-# Required Proposer Workflow
+# Workflow
 
-Before emitting `new_instructions`, follow this procedure:
-
-1. Load {{TRACES_FILE_MOUNT}} with structured JSON parsing. Do not rely on
-   broad regex over raw file text; regex is acceptable only inside parsed
-   fields such as `Feedback` or `Generated Outputs`.
-2. Parse scores and separate records into bottom failures, middle partials or
-   near-misses, top successes, and unscored or crashed records.
-3. Inspect bottom records for corrective rules, top records for strategies
-   worth preserving, and middle records for directional rules that could push
-   near-misses over the threshold. Also check whether top traces solved tasks
-   by ignoring or contradicting a current rule; success despite violating a
-   rule is evidence that the rule may be harmful or over-broad.
-4. Build compact evidence packets for representative records: task cue, score,
-   observed behavior, expected behavior or feedback mismatch, failure mode, and
-   any current-instruction rule implicated.
-5. Use one or more `predict()` calls after compact evidence packets when
-   packets may share latent causes. If evidence separates into independent
-   clusters, call `predict()` for those clusters concurrently with
-   `asyncio.gather(...)` rather than forcing one serial mega-call. Synthesize
-   cross-cutting failure modes, root causes, and candidate rule changes, not
-   full instruction rewrites.
-6. Compare proposed changes against `current_instructions`; explicitly decide
-   which rules are kept, modified, added, or removed. After making these
-   decisions, use one or more `predict()` calls to draft concrete edits from a
-   structured brief containing root causes and edit decisions plus only the
-   relevant current-instruction sections. Use multiple edit-drafting calls when
-   independent sections or rule families can be drafted separately, and run
-   independent calls concurrently with `asyncio.gather(...)`. The outer proposer
-   may splice, consolidate, and audit the result, but must not draft the
-   substantive wording from scratch unless the edit-drafting call fails. Do not
-   use `predict()` as an unconstrained whole-instruction rewriter.
-7. Splice edits into the current instruction structure. Emit the full revised
-   instructions, not a diff. Preserve useful behavior unless trace evidence
-   shows a rule is harmful. Treat about 10K characters as a soft budget, not a
-   hard cap; if the revised instructions would exceed about 10-11K characters,
-   consolidate redundant rules and drop low-evidence additions before appending
-   more.
-8. Emit `generalization_check` audit lines for every material rule decision,
-   including kept, modified, new, and removed rules, especially removals and
-   default inversions.
-
-# Contradictory Seed Axioms and Default Inversions
-
-Actively search for current-instruction rules that are contradicted by repeated
-trace evidence. If a seed rule causes a repeated failure pattern, do not only
-add narrow exceptions around it. You may remove the rule or invert the default
-policy when the evidence supports that change.
-
-A `[REMOVED]` or `[MODIFIED]` default inversion is appropriate only when:
-- multiple bottom or middle traces fail in the same way;
-- the failure can be tied to an existing rule, default, or decision boundary;
-- top traces do not show that the old rule must remain the broad default;
-- the replacement has a clear trigger and non-application boundary;
-- the edit preserves unrelated successful behavior.
-
-# Audit Requirements
-
-Emit one `generalization_check` audit line per material rule decision. Each line
-must start with one of `[KEPT]`, `[MODIFIED]`, `[NEW]`, or `[REMOVED]`.
-
-Every audit line should include: grounding, use case, principle,
-counterfactual_1, and counterfactual_2. The counterfactuals must span different
-{{COUNTERFACTUAL_AXIS_NAME}}.
-
-For `[REMOVED]` lines and `[MODIFIED]` default inversions, also include the old
-rule or default being changed, the repeated failure pattern that contradicted
-it, the replacement behavior, and the preservation or non-application boundary.
-
-Keep audit labels and task IDs inside `generalization_check`; do not place them
-inside `new_instructions`.
+1. Load {{TRACES_FILE_MOUNT}} with JSON parsing and work from parsed records.
+   Use regex only as a local extractor inside parsed string fields when helpful,
+   not as the primary way to scan the raw trace file.
+2. Bucket scored records into bottom failures, middle partials/near-misses, and
+   top successes before choosing edits. Keep unscored/crashed records separate
+   from score-ranked evidence.
+3. Inspect bottom records for concrete failures, top records for strategies to
+   preserve, and middle records for near-miss patterns. For large or diverse
+   trace sets, use divide-and-conquer: run separate `predict()` calls with
+   `asyncio.gather(...)` over focused trace subsets to extract non-lossy,
+   evidence-grounded patterns tied to record ids/scores. Helper `predict()`
+   calls may extract and reason about trace evidence; you choose the final
+   rules or edits and emit the final full instructions.
+4. Only add or modify rules grounded in trace evidence plus available tools,
+   target signature, runtime behavior, or scoring contract.
+5. Keep the edit surgical: identify kept, modified, added, and removed rules. If
+   evidence shows an existing rule/default is causing the repeated failure,
+   modify or replace that local text instead of appending a conflicting
+   exception, and state the trigger and non-application boundary in the audit.
+6. Emit one `generalization_check` audit line per material rule change. Each line
+   starts with `[KEPT|MODIFIED|NEW|REMOVED]` and includes: grounding, use case,
+   principle, counterfactual_1, and counterfactual_2. The counterfactuals must
+   span different {{COUNTERFACTUAL_AXIS_NAME}}.
 """
 
 
