@@ -18,6 +18,7 @@ from rlm_gepa import (
     OptimizeConfig,
     RLMGepaProject,
     agent_spec_from_rlm,
+    build_merge_signature,
     build_proposer_for_rlm,
     check_optimization,
     run_optimization,
@@ -2379,33 +2380,15 @@ def test_patch_merge_adapter_uses_patch_signature_and_persists_metadata(
                 base_parent_id=10,
                 patch_summary="imported one clause",
                 selected_capability={
-                    "name": "validated tool usage",
+                    "decision": "grafted",
+                    "summary": "validate inputs before invoking tools",
                     "evidence_task_ids": ["train-a"],
-                    "trigger": "inputs require tool use",
-                    "action": "validate inputs before invoking the tool",
-                    "non_application_boundary": "do not apply to unrelated formatting tasks",
-                    "preservation_note": "preserves base wins by only applying to tool-use rows",
-                    "verification_signal": "tool call follows validated inputs",
                 },
-                behavioral_rules=[
-                    {
-                        "behavioral_rule": "Use the tool only after validating inputs.",
-                        "evidence_task_ids": ["train-a"],
-                        "reason": "source wins train-a",
-                    }
-                ],
-                patch_merge_audit={
-                    "helper_purpose_or_call_reference": "support-filter helper",
+                patch_audit={
                     "supported_source_win_ids": ["train-a"],
-                    "unsupported_source_win_ids": [],
-                    "base_win_hazards": [],
-                    "both_success_invariants": [],
-                    "base_duplicate_check": "base lacks this validated-input facet",
-                    "guardrail_conflicts": [],
-                    "verification_signal": "tool call follows validated inputs",
-                    "outer_proposer_narrowed_or_overrode_helper": "kept one bounded rule",
+                    "guardrail_hazards": [],
+                    "notes": "base lacks this validated-input facet",
                 },
-                rejected_from_other=["Do not copy unrelated formatting advice."],
                 new_instructions="base plus patch",
                 trace=None,
                 trajectory=[],
@@ -2444,7 +2427,7 @@ def test_patch_merge_adapter_uses_patch_signature_and_persists_metadata(
 
     assert new_text == "base plus patch"
     assert metadata["patch_summary"] == "imported one clause"
-    assert metadata["selected_capability"]["name"] == "validated tool usage"
+    assert metadata["selected_capability"]["decision"] == "grafted"
     assert metadata["base_instruction_chars"] == len("base")
     assert metadata["new_instruction_chars"] == len("base plus patch")
     assert metadata["instruction_char_delta"] == len("base plus patch") - len("base")
@@ -2456,12 +2439,17 @@ def test_patch_merge_adapter_uses_patch_signature_and_persists_metadata(
         "paired_disagreement_traces_file",
     }
     assert "selected_capability" in captured["signature"].output_fields
-    assert "behavioral_rules" in captured["signature"].output_fields
+    assert "patch_audit" in captured["signature"].output_fields
+    assert "behavioral_rules" not in captured["signature"].output_fields
+    assert "patch_merge_audit" not in captured["signature"].output_fields
+    assert "rejected_from_other" not in captured["signature"].output_fields
     assert "imported_from_other" not in captured["signature"].output_fields
     assert "common_ancestor_instructions" not in captured["inputs"]
     assert captured["inputs"]["base_parent_id"] == 10
     assert captured["inputs"]["patch_source_parent_id"] == 11
-    artifacts = list((tmp_path / "proposer_traces").glob("*_patch_from_cand_10_using_cand_11.json"))
+    artifacts = list(
+        (tmp_path / "proposer_traces").glob("*_patch_from_cand_10_using_cand_11.json")
+    )
     assert len(artifacts) == 1
     payload = json.loads(artifacts[0].read_text())
     assert payload["kind"] == "patch_merge_proposer"
@@ -2472,7 +2460,116 @@ def test_patch_merge_adapter_uses_patch_signature_and_persists_metadata(
         base_instructions="base",
         new_instructions="base plus patch",
     )
-    assert patch_output["behavioral_rules"][0]["evidence_task_ids"] == ["train-a"]
+    assert patch_output["patch_audit"]["supported_source_win_ids"] == ["train-a"]
+    assert "behavioral_rules" not in patch_output
+    assert "patch_merge_audit" not in patch_output
+    assert "rejected_from_other" not in patch_output
+
+
+def test_rlm_patch_merge_no_op_patch_persists_compact_audit(
+    tmp_path: Path, monkeypatch
+):
+    import rlm_gepa.proposer.rlm as proposer_module
+    import rlm_gepa.runtime.adapter as adapter_module
+
+    base_instructions = "base rules"
+
+    class FakePredictRLM:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        async def acall(self, **_kwargs):
+            return SimpleNamespace(
+                base_parent_id=10,
+                patch_summary="left base unchanged because the source capability duplicates base",
+                selected_capability={
+                    "decision": "no-op",
+                    "summary": "source behavior duplicates the base",
+                    "evidence_task_ids": [],
+                },
+                patch_audit={
+                    "supported_source_win_ids": [],
+                    "guardrail_hazards": ["candidate duplicates the base rule"],
+                    "notes": "no-op: duplicate source behavior, no clean missing facet",
+                },
+                new_instructions=base_instructions,
+                trace=None,
+                trajectory=[],
+            )
+
+    monkeypatch.setattr(adapter_module, "PredictRLM", FakePredictRLM)
+    monkeypatch.setattr(adapter_module, "progress_write", lambda _message: None)
+    monkeypatch.setattr(proposer_module, "progress_write", lambda _message: None)
+    (tmp_path / "proposer_traces").mkdir()
+    paired_trace = tmp_path / "paired_patch.jsonl"
+    paired_trace.write_text("{}\n")
+    adapter = RLMGepaAdapter(
+        project=_Project(),
+        lm=_DummyLM(),
+        sub_lm=_DummyLM(),
+        max_iterations=1,
+        concurrency=1,
+        task_timeout=1,
+        output_dir=tmp_path,
+        run_id="run_test",
+        proposer_lm=_DummyLM(),
+        proposer_sub_lm=_DummyLM(),
+        proposer_max_iterations=1,
+    )
+
+    new_text, metadata = adapter._rlm_propose_patch_merge_texts(
+        call_idx=4,
+        attempt_idx=2,
+        base_parent_id=10,
+        patch_source_parent_id=11,
+        base_parent_instructions=base_instructions,
+        patch_source_parent_instructions="source rules",
+        paired_disagreement_traces_file=SimpleNamespace(path=str(paired_trace)),
+        trace_task_ids=["train-a"],
+    )
+
+    assert new_text == base_instructions
+    assert metadata["new_instructions"] == base_instructions
+    assert metadata["selected_capability"]["evidence_task_ids"] == []
+    assert metadata["instruction_char_delta"] == 0
+    assert metadata["patch_audit"]["supported_source_win_ids"] == []
+    assert "duplicate" in metadata["patch_audit"]["notes"]
+    artifacts = list(
+        (tmp_path / "proposer_traces").glob("*_patch_from_cand_10_using_cand_11.json")
+    )
+    assert len(artifacts) == 1
+    patch_output = json.loads(artifacts[0].read_text())["patch_output"]
+    _assert_valid_patch_output(
+        patch_output,
+        trace_task_ids=["train-a"],
+        base_instructions=base_instructions,
+        new_instructions=base_instructions,
+    )
+    assert patch_output["selected_capability"]["decision"] == "no-op"
+
+
+def test_patch_merge_prompt_contains_compact_grounding_invariants():
+    instructions = build_merge_signature(_spec()).instructions
+
+    assert "# Workflow" in instructions
+    assert "# Patch Contract" not in instructions
+    assert "one coherent missing capability family" in instructions
+    assert "necessary facets of the same behavior" in instructions
+    assert "do not import unrelated source-parent behaviors" in instructions
+    assert "return\n`new_instructions` unchanged" in instructions
+    assert "no task IDs, row labels, audit labels, or" in instructions
+    assert "provenance notes in `new_instructions`" in instructions
+    assert "base wins" in instructions
+    assert "both-success rows are preservation checks" in instructions
+    assert "Use available tools and `predict()` for focused evidence extraction" in instructions
+    assert "Helper `predict()` calls may extract evidence" in instructions
+    assert "you choose the final" in instructions
+    assert "outer proposer" not in instructions
+    assert "helper output" not in instructions
+    assert "support-filter" not in instructions
+    assert "trigger" not in instructions
+    assert "non-application" not in instructions
+    assert "verification" not in instructions
 
 
 def _assert_valid_patch_output(
@@ -2485,15 +2582,18 @@ def _assert_valid_patch_output(
     selected_capability = patch_output["selected_capability"]
     assert isinstance(selected_capability, dict)
     assert set(selected_capability) >= {
-        "name",
+        "decision",
+        "summary",
         "evidence_task_ids",
-        "trigger",
-        "action",
-        "non_application_boundary",
-        "preservation_note",
-        "verification_signal",
     }
     assert set(selected_capability["evidence_task_ids"]) <= set(trace_task_ids)
+    patch_audit = patch_output["patch_audit"]
+    assert isinstance(patch_audit, dict)
+    assert set(patch_audit) >= {
+        "supported_source_win_ids",
+        "guardrail_hazards",
+        "notes",
+    }
     assert patch_output["base_instruction_chars"] == len(base_instructions)
     assert patch_output["new_instruction_chars"] == len(new_instructions)
     assert patch_output["instruction_char_delta"] == len(new_instructions) - len(
