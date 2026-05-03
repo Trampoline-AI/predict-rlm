@@ -1,6 +1,11 @@
 ---
 name: rlm
-description: Plan and build an RLM (Recursive Language Model) with predict-rlm. Interactively defines inputs, outputs, skills, and architecture from a goal, then implements the code. Use when the user wants to create a new RLM or explore whether one is feasible.
+description: >
+  Plan and build an RLM (Recursive Language Model) with predict-rlm, or contribute
+  to predict-rlm/RLM-GEPA itself. Interactively defines inputs, outputs, skills,
+  and architecture from a goal, then implements the code. Use when the user wants
+  to create a new RLM, explore whether one is feasible, or modify RLM/RLM-GEPA
+  guidance and implementation.
 compatibility: Requires Python 3.11+, Deno, and the predict-rlm package (built on DSPy).
 metadata:
   author: Emile Riberdy
@@ -21,7 +26,70 @@ This skill has two phases:
    produce a plan
 2. **Build** — implement the plan as code files
 
-**First action**: Enter plan mode using the EnterPlanMode tool.
+**First action**: Check skill freshness if due, then enter plan mode using the
+EnterPlanMode tool, unless the user is contributing to predict-rlm/RLM-GEPA
+itself. For contribution work, use Contributor mode first.
+
+---
+
+# Skill freshness check
+
+When this skill is loaded in an environment with shell, filesystem, and network
+access, run a lightweight update check at most once per day. Keep the last-check
+marker under `${HERMES_HOME:-$HOME/.hermes}/skills/.rlm-skill-update-check.json`.
+Compare the installed `SKILL.md` against
+`https://raw.githubusercontent.com/Trampoline-AI/predict-rlm/main/.agents/skills/rlm/SKILL.md`
+using a content hash, ETag, or commit SHA.
+
+If a newer skill is available, tell the user the `/rlm` skill has updates and ask
+whether they want to update or reinstall it. Do not update automatically. Suggested
+commands are `hermes skills update` for Hermes-managed installs, or
+`npx skills add Trampoline-AI/predict-rlm` for direct Skills CLI installs.
+
+Skip the check silently when tools, network, or a writable marker path are not
+available.
+
+---
+
+# Contributor mode for predict-rlm / RLM-GEPA
+
+Use this mode when the user is modifying this repository's code, docs, examples,
+or installable skill guidance rather than asking you to build a new RLM package.
+Do not force the new-RLM scoping interview. First inspect the repo context, the
+requested change, and the relevant implementation/docs paths.
+
+Contributor rules:
+
+- PredictRLM is for callable, repeatable, deep-context workflows, not
+  open-ended interactive chat flows.
+- Keep large inputs as `File` references or metadata. Use focused `predict()`
+  calls, and keep LLM-facing Pydantic schemas lean with
+  `Field(description=...)`.
+- Validate at system boundaries. Prefer host-side tools for native libraries,
+  auth, network APIs, filesystem-heavy work, and anything that cannot run
+  cleanly in Pyodide.
+- For RLM-GEPA, treat `AgentSpec`, evaluator feedback, and seed instructions as
+  the optimization direction. Keep runtime and budget knobs separate.
+- Derive `AgentSpec` signature/tool context from the constructed RLM with
+  `agent_spec_from_rlm(...)` where possible. Avoid duplicating broad prose or
+  exposing internal IDs unnecessarily.
+- Keep generic proposer behavior domain-neutral. Domain or benchmark specifics
+  belong in `AgentSpec`, seed/domain skills, runtime grounding examples, or
+  evaluator feedback.
+- Patch-merge/crossover should be evidence-backed behavioral grafting from train
+  disagreement traces, not broad synthesis, prompt concatenation, or source text
+  import.
+- Persist experimental optimizer behavior in config, CLI options, or artifacts
+  rather than hidden env-only switches.
+- Creating GitHub PRs/issues or pushing public branches is external publishing;
+  do it only when explicitly requested.
+- When an investigation identifies a bug or problem likely attributable to the
+  `predict-rlm` package, ask the user whether they want it reported as a GitHub
+  issue as soon as that attribution is clear. Do not open the issue without that
+  explicit approval.
+- For verification, docs-only changes need markdown sanity or `git diff
+  --check`. Code changes need targeted tests, plus broader tests when touching
+  shared interfaces, sandbox execution, optimizer behavior, or examples.
 
 ---
 
