@@ -4,12 +4,20 @@ import asyncio
 import json
 from collections.abc import Mapping, Sequence
 from contextlib import contextmanager
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
 from gepa import EvaluationBatch
 
 from predict_rlm import PredictRLM
+from predict_rlm.telemetry import (
+    TelemetryContext,
+    make_trace_id,
+)
+from predict_rlm.telemetry import (
+    candidate_hash as compute_candidate_hash,
+)
 from predict_rlm.trace import extract_trace_from_exc
 
 from ..proposer.rlm import (
@@ -55,6 +63,7 @@ class RLMGepaAdapter:
         verbose_rlm: bool = False,
         display_progress_bar: bool = False,
         valset_size: int | None = None,
+        telemetry_context: TelemetryContext | None = None,
     ):
         self.project = project
         self.lm = lm
@@ -77,6 +86,7 @@ class RLMGepaAdapter:
         self.heartbeat_interval_seconds = heartbeat_interval_seconds
         self.display_progress_bar = display_progress_bar
         self.valset_size = valset_size
+        self.telemetry_context = telemetry_context
         self._last_minibatch_signature: tuple[str, ...] | None = None
         self._progress_label_override: str | None = None
         self._reflective_progress: dict[str, int] | None = None
@@ -147,6 +157,14 @@ class RLMGepaAdapter:
         self._eval_counts[eval_kind] = eval_idx + 1
         event_id = f"{self.run_id}_eval_{eval_kind}_attempt_{eval_idx:04d}"
         operation_id = f"eval_{eval_kind}_{eval_idx:04d}"
+        attempt_id = f"attempt_{eval_idx:04d}"
+        cand_hash = compute_candidate_hash(candidate)
+        eval_telemetry_context = self._eval_telemetry_context(
+            candidate_hash=cand_hash,
+            eval_kind=eval_kind,
+            eval_idx=eval_idx,
+            attempt_id=attempt_id,
+        )
 
         context = EvaluationContext(
             lm=self.lm,
@@ -156,18 +174,29 @@ class RLMGepaAdapter:
             output_dir=self.output_dir,
             kind=eval_kind,
             verbose_rlm=self.verbose_rlm,
+            concurrency=self.concurrency,
+            telemetry_context=eval_telemetry_context,
         )
 
         semaphore = asyncio.Semaphore(self.concurrency)
 
         async def run_one(index: int, example: Any) -> tuple[int, RLMGepaExampleResult]:
+            example_context = replace(
+                context,
+                telemetry_context=self._example_telemetry_context(
+                    eval_telemetry_context,
+                    example=example,
+                    index=index,
+                ),
+            )
             async with semaphore:
                 try:
                     result = await asyncio.wait_for(
-                        self.project.evaluate_example(candidate, example, context),
+                        self.project.evaluate_example(candidate, example, example_context),
                         timeout=self.task_timeout,
                     )
                 except asyncio.TimeoutError:
+                    self._write_outer_timeout_event(example_context, example, index)
                     return index, RLMGepaExampleResult(
                         score=0.0,
                         feedback=f"evaluation timeout at {self.task_timeout}s",
@@ -246,6 +275,7 @@ class RLMGepaAdapter:
                     "operation_id": operation_id,
                     "example_id": example_id,
                     "candidate_id": None,
+                    "candidate_hash": cand_hash,
                     "kind": eval_kind,
                     "status": "error" if result.error else "completed",
                     "score": result.score,
@@ -309,6 +339,81 @@ class RLMGepaAdapter:
             leave=False,
             unit="task",
         )
+
+    def _eval_telemetry_context(
+        self,
+        *,
+        candidate_hash: str,
+        eval_kind: str,
+        eval_idx: int,
+        attempt_id: str,
+    ) -> TelemetryContext | None:
+        if self.telemetry_context is None:
+            return None
+        return replace(
+            self.telemetry_context,
+            trace_id=make_trace_id(self.run_id, candidate_hash, eval_kind, eval_idx),
+            run_id=self.run_id,
+            eval_kind=eval_kind,
+            eval_idx=eval_idx,
+            attempt_id=attempt_id,
+            candidate_hash=candidate_hash,
+        )
+
+    def _example_telemetry_context(
+        self,
+        telemetry_context: TelemetryContext | None,
+        *,
+        example: Any,
+        index: int,
+    ) -> TelemetryContext | None:
+        if telemetry_context is None:
+            return None
+        example_id = _example_id(example) or str(index)
+        return replace(
+            telemetry_context,
+            trace_id=make_trace_id(
+                self.run_id,
+                telemetry_context.candidate_hash,
+                telemetry_context.eval_kind,
+                telemetry_context.eval_idx,
+                example_id,
+            ),
+            parent_span_id=f"eval_{telemetry_context.eval_kind}_{telemetry_context.eval_idx}",
+            example_id=example_id,
+        )
+
+    def _write_outer_timeout_event(
+        self,
+        context: EvaluationContext,
+        example: Any,
+        index: int,
+    ) -> None:
+        telemetry_context = context.telemetry_context
+        if telemetry_context is None or self.project.project_name != "spreadsheet-rlm":
+            return
+        try:
+            telemetry_context.write_span(
+                "spreadbench.case.timeout",
+                event_domain="spreadbench",
+                status={
+                    "code": "ERROR",
+                    "message": f"outer task timeout at {self.task_timeout}s",
+                },
+                attributes={
+                    "rlm.phase": context.kind,
+                    "rlm.configured_timeout_sec": self.task_timeout,
+                    "rlm.concurrency": self.concurrency,
+                    "spreadbench.case_idx": index,
+                    "spreadbench.example_id": telemetry_context.example_id
+                    or _example_id(example)
+                    or str(index),
+                    "failure.class": "outer_task_timeout",
+                    "failure.evidence": "provisional",
+                },
+            )
+        except Exception:
+            return
 
     def make_reflective_dataset(
         self,

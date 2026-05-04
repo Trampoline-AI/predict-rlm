@@ -13,8 +13,10 @@ import dspy
 import pytest
 
 import rlm_gepa.cli as cli_module
+from predict_rlm.telemetry import JsonlTelemetrySink, TelemetryContext
 from rlm_gepa import (
     AgentSpec,
+    EvaluationContext,
     OptimizeConfig,
     RLMGepaProject,
     agent_spec_from_rlm,
@@ -2291,6 +2293,75 @@ def test_adapter_propagates_verbose_rlm_to_every_example(tmp_path: Path):
     assert project.verbose_values == [True, True]
 
 
+class _TelemetryProject(_Project):
+    def __init__(self):
+        self.contexts: list[EvaluationContext] = []
+
+    async def evaluate_example(self, candidate, example, context):
+        self.contexts.append(context)
+        context.telemetry_context.write_span(
+            "test.case",
+            event_domain="test",
+            attributes={"example": example},
+        )
+        return RLMGepaExampleResult(
+            score=1.0,
+            feedback="",
+            traces=[{"status": "ok"}],
+            example_id=str(example),
+        )
+
+
+def test_adapter_threads_telemetry_context_and_persists_candidate_hash(tmp_path: Path):
+    project = _TelemetryProject()
+    telemetry_context = TelemetryContext(
+        sink=JsonlTelemetrySink(tmp_path / "telemetry" / "events.jsonl"),
+        trace_id="run_test",
+        run_id="run_test",
+    )
+    adapter = RLMGepaAdapter(
+        project=project,
+        lm=_DummyLM(),
+        sub_lm=_DummyLM(),
+        max_iterations=1,
+        concurrency=2,
+        task_timeout=1,
+        output_dir=tmp_path,
+        run_id="run_test",
+        telemetry_context=telemetry_context,
+    )
+
+    adapter.evaluate(
+        [SimpleNamespace(task_id="example")],
+        {"skill_instructions": "seed"},
+        capture_traces=False,
+    )
+
+    context = project.contexts[0].telemetry_context
+    assert context.run_id == "run_test"
+    assert context.eval_kind == "valset"
+    assert context.eval_idx == 0
+    assert context.attempt_id == "attempt_0000"
+    assert context.example_id == "example"
+    assert context.candidate_id is None
+    assert context.candidate_hash.startswith("cand_sha256_")
+    events = [
+        json.loads(line)
+        for line in (tmp_path / "telemetry" / "events.jsonl").read_text().splitlines()
+    ]
+    assert events[0]["attributes"]["rlm.candidate_hash"] == context.candidate_hash
+    trace_rows = [
+        json.loads(line)
+        for line in (
+            tmp_path / "task_traces" / "run_test_eval_valset_attempt_0000_valset.jsonl"
+        )
+        .read_text()
+        .splitlines()
+    ]
+    assert trace_rows[0]["candidate_id"] is None
+    assert trace_rows[0]["candidate_hash"] == context.candidate_hash
+
+
 def test_adapter_enforces_per_example_timeout(tmp_path: Path):
     adapter = RLMGepaAdapter(
         project=_TimeoutProject(),
@@ -2347,6 +2418,7 @@ def test_resume_uses_unique_event_namespace_for_write_once_artifacts(tmp_path: P
     run_dir = tmp_path / "run"
     config = OptimizeConfig(run_dir=run_dir)
     _run_dir, first_run_id = prepare_run_dir(_Project(), config, command="first")
+    assert (run_dir / "telemetry").is_dir()
     (run_dir / "gepa_state.bin").write_bytes(b"checkpoint")
     old_trace = run_dir / "task_traces" / f"{first_run_id}_eval_valset_attempt_0000_valset.jsonl"
     old_trace.write_text("existing\n")

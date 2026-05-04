@@ -8,6 +8,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from predict_rlm.telemetry import JsonlTelemetrySink, NoopTelemetrySink, TelemetryContext
+
 from .reporting.cost import aggregate_costs_from_log, append_cost_rows
 from .runtime.adapter import RLMGepaAdapter
 from .runtime.lm_config import build_lm, validate_lm_env
@@ -29,6 +31,17 @@ def run_optimization(
 ) -> OptimizeReport:
     validation = validate_project(project)
     run_dir, run_id = prepare_run_dir(project, config, command=command)
+    telemetry_sink = (
+        JsonlTelemetrySink(run_dir / "telemetry" / "events.jsonl")
+        if config.telemetry_enabled
+        else NoopTelemetrySink()
+    )
+    telemetry_context = TelemetryContext(
+        sink=telemetry_sink,
+        trace_id=run_id,
+        run_id=run_id,
+        telemetry_level=config.telemetry_level,
+    )
 
     lm = build_lm(
         config.executor_lm,
@@ -89,6 +102,7 @@ def run_optimization(
         verbose_rlm=config.verbose_rlm,
         display_progress_bar=config.display_progress_bar,
         valset_size=len(validation.valset),
+        telemetry_context=telemetry_context,
     )
 
     t0 = time.time()
@@ -159,6 +173,7 @@ def prepare_run_dir(
         state_path = run_dir / "gepa_state.bin"
         if not state_path.exists():
             raise ValueError(f"--resume requires existing checkpoint: {state_path}")
+        (run_dir / "telemetry").mkdir(parents=True, exist_ok=True)
         metadata = json.loads(metadata_path.read_text()) if metadata_path.exists() else {}
         base_run_id = str(metadata.get("run_id") or f"run_{uuid.uuid4().hex[:8]}")
         run_id = f"{base_run_id}_resume_{uuid.uuid4().hex[:8]}"
@@ -167,6 +182,7 @@ def prepare_run_dir(
     run_dir.mkdir(parents=True, exist_ok=False)
     (run_dir / "task_traces").mkdir()
     (run_dir / "proposer_traces").mkdir()
+    (run_dir / "telemetry").mkdir()
     run_id = f"run_{uuid.uuid4().hex[:8]}"
     metadata = {
         "schema_version": 1,

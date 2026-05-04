@@ -9,6 +9,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from predict_rlm.telemetry import TelemetryContext
 from predict_rlm.trace import RunTrace
 
 SCHEMA_VERSION = 1
@@ -151,6 +152,8 @@ class OptimizeConfig:
     cache: bool = False
     verbose_rlm: bool = False
     display_progress_bar: bool = True
+    telemetry_enabled: bool = True
+    telemetry_level: str = "minimal"
     run_dir: Path | None = None
     resume: bool = False
     extra: dict[str, Any] = field(default_factory=dict)
@@ -225,6 +228,8 @@ class EvaluationContext:
     output_dir: Path
     kind: str
     verbose_rlm: bool = False
+    concurrency: int | None = None
+    telemetry_context: TelemetryContext | None = None
 
 
 @dataclass
