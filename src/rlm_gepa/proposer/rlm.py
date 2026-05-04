@@ -33,7 +33,9 @@ use cases:
 
 You are producing a surgical edit of `current_instructions`, not a rewrite.
 Preserve the existing structure unless trace evidence shows a rule is actively
-wrong. Add rules inline near the relevant existing section. Emit the full revised
+wrong. Prefer replacing, narrowing, or compressing nearby text over appending
+new parallel guidance. Net instruction growth is a cost: add words only when
+they remove ambiguity that caused repeated failures. Emit the full revised
 instructions in `new_instructions`, not a diff.
 
 # Tools Available To The Agent
@@ -95,15 +97,21 @@ Every proposed rule must pass all structural tests:
    evidence-grounded patterns tied to record ids/scores. Helper `predict()`
    calls may extract and reason about trace evidence; you choose the final
    rules or edits and emit the final full instructions.
+   Before changing a rule, name the solved behavior that the edit must leave
+   unchanged.
 4. Only add or modify rules grounded in trace evidence plus available tools,
    target signature, runtime behavior, or scoring contract.
 5. Keep the edit surgical: identify kept, modified, added, and removed rules. If
    evidence shows an existing rule/default is causing the repeated failure,
    modify or replace that local text instead of appending a conflicting
-   exception, and state the trigger and non-application boundary in the audit.
-6. Emit one `generalization_check` audit line per material rule change. Each line
-   starts with `[KEPT|MODIFIED|NEW|REMOVED]` and includes: grounding, use case,
-   principle, counterfactual_1, and counterfactual_2. The counterfactuals must
+   exception. If adding a rule, delete or compress any now-redundant nearby
+   wording. State the trigger, non-application boundary, and preserved solved
+   behavior in the audit.
+6. Emit one `generalization_check` audit line per material rule change.
+   Fewer, higher-confidence material changes are preferred. Each line starts with
+   `[KEPT|MODIFIED|NEW|REMOVED]` and includes: grounding, use case, principle,
+   preserved_behavior, counterfactual_1, and counterfactual_2. The
+   counterfactuals must
    span different {{COUNTERFACTUAL_AXIS_NAME}}.
 """
 
@@ -232,12 +240,15 @@ class ImproveInstructionsGeneric(dspy.Signature):
     component_focus: str = dspy.InputField(desc="Optional per-component focus text")
     traces_file: File = dspy.InputField(desc="JSON file containing rendered task traces")
     new_instructions: str = dspy.OutputField(
-        desc="Full revised skill instructions text. Do not include audit labels or task IDs."
+        desc=(
+            "Full revised skill instructions text; prefer compact replacement or "
+            "compression over appending. Do not include audit labels or task IDs."
+        )
     )
     generalization_check: list[str] = dspy.OutputField(
         desc=(
             "Audit lines for kept/modified/new/removed rules, including evidence "
-            "and boundaries for removals/default inversions."
+            "and boundaries for removals/default inversions, plus preserved solved behavior."
         )
     )
 

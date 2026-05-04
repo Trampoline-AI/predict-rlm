@@ -20,11 +20,13 @@ from rlm_gepa import (
     agent_spec_from_rlm,
     build_merge_signature,
     build_proposer_for_rlm,
+    build_proposer_signature,
     check_optimization,
     run_optimization,
 )
 from rlm_gepa.cli import apply_optimize_args, run_project_cli
 from rlm_gepa.proposer.merge import VALID_STATUSES, RlmMergeProposer
+from rlm_gepa.proposer.rlm import ImproveInstructionsGeneric
 from rlm_gepa.proposer.selection import (
     PatchMergePair,
     pick_patch_merge_pair,
@@ -2570,6 +2572,34 @@ def test_patch_merge_prompt_contains_compact_grounding_invariants():
     assert "trigger" not in instructions
     assert "non-application" not in instructions
     assert "verification" not in instructions
+
+
+def test_generic_proposer_prompt_contains_surgical_compression_invariants():
+    instructions = build_proposer_signature(_spec()).instructions
+
+    assert "Prefer replacing, narrowing, or compressing" in instructions
+    assert "Net instruction growth is a cost" in instructions
+    assert "Before changing a rule, name the solved behavior" in instructions
+    assert "Fewer, higher-confidence material changes are preferred" in instructions
+    assert "preserved_behavior" in instructions
+    assert "Helper `predict()`" in instructions
+    assert "you choose the final" in instructions
+    assert "outer proposer" not in instructions
+    assert "helper output" not in instructions
+    assert "support-filter" not in instructions
+    assert "one coherent missing capability family" not in instructions
+    assert "patch-source" not in instructions
+
+
+def test_generic_proposer_output_fields_describe_compact_edits_and_preservation():
+    output_fields = ImproveInstructionsGeneric.output_fields
+
+    new_desc = output_fields["new_instructions"].json_schema_extra["desc"]
+    check_desc = output_fields["generalization_check"].json_schema_extra["desc"]
+
+    assert "compact replacement or compression over appending" in new_desc
+    assert "Do not include audit labels or task IDs" in new_desc
+    assert "preserved solved behavior" in check_desc
 
 
 def _assert_valid_patch_output(
