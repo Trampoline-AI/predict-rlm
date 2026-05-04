@@ -147,7 +147,7 @@ def iteration_rows(run_dir: str | Path) -> list[dict[str, Any]]:
                 "soft: par → child": soft_change,
                 "hard: par → child": hard_change,
                 "flips": flips,
-                "p": f"{_mcnemar_exact_p(gains, losses):.2f}",
+                "p": f"{_one_sided_sign_test_p(gains, losses):.2f}",
                 "outcome": f"→ cand {entry['new_program_idx']}" if "new_program_idx" in entry else "REJECTED",
                 "_highlight": entry.get("new_program_idx") == best_idx,
                 "_muted_prefix": {
@@ -1601,12 +1601,19 @@ def _format_flips(gains: int, losses: int) -> tuple[str, str]:
     return f"{primary} {secondary}", f" {secondary}"
 
 
+def _one_sided_sign_test_p(gains: int, losses: int) -> float:
+    total = gains + losses
+    if total == 0:
+        return 1.0
+    return sum(math.comb(total, i) for i in range(gains, total + 1)) * (0.5**total)
+
+
 def _mcnemar_exact_p(gains: int, losses: int) -> float:
     total = gains + losses
     if total == 0:
         return 1.0
     smaller = min(gains, losses)
-    cdf = sum(math.comb(total, i) for i in range(smaller + 1)) * (0.5 ** total)
+    cdf = sum(math.comb(total, i) for i in range(smaller + 1)) * (0.5**total)
     return min(1.0, 2 * cdf)
 
 

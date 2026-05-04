@@ -1578,7 +1578,7 @@ def test_reporting_tables_from_artifacts(tmp_path: Path):
     assert rows[0]["soft: par → child"] == "0.500 → 1.000 +0.500"
     assert rows[0]["hard: par → child"] == "0.500 → 1.000 +0.500; 1 → 2"
     assert rows[0]["flips"] == "+1/-0 +1"
-    assert rows[0]["p"] == "1.00"
+    assert rows[0]["p"] == "0.50"
     assert rows[0]["iter"] == "0 [0]"
     assert rows[0]["_highlight"] is True
     iteration_terminal = render_table(rows)
