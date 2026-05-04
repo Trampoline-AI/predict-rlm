@@ -10,7 +10,7 @@ import litellm
 _LITELLM_LOGGER_NAMES = ("LiteLLM", "LiteLLM Router", "LiteLLM Proxy")
 _MERCURY_MODELS = {"mercury-2", "mercury-edit-2"}
 _INCEPTION_API_BASE = "https://api.inceptionlabs.ai/v1"
-_MERCURY_MAX_TOKENS = 32768
+_MERCURY_MAX_TOKENS = 50000
 
 
 def configure_litellm_logging() -> None:
