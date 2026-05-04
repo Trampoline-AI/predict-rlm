@@ -1414,6 +1414,34 @@ class TestExecuteIteration:
 class TestPredictRLMTelemetry:
     """Focused generated-code telemetry tests without real LM calls."""
 
+    def test_interpreter_construction_receives_current_telemetry_context(self):
+        sink = ListTelemetrySink()
+        telemetry_context = TelemetryContext(sink=sink, trace_id="trace_case_interpreter")
+        rlm = PredictRLM(
+            ImageAnalysisSignature,
+            sub_lm=MagicMock(),
+            telemetry_context=telemetry_context,
+        )
+        created_kwargs = {}
+
+        class FakeJspiInterpreter:
+            def __init__(self, **kwargs):
+                created_kwargs.update(kwargs)
+
+            def shutdown(self):
+                created_kwargs["shutdown_called"] = True
+
+        with patch("predict_rlm.predict_rlm.JspiInterpreter", FakeJspiInterpreter):
+            rlm._begin_telemetry_execution()
+            try:
+                with rlm._interpreter_context(execution_tools={}) as repl:
+                    assert isinstance(repl, FakeJspiInterpreter)
+            finally:
+                rlm._clear_telemetry_execution()
+
+        assert created_kwargs["telemetry_context"] is telemetry_context
+        assert created_kwargs["shutdown_called"] is True
+
     def test_generated_code_event_uses_safe_payload(self):
         sink = ListTelemetrySink()
         telemetry_context = TelemetryContext(sink=sink, trace_id="trace_case_1")

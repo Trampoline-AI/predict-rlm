@@ -1256,6 +1256,7 @@ class PredictRLM(dspy.RLM):
                 debug=self._debug,
                 extra_read_paths=extra_read or None,
                 extra_write_paths=extra_write,
+                telemetry_context=self._current_telemetry_context,
             )
             try:
                 yield repl
