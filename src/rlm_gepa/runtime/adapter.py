@@ -13,6 +13,7 @@ from gepa import EvaluationBatch
 from predict_rlm import PredictRLM
 from predict_rlm.telemetry import (
     TelemetryContext,
+    classify_failure,
     make_trace_id,
 )
 from predict_rlm.telemetry import (
@@ -259,6 +260,12 @@ class RLMGepaAdapter:
         with trace_path.open("x", encoding="utf-8") as f:
             for index, result in enumerate(results):
                 example_id = result.example_id or str(index)
+                row_telemetry_context = self._example_telemetry_context(
+                    eval_telemetry_context,
+                    example=batch[index],
+                    index=index,
+                )
+                trace_events = _events_for_trace(row_telemetry_context)
                 outputs.append({"example_id": example_id, "score": result.score})
                 scores.append(float(result.score))
                 if result.objective_scores is not None:
@@ -269,7 +276,7 @@ class RLMGepaAdapter:
                 record = reflective_record(result)
                 if trajectories is not None:
                     trajectories.append({"example_id": example_id, "task_id": example_id, "record": record})
-                row = {
+                row: dict[str, Any] = {
                     "schema_version": 1,
                     "event_id": event_id,
                     "operation_id": operation_id,
@@ -285,6 +292,13 @@ class RLMGepaAdapter:
                     "traces": [trace_to_json(trace) for trace in result.traces],
                     "error": result.error,
                 }
+                row.update(
+                    _row_failure_metadata(
+                        row,
+                        trace_events,
+                        telemetry_context=row_telemetry_context,
+                    )
+                )
                 f.write(json.dumps(row, default=str) + "\n")
 
         self._write_eval_cost(
@@ -643,6 +657,86 @@ def reflective_record(result: RLMGepaExampleResult) -> dict[str, str]:
 def _example_id(example: Any) -> str | None:
     value = getattr(example, "task_id", None) or getattr(example, "example_id", None)
     return str(value) if value is not None else None
+
+
+def _events_for_trace(
+    telemetry_context: TelemetryContext | None,
+) -> list[dict[str, Any]]:
+    if telemetry_context is None:
+        return []
+    sink_path = getattr(telemetry_context.sink, "path", None)
+    if sink_path is None:
+        return []
+    path = Path(sink_path)
+    if not path.is_file():
+        return []
+    events: list[dict[str, Any]] = []
+    try:
+        for line in path.read_text(encoding="utf-8").splitlines():
+            if not line.strip():
+                continue
+            event = json.loads(line)
+            if event.get("trace_id") == telemetry_context.trace_id:
+                events.append(event)
+    except Exception:
+        return []
+    return events
+
+
+def _row_failure_metadata(
+    row: dict[str, Any],
+    events: list[dict[str, Any]],
+    *,
+    telemetry_context: TelemetryContext | None,
+) -> dict[str, Any]:
+    metadata: dict[str, Any] = {}
+    if float(row.get("score") or 0.0) == 0.0:
+        metadata["failure_class"] = classify_failure(row, events)
+        metadata["failure_reason"] = _failure_reason(row, events)
+    ref = _telemetry_ref(telemetry_context)
+    if ref is not None:
+        metadata["telemetry_ref"] = ref
+    if row.get("candidate_id") is None and telemetry_context is not None:
+        metadata["candidate_hash"] = telemetry_context.candidate_hash
+    return metadata
+
+
+def _telemetry_ref(telemetry_context: TelemetryContext | None) -> dict[str, Any] | None:
+    if telemetry_context is None:
+        return None
+    ref: dict[str, Any] = {"trace_id": telemetry_context.trace_id}
+    if telemetry_context.candidate_hash is not None:
+        ref["candidate_hash"] = telemetry_context.candidate_hash
+    sink_path = getattr(telemetry_context.sink, "path", None)
+    if sink_path is not None:
+        parts = Path(sink_path).parts
+        if "telemetry" in parts:
+            idx = parts.index("telemetry")
+            ref["events_path"] = str(Path(*parts[idx:]))
+    return ref
+
+
+def _failure_reason(row: dict[str, Any], events: list[dict[str, Any]]) -> str | None:
+    for event in events:
+        attrs = event.get("attributes") if isinstance(event.get("attributes"), dict) else {}
+        for key in ("failure.reason", "failure.evidence"):
+            value = attrs.get(key)
+            if value:
+                return _compact_reason(value)
+        status = event.get("status") if isinstance(event.get("status"), dict) else {}
+        if status.get("message"):
+            return _compact_reason(status["message"])
+    for key in ("error", "feedback"):
+        if row.get(key):
+            return _compact_reason(row[key])
+    return None
+
+
+def _compact_reason(value: Any, *, limit: int = 240) -> str:
+    text = " ".join(str(value).split())
+    if len(text) <= limit:
+        return text
+    return text[: limit - 3] + "..."
 
 
 def _batch_signature(batch: Sequence[Any]) -> tuple[str, ...]:

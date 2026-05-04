@@ -51,6 +51,11 @@ def _add_project_args(parser: argparse.ArgumentParser) -> None:
         default=[],
         help="model substring to leave unpatched when --codex-lm is enabled; repeatable",
     )
+    parser.add_argument(
+        "--telemetry-redact-paths",
+        action="store_true",
+        help="reserved for future path redaction controls; Phase 0 avoids workbook paths",
+    )
 
 
 def _apply_project_args(config: OptimizeConfig, args: Any) -> SpreadsheetGepaConfig:
@@ -65,4 +70,6 @@ def _apply_project_args(config: OptimizeConfig, args: Any) -> SpreadsheetGepaCon
         config.val_limit = args.val_limit
     if args.cases_per_task is not None:
         config.cases_per_task = args.cases_per_task
+    if args.telemetry_redact_paths:
+        config.extra["telemetry_redact_paths"] = True
     return config

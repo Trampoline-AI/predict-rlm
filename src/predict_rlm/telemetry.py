@@ -7,6 +7,7 @@ import json
 import re
 import secrets
 import time
+from contextvars import ContextVar, Token
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal, Protocol
@@ -60,6 +61,10 @@ _ENV_SECRET_RE = re.compile(
 )
 _VALUE_SECRET_RE = re.compile(r"(?i)^(sk-|xox[baprs]-|gh[pousr]_|bearer\s+)")
 _REDACTED = "[REDACTED]"
+_current_context: ContextVar["TelemetryContext | None"] = ContextVar(
+    "predict_rlm_telemetry_context",
+    default=None,
+)
 
 
 class TelemetrySink(Protocol):
@@ -140,6 +145,26 @@ class TelemetryContext:
         )
         self.sink.write(record)
         return record
+
+
+def current_telemetry_context() -> TelemetryContext | None:
+    """Return telemetry context for host tools that cannot receive it directly."""
+
+    return _current_context.get()
+
+
+def set_current_telemetry_context(
+    telemetry_context: TelemetryContext | None,
+) -> Token[TelemetryContext | None]:
+    """Set the current telemetry context and return a reset token."""
+
+    return _current_context.set(telemetry_context)
+
+
+def reset_current_telemetry_context(token: Token[TelemetryContext | None]) -> None:
+    """Reset the current telemetry context from a token."""
+
+    _current_context.reset(token)
 
 
 def make_trace_id(*parts: Any) -> str:

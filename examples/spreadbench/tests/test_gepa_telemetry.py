@@ -114,3 +114,35 @@ def test_spreadsheet_project_writes_case_start_and_end_telemetry(
     assert attrs["rlm.configured_timeout_sec"] == 5
     assert attrs["rlm.concurrency"] == 7
     assert attrs["spreadbench.score"] == 1.0
+
+
+def test_best_effort_recalculate_preserves_telemetry_when_exception_is_swallowed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    def fake_recalculate(_path: str, *, telemetry_context: TelemetryContext | None = None):
+        assert telemetry_context is not None
+        telemetry_context.write_span(
+            "host_tool.recalculate",
+            event_domain="host_tool",
+            status={"code": "ERROR", "message": "synthetic recalc failure"},
+            attributes={"failure.class": "evaluator_exception"},
+        )
+        raise RuntimeError("synthetic recalc failure")
+
+    monkeypatch.setattr(project_module, "recalculate", fake_recalculate)
+    telemetry_context = TelemetryContext(
+        sink=JsonlTelemetrySink(tmp_path / "telemetry" / "events.jsonl"),
+        trace_id="trace-recalc-swallowed",
+        run_id="run_test",
+    )
+
+    project_module._best_effort_recalculate(tmp_path / "output.xlsx", telemetry_context)
+
+    events = [
+        json.loads(line)
+        for line in (tmp_path / "telemetry" / "events.jsonl").read_text().splitlines()
+    ]
+    assert events[0]["name"] == "host_tool.recalculate"
+    assert events[0]["status"]["code"] == "ERROR"
+    assert events[0]["attributes"]["failure.class"] == "evaluator_exception"

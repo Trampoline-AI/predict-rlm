@@ -202,7 +202,7 @@ class SpreadsheetGepaProject(RLMGepaProject):
                 extract_trace_from_exc(exc),
             )
 
-        await asyncio.to_thread(_best_effort_recalculate, output_path)
+        await asyncio.to_thread(_best_effort_recalculate, output_path, telemetry_context)
         if answer_path is None:
             score = 0.0
             _write_case_end(
@@ -283,10 +283,29 @@ def split_train_val(
     return train, val
 
 
-def _best_effort_recalculate(path: Path) -> None:
+def _best_effort_recalculate(
+    path: Path,
+    telemetry_context: TelemetryContext | None = None,
+) -> None:
     try:
-        recalculate(str(path))
-    except Exception:
+        recalculate(str(path), telemetry_context=telemetry_context)
+    except Exception as exc:
+        if telemetry_context is not None:
+            try:
+                telemetry_context.write_span(
+                    "host_tool.recalculate",
+                    event_domain="host_tool",
+                    status={
+                        "code": "ERROR",
+                        "message": f"evaluator recalc {type(exc).__name__}: {exc}",
+                    },
+                    attributes={
+                        "failure.class": "evaluator_exception",
+                        "failure.reason": "evaluator-side recalc exception",
+                    },
+                )
+            except Exception:
+                pass
         return
 
 

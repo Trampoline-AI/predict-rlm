@@ -45,6 +45,9 @@ import time
 from pathlib import Path
 
 import pytest
+from openpyxl import Workbook
+
+from predict_rlm.telemetry import JsonlTelemetrySink, TelemetryContext
 
 _TESTS_DIR = Path(__file__).resolve().parent
 _EXAMPLE_DIR = _TESTS_DIR.parent
@@ -113,3 +116,31 @@ def test_recalculate_does_not_hang_on_full_column_refs(tmp_path: Path):
         f"land on baseline or libreoffice, got source={source!r}"
     )
     assert any("timed out after" in err for err in payload["errors"]), payload
+
+
+def test_recalculate_writes_host_tool_telemetry_for_no_formula_workbook(tmp_path: Path):
+    src = tmp_path / "plain.xlsx"
+    wb = Workbook()
+    wb.active["A1"] = "plain"
+    wb.save(src)
+    wb.close()
+    telemetry_context = TelemetryContext(
+        sink=JsonlTelemetrySink(tmp_path / "telemetry" / "events.jsonl"),
+        trace_id="trace-recalc",
+        run_id="run-test",
+    )
+
+    from spreadsheet_rlm.tools.recalculate import recalculate
+
+    result = recalculate(src, telemetry_context=telemetry_context)
+
+    assert result.source == "baseline"
+    events = [
+        json.loads(line)
+        for line in (tmp_path / "telemetry" / "events.jsonl").read_text().splitlines()
+    ]
+    assert events[0]["name"] == "host_tool.recalculate"
+    assert events[0]["event_domain"] == "host_tool"
+    attrs = events[0]["attributes"]
+    assert attrs["spreadbench.recalculate.branch"] == "no_formulas"
+    assert attrs["spreadbench.recalculate.total_formulas"] == 0

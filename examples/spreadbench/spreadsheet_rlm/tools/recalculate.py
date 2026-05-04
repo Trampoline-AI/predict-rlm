@@ -37,12 +37,15 @@ import re
 import shutil
 import subprocess
 import tempfile
+import time
 import warnings
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal
 
 import openpyxl
+
+from predict_rlm.telemetry import TelemetryContext, current_telemetry_context
 
 try:
     import formulas as _formulas_lib
@@ -126,7 +129,11 @@ class RecalcResult:
     errors: list[str] = field(default_factory=list)
 
 
-def recalculate(path: str | Path) -> RecalcResult:
+def recalculate(
+    path: str | Path,
+    *,
+    telemetry_context: TelemetryContext | None = None,
+) -> RecalcResult:
     """Recalculate formulas in *path*, writing the best candidate back in place.
 
     The pipeline snapshots the baseline workbook, runs the Python
@@ -141,31 +148,49 @@ def recalculate(path: str | Path) -> RecalcResult:
     and the formulas library flattens computed formulas to literal
     values.
     """
+    telemetry_context = telemetry_context or current_telemetry_context()
+    start_ns = time.time_ns()
     src = Path(path).resolve()
     if not src.is_file():
+        _write_recalc_span(
+            telemetry_context,
+            "host_tool.recalculate",
+            start_time_unix_nano=start_ns,
+            status={"code": "ERROR", "message": "workbook not found"},
+            attributes={"failure.class": "evaluator_limitation"},
+        )
         raise FileNotFoundError(f"workbook not found: {src}")
 
     targets = _formula_targets(src)
     total = len(targets)
 
     if total == 0:
-        return RecalcResult(
+        result = RecalcResult(
             source="baseline",
             resolved=0,
             total_formulas=0,
             baseline_resolved=0,
         )
+        _write_recalc_result_span(telemetry_context, start_ns, result, branch="no_formulas")
+        return result
 
     baseline_resolved = _count_resolved(src, targets)
     log.debug("baseline: %d/%d formula cells resolved", baseline_resolved, total)
 
     if baseline_resolved == total:
-        return RecalcResult(
+        result = RecalcResult(
             source="baseline",
             resolved=baseline_resolved,
             total_formulas=total,
             baseline_resolved=baseline_resolved,
         )
+        _write_recalc_result_span(
+            telemetry_context,
+            start_ns,
+            result,
+            branch="baseline_already_resolved",
+        )
+        return result
 
     errors: list[str] = []
     candidates: dict[Source, tuple[Path, int]] = {}
@@ -181,7 +206,7 @@ def recalculate(path: str | Path) -> RecalcResult:
 
         formulas_out = tmp / "formulas.xlsx"
         try:
-            _recalc_with_formulas(src, formulas_out)
+            _recalc_with_formulas(src, formulas_out, telemetry_context=telemetry_context)
             formulas_resolved = _count_resolved(formulas_out, targets)
             candidates["formulas"] = (formulas_out, formulas_resolved)
             log.debug("formulas: %d/%d resolved", formulas_resolved, total)
@@ -194,7 +219,7 @@ def recalculate(path: str | Path) -> RecalcResult:
         # running formulas first.
         if formulas_resolved == total:
             _replace(candidates["formulas"][0], src)
-            return RecalcResult(
+            result = RecalcResult(
                 source="formulas",
                 resolved=formulas_resolved,
                 total_formulas=total,
@@ -203,10 +228,12 @@ def recalculate(path: str | Path) -> RecalcResult:
                 libreoffice_resolved=None,
                 errors=errors,
             )
+            _write_recalc_result_span(telemetry_context, start_ns, result, branch="formulas")
+            return result
 
         lo_out = tmp / "libreoffice.xlsx"
         try:
-            _recalc_with_libreoffice(src, lo_out)
+            _recalc_with_libreoffice(src, lo_out, telemetry_context=telemetry_context)
             libreoffice_resolved = _count_resolved(lo_out, targets)
             candidates["libreoffice"] = (lo_out, libreoffice_resolved)
             log.debug("libreoffice: %d/%d resolved", libreoffice_resolved, total)
@@ -219,7 +246,7 @@ def recalculate(path: str | Path) -> RecalcResult:
         if winner != "baseline":
             _replace(winner_path, src)
 
-    return RecalcResult(
+    result = RecalcResult(
         source=winner,
         resolved=winner_count,
         total_formulas=total,
@@ -228,6 +255,8 @@ def recalculate(path: str | Path) -> RecalcResult:
         libreoffice_resolved=libreoffice_resolved,
         errors=errors,
     )
+    _write_recalc_result_span(telemetry_context, start_ns, result, branch=winner)
+    return result
 
 
 def _formula_targets(path: Path) -> list[tuple[str, str]]:
@@ -283,11 +312,23 @@ def _run_formulas_worker(src: str, dst: str, send_conn: Any) -> None:
         send_conn.close()
 
 
-def _recalc_with_formulas(src: Path, dst: Path) -> None:
+def _recalc_with_formulas(
+    src: Path,
+    dst: Path,
+    *,
+    telemetry_context: TelemetryContext | None = None,
+) -> None:
     """Run formulas in a child process with a hard timeout."""
     if _formulas_lib is None:
+        _write_recalc_span(
+            telemetry_context,
+            "host_tool.recalculate.formulas_worker",
+            status={"code": "ERROR", "message": "formulas library not installed"},
+            attributes={"failure.class": "evaluator_limitation"},
+        )
         raise RuntimeError("formulas library not installed")
 
+    start_ns = time.time_ns()
     context = mp.get_context("spawn")
     recv_conn, send_conn = context.Pipe(duplex=False)
     worker = context.Process(
@@ -295,16 +336,44 @@ def _recalc_with_formulas(src: Path, dst: Path) -> None:
         args=(str(src), str(dst), send_conn),
     )
     worker.start()
+    _write_recalc_span(
+        telemetry_context,
+        "host_tool.recalculate.formulas_worker.start",
+        start_time_unix_nano=start_ns,
+        end_time_unix_nano=start_ns,
+        attributes={
+            "process.pid": worker.pid,
+            "timeout.seconds": _FORMULAS_TIMEOUT_SECONDS,
+        },
+    )
     send_conn.close()
 
     worker.join(_FORMULAS_TIMEOUT_SECONDS)
     if worker.is_alive():
+        killed = False
         worker.terminate()
         worker.join(_FORMULAS_TERMINATE_GRACE_SECONDS)
         if worker.is_alive():
             worker.kill()
+            killed = True
             worker.join()
         recv_conn.close()
+        _write_recalc_span(
+            telemetry_context,
+            "host_tool.recalculate.formulas_worker.timeout",
+            start_time_unix_nano=start_ns,
+            status={
+                "code": "ERROR",
+                "message": f"timed out after {_FORMULAS_TIMEOUT_SECONDS:.1f}s",
+            },
+            attributes={
+                "process.pid": worker.pid,
+                "process.exit_code": worker.exitcode,
+                "process.killed": killed,
+                "timeout.seconds": _FORMULAS_TIMEOUT_SECONDS,
+                "failure.class": "host_tool_timeout_or_leak",
+            },
+        )
         raise RuntimeError(f"timed out after {_FORMULAS_TIMEOUT_SECONDS:.1f}s")
 
     ok = False
@@ -314,9 +383,39 @@ def _recalc_with_formulas(src: Path, dst: Path) -> None:
     recv_conn.close()
 
     if not ok:
+        _write_recalc_span(
+            telemetry_context,
+            "host_tool.recalculate.formulas_worker",
+            start_time_unix_nano=start_ns,
+            status={"code": "ERROR", "message": message},
+            attributes={
+                "process.pid": worker.pid,
+                "process.exit_code": worker.exitcode,
+            },
+        )
         raise RuntimeError(message)
     if not dst.is_file():
+        _write_recalc_span(
+            telemetry_context,
+            "host_tool.recalculate.formulas_worker",
+            start_time_unix_nano=start_ns,
+            status={"code": "ERROR", "message": "worker produced no output workbook"},
+            attributes={
+                "process.pid": worker.pid,
+                "process.exit_code": worker.exitcode,
+                "failure.class": "evaluator_exception",
+            },
+        )
         raise RuntimeError("worker produced no output workbook")
+    _write_recalc_span(
+        telemetry_context,
+        "host_tool.recalculate.formulas_worker",
+        start_time_unix_nano=start_ns,
+        attributes={
+            "process.pid": worker.pid,
+            "process.exit_code": worker.exitcode,
+        },
+    )
 
 
 def _recalc_with_formulas_inprocess(src: Path, dst: Path) -> None:
@@ -360,10 +459,21 @@ def _recalc_with_formulas_inprocess(src: Path, dst: Path) -> None:
         wb.close()
 
 
-def _recalc_with_libreoffice(src: Path, dst: Path) -> None:
+def _recalc_with_libreoffice(
+    src: Path,
+    dst: Path,
+    *,
+    telemetry_context: TelemetryContext | None = None,
+) -> None:
     """Recalculate *src* via ``soffice --headless`` and write it to *dst*."""
     soffice = _find_libreoffice()
     if not soffice:
+        _write_recalc_span(
+            telemetry_context,
+            "host_tool.recalculate.libreoffice",
+            status={"code": "ERROR", "message": "LibreOffice not found"},
+            attributes={"failure.class": "evaluator_limitation"},
+        )
         raise RuntimeError("LibreOffice not found")
 
     original_names: list[str] = []
@@ -380,29 +490,92 @@ def _recalc_with_libreoffice(src: Path, dst: Path) -> None:
         profile.mkdir()
         outdir = tmp / "out"
         outdir.mkdir()
-        result = subprocess.run(
-            [
-                soffice,
-                "--headless",
-                "--calc",
-                "--convert-to",
-                "xlsx:Calc MS Excel 2007 XML",
-                "--outdir",
-                str(outdir),
-                f"-env:UserInstallation=file://{profile}",
-                str(src),
-            ],
-            capture_output=True,
-            text=True,
-            timeout=120,
+        cmd = [
+            soffice,
+            "--headless",
+            "--calc",
+            "--convert-to",
+            "xlsx:Calc MS Excel 2007 XML",
+            "--outdir",
+            str(outdir),
+            f"-env:UserInstallation=file://{profile}",
+            str(src),
+        ]
+        start_ns = time.time_ns()
+        _write_recalc_span(
+            telemetry_context,
+            "host_tool.recalculate.libreoffice.start",
+            start_time_unix_nano=start_ns,
+            end_time_unix_nano=start_ns,
+            attributes={
+                "process.executable": Path(soffice).name,
+                "timeout.seconds": 120,
+            },
         )
+        try:
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=120,
+            )
+        except subprocess.TimeoutExpired as exc:
+            _write_recalc_span(
+                telemetry_context,
+                "host_tool.recalculate.libreoffice.timeout",
+                start_time_unix_nano=start_ns,
+                status={"code": "ERROR", "message": "LibreOffice timed out"},
+                attributes={
+                    "process.executable": Path(soffice).name,
+                    "timeout.seconds": 120,
+                    "subprocess.stderr_tail_hash": _tail_hash(exc.stderr),
+                    "subprocess.stderr_tail_len": len(_tail(exc.stderr)),
+                    "failure.class": "host_tool_timeout_or_leak",
+                },
+            )
+            raise
         if result.returncode != 0:
             msg = result.stderr.strip() or result.stdout.strip() or "unknown error"
+            _write_recalc_span(
+                telemetry_context,
+                "host_tool.recalculate.libreoffice",
+                start_time_unix_nano=start_ns,
+                status={"code": "ERROR", "message": "LibreOffice failed"},
+                attributes={
+                    "process.executable": Path(soffice).name,
+                    "process.exit_code": result.returncode,
+                    "subprocess.stderr_tail_hash": _tail_hash(result.stderr),
+                    "subprocess.stderr_tail_len": len(_tail(result.stderr)),
+                    "failure.class": "evaluator_exception",
+                },
+            )
             raise RuntimeError(f"libreoffice failed: {msg}")
         produced = list(outdir.glob("*.xlsx"))
         if not produced:
+            _write_recalc_span(
+                telemetry_context,
+                "host_tool.recalculate.libreoffice",
+                start_time_unix_nano=start_ns,
+                status={"code": "ERROR", "message": "LibreOffice produced no xlsx output"},
+                attributes={
+                    "process.executable": Path(soffice).name,
+                    "process.exit_code": result.returncode,
+                    "failure.class": "evaluator_exception",
+                },
+            )
             raise RuntimeError("libreoffice produced no xlsx output")
         shutil.copy2(produced[0], dst)
+        _write_recalc_span(
+            telemetry_context,
+            "host_tool.recalculate.libreoffice",
+            start_time_unix_nano=start_ns,
+            attributes={
+                "process.executable": Path(soffice).name,
+                "process.exit_code": result.returncode,
+                "subprocess.stderr_tail_hash": _tail_hash(result.stderr),
+                "subprocess.stderr_tail_len": len(_tail(result.stderr)),
+            },
+        )
 
     if original_names:
         _restore_sheet_names(dst, original_names)
@@ -485,3 +658,68 @@ def _extract_scalar(value: Any) -> Any:
 def _replace(src: Path, dst: Path) -> None:
     """Overwrite *dst* with the contents of *src*, preserving metadata."""
     shutil.copy2(src, dst)
+
+
+def _write_recalc_result_span(
+    telemetry_context: TelemetryContext | None,
+    start_ns: int,
+    result: RecalcResult,
+    *,
+    branch: str,
+) -> None:
+    _write_recalc_span(
+        telemetry_context,
+        "host_tool.recalculate",
+        start_time_unix_nano=start_ns,
+        attributes={
+            "spreadbench.recalculate.branch": branch,
+            "spreadbench.recalculate.source": result.source,
+            "spreadbench.recalculate.total_formulas": result.total_formulas,
+            "spreadbench.recalculate.resolved": result.resolved,
+            "spreadbench.recalculate.baseline_resolved": result.baseline_resolved,
+            "spreadbench.recalculate.formulas_resolved": result.formulas_resolved,
+            "spreadbench.recalculate.libreoffice_resolved": result.libreoffice_resolved,
+            "spreadbench.recalculate.error_count": len(result.errors),
+        },
+    )
+
+
+def _write_recalc_span(
+    telemetry_context: TelemetryContext | None,
+    name: str,
+    *,
+    start_time_unix_nano: int | None = None,
+    end_time_unix_nano: int | None = None,
+    status: str | dict[str, Any] = "OK",
+    attributes: dict[str, Any] | None = None,
+) -> None:
+    if telemetry_context is None:
+        return
+    try:
+        telemetry_context.write_span(
+            name,
+            event_domain="host_tool",
+            start_time_unix_nano=start_time_unix_nano,
+            end_time_unix_nano=end_time_unix_nano,
+            status=status,
+            attributes=attributes,
+        )
+    except Exception:
+        return
+
+
+def _tail(value: str | bytes | None, limit: int = 512) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, bytes):
+        value = value.decode("utf-8", errors="replace")
+    return value[-limit:]
+
+
+def _tail_hash(value: str | bytes | None) -> str | None:
+    tail = _tail(value)
+    if not tail:
+        return None
+    import hashlib
+
+    return "sha256_" + hashlib.sha256(tail.encode("utf-8")).hexdigest()

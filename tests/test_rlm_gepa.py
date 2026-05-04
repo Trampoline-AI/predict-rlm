@@ -2360,6 +2360,61 @@ def test_adapter_threads_telemetry_context_and_persists_candidate_hash(tmp_path:
     ]
     assert trace_rows[0]["candidate_id"] is None
     assert trace_rows[0]["candidate_hash"] == context.candidate_hash
+    assert trace_rows[0]["telemetry_ref"]["trace_id"] == context.trace_id
+
+
+class _FailingTelemetryProject(_Project):
+    async def evaluate_example(self, candidate, example, context):
+        context.telemetry_context.write_span(
+            "host_tool.recalculate.timeout",
+            event_domain="host_tool",
+            status={"code": "ERROR", "message": "tool timed out"},
+            attributes={"failure.class": "host_tool_timeout_or_leak"},
+        )
+        return RLMGepaExampleResult(
+            score=0.0,
+            feedback="tool failed",
+            traces=[],
+            example_id=str(example),
+            error="tool timed out",
+        )
+
+
+def test_adapter_trace_rows_include_compact_failure_metadata(tmp_path: Path):
+    telemetry_context = TelemetryContext(
+        sink=JsonlTelemetrySink(tmp_path / "telemetry" / "events.jsonl"),
+        trace_id="run_test",
+        run_id="run_test",
+    )
+    adapter = RLMGepaAdapter(
+        project=_FailingTelemetryProject(),
+        lm=_DummyLM(),
+        sub_lm=_DummyLM(),
+        max_iterations=1,
+        concurrency=1,
+        task_timeout=1,
+        output_dir=tmp_path,
+        run_id="run_test",
+        telemetry_context=telemetry_context,
+    )
+
+    adapter.evaluate(["example"], {"skill_instructions": "seed"}, capture_traces=False)
+
+    trace_rows = [
+        json.loads(line)
+        for line in (
+            tmp_path / "task_traces" / "run_test_eval_valset_attempt_0000_valset.jsonl"
+        )
+        .read_text()
+        .splitlines()
+    ]
+    row = trace_rows[0]
+    assert row["candidate_id"] is None
+    assert row["candidate_hash"].startswith("cand_sha256_")
+    assert row["failure_class"] == "host_tool_timeout_or_leak"
+    assert row["failure_reason"] == "tool timed out"
+    assert row["telemetry_ref"]["events_path"] == "telemetry/events.jsonl"
+    assert row["telemetry_ref"]["trace_id"].endswith(":0")
 
 
 def test_adapter_enforces_per_example_timeout(tmp_path: Path):

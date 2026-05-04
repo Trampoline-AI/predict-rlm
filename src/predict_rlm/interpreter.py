@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
+import contextvars
 import functools
 import inspect
 import json
@@ -32,7 +33,12 @@ from dspy.primitives.code_interpreter import CodeInterpreterError, FinalOutput
 from dspy.primitives.python_interpreter import PythonInterpreter
 from pydantic import BaseModel
 
-from .telemetry import TelemetryContext, make_span_id
+from .telemetry import (
+    TelemetryContext,
+    make_span_id,
+    reset_current_telemetry_context,
+    set_current_telemetry_context,
+)
 
 if TYPE_CHECKING:
     from os import PathLike
@@ -1346,6 +1352,7 @@ class JspiInterpreter(PythonInterpreter):
             # recoverable error. Sandbox stays alive, RLM sees the
             # error and can rewrite its code to avoid the slow path.
             if asyncio.iscoroutinefunction(tool_fn):
+                token = set_current_telemetry_context(self._telemetry_context)
                 try:
                     result = await asyncio.wait_for(
                         tool_fn(*args, **kwargs),
@@ -1356,10 +1363,16 @@ class JspiInterpreter(PythonInterpreter):
                         f"tool {tool_name!r} timed out after "
                         f"{TOOL_CALL_TIMEOUT_SEC}s (per-call budget)"
                     ) from e
+                finally:
+                    reset_current_telemetry_context(token)
             else:
                 loop = asyncio.get_running_loop()
+                token = set_current_telemetry_context(self._telemetry_context)
+                ctx = contextvars.copy_context()
+                reset_current_telemetry_context(token)
                 future = loop.run_in_executor(
                     self._executor,
+                    ctx.run,
                     functools.partial(tool_fn, *args, **kwargs),
                 )
                 try:
