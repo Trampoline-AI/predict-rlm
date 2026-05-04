@@ -133,6 +133,7 @@ class SpreadsheetGepaProject(RLMGepaProject):
                 max_iterations=context.max_iterations,
                 verbose=context.verbose_rlm,
                 debug=False,
+                telemetry_context=telemetry_context,
             )
             result = await asyncio.wait_for(
                 predictor.acall(

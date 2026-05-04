@@ -28,7 +28,9 @@ class TokenUsage(BaseModel):
 
     input_tokens: int = Field(default=0, description="Total input/prompt tokens")
     output_tokens: int = Field(default=0, description="Total output/completion tokens")
-    cost: float = Field(default=0.0, description="Total billed cost in USD (excludes cache hits)")
+    cost: float = Field(
+        default=0.0, description="Total billed cost in USD (excludes cache hits)"
+    )
     cache_hits: int = Field(
         default=0, description="Number of LM calls served from DSPy's cache"
     )
@@ -141,6 +143,10 @@ class RunTrace(BaseModel):
     duration_ms: int = Field(description="Total wall-clock duration in milliseconds")
     usage: LMUsage = Field(
         default_factory=LMUsage, description="Token usage split by main and sub LM"
+    )
+    telemetry_ref: dict[str, Any] | None = Field(
+        default=None,
+        description="Compact telemetry reference for joining partial traces to events",
     )
     steps: list[IterationStep] = Field(
         default_factory=list, description="Per-iteration execution steps"
