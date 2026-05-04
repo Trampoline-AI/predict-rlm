@@ -1355,7 +1355,7 @@ def test_merge_rows_report_accepted_child_full_val_against_both_parents(tmp_path
     assert rows[0]["soft: best(par) -> merge"] == "0.500 → 1.000 +0.500"
     assert rows[0]["hard: best(par) -> merge"] == "0.500 → 1.000 +0.500; 1 → 2"
     assert rows[0]["flips"] == "+1/-0 +1"
-    assert rows[0]["p"] == "1.00"
+    assert rows[0]["p"] == "0.50"
     assert rows[0]["outcome"] == "accepted"
     assert rows[0]["_muted_prefix"] == {
         "soft: best(par) -> merge": "0.500 → 1.000",
@@ -1403,7 +1403,7 @@ def test_merge_rows_do_not_use_normal_mutation_child_for_rejected_merge_val(tmp_
     assert rows[0]["soft: best(par) -> merge"] == "0.500 → 0.500 +0.000"
     assert rows[0]["hard: best(par) -> merge"] == "0.500 → 0.500 +0.000; 1 → 1"
     assert rows[0]["flips"] == "+1/-1 +0"
-    assert rows[0]["p"] == "1.00"
+    assert rows[0]["p"] == "0.75"
     assert rows[0]["outcome"] == "rejected"
     assert rows[0]["_muted_prefix"] == {
         "soft: best(par) -> merge": "0.500 → 0.500",
@@ -1447,7 +1447,7 @@ def test_merge_rows_use_explicit_merge_child_for_accepted_full_val(tmp_path: Pat
     assert rows[0]["soft: best(par) -> merge"] == "0.500 → 1.000 +0.500"
     assert rows[0]["hard: best(par) -> merge"] == "0.500 → 1.000 +0.500; 1 → 2"
     assert rows[0]["flips"] == "+1/-0 +1"
-    assert rows[0]["p"] == "1.00"
+    assert rows[0]["p"] == "0.50"
     assert rows[0]["outcome"] == "accepted"
     assert rows[0]["_muted_prefix"] == {
         "soft: best(par) -> merge": "0.500 → 1.000",
@@ -1601,7 +1601,7 @@ def test_reporting_tables_from_artifacts(tmp_path: Path):
         "soft: best(par) -> merge": "0.500 → 0.500 +0.000",
         "hard: best(par) -> merge": "0.500 → 0.500 +0.000; 1 → 1",
         "flips": "+1/-1 +0",
-        "p": "1.00",
+        "p": "0.75",
         "outcome": "rejected",
         "_detail": "not better than best parent",
         "_muted_prefix": {

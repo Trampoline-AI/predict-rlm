@@ -223,7 +223,7 @@ def merge_rows(run_dir: str | Path) -> list[dict[str, Any]]:
             soft_change, soft_secondary = _format_soft_change(parent_scores, new_scores)
             hard_change, hard_secondary = _format_hard_change(parent_scores, new_scores, include_total=False)
             flips, flips_secondary = _format_flips(gains, losses)
-            p_value = f"{_mcnemar_exact_p(gains, losses):.2f}"
+            p_value = f"{_one_sided_sign_test_p(gains, losses):.2f}"
             hard_denominator = min(len(parent_scores), len(new_scores))
             muted_prefix = {
                 "soft: best(par) -> merge": soft_change.removesuffix(soft_secondary),
