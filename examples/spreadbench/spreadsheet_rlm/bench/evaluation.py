@@ -461,9 +461,13 @@ def _build_instruction(
 ) -> str:
     if instruction_type == "Sheet-Level Manipulation":
         pos_note = (
+            "This is a workbook editing task, not a question-answering task. "
+            "Do not answer with explanatory prose, VBA text, or source code in cells; "
+            "implement the requested final workbook state with Python/openpyxl. "
             f"Answer position: {answer_range} on sheet '{answer_sheet}'. "
-            "This is the maximum range of cells you may modify. "
-            "You only need to modify or fill in values within this range."
+            "This is the maximum range whose values or formatting/style changes may be scored. "
+            "For formatting/color tasks, preserve existing cell values unless the instruction "
+            "explicitly asks to change them."
         )
     else:
         pos_note = (
