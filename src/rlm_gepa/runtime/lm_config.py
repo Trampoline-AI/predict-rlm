@@ -10,6 +10,7 @@ import litellm
 _LITELLM_LOGGER_NAMES = ("LiteLLM", "LiteLLM Router", "LiteLLM Proxy")
 _MERCURY_MODELS = {"mercury-2", "mercury-edit-2"}
 _INCEPTION_API_BASE = "https://api.inceptionlabs.ai/v1"
+_MERCURY_MAX_TOKENS = 32768
 
 
 def configure_litellm_logging() -> None:
@@ -47,6 +48,7 @@ def get_lm_config(
     if _is_mercury_model(lm):
         config["api_base"] = _INCEPTION_API_BASE
         config["api_key"] = os.environ["INCEPTION_API_KEY"]
+        config["max_tokens"] = _MERCURY_MAX_TOKENS
 
     if reasoning_effort and reasoning_effort != "none":
         config["reasoning_effort"] = reasoning_effort

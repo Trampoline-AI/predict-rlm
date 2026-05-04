@@ -9,6 +9,7 @@ def test_mercury_reasoning_effort_uses_inception_directly(monkeypatch):
     assert config["api_base"] == "https://api.inceptionlabs.ai/v1"
     assert config["api_key"] == "inception-test-key"
     assert config["reasoning_effort"] == "low"
+    assert config["max_tokens"] == 32768
     assert config["allowed_openai_params"] == ["reasoning_effort"]
 
 
