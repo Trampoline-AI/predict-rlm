@@ -2309,6 +2309,29 @@ def test_adapter_enforces_per_example_timeout(tmp_path: Path):
     assert batch.trajectories[0]["record"]["Feedback"] == "evaluation timeout at 0.01s"
 
 
+def test_adapter_prints_big_warning_for_evaluation_errors(tmp_path: Path, monkeypatch):
+    import rlm_gepa.runtime.adapter as adapter_module
+
+    messages: list[str] = []
+    monkeypatch.setattr(adapter_module, "progress_write", messages.append)
+    adapter = RLMGepaAdapter(
+        project=_ErrorProject(),
+        lm=_DummyLM(),
+        sub_lm=_DummyLM(),
+        max_iterations=1,
+        concurrency=1,
+        task_timeout=1,
+        output_dir=tmp_path,
+        run_id="run_test",
+    )
+
+    adapter.evaluate(["example"], {"skill_instructions": "seed"})
+
+    assert messages == [
+        "⚠️  EVALUATION ERROR valset example: expected failure",
+    ]
+
+
 class _ErrorProject(_Project):
     async def evaluate_example(self, candidate, example, context):
         return RLMGepaExampleResult(
