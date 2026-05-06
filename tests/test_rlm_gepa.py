@@ -1546,6 +1546,40 @@ def test_merge_rows_use_explicit_merge_child_for_accepted_full_val(tmp_path: Pat
     assert rows[0]["_detail"].startswith("→ cand 4; full val vs 1:")
 
 
+def test_iteration_rows_include_attempts_without_child_scores(tmp_path: Path):
+    state = {
+        "full_program_trace": [
+            {"i": 0, "selected_program_candidate": 0, "subsample_scores": [1.0, 0.0]},
+            {"i": 1, "selected_program_candidate": 0, "subsample_scores": [1.0, 0.0]},
+            {
+                "i": 2,
+                "selected_program_candidate": 0,
+                "subsample_scores": [1.0, 0.0],
+                "new_subsample_scores": [0.0, 0.0],
+            },
+        ]
+    }
+    with (tmp_path / "gepa_state.bin").open("wb") as f:
+        pickle.dump(state, f)
+
+    rows = iteration_rows(tmp_path)
+
+    assert [row["iter"] for row in rows] == ["1 [0]", "2 [0]"]
+    assert rows[0] == {
+        "iter": "1 [0]",
+        "soft: par → child": "0.500 → -",
+        "hard: par → child": "0.500 → -; 1 → -",
+        "flips": "-",
+        "p": "-",
+        "outcome": "NO CHILD",
+        "_highlight": False,
+        "_muted_prefix": {},
+        "_iteration_hard_denominator": 2,
+        "_terminal_header_suffixes": {"hard: par → child": "/2"},
+    }
+    assert rows[1]["outcome"] == "REJECTED"
+
+
 def test_merge_rows_compact_outcomes_for_terminal_width(tmp_path: Path):
     state = {
         "full_program_trace": [
