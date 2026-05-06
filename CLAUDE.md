@@ -48,6 +48,10 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - Assume the reader has no prior context -- don't reference earlier commits or conversations
 - Include a Test Plan with checkable items
 
+### 10. Commit Scopes
+- Use Conventional Commits.
+- The scope in parentheses must be one of: `rlm-gepa`, `predict-rlm`, or `examples/[example-name]`.
+
 ## Core Principles
 
 - **Simplicity First**: Make every change as simple as possible. Impact minimal code.
