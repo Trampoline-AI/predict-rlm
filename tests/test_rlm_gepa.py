@@ -31,6 +31,7 @@ from rlm_gepa import (
     RLMGepaProject,
     agent_spec_from_rlm,
     build_merge_signature,
+    build_patch_merge_signature,
     build_proposer_for_rlm,
     build_proposer_signature,
     check_optimization,
@@ -42,6 +43,7 @@ from rlm_gepa.proposer.rlm import (
     ImproveInstructionsGeneric,
     PatchMergeInstructionsGeneric,
     RLMInstructionProposer,
+    SelectedCapability,
 )
 from rlm_gepa.proposer.selection import (
     PatchMergePair,
@@ -227,14 +229,14 @@ def test_agent_spec_from_rlm_can_omit_agent_type():
     assert "lookup" in spec.tool_signatures
 
 
-def test_proposer_signature_allows_multiple_async_predict_passes_for_concrete_edits():
+def test_proposer_signature_mentions_parallel_predict_analysis_for_concrete_edits():
     proposer = build_proposer_signature(_spec())
     instructions = " ".join(proposer.instructions.split())
 
-    assert "one or more `predict()` calls" in instructions
+    assert "predict()" in instructions
     assert "asyncio.gather" in instructions
-    assert "structured brief containing root causes and edit decisions" in instructions
-    assert "must not draft the substantive wording from scratch" in instructions
+    assert "concrete" in instructions
+    assert "new_instructions" in instructions
 
 
 def test_patch_merge_signature_uses_base_and_patch_source_without_ancestor():
@@ -252,17 +254,14 @@ def test_patch_merge_signature_uses_base_and_patch_source_without_ancestor():
 def test_patch_merge_signature_exposes_selected_capability_contract():
     patch = build_patch_merge_signature(_spec())
 
+    assert "patch_summary" in patch.output_fields
     assert "selected_capability" in patch.output_fields
-    assert "imported_from_other" in patch.output_fields
-    assert "rejected_from_other" in patch.output_fields
+    assert "patch_audit" in patch.output_fields
     assert "new_instructions" in patch.output_fields
     assert set(SelectedCapability.model_fields) == {
-        "name",
+        "decision",
+        "summary",
         "evidence_task_ids",
-        "trigger",
-        "action",
-        "non_application_boundary",
-        "preservation_note",
     }
 
 
