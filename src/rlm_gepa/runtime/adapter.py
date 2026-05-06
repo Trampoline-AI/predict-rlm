@@ -124,6 +124,15 @@ class RLMGepaAdapter:
     ) -> EvaluationBatch:
         return run_coro_sync(self._evaluate_async(batch, candidate, capture_traces, kind))
 
+    async def aevaluate(
+        self,
+        batch: list[Any],
+        candidate: dict[str, str],
+        capture_traces: bool = False,
+        kind: str | None = None,
+    ) -> EvaluationBatch:
+        return await self._evaluate_async(batch, candidate, capture_traces, kind)
+
     def set_reflective_progress_context(
         self,
         *,
