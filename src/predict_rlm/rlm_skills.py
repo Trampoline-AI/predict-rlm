@@ -9,12 +9,11 @@ particular class of problems. It combines:
 2. **Packages** — PyPI packages installed into the REPL sandbox so the RLM
    can ``import`` and use them in generated code.
 
-3. **Tools** — optional callable functions exposed to the RLM alongside the
-   built-in ``predict()`` / ``sub_lm_query()`` tools.
+3. **Tools** — optional host-side callable functions exposed to the RLM
+   alongside the built-in ``predict()`` helper.
 
-Skills are composable: pass one or many to a ``PredictRLM`` or ``VisionRLM``
-and the framework merges their instructions, packages, and tools
-automatically.
+Skills are composable: pass one or many to a ``PredictRLM`` and the framework
+merges their instructions, packages, modules, and tools automatically.
 
 Example — defining a skill::
 
@@ -24,11 +23,11 @@ Example — defining a skill::
         name="pdf-extraction",
         instructions=\"\"\"
         You are extracting structured data from PDF documents.
-        Use `pdfplumber` to open documents and iterate over pages.
-        Prefer table extraction (`page.extract_tables()`) over raw text
-        when the content is tabular.
+        Use PyMuPDF (`pymupdf`) to open documents and iterate over pages.
+        Render pages when layout matters, and extract text directly when the
+        content is simple.
         \"\"\",
-        packages=["pdfplumber"],
+        packages=["pymupdf"],
     )
 
 Example — skill with tools::
@@ -51,7 +50,7 @@ Example — using skills with an RLM::
     rlm = PredictRLM(
         "documents -> extracted_data: list[dict]",
         skills=[pdf_extraction, doc_skill],
-        sub_lm="anthropic/claude-sonnet-4-5-20250929",
+        sub_lm="openai/gpt-5.4-mini",
     )
     result = rlm(documents=doc_list)
 """

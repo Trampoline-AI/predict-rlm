@@ -340,6 +340,36 @@ seed candidate text. The seed candidate means the initial mutable component, suc
 as baseline skill instructions; it is separate from the random seed used for
 splits, sampling, or optimizer reproducibility.
 
+For benchmarks with official splits, preserve the benchmark's public semantics.
+Use the official train split for optimization data, carve GEPA validation from
+that train split when a candidate-selection set is needed, and reserve official
+dev/test/challenge splits for reporting only when the user asks for held-out
+benchmark evaluation. Do not let optimizer feedback leak from held-out splits
+into seed instructions or candidate selection.
+
+### Benchmark integration boundaries
+
+Keep benchmark evaluators and oracle-style answer checkers harness-side. The RLM
+may see environment-safe tools, docs, state APIs, or session controls, but it
+should not see evaluator feedback or hidden scoring APIs while solving an
+example. After the attempt, the harness can call the evaluator and pass score and
+feedback to GEPA as the learning signal.
+
+When benchmark packages conflict with predict-rlm, DSPy, Pyodide, or the main
+project environment, prefer an isolated host-side runner/tool behind a typed
+JSON boundary. Do not force incompatible benchmark dependencies into the RLM
+sandbox or main package environment.
+
+For eval and optimization CLIs, route task execution through the shared
+`rlm_gepa.runtime.adapter.RLMGepaAdapter` semantics rather than bespoke
+`asyncio.gather` loops. Project-local `bench/` code may own dataset selection,
+candidate loading, and `eval.json` summary shaping, but should reuse the adapter
+for concurrency, per-task timeouts, progress bars, verbose RLM log handling,
+`task_traces/*.jsonl`, and `cost_log.jsonl`. If the eval command is async, call
+`await adapter.aevaluate(...)`; if it is synchronous, call `adapter.evaluate(...)`.
+Write `eval.json` in the run directory so `rlm-gepa stats <run_dir>` works for
+held-out evals as well as optimize runs.
+
 ## Feasibility Checklist
 
 Before producing the final plan, verify:
@@ -440,7 +470,7 @@ projects. The grouped imports are the source of truth.
 
 Every generated RLM project should record which predict-rlm version and skill
 layout it targets. Use the current package version unless the user explicitly
-pins another one. For this repository version, that is `0.3.0`.
+pins another one. For this repository version, that is `0.4.1`.
 
 Agent-only project:
 
@@ -450,11 +480,11 @@ name = "my-rlm"
 version = "0.1.0"
 requires-python = ">=3.11"
 dependencies = [
-    "predict-rlm>=0.3.0,<0.4",
+    "predict-rlm>=0.4.1,<0.5",
 ]
 
 [tool.predict-rlm.generated]
-predict_rlm_version = "0.3.0"
+predict_rlm_version = "0.4.1"
 skill_version = "2.0"
 layout = "agent-tools-bench-gepa"
 features = ["agent"]
@@ -467,14 +497,14 @@ or eval-only project.
 
 ```toml
 dependencies = [
-    "predict-rlm[examples,gepa,gepa-viz]>=0.4.0,<0.5",
+    "predict-rlm[examples,gepa,gepa-viz]>=0.4.1,<0.5",
 ]
 
 [project.scripts]
 rlm-gepa = "my_rlm.gepa:main"
 
 [tool.predict-rlm.generated]
-predict_rlm_version = "0.4.0"
+predict_rlm_version = "0.4.1"
 skill_version = "2.0"
 layout = "agent-tools-bench-gepa"
 features = ["agent", "tools", "bench", "rlm-gepa"]
@@ -701,10 +731,16 @@ bench/
 ├── __init__.py
 ├── config.py      # Eval defaults and EvalConfig
 ├── dataset.py      # Load examples/fixtures into typed task objects
-├── evaluation.py   # Run the agent on examples and aggregate metrics
+├── evaluation.py   # Project-specific task execution/scoring contract
 ├── scoring.py      # Deterministic task-specific scoring
 └── cli.py          # Optional held-out eval subcommand/helpers
 ```
+
+For benchmark eval and optimize entrypoints, use the shared RLM-GEPA runtime
+adapter semantics in `src/rlm_gepa/runtime/adapter.py` unless the user explicitly
+asks for a one-off local harness. Put dataset loading, scoring, setup, and task
+cleanup behind the project contract; let the shared adapter own concurrency,
+timeouts, progress/tqdm display, trace capture, and report semantics.
 
 ## Optional gepa/ package — Optimization
 
