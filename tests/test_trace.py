@@ -8,6 +8,7 @@ import pytest
 
 from predict_rlm.trace import (
     IterationStep,
+    LMFinishMetadata,
     LMUsage,
     PredictCallDetail,
     PredictCallGroup,
@@ -20,6 +21,7 @@ from predict_rlm.trace import (
     drain_tool_calls,
     init_predict_call_collector,
     init_tool_call_collector,
+    lm_finish_since,
     ms_since,
     record_predict_call,
     record_tool_call,
@@ -112,11 +114,18 @@ class TestRunTrace:
                     output="",
                     untruncated_output="",
                     duration_ms=400,
+                    lm=LMFinishMetadata(finish_reason="length"),
                     predict_calls=[
                         PredictCallGroup(
                             signature="q -> a",
                             model="openai/gpt-4o",
-                            calls=[PredictCallDetail(duration_ms=200, usage=TokenUsage(input_tokens=30, output_tokens=10, cost=0.01))],
+                            calls=[
+                                PredictCallDetail(
+                                    duration_ms=200,
+                                    usage=TokenUsage(input_tokens=30, output_tokens=10, cost=0.01),
+                                    lm=LMFinishMetadata(finish_reason="length"),
+                                )
+                            ],
                         )
                     ],
                 ),
@@ -141,6 +150,68 @@ class TestRunTrace:
         assert data["steps"][0]["predict_calls"][0]["model"] == "openai/gpt-4o"
         assert data["usage"]["main"]["input_tokens"] == 70
         assert data["usage"]["sub"]["input_tokens"] == 30
+
+    def test_exportable_json_keeps_lm_finish_metadata_compact(self):
+        trace = RunTrace(
+            status="completed",
+            model="openai/gpt-5",
+            iterations=1,
+            max_iterations=5,
+            duration_ms=100,
+            usage=LMUsage(
+                main=TokenUsage(input_tokens=100, output_tokens=50, cost=0.01),
+                sub=TokenUsage(input_tokens=20, output_tokens=10, cost=0.002),
+            ),
+            steps=[
+                IterationStep(
+                    iteration=1,
+                    reasoning="think",
+                    code="answer = predict(q='x')",
+                    output="ok",
+                    untruncated_output="ok",
+                    duration_ms=100,
+                    lm=LMFinishMetadata(finish_reason="length"),
+                    predict_calls=[
+                        PredictCallGroup(
+                            signature="q -> a",
+                            model="openai/gpt-4o",
+                            total_usage=TokenUsage(input_tokens=20, output_tokens=10, cost=0.002),
+                            calls=[
+                                PredictCallDetail(
+                                    duration_ms=20,
+                                    usage=TokenUsage(input_tokens=20, output_tokens=10, cost=0.002),
+                                    lm=LMFinishMetadata(finish_reason="length"),
+                                )
+                            ],
+                        )
+                    ],
+                )
+            ],
+        )
+
+        import json
+
+        data = json.loads(trace.to_exportable_json())
+        serialized = trace.to_exportable_json()
+        assert '"truncation"' not in serialized
+        assert data["usage"]["main"] == {
+            "input_tokens": 100,
+            "output_tokens": 50,
+            "cost": 0.01,
+            "cache_hits": 0,
+        }
+        assert data["usage"]["sub"] == {
+            "input_tokens": 20,
+            "output_tokens": 10,
+            "cost": 0.002,
+            "cache_hits": 0,
+        }
+        assert data["steps"][0]["lm"] == {"finish_reason": "length"}
+        call = data["steps"][0]["predict_calls"][0]["calls"][0]
+        assert call["lm"] == {"finish_reason": "length"}
+        forbidden = {"truncated", "truncation_reason", "max_tokens", "output_tokens"}
+        assert forbidden.isdisjoint(data["steps"][0]["lm"])
+        assert forbidden.isdisjoint(call["lm"])
 
     def test_sub_model_optional(self):
         trace = RunTrace(
@@ -525,6 +596,36 @@ class TestUsageSince:
         assert usage.output_tokens == 0
         assert usage.cost == 0
         assert usage.cache_hits == 0
+
+    def test_usage_since_keeps_token_usage_free_of_truncation_metadata(self):
+        lm = MagicMock()
+        lm.history = [
+            {
+                "usage": {"prompt_tokens": 100, "completion_tokens": 50000},
+                "kwargs": {"max_tokens": 50000},
+                "response": {"choices": [{"finish_reason": "length"}]},
+            }
+        ]
+
+        usage = usage_since(lm, 0)
+
+        assert usage.input_tokens == 100
+        assert usage.output_tokens == 50000
+        assert not hasattr(usage, "truncation")
+
+    def test_lm_finish_since_extracts_finish_reason_only(self):
+        lm = MagicMock()
+        lm.history = [
+            {
+                "usage": {"prompt_tokens": 100, "completion_tokens": 49100},
+                "kwargs": {"max_tokens": 50000},
+                "response": {"choices": [{"finish_reason": "stop"}]},
+            }
+        ]
+
+        metadata = lm_finish_since(lm, 0)
+
+        assert metadata == LMFinishMetadata(finish_reason="stop")
 
 
 class TestConcurrentUsageAccounting:

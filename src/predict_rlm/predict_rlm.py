@@ -48,6 +48,8 @@ from .trace import (
     drain_tool_calls,
     init_predict_call_collector,
     init_tool_call_collector,
+    lm_completion_metadata_since,
+    lm_finish_since,
     ms_since,
     record_predict_call,
     reset_predict_call_collector,
@@ -1151,6 +1153,7 @@ class PredictRLM(dspy.RLM):
                         input=kwargs,
                         output=result,
                         error=str(exc),
+                        lm=lm_finish_since(lm, _hist_len_before),
                     )
                 )
                 raise
@@ -1164,6 +1167,7 @@ class PredictRLM(dspy.RLM):
                         usage=usage_since(lm, _hist_len_before),
                         input=kwargs,
                         output=result,
+                        lm=lm_finish_since(lm, _hist_len_before),
                     )
                 )
                 return result
@@ -1517,6 +1521,7 @@ class PredictRLM(dspy.RLM):
             end_time_unix_nano=action_start_ns,
         )
         try:
+            lm_hist_before_action = snapshot_lm_history_len(dspy.settings.lm)
             pred = self.generate_action(
                 variables_info=variables_info,
                 repl_history=history,
@@ -1541,6 +1546,7 @@ class PredictRLM(dspy.RLM):
                 start_time_unix_nano=action_start_ns,
             )
             raise
+        lm_metadata = lm_finish_since(dspy.settings.lm, lm_hist_before_action)
         self._write_telemetry_span(
             "rlm.action_generation.ok",
             iteration=iteration + 1,
@@ -1591,6 +1597,7 @@ class PredictRLM(dspy.RLM):
             self._partial_history = step_result
         self._partial_pending_entry = None
         self._partial_pending_start = None
+        self._last_action_lm_metadata = lm_metadata
         return step_result
 
     async def _aexecute_iteration(
@@ -1618,6 +1625,7 @@ class PredictRLM(dspy.RLM):
             end_time_unix_nano=action_start_ns,
         )
         try:
+            lm_hist_before_action = snapshot_lm_history_len(dspy.settings.lm)
             pred = await self.generate_action.acall(
                 variables_info=variables_info,
                 repl_history=history,
@@ -1642,6 +1650,7 @@ class PredictRLM(dspy.RLM):
                 start_time_unix_nano=action_start_ns,
             )
             raise
+        lm_metadata = lm_finish_since(dspy.settings.lm, lm_hist_before_action)
         self._write_telemetry_span(
             "rlm.action_generation.ok",
             iteration=iteration + 1,
@@ -1702,6 +1711,7 @@ class PredictRLM(dspy.RLM):
             self._partial_history = step_result
         self._partial_pending_entry = None
         self._partial_pending_start = None
+        self._last_action_lm_metadata = lm_metadata
         return step_result
 
     def _prepare_file_io(
@@ -1904,6 +1914,8 @@ class PredictRLM(dspy.RLM):
                         result = self._execute_iteration(
                             repl, variables, history, iteration, input_args, output_field_names
                         )
+                        action_lm_metadata = getattr(self, "_last_action_lm_metadata", None)
+                        self._last_action_lm_metadata = None
 
                         # Extract step data from the new history entry
                         new_history = result if isinstance(result, REPLHistory) else None
@@ -1943,6 +1955,7 @@ class PredictRLM(dspy.RLM):
                             duration_ms=ms_since(iter_start),
                             tool_calls=drain_tool_calls(),
                             predict_calls=drain_predict_calls(),
+                            lm=action_lm_metadata,
                         )
                         steps.append(step)
 
@@ -2058,6 +2071,8 @@ class PredictRLM(dspy.RLM):
                         result = await self._aexecute_iteration(
                             repl, variables, history, iteration, input_args, output_field_names
                         )
+                        action_lm_metadata = getattr(self, "_last_action_lm_metadata", None)
+                        self._last_action_lm_metadata = None
 
                         new_history = result if isinstance(result, REPLHistory) else None
                         if new_history and len(new_history.entries) > len(history.entries):
@@ -2096,6 +2111,7 @@ class PredictRLM(dspy.RLM):
                             duration_ms=ms_since(iter_start),
                             tool_calls=drain_tool_calls(),
                             predict_calls=drain_predict_calls(),
+                            lm=action_lm_metadata,
                         )
                         steps.append(step)
 
