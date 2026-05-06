@@ -20,7 +20,7 @@ def should_accept_reflective_candidate(
     before_scores: Sequence[float],
     after_scores: Sequence[float],
     dense_loss_floor: float = -0.01,
-    hard_flip_p_threshold: float = 0.30,
+    hard_flip_p_threshold: float = 0.40,
     perfect_score: float = 1.0,
     eps: float = 1e-9,
 ) -> AcceptanceDecision:
@@ -29,7 +29,7 @@ def should_accept_reflective_candidate(
 
     dense_delta = _mean(after_scores) - _mean(before_scores)
     hard_wins, hard_losses = _hard_flips(before_scores, after_scores, perfect_score, eps)
-    p_value = _one_sided_sign_test_p_value(hard_wins, hard_losses)
+    p_value = _two_sided_sign_test_p_value(hard_wins, hard_losses)
 
     if dense_delta > 0.0:
         return AcceptanceDecision(
@@ -74,8 +74,10 @@ def _hard_flips(
     return wins, losses
 
 
-def _one_sided_sign_test_p_value(wins: int, losses: int) -> float:
+def _two_sided_sign_test_p_value(wins: int, losses: int) -> float:
     trials = wins + losses
     if trials == 0:
         return 1.0
-    return sum(comb(trials, k) for k in range(wins, trials + 1)) / (2**trials)
+    less_frequent_flips = min(wins, losses)
+    one_tail = sum(comb(trials, k) for k in range(less_frequent_flips + 1)) / (2**trials)
+    return min(1.0, 2 * one_tail)

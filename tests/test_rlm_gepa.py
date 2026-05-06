@@ -133,7 +133,7 @@ def test_reflective_candidate_accepts_bounded_dense_loss_with_hard_flip_signal()
     assert decision.dense_delta < 0.0
     assert decision.hard_wins == 3
     assert decision.hard_losses == 0
-    assert decision.hard_flip_p_value <= 0.30
+    assert decision.hard_flip_p_value <= 0.40
 
 
 def test_reflective_candidate_rejects_bounded_dense_loss_without_significant_hard_flips():
@@ -146,7 +146,32 @@ def test_reflective_candidate_rejects_bounded_dense_loss_without_significant_har
     assert decision.reason == "not_improved"
     assert decision.hard_wins == 1
     assert decision.hard_losses == 0
-    assert decision.hard_flip_p_value > 0.30
+    assert decision.hard_flip_p_value > 0.40
+
+
+def test_reflective_candidate_reports_two_sided_hard_flip_p_value_for_ties():
+    decision = should_accept_reflective_candidate(
+        before_scores=[0.99, 0.99, 0.99, 0.99, 1.00, 1.00, 1.00, 1.00],
+        after_scores=[1.00, 1.00, 1.00, 1.00, 0.99, 0.99, 0.99, 0.99],
+    )
+
+    assert decision.hard_wins == 4
+    assert decision.hard_losses == 4
+    assert decision.hard_flip_p_value == pytest.approx(1.0)
+
+
+def test_reflective_candidate_accepts_two_sided_hard_flip_signal_under_default_threshold():
+    decision = should_accept_reflective_candidate(
+        before_scores=[0.99, 0.99, 0.99, 0.99, 1.00],
+        after_scores=[1.00, 1.00, 1.00, 1.00, 0.94],
+    )
+
+    assert decision.accepted
+    assert decision.reason == "hard_flip_signal"
+    assert decision.dense_delta >= -0.01
+    assert decision.hard_wins == 4
+    assert decision.hard_losses == 1
+    assert decision.hard_flip_p_value == pytest.approx(0.375)
 
 
 def test_build_signatures_render_agent_spec():
@@ -1320,6 +1345,39 @@ def test_merge_iteration_rows_use_best_actual_parent_instead_of_oracle(tmp_path:
     assert "score Δ" not in merge_stats[0]
 
 
+def test_stats_hard_flip_p_values_use_two_sided_exact_for_ties(tmp_path: Path):
+    parent_scores = [0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0]
+    child_scores = [1.0, 1.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0]
+    state = {
+        "full_program_trace": [
+            {
+                "i": 0,
+                "selected_program_candidate": 0,
+                "new_program_idx": 1,
+                "subsample_scores": parent_scores,
+                "new_subsample_scores": child_scores,
+            },
+            {
+                "i": 1,
+                "rlm_merge_candidate_pair": (0, 1),
+                "id1_subsample_scores": parent_scores,
+                "id2_subsample_scores": [0.0] * len(parent_scores),
+                "new_program_subsample_scores": child_scores,
+            },
+        ],
+    }
+    with (tmp_path / "gepa_state.bin").open("wb") as f:
+        pickle.dump(state, f)
+
+    rows = iteration_rows(tmp_path)
+    merge_stats = merge_rows(tmp_path)
+
+    assert rows[0]["flips"] == "+4/-4 +0"
+    assert rows[0]["p"] == "1.00"
+    assert merge_stats[0]["flips"] == "+4/-4 +0"
+    assert merge_stats[0]["p"] == "1.00"
+
+
 def test_merge_rows_report_accepted_child_full_val_against_both_parents(tmp_path: Path):
     state = {
         "prog_candidate_val_subscores": [
@@ -1365,7 +1423,7 @@ def test_merge_rows_report_accepted_child_full_val_against_both_parents(tmp_path
     assert rows[0]["soft: best(par) -> merge"] == "0.500 → 1.000 +0.500"
     assert rows[0]["hard: best(par) -> merge"] == "0.500 → 1.000 +0.500; 1 → 2"
     assert rows[0]["flips"] == "+1/-0 +1"
-    assert rows[0]["p"] == "0.50"
+    assert rows[0]["p"] == "1.00"
     assert rows[0]["outcome"] == "accepted"
     assert rows[0]["_muted_prefix"] == {
         "soft: best(par) -> merge": "0.500 → 1.000",
@@ -1413,7 +1471,7 @@ def test_merge_rows_do_not_use_normal_mutation_child_for_rejected_merge_val(tmp_
     assert rows[0]["soft: best(par) -> merge"] == "0.500 → 0.500 +0.000"
     assert rows[0]["hard: best(par) -> merge"] == "0.500 → 0.500 +0.000; 1 → 1"
     assert rows[0]["flips"] == "+1/-1 +0"
-    assert rows[0]["p"] == "0.75"
+    assert rows[0]["p"] == "1.00"
     assert rows[0]["outcome"] == "rejected"
     assert rows[0]["_muted_prefix"] == {
         "soft: best(par) -> merge": "0.500 → 0.500",
@@ -1457,7 +1515,7 @@ def test_merge_rows_use_explicit_merge_child_for_accepted_full_val(tmp_path: Pat
     assert rows[0]["soft: best(par) -> merge"] == "0.500 → 1.000 +0.500"
     assert rows[0]["hard: best(par) -> merge"] == "0.500 → 1.000 +0.500; 1 → 2"
     assert rows[0]["flips"] == "+1/-0 +1"
-    assert rows[0]["p"] == "0.50"
+    assert rows[0]["p"] == "1.00"
     assert rows[0]["outcome"] == "accepted"
     assert rows[0]["_muted_prefix"] == {
         "soft: best(par) -> merge": "0.500 → 1.000",
@@ -1588,7 +1646,7 @@ def test_reporting_tables_from_artifacts(tmp_path: Path):
     assert rows[0]["soft: par → child"] == "0.500 → 1.000 +0.500"
     assert rows[0]["hard: par → child"] == "0.500 → 1.000 +0.500; 1 → 2"
     assert rows[0]["flips"] == "+1/-0 +1"
-    assert rows[0]["p"] == "0.50"
+    assert rows[0]["p"] == "1.00"
     assert rows[0]["iter"] == "0 [0]"
     assert rows[0]["_highlight"] is True
     iteration_terminal = render_table(rows)
@@ -1611,7 +1669,7 @@ def test_reporting_tables_from_artifacts(tmp_path: Path):
         "soft: best(par) -> merge": "0.500 → 0.500 +0.000",
         "hard: best(par) -> merge": "0.500 → 0.500 +0.000; 1 → 1",
         "flips": "+1/-1 +0",
-        "p": "0.75",
+        "p": "1.00",
         "outcome": "rejected",
         "_detail": "not better than best parent",
         "_muted_prefix": {

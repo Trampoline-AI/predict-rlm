@@ -147,7 +147,7 @@ def iteration_rows(run_dir: str | Path) -> list[dict[str, Any]]:
                 "soft: par → child": soft_change,
                 "hard: par → child": hard_change,
                 "flips": flips,
-                "p": f"{_one_sided_sign_test_p(gains, losses):.2f}",
+                "p": f"{_mcnemar_exact_p(gains, losses):.2f}",
                 "outcome": f"→ cand {entry['new_program_idx']}" if "new_program_idx" in entry else "REJECTED",
                 "_highlight": entry.get("new_program_idx") == best_idx,
                 "_muted_prefix": {
@@ -223,7 +223,7 @@ def merge_rows(run_dir: str | Path) -> list[dict[str, Any]]:
             soft_change, soft_secondary = _format_soft_change(parent_scores, new_scores)
             hard_change, hard_secondary = _format_hard_change(parent_scores, new_scores, include_total=False)
             flips, flips_secondary = _format_flips(gains, losses)
-            p_value = f"{_one_sided_sign_test_p(gains, losses):.2f}"
+            p_value = f"{_mcnemar_exact_p(gains, losses):.2f}"
             hard_denominator = min(len(parent_scores), len(new_scores))
             muted_prefix = {
                 "soft: best(par) -> merge": soft_change.removesuffix(soft_secondary),
@@ -1599,13 +1599,6 @@ def _format_flips(gains: int, losses: int) -> tuple[str, str]:
     primary = f"+{gains}/-{losses}"
     secondary = f"{net:+d}"
     return f"{primary} {secondary}", f" {secondary}"
-
-
-def _one_sided_sign_test_p(gains: int, losses: int) -> float:
-    total = gains + losses
-    if total == 0:
-        return 1.0
-    return sum(math.comb(total, i) for i in range(gains, total + 1)) * (0.5**total)
 
 
 def _mcnemar_exact_p(gains: int, losses: int) -> float:
