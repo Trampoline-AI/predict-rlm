@@ -19,7 +19,11 @@ from predict_rlm.trace import extract_trace_from_exc
 
 from ..reporting.cost import append_trace_cost_rows
 from ..runtime.progress import install_rlm_log_stream, progress_write, restore_rlm_log_stream
-from ..runtime.trace_rendering import trace_to_json
+from ..runtime.trace_rendering import (
+    proposer_failure_metadata,
+    trace_to_json,
+    trace_to_proposer_json,
+)
 from ..runtime.utils import atomic_write_json, run_coro_sync
 from ..schema import COUNTERFACTUAL_AXIS_SINGULAR, AgentSpec
 
@@ -61,10 +65,23 @@ Good rules must name a stable runtime behavior from one of these groups:
 
 {{TRACES_FILE_MOUNT}} is a JSON file. Each record has:
 - `Inputs`: task inputs and metadata.
-- `Generated Outputs`: rendered PredictRLM trace with reasoning, code, tool
-  calls, predict calls, output, timings, status, iterations, and token usage.
+- `Score`: numeric evaluator score for the record.
+- `Traces`: structured execution evidence. Inspect failed rows alongside their
+  scores and feedback, then read the trace fields that explain behavior:
+  reasoning, code, sandbox output, errors, tool-call inputs/outputs/errors,
+  predict-call inputs/outputs/errors, and LM finish reasons. Prefer direct trace
+  fields over rendered prose. `steps[*].output` can be shortened for display;
+  when diagnosing sandbox or REPL output, prefer `steps[*].untruncated_output`
+  if it is present.
+- `Failure Metadata`: compact failure hints for the row. Use it to confirm or
+  disambiguate repeated failure modes, especially tool/predict-call failures
+  and finish-reason issues. `Failure Metadata.failure_class ==
+  "model_output_truncated"` means the generated LM answer was cut off or
+  incomplete because it hit output limits; treat that differently from shortened
+  sandbox display output.
 - `Feedback`: evaluator signal for that record, including scores, mismatches,
   crash reasons, and other domain-specific failure details.
+- `Error`: outer evaluation error if one was raised.
 
 # Valid Rule Shapes
 
@@ -85,20 +102,22 @@ Every proposed rule must pass all structural tests:
 # Workflow
 
 1. Load {{TRACES_FILE_MOUNT}} with JSON parsing and work from parsed records.
-   Use regex only as a local extractor inside parsed string fields when helpful,
-   not as the primary way to scan the raw trace file.
+   Treat `Traces` and `Failure Metadata` as primary evidence. Use regex only as
+   a local extractor inside parsed string fields when helpful, not as the
+   primary way to scan the raw trace file.
 2. Bucket scored records into bottom failures, middle partials/near-misses, and
    top successes before choosing edits. Keep unscored/crashed records separate
    from score-ranked evidence.
 3. Inspect bottom records for concrete failures, top records for strategies to
-   preserve, and middle records for near-miss patterns. For large or diverse
-   trace sets, use divide-and-conquer: run separate `predict()` calls with
-   `asyncio.gather(...)` over focused trace subsets to extract non-lossy,
-   evidence-grounded patterns tied to record ids/scores. Helper `predict()`
-   calls may extract and reason about trace evidence; you choose the final
-   rules or edits and emit the final full instructions.
-   Before changing a rule, name the solved behavior that the edit must leave
-   unchanged.
+   preserve, and middle records for near-miss patterns. Treat base wins, top
+   successes, and both-success rows as constraints on edits, not just failures
+   as targets. For large or diverse trace sets, use divide-and-conquer: run
+   separate `predict()` calls with `asyncio.gather(...)` over focused trace
+   subsets to extract non-lossy, evidence-grounded patterns tied to record
+   ids/scores. Helper `predict()` calls may extract and reason about trace
+   evidence; you choose the final rules or edits and emit the final full
+   instructions. Before changing a rule, name the solved behavior that the edit
+   must leave unchanged.
 4. Only add or modify rules grounded in trace evidence plus available tools,
    target signature, runtime behavior, or scoring contract.
 5. Keep the edit surgical: identify kept, modified, added, and removed rules. If
@@ -113,6 +132,11 @@ Every proposed rule must pass all structural tests:
    preserved_behavior, counterfactual_1, and counterfactual_2. The
    counterfactuals must
    span different {{COUNTERFACTUAL_AXIS_NAME}}.
+
+Reminder: do not turn local evidence into a broad default reversal. If a
+change affects a broad rule, make it conditional on the task intent and name
+what solved behavior remains unchanged; when support is narrow, prefer one local
+edit or no-op over bundling unrelated behavior.
 """
 
 
@@ -161,7 +185,18 @@ The patched skill must work across these use cases:
   `evidence_role`, `abs_delta`, base-parent trace/feedback/score, and
   patch-source-parent trace/feedback/score. Rows with `winner="both_success"`
   are guardrails: both parents solved them, so preserve that behavior rather
-  than using them as import evidence.
+  than using them as import evidence. Parent objects include structured
+  `traces` and `failure_metadata`; use those as primary behavioral evidence.
+  Inspect failed rows alongside scores and feedback, then read reasoning, code,
+  sandbox output, errors, tool-call inputs/outputs/errors, predict-call
+  inputs/outputs/errors, and LM finish reasons to understand why one parent
+  won. `steps[*].output` can be shortened for display; when diagnosing sandbox
+  or REPL output, prefer `steps[*].untruncated_output` if present. Parent
+  `failure_metadata.failure_class == "model_output_truncated"` means the
+  generated LM answer was cut off or incomplete because it hit output limits;
+  treat that differently from shortened sandbox display output. Use repeated
+  behavioral failure modes to propose surgical imports from the winning parent,
+  and do not overfit to one unusual disagreement row.
 
 # Workflow
 
@@ -238,7 +273,9 @@ def render_template(template: str, spec: AgentSpec) -> str:
 class ImproveInstructionsGeneric(dspy.Signature):
     current_instructions: str = dspy.InputField(desc="Current skill instructions text")
     component_focus: str = dspy.InputField(desc="Optional per-component focus text")
-    traces_file: File = dspy.InputField(desc="JSON file containing rendered task traces")
+    traces_file: File = dspy.InputField(
+        desc="JSON file containing structured execution evidence for proposer review"
+    )
     new_instructions: str = dspy.OutputField(
         desc=(
             "Full revised skill instructions text; prefer compact replacement or "
@@ -264,7 +301,7 @@ class PatchMergeInstructionsGeneric(dspy.Signature):
         desc="Full patch-source parent skill text"
     )
     paired_disagreement_traces_file: File = dspy.InputField(
-        desc="JSONL file carrying train disagreement traces for the two parents"
+        desc="JSONL file carrying train disagreement evidence for the two parents"
     )
     patch_summary: str = dspy.OutputField(desc="Short summary of the patch decision")
     selected_capability: SelectedCapability = dspy.OutputField(
@@ -382,14 +419,18 @@ class RLMInstructionProposer:
         call_idx = self._call_count
         event_id = f"{self.run_id}_proposer_attempt_{call_idx:04d}_component_{component_name}"
         operation_id = f"proposer_{component_name}_{call_idx:04d}"
-        serializable = [
-            {
-                "Inputs": record.get("Inputs", ""),
-                "Generated Outputs": record.get("Generated Outputs", ""),
-                "Feedback": record.get("Feedback", ""),
+        serializable: list[dict[str, Any]] = []
+        for record in records:
+            proposer_record = {
+                key: value
+                for key, value in dict(record).items()
+                if key not in {"Trace Preview", "Generated Outputs"}
             }
-            for record in records
-        ]
+            converted = _jsonable(proposer_record)
+            if isinstance(converted, dict):
+                serializable.append(converted)
+            else:
+                serializable.append({"record": converted})
 
         with tempfile.NamedTemporaryFile(
             mode="w",
@@ -398,7 +439,7 @@ class RLMInstructionProposer:
             delete=False,
             encoding="utf-8",
         ) as f:
-            json.dump(serializable, f, indent=2)
+            json.dump(serializable, f, indent=2, default=str)
             traces_path = Path(f.name)
 
         try:
@@ -609,6 +650,27 @@ def sum_traces(traces: Sequence[Any]) -> tuple[Any, Any, str, str | None, int, i
                 sub_calls += len(getattr(group, "calls", None) or [])
     sub_usage = sub if sub.input_tokens or sub.output_tokens or sub.cache_hits else None
     return main, sub_usage, main_model, sub_model, main_calls, sub_calls
+
+
+def _jsonable(value: Any) -> Any:
+    if hasattr(value, "to_proposer_json") or hasattr(value, "to_proposer"):
+        return trace_to_proposer_json(value)
+    if hasattr(value, "to_exportable_json"):
+        return trace_to_json(value)
+    if hasattr(value, "model_dump"):
+        return value.model_dump()
+    if isinstance(value, Mapping):
+        return {
+            key: _jsonable(
+                proposer_failure_metadata(item)
+                if key in {"Failure Metadata", "failure_metadata"}
+                else item
+            )
+            for key, item in value.items()
+        }
+    if isinstance(value, list | tuple):
+        return [_jsonable(item) for item in value]
+    return value
 
 
 async def _acall_with_heartbeat(

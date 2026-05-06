@@ -12,6 +12,7 @@ from predict_rlm.trace import (
     LMUsage,
     PredictCallDetail,
     PredictCallGroup,
+    ProposerRunTrace,
     RunTrace,
     TokenUsage,
     ToolCall,
@@ -272,6 +273,151 @@ class TestRunTrace:
         # model_dump still has the full data
         full = trace.model_dump()
         assert b64 in full["steps"][0]["predict_calls"][0]["calls"][0]["input"]["page"]
+
+    def test_to_proposer_keeps_behavioral_evidence_without_accounting(self):
+        trace = RunTrace(
+            status="completed",
+            model="openai/gpt-5",
+            sub_model="openai/gpt-4o",
+            iterations=1,
+            max_iterations=5,
+            duration_ms=100,
+            usage=LMUsage(
+                main=TokenUsage(input_tokens=100, output_tokens=50, cost=0.01),
+                sub=TokenUsage(input_tokens=20, output_tokens=10, cost=0.002),
+            ),
+            steps=[
+                IterationStep(
+                    iteration=1,
+                    reasoning="inspect",
+                    code="answer = tool('x')",
+                    output="truncated",
+                    untruncated_output="full",
+                    error=True,
+                    duration_ms=100,
+                    lm=LMFinishMetadata(finish_reason="stop"),
+                    tool_calls=[
+                        ToolCall(
+                            name="tool",
+                            args=["x"],
+                            kwargs={"mode": "fast"},
+                            result={"answer": 1},
+                            error="tool failed",
+                            duration_ms=3,
+                        )
+                    ],
+                    predict_calls=[
+                        PredictCallGroup(
+                            signature="q -> a",
+                            instructions="answer",
+                            model="openai/gpt-4o",
+                            total_usage=TokenUsage(
+                                input_tokens=20,
+                                output_tokens=10,
+                                cost=0.002,
+                                cache_hits=1,
+                            ),
+                            calls=[
+                                PredictCallDetail(
+                                    duration_ms=10,
+                                    usage=TokenUsage(
+                                        input_tokens=20,
+                                        output_tokens=10,
+                                        cost=0.002,
+                                        cache_hits=1,
+                                    ),
+                                    input={"q": "question"},
+                                    output={"a": "answer"},
+                                    error="predict failed",
+                                    lm=LMFinishMetadata(finish_reason="length"),
+                                )
+                            ],
+                        )
+                    ],
+                )
+            ],
+        )
+
+        proposer = trace.to_proposer()
+        data = proposer.model_dump()
+        step = data["steps"][0]
+        predict_call = step["predict_calls"][0]["calls"][0]
+
+        assert isinstance(proposer, ProposerRunTrace)
+        assert data["status"] == "completed"
+        assert data["model"] == "openai/gpt-5"
+        assert data["sub_model"] == "openai/gpt-4o"
+        assert data["iterations"] == 1
+        assert data["max_iterations"] == 5
+        assert step["reasoning"] == "inspect"
+        assert step["code"] == "answer = tool('x')"
+        assert step["output"] == "truncated"
+        assert step["untruncated_output"] == "full"
+        assert step["error"] is True
+        assert step["lm"] == {"finish_reason": "stop"}
+        assert step["tool_calls"][0] == {
+            "name": "tool",
+            "args": ["x"],
+            "kwargs": {"mode": "fast"},
+            "result": {"answer": 1},
+            "error": "tool failed",
+        }
+        assert predict_call["input"] == {"q": "question"}
+        assert predict_call["output"] == {"a": "answer"}
+        assert predict_call["error"] == "predict failed"
+        assert predict_call["lm"] == {"finish_reason": "length"}
+
+        serialized = trace.to_proposer_json()
+        forbidden = ("usage", "duration_ms", "cost", "cache_hits", "total_usage")
+        for field in forbidden:
+            assert f'"{field}"' not in serialized
+
+    def test_to_proposer_sanitizes_base64_payloads(self):
+        b64 = "A" * 40000
+        trace = RunTrace(
+            status="completed",
+            model="openai/gpt-5",
+            iterations=1,
+            max_iterations=5,
+            duration_ms=100,
+            steps=[
+                IterationStep(
+                    iteration=1,
+                    reasoning=f"see data:image/png;base64,{b64}",
+                    code="SUBMIT(answer)",
+                    output="ok",
+                    untruncated_output="ok",
+                    duration_ms=100,
+                    tool_calls=[
+                        ToolCall(
+                            name="tool",
+                            args=[f"data:image/png;base64,{b64}"],
+                            result={"image": f"data:image/png;base64,{b64}"},
+                            duration_ms=1,
+                        )
+                    ],
+                    predict_calls=[
+                        PredictCallGroup(
+                            signature="page: dspy.Image -> answer",
+                            model="openai/gpt-4o",
+                            calls=[
+                                PredictCallDetail(
+                                    duration_ms=50,
+                                    input={"page": f"data:image/png;base64,{b64}"},
+                                    output={"answer": "hello"},
+                                )
+                            ],
+                        )
+                    ],
+                )
+            ],
+        )
+
+        result = trace.to_proposer_json()
+        assert "AAAA" not in result
+        assert result.count("<IMAGE_BASE_64_ENCODED(40000)>") == 4
+        full = trace.model_dump()
+        assert b64 in full["steps"][0]["reasoning"]
 
     def test_to_exportable_json_writes_file(self, tmp_path):
         trace = RunTrace(

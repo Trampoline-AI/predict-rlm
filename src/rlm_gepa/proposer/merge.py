@@ -19,6 +19,7 @@ from gepa.proposer.merge import MergeProposer
 
 from predict_rlm import File
 
+from ..runtime.trace_rendering import proposer_failure_metadata
 from ..runtime.utils import atomic_write_json
 from .selection import pick_patch_merge_pair
 
@@ -466,12 +467,20 @@ class RlmMergeProposer(MergeProposer):
                 "evidence_role": evidence_role,
                 "inputs": rec_base.get("Inputs") or rec_source.get("Inputs") or "",
                 "base_parent": {
-                    "generated_outputs": rec_base.get("Generated Outputs", ""),
+                    "traces": rec_base.get("Traces", []),
+                    "failure_metadata": proposer_failure_metadata(
+                        rec_base.get("Failure Metadata", {})
+                    ),
+                    "error": rec_base.get("Error"),
                     "feedback": rec_base.get("Feedback", ""),
                     "score": score_base,
                 },
                 "patch_source_parent": {
-                    "generated_outputs": rec_source.get("Generated Outputs", ""),
+                    "traces": rec_source.get("Traces", []),
+                    "failure_metadata": proposer_failure_metadata(
+                        rec_source.get("Failure Metadata", {})
+                    ),
+                    "error": rec_source.get("Error"),
                     "feedback": rec_source.get("Feedback", ""),
                     "score": score_source,
                 },
