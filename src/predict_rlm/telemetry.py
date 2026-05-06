@@ -17,6 +17,7 @@ SCHEMA_VERSION = 1
 FailureClass = Literal[
     "model_generated_bad_code",
     "model_no_code_generated",
+    "model_output_truncated",
     "sandbox_lifecycle_failure",
     "sandbox_exec_timeout",
     "host_tool_timeout_or_leak",
@@ -30,6 +31,7 @@ FailureClass = Literal[
 FAILURE_CLASSES: tuple[str, ...] = (
     "model_generated_bad_code",
     "model_no_code_generated",
+    "model_output_truncated",
     "sandbox_lifecycle_failure",
     "sandbox_exec_timeout",
     "host_tool_timeout_or_leak",
@@ -47,6 +49,7 @@ _PRECEDENCE: tuple[FailureClass, ...] = (
     "outer_task_timeout",
     "evaluator_limitation",
     "evaluator_exception",
+    "model_output_truncated",
     "model_no_code_generated",
     "model_generated_bad_code",
     "resource_saturation_unknown",
@@ -366,6 +369,18 @@ def _infer_failure_classes(item: dict[str, Any]) -> set[FailureClass]:
     )
 
     inferred: set[FailureClass] = set()
+    if (
+        attrs.get("lm.truncated") is True
+        or item.get("truncated") is True
+        or "model_output_truncated" in text
+        or (
+            "finish_reason" in text
+            and any(marker in text for marker in ("length", "max_tokens", "max output"))
+        )
+        or "lm response was truncated" in text
+    ):
+        inferred.add("model_output_truncated")
+
     is_error = "error" in text or "timeout" in text or "timed out" in text
     if not is_error:
         return inferred

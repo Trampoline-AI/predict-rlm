@@ -13,7 +13,17 @@ import dspy
 import pytest
 
 import rlm_gepa.cli as cli_module
-from predict_rlm.telemetry import JsonlTelemetrySink, TelemetryContext
+from predict_rlm.telemetry import JsonlTelemetrySink, TelemetryContext, classify_failure
+from predict_rlm.trace import (
+    IterationStep,
+    LMFinishMetadata,
+    LMUsage,
+    PredictCallDetail,
+    PredictCallGroup,
+    RunTrace,
+    TokenUsage,
+    ToolCall,
+)
 from rlm_gepa import (
     AgentSpec,
     EvaluationContext,
@@ -47,7 +57,7 @@ from rlm_gepa.reporting.stats import (
     render_table,
 )
 from rlm_gepa.runtime.acceptance import should_accept_reflective_candidate
-from rlm_gepa.runtime.adapter import RLMGepaAdapter
+from rlm_gepa.runtime.adapter import RLMGepaAdapter, _row_failure_metadata
 from rlm_gepa.schema import RLMGepaExampleResult, validate_project
 from rlm_gepa.service import (
     _coerce_reflection_lm_text,
@@ -2415,6 +2425,66 @@ def test_adapter_trace_rows_include_compact_failure_metadata(tmp_path: Path):
     assert row["failure_reason"] == "tool timed out"
     assert row["telemetry_ref"]["events_path"] == "telemetry/events.jsonl"
     assert row["telemetry_ref"]["trace_id"].endswith(":0")
+
+
+def test_gepa_failure_metadata_includes_lm_truncation_fields():
+    events = [
+        {
+            "name": "rlm.action_generation.parse_error",
+            "status": {"code": "ERROR", "message": "parse failed"},
+            "attributes": {
+                "failure.class": "model_output_truncated",
+                "lm.truncated": True,
+                "lm.truncation_reason": "max_tokens",
+                "lm.finish_reason": "length",
+                "lm.max_tokens": 50000,
+                "lm.output_tokens": 50000,
+            },
+        }
+    ]
+
+    metadata = _row_failure_metadata(
+        {"score": 0.0},
+        events,
+        telemetry_context=None,
+    )
+
+    assert metadata["failure_class"] == "model_output_truncated"
+    assert metadata["truncated"] is True
+    assert metadata["truncation_reason"] == "max_tokens"
+    assert metadata["finish_reason"] == "length"
+    assert metadata["max_tokens"] == 50000
+    assert metadata["output_tokens"] == 50000
+
+
+def test_gepa_failure_metadata_infers_truncation_from_structured_trace_finish_reason():
+    metadata = _row_failure_metadata(
+        {
+            "score": 0.0,
+            "trace": {
+                "usage": {
+                    "main": {
+                        "output_tokens": 50000,
+                        "max_tokens": 50000,
+                    }
+                },
+                "steps": [{"lm": {"finish_reason": "length"}}],
+            },
+        },
+        [],
+        telemetry_context=None,
+    )
+
+    assert metadata["failure_class"] == "model_output_truncated"
+    assert metadata["truncated"] is True
+    assert metadata["truncation_reason"] == "max_tokens"
+    assert metadata["finish_reason"] == "length"
+    assert metadata["max_tokens"] == 50000
+    assert metadata["output_tokens"] == 50000
+
+
+def test_telemetry_classifier_uses_truncation_without_error_text():
+    assert classify_failure({"score": 0.0, "truncated": True}, []) == "model_output_truncated"
 
 
 def test_adapter_enforces_per_example_timeout(tmp_path: Path):

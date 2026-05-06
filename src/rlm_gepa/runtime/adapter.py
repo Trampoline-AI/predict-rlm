@@ -690,15 +690,116 @@ def _row_failure_metadata(
     telemetry_context: TelemetryContext | None,
 ) -> dict[str, Any]:
     metadata: dict[str, Any] = {}
+    truncation = _lm_truncation_metadata(row, events)
+    row_for_classification = {**row, **truncation}
     if float(row.get("score") or 0.0) == 0.0:
-        metadata["failure_class"] = classify_failure(row, events)
+        metadata["failure_class"] = classify_failure(row_for_classification, events)
         metadata["failure_reason"] = _failure_reason(row, events)
+    metadata.update(truncation)
     ref = _telemetry_ref(telemetry_context)
     if ref is not None:
         metadata["telemetry_ref"] = ref
     if row.get("candidate_id") is None and telemetry_context is not None:
         metadata["candidate_hash"] = telemetry_context.candidate_hash
     return metadata
+
+
+def _lm_truncation_metadata(
+    row: dict[str, Any],
+    events: list[dict[str, Any]],
+) -> dict[str, Any]:
+    metadata: dict[str, Any] = {}
+    sources: list[dict[str, Any]] = [row]
+    sources.extend(_trace_truncation_sources(row.get("trace")))
+    for trace in row.get("traces") or []:
+        sources.extend(_trace_truncation_sources(trace))
+    for event in events:
+        attrs = event.get("attributes") if isinstance(event.get("attributes"), dict) else {}
+        sources.append(attrs)
+    for source in sources:
+        truncated = source.get("lm.truncated") or source.get("truncated")
+        if truncated is True or str(truncated).lower() == "true":
+            metadata["truncated"] = True
+        for src_key, dst_key in (
+            ("lm.truncation_reason", "truncation_reason"),
+            ("lm.finish_reason", "finish_reason"),
+            ("lm.max_tokens", "max_tokens"),
+            ("lm.output_tokens", "output_tokens"),
+        ):
+            if dst_key not in metadata and source.get(src_key) is not None:
+                metadata[dst_key] = source[src_key]
+            if dst_key not in metadata and source.get(dst_key) is not None:
+                metadata[dst_key] = source[dst_key]
+    finish_reason = str(metadata.get("finish_reason") or "").lower().replace("-", "_")
+    if finish_reason in {
+        "length",
+        "max_tokens",
+        "max_output_tokens",
+        "content_length",
+        "token_limit",
+    }:
+        metadata["truncated"] = True
+        metadata.setdefault("truncation_reason", "max_tokens")
+    max_tokens = _coerce_positive_int(metadata.get("max_tokens"))
+    output_tokens = _coerce_positive_int(metadata.get("output_tokens"))
+    if max_tokens is not None:
+        metadata["max_tokens"] = max_tokens
+    if output_tokens is not None:
+        metadata["output_tokens"] = output_tokens
+    if (
+        max_tokens is not None
+        and output_tokens is not None
+        and output_tokens >= int(max_tokens * 0.98)
+    ):
+        metadata["truncated"] = True
+        metadata.setdefault("truncation_reason", "max_tokens")
+    return metadata
+
+
+def _trace_truncation_sources(trace: Any) -> list[dict[str, Any]]:
+    if not isinstance(trace, Mapping):
+        return []
+    sources: list[dict[str, Any]] = []
+    usage = trace.get("usage") if isinstance(trace.get("usage"), Mapping) else {}
+    for usage_key in ("main", "sub"):
+        usage_part = usage.get(usage_key) if isinstance(usage.get(usage_key), Mapping) else {}
+        if usage_part:
+            sources.append(dict(usage_part))
+        truncation = usage_part.get("truncation")
+        if isinstance(truncation, Mapping):
+            sources.append(dict(truncation))
+    for step in trace.get("steps") or []:
+        if not isinstance(step, Mapping):
+            continue
+        lm = step.get("lm")
+        if isinstance(lm, Mapping):
+            sources.append(dict(lm))
+        for group in step.get("predict_calls") or []:
+            if not isinstance(group, Mapping):
+                continue
+            total_usage = group.get("total_usage")
+            if isinstance(total_usage, Mapping) and isinstance(total_usage.get("truncation"), Mapping):
+                sources.append(dict(total_usage["truncation"]))
+            for call in group.get("calls") or []:
+                if not isinstance(call, Mapping):
+                    continue
+                call_lm = call.get("lm")
+                if isinstance(call_lm, Mapping):
+                    sources.append(dict(call_lm))
+                call_usage = call.get("usage")
+                if isinstance(call_usage, Mapping):
+                    sources.append(dict(call_usage))
+                if isinstance(call_usage, Mapping) and isinstance(call_usage.get("truncation"), Mapping):
+                    sources.append(dict(call_usage["truncation"]))
+    return sources
+
+
+def _coerce_positive_int(value: Any) -> int | None:
+    try:
+        coerced = int(value)
+    except (TypeError, ValueError):
+        return None
+    return coerced if coerced > 0 else None
 
 
 def _telemetry_ref(telemetry_context: TelemetryContext | None) -> dict[str, Any] | None:

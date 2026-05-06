@@ -1379,26 +1379,57 @@ class PredictRLM(dspy.RLM):
         except Exception:
             return
 
-    def _action_generation_error_attrs(self, exc: BaseException) -> dict[str, Any]:
-        text = str(exc)
-        invalid_action_output = isinstance(exc, RuntimeError) and text.startswith(
-            "PredictRLM action adapter returned invalid"
+    def _action_generation_error_attrs(
+        self,
+        exc: BaseException,
+        *,
+        lm_metadata: Any | None = None,
+    ) -> dict[str, Any]:
+        exception_message = str(exc)
+        invalid_action_output = (
+            isinstance(exc, RuntimeError)
+            and exception_message.startswith("PredictRLM action adapter returned invalid")
         )
-        failure_class = (
-            "model_no_code_generated"
-            if isinstance(exc, (AdapterParseError, ValidationError)) or invalid_action_output
-            else "unknown"
+        normalized_exception_message = exception_message.lower()
+        truncated = bool(lm_metadata and lm_metadata.truncated) or (
+            "lm response was truncated" in normalized_exception_message
+            or (
+                "truncated" in normalized_exception_message
+                and any(
+                    marker in normalized_exception_message
+                    for marker in ("max_tokens", "max output")
+                )
+            )
         )
-        return {
+        failure_class = "unknown"
+        if truncated:
+            failure_class = "model_output_truncated"
+        elif isinstance(exc, (AdapterParseError, ValidationError)) or invalid_action_output:
+            failure_class = "model_no_code_generated"
+        attrs: dict[str, Any] = {
             "has_code": False,
             "code_chars": 0,
             "code_sha256": _sha256_text(""),
             "reasoning_chars": 0,
             "error.type": type(exc).__name__,
-            "error.message_chars": len(text),
-            "error.message_sha256": _sha256_text(text),
+            "error.message_chars": len(exception_message),
+            "error.message_sha256": _sha256_text(exception_message),
             "failure.class": failure_class,
         }
+        if lm_metadata is not None:
+            attrs["lm.truncated"] = lm_metadata.truncated
+            if lm_metadata.truncation_reason is not None:
+                attrs["lm.truncation_reason"] = lm_metadata.truncation_reason
+            if lm_metadata.finish_reason is not None:
+                attrs["lm.finish_reason"] = lm_metadata.finish_reason
+            if lm_metadata.max_tokens is not None:
+                attrs["lm.max_tokens"] = lm_metadata.max_tokens
+            if lm_metadata.output_tokens is not None:
+                attrs["lm.output_tokens"] = lm_metadata.output_tokens
+        elif truncated:
+            attrs["lm.truncated"] = True
+            attrs["lm.truncation_reason"] = "max_tokens"
+        return attrs
 
     def _action_generation_error_status(self, exc: BaseException) -> dict[str, Any]:
         return {
@@ -1538,11 +1569,17 @@ class PredictRLM(dspy.RLM):
                     "expected a validated non-empty string."
                 )
         except BaseException as exc:
+            lm_metadata = lm_completion_metadata_since(
+                dspy.settings.lm, lm_hist_before_action
+            )
             self._write_telemetry_span(
                 "rlm.action_generation.parse_error",
                 iteration=iteration + 1,
                 status=self._action_generation_error_status(exc),
-                attributes=self._action_generation_error_attrs(exc),
+                attributes=self._action_generation_error_attrs(
+                    exc,
+                    lm_metadata=lm_metadata,
+                ),
                 start_time_unix_nano=action_start_ns,
             )
             raise
@@ -1642,11 +1679,17 @@ class PredictRLM(dspy.RLM):
                     "expected a validated non-empty string."
                 )
         except BaseException as exc:
+            lm_metadata = lm_completion_metadata_since(
+                dspy.settings.lm, lm_hist_before_action
+            )
             self._write_telemetry_span(
                 "rlm.action_generation.parse_error",
                 iteration=iteration + 1,
                 status=self._action_generation_error_status(exc),
-                attributes=self._action_generation_error_attrs(exc),
+                attributes=self._action_generation_error_attrs(
+                    exc,
+                    lm_metadata=lm_metadata,
+                ),
                 start_time_unix_nano=action_start_ns,
             )
             raise

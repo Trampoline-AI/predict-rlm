@@ -13,6 +13,7 @@ from rlm_gepa.runtime.telemetry_analyzer import analyze_run, analyze_trace_rows
         ("outer_task_timeout", "outer_task_timeout"),
         ("evaluator_limitation", "evaluator_limitation"),
         ("evaluator_exception", "evaluator_exception"),
+        ("model_output_truncated", "model_output_truncated"),
         ("model_no_code_generated", "model_no_code_generated"),
         ("model_generated_bad_code", "model_generated_bad_code"),
         ("resource_saturation_unknown", "resource_saturation_unknown"),
@@ -100,6 +101,25 @@ def test_model_no_code_precedes_model_generated_bad_code():
     ]
 
     assert classify_failure({"score": 0}, events) == "model_no_code_generated"
+
+
+def test_model_output_truncated_precedes_generic_no_code_failure():
+    events = [
+        {
+            "name": "rlm.action_generation.parse_error",
+            "status": {"code": "ERROR", "message": "parse failed"},
+            "attributes": {
+                "failure.class": "model_no_code_generated",
+                "lm.truncated": True,
+                "lm.truncation_reason": "max_tokens",
+                "lm.finish_reason": "length",
+                "lm.max_tokens": 50000,
+                "lm.output_tokens": 50000,
+            },
+        }
+    ]
+
+    assert classify_failure({"score": 0}, events) == "model_output_truncated"
 
 
 def test_resource_saturation_is_only_above_unknown():
