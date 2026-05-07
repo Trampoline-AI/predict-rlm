@@ -25,6 +25,40 @@ Based on the [Recursive Language Models](https://arxiv.org/abs/2512.24601v1) pap
 uv add predict-rlm
 ```
 
+### Docker Sandboxes backend
+
+JSPI/Deno/Pyodide remains the default sandbox. Docker Sandboxes (`sbx`) is an explicit opt-in backend for environments that want a Linux Python runner:
+
+```bash
+brew install docker/tap/sbx
+sbx login
+```
+
+```python
+from predict_rlm import PredictRLM, SbxConfig, SbxPool
+
+rlm = PredictRLM(
+    "question -> answer",
+    sandbox_backend="sbx",
+    sbx_config=SbxConfig(name="my-predict-rlm-sbx"),
+)
+```
+
+By default, `SbxConfig` passes the explicit non-Docker shell template `docker.io/docker/sandbox-templates:shell` to `sbx create`. Pass a custom `template="..."` to override it, or `template=None` to omit `--template` and use Docker's CLI default behavior.
+
+For throughput-sensitive evals or optimization loops, create a pool of prewarmed runners and pass it explicitly:
+
+```python
+with SbxPool(size=4, config=SbxConfig()) as pool:
+    rlm = PredictRLM(
+        "question -> answer",
+        sandbox_backend="sbx",
+        sbx_pool=pool,
+    )
+```
+
+The backend stages virtual files under `.predict_rlm_sbx/` while preserving model-facing paths such as `/sandbox/input/...` and `/sandbox/output/...`. Real `sbx` integration tests are skipped by default; run them with `PREDICT_RLM_RUN_SBX_TESTS=1 uv run pytest -m sbx` after the CLI is installed and logged in.
+
 ## Why RLMs?
 
 <p align="center">
