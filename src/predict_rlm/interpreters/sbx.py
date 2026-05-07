@@ -63,6 +63,7 @@ class SbxInterpreter(PredictRLMInterpreter):
         self.extra_write_paths = extra_write_paths or []
         self._runner_command = _runner_command
         self._workspace = Path.cwd()
+        self._owns_staging_root = _staging_root is None
         self._staging_root = Path(_staging_root) if _staging_root else (
             self._workspace / ".predict_rlm_sbx" / uuid.uuid4().hex
         )
@@ -204,6 +205,16 @@ class SbxInterpreter(PredictRLMInterpreter):
                     text=True,
                 )
         self._tool_executor.shutdown(wait=False, cancel_futures=True)
+        self._cleanup_staging_root()
+
+    def _cleanup_staging_root(self) -> None:
+        if not self._owns_staging_root or self.config.persist:
+            return
+        shutil.rmtree(self._staging_root, ignore_errors=True)
+        try:
+            self._staging_root.parent.rmdir()
+        except OSError:
+            pass
 
     def _ensure_process(self) -> None:
         if self._proc and self._proc.poll() is None:

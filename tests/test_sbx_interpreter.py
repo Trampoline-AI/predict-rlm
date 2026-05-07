@@ -249,6 +249,66 @@ class TestSbxInterpreterLocalRunner:
         assert output.read_text(encoding="utf-8") == "from staging"
         assert interpreter._proc is None
 
+    def test_shutdown_removes_owned_staging_root(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        monkeypatch.chdir(tmp_path)
+        interpreter = SbxInterpreter(
+            config=SbxConfig(name="local-test"),
+            preinstall_packages=False,
+            _runner_command=[sys.executable, "-u", str(RUNNER_PATH)],
+        )
+        staging_root = interpreter._staging_root
+        source = tmp_path / "input.txt"
+        source.write_text("host visible", encoding="utf-8")
+
+        try:
+            interpreter.mount_file_at(str(source), "/sandbox/input/source/input.txt")
+            assert staging_root.is_dir()
+        finally:
+            interpreter.shutdown()
+
+        assert not staging_root.exists()
+
+    def test_shutdown_preserves_caller_owned_staging_root(self, tmp_path: Path):
+        staging_root = tmp_path / "staging"
+        interpreter = SbxInterpreter(
+            config=SbxConfig(name="local-test"),
+            preinstall_packages=False,
+            _runner_command=[sys.executable, "-u", str(RUNNER_PATH)],
+            _staging_root=staging_root,
+        )
+        source = tmp_path / "input.txt"
+        source.write_text("host visible", encoding="utf-8")
+
+        try:
+            interpreter.mount_file_at(str(source), "/sandbox/input/source/input.txt")
+        finally:
+            interpreter.shutdown()
+
+        assert staging_root.is_dir()
+        assert (
+            staging_root / "sandbox" / "input" / "source" / "input.txt"
+        ).read_text(encoding="utf-8") == "host visible"
+
+    def test_persist_preserves_owned_staging_root(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        monkeypatch.chdir(tmp_path)
+        interpreter = SbxInterpreter(
+            config=SbxConfig(name="local-test", persist=True),
+            preinstall_packages=False,
+            _runner_command=[sys.executable, "-u", str(RUNNER_PATH)],
+        )
+        staging_root = interpreter._staging_root
+
+        try:
+            interpreter.mkdir_p("/sandbox/output/result")
+        finally:
+            interpreter.shutdown()
+
+        assert staging_root.is_dir()
+
     def test_execute_can_call_registered_host_tools(self, tmp_path: Path):
         async def add(a: int, b: int) -> dict:
             await asyncio.sleep(0)
