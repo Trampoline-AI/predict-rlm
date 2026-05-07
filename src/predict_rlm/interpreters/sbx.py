@@ -614,6 +614,8 @@ class SbxPool:
         self._started = False
         self._starting = False
         self._shutdown = False
+        self._shutdown_requested = False
+        self._shutting_down = False
 
     def __enter__(self) -> SbxPool:
         self.start()
@@ -623,16 +625,32 @@ class SbxPool:
         self.shutdown()
 
     def start(self) -> None:
+        if self._begin_start(allow_restart=True):
+            self._finish_start()
+
+    def _begin_start(self, *, allow_restart: bool) -> bool:
         with self._state_changed:
+            if allow_restart:
+                while self._shutting_down:
+                    self._state_changed.wait()
+            elif self._is_stopping_locked():
+                raise RuntimeError("SbxPool is shut down")
             if self._started:
-                return
+                return False
             while self._starting:
                 self._state_changed.wait()
+                if not allow_restart and self._is_stopping_locked():
+                    raise RuntimeError("SbxPool is shut down")
                 if self._started:
-                    return
+                    return False
+            if not allow_restart and self._is_stopping_locked():
+                raise RuntimeError("SbxPool is shut down")
             self._starting = True
             self._shutdown = False
+            self._shutdown_requested = False
+            return True
 
+    def _finish_start(self) -> None:
         interpreters: list[SbxInterpreter] = []
         try:
             for index in range(self.size):
@@ -668,42 +686,79 @@ class SbxPool:
         tools: dict[str, Callable[..., Any]] | None = None,
         output_fields: list[dict] | None = None,
     ):
-        if not self._started:
-            self.start()
-        interpreter = self._available.get()
+        self._ensure_started_for_lease()
+        interpreter = self._acquire_interpreter()
         try:
             interpreter.configure_runtime(tools=tools, output_fields=output_fields)
             yield interpreter
         finally:
+            with self._state_changed:
+                stopping = self._is_stopping_locked() or interpreter not in self._all_interpreters
+            if stopping:
+                return
             try:
                 interpreter.reset()
             except Exception:
                 interpreter.shutdown()
-                with self._lock:
-                    if interpreter in self._all_interpreters:
-                        index = self._all_interpreters.index(interpreter)
-                        replacement = self._create_interpreter(index)
-                        replacement.prewarm()
-                        self._all_interpreters[index] = replacement
-                        interpreter = replacement
-                    else:
-                        raise
-            self._available.put(interpreter)
+                with self._state_changed:
+                    if self._is_stopping_locked() or interpreter not in self._all_interpreters:
+                        self._state_changed.notify_all()
+                        return
+                    index = self._all_interpreters.index(interpreter)
+                    replacement = self._create_interpreter(index)
+                    replacement.prewarm()
+                    self._all_interpreters[index] = replacement
+                    interpreter = replacement
+            with self._state_changed:
+                if self._is_stopping_locked() or interpreter not in self._all_interpreters:
+                    self._state_changed.notify_all()
+                    return
+                self._available.put_nowait(interpreter)
+                self._state_changed.notify()
 
     def shutdown(self) -> None:
         with self._state_changed:
             while self._starting:
+                self._shutdown_requested = True
+                self._state_changed.notify_all()
                 self._state_changed.wait()
             if self._shutdown:
                 return
             self._shutdown = True
+            self._shutdown_requested = False
+            self._shutting_down = True
             interpreters = list(self._all_interpreters)
             self._drain_available_locked()
             self._all_interpreters.clear()
             self._started = False
             self._state_changed.notify_all()
 
-        self._shutdown_interpreters(interpreters)
+        try:
+            self._shutdown_interpreters(interpreters)
+        finally:
+            with self._state_changed:
+                self._shutting_down = False
+                self._state_changed.notify_all()
+
+    def _ensure_started_for_lease(self) -> None:
+        if self._begin_start(allow_restart=False):
+            self._finish_start()
+        with self._state_changed:
+            if self._is_stopping_locked() or not self._started:
+                raise RuntimeError("SbxPool is shut down")
+
+    def _acquire_interpreter(self) -> SbxInterpreter:
+        with self._state_changed:
+            while True:
+                if self._is_stopping_locked() or not self._started:
+                    raise RuntimeError("SbxPool is shut down")
+                try:
+                    return self._available.get_nowait()
+                except queue.Empty:
+                    self._state_changed.wait()
+
+    def _is_stopping_locked(self) -> bool:
+        return self._shutdown or self._shutdown_requested or self._shutting_down
 
     def _create_interpreter(self, index: int) -> SbxInterpreter:
         kwargs = dict(self._interpreter_kwargs)
