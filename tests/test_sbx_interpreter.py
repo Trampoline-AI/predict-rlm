@@ -625,9 +625,33 @@ class TestSbxCommandConstruction:
         interpreter._start_sbx_and_build_runner_command()
 
         create_cmd = commands[0]
-        workspace_arg = f"{Path.cwd()}:ro"
+        workspace_arg = f"{tmp_path / 'staging'}:ro"
         assert create_cmd[:4] == ["sbx", "create", "shell", workspace_arg]
         assert create_cmd[4:6] == [str(extra_one), str(extra_two)]
+
+    def test_default_workspace_is_staging_root_not_repo(
+        self, monkeypatch, tmp_path: Path
+    ):
+        commands: list[list[str]] = []
+
+        def fake_run(command, **kwargs):
+            commands.append(command)
+            return subprocess.CompletedProcess(command, 0, stdout="created-name\n", stderr="")
+
+        monkeypatch.setattr(shutil, "which", lambda name: "/usr/local/bin/sbx")
+        monkeypatch.setattr(subprocess, "run", fake_run)
+        interpreter = SbxInterpreter(
+            config=SbxConfig(name="created-name"),
+            preinstall_packages=False,
+            _staging_root=tmp_path / "staging",
+        )
+
+        command = interpreter._start_sbx_and_build_runner_command()
+
+        create_cmd = commands[0]
+        assert create_cmd[:4] == ["sbx", "create", "shell", str(tmp_path / "staging")]
+        assert str(Path.cwd()) not in create_cmd
+        assert command[:5] == ["sbx", "exec", "-i", "-w", str(tmp_path / "staging")]
 
     def test_runner_command_uses_python3_executable(self, monkeypatch, tmp_path: Path):
         def fake_run(command, **kwargs):
@@ -644,7 +668,11 @@ class TestSbxCommandConstruction:
         command = interpreter._start_sbx_and_build_runner_command()
 
         assert "python" not in command
-        assert command[-3:] == ["python3", "-u", str(RUNNER_PATH)]
+        runner_path = tmp_path / "staging" / ".predict_rlm_runner" / "python_runner.py"
+        assert runner_path.read_text(encoding="utf-8") == RUNNER_PATH.read_text(
+            encoding="utf-8"
+        )
+        assert command[-3:] == ["python3", "-u", str(runner_path)]
 
     def test_package_bootstrap_failure_raises_context(self, monkeypatch, tmp_path: Path):
         def fake_run(command, **kwargs):
@@ -690,7 +718,7 @@ class TestSbxCommandConstruction:
                 "sbx",
                 "exec",
                 "-w",
-                str(Path.cwd()),
+                str(tmp_path / "staging"),
                 "created-name",
                 "python3",
                 "-m",

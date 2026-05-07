@@ -62,10 +62,10 @@ class SbxInterpreter(PredictRLMInterpreter):
         self.extra_read_paths = extra_read_paths or []
         self.extra_write_paths = extra_write_paths or []
         self._runner_command = _runner_command
-        self._workspace = Path.cwd()
+        self._host_workspace = Path.cwd()
         self._owns_staging_root = _staging_root is None
         self._staging_root = Path(_staging_root) if _staging_root else (
-            self._workspace / ".predict_rlm_sbx" / uuid.uuid4().hex
+            self._host_workspace / ".predict_rlm_sbx" / uuid.uuid4().hex
         )
         self._staging_root.mkdir(parents=True, exist_ok=True)
         self._proc: subprocess.Popen[str] | None = None
@@ -268,7 +268,9 @@ class SbxInterpreter(PredictRLMInterpreter):
                 "Install it with `brew install docker/tap/sbx` and run `sbx login`."
             )
 
-        primary_workspace = str(self._workspace)
+        runner_path = self._prepare_runner_script()
+
+        primary_workspace = str(self._staging_root)
         if self.config.workspace_read_only:
             primary_workspace = f"{primary_workspace}:ro"
         create_cmd = [
@@ -311,14 +313,21 @@ class SbxInterpreter(PredictRLMInterpreter):
             "exec",
             "-i",
             "-w",
-            str(self._workspace),
+            str(self._staging_root),
             self._sandbox_name,
             "env",
             f"PREDICT_RLM_SBX_ROOT={runner_root}",
             SBX_PYTHON_EXECUTABLE,
             "-u",
-            str(RUNNER_PATH),
+            str(runner_path),
         ]
+
+    def _prepare_runner_script(self) -> Path:
+        runner_dir = self._staging_root / ".predict_rlm_runner"
+        runner_dir.mkdir(parents=True, exist_ok=True)
+        runner_path = runner_dir / "python_runner.py"
+        shutil.copy2(RUNNER_PATH, runner_path)
+        return runner_path
 
     def _parse_sandbox_name(self, stdout: str) -> str:
         for token in reversed(stdout.replace("\n", " ").split()):
@@ -349,7 +358,7 @@ class SbxInterpreter(PredictRLMInterpreter):
             "sbx",
             "exec",
             "-w",
-            str(self._workspace),
+            str(self._staging_root),
             self._sandbox_name,
             SBX_PYTHON_EXECUTABLE,
             "-m",

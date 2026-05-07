@@ -57,7 +57,7 @@ with SbxPool(size=4, config=SbxConfig()) as pool:
     )
 ```
 
-The backend stages virtual files under `.predict_rlm_sbx/` while preserving model-facing paths such as `/sandbox/input/...` and `/sandbox/output/...`. Real `sbx` integration tests are skipped by default; run them with `PREDICT_RLM_RUN_SBX_TESTS=1 uv run pytest -m sbx` after the CLI is installed and logged in.
+The backend mounts only a per-run staging directory under `.predict_rlm_sbx/` by default, preserving model-facing paths such as `/sandbox/input/...` and `/sandbox/output/...` without exposing the rest of the repo workspace. Use `SbxConfig(extra_workspaces=[...])` only when the sandbox needs explicit additional host mounts. Real `sbx` integration tests are skipped by default; run them with `PREDICT_RLM_RUN_SBX_TESTS=1 uv run pytest -m sbx` after the CLI is installed and logged in.
 
 ## Why RLMs?
 
