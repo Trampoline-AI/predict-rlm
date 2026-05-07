@@ -60,28 +60,7 @@ def run_eval_args(args: argparse.Namespace) -> int:
             handler.setFormatter(logging.Formatter("%(asctime)s %(message)s"))
             rlm_logger.addHandler(handler)
 
-    effort = args.reasoning_effort
-    if effort and effort.strip().lower() == "none":
-        effort = None
-
-    config = EvalConfig(
-        lm=args.lm,
-        sub_lm=args.sub_lm,
-        reasoning_effort=effort or None,
-        thinking_budget=args.thinking_budget,
-        dataset=args.dataset,
-        run_dir=str(args.run_dir) if args.run_dir is not None else None,
-        only=args.only,
-        cand_idx=args.cand_idx,
-        limit=args.limit,
-        task_ids=parse_eval_task_ids(args.task_ids),
-        cases_per_task=args.cases_per_task,
-        concurrency=args.concurrency,
-        max_iterations=args.max_iterations,
-        task_timeout=args.task_timeout,
-        cache=args.cache,
-        log_dir=log_dir,
-    )
+    config = build_eval_config(args, log_dir=log_dir)
     report = run_evaluation(config)
     output_path.write_text(json.dumps(report.to_dict(), indent=2))
 
@@ -131,6 +110,35 @@ def run_eval_args(args: argparse.Namespace) -> int:
     if config.log_dir is not None:
         print(f"Per-case logs:  {config.log_dir}")
     return 0
+
+
+def build_eval_config(args: argparse.Namespace, log_dir: Path | None) -> EvalConfig:
+    effort = args.reasoning_effort
+    if effort and effort.strip().lower() == "none":
+        effort = None
+
+    return EvalConfig(
+        lm=args.lm,
+        sub_lm=args.sub_lm,
+        reasoning_effort=effort or None,
+        thinking_budget=args.thinking_budget,
+        dataset=args.dataset,
+        run_dir=str(args.run_dir) if args.run_dir is not None else None,
+        only=args.only,
+        cand_idx=args.cand_idx,
+        limit=args.limit,
+        task_ids=parse_eval_task_ids(args.task_ids),
+        cases_per_task=args.cases_per_task,
+        concurrency=args.concurrency,
+        max_iterations=args.max_iterations,
+        task_timeout=args.task_timeout,
+        cache=args.cache,
+        log_dir=log_dir,
+        sandbox_backend=args.sandbox_backend,
+        sbx_pool_size=args.sbx_pool_size,
+        sbx_template=args.sbx_template,
+        sbx_preinstall_packages=args.sbx_preinstall_packages,
+    )
 
 
 def build_eval_parser() -> argparse.ArgumentParser:
@@ -220,6 +228,30 @@ def add_eval_args(parser: argparse.ArgumentParser) -> None:
         dest="task_timeout",
         type=int,
         default=300,
+    )
+    parser.add_argument(
+        "--sandbox-backend",
+        choices=["jspi", "sbx"],
+        default="jspi",
+        help="PredictRLM sandbox backend",
+    )
+    parser.add_argument(
+        "--sbx-pool-size",
+        type=int,
+        default=None,
+        help="prewarmed Docker Sandboxes pool size; requires --sandbox-backend sbx",
+    )
+    parser.add_argument(
+        "--sbx-template",
+        default=None,
+        help="Docker Sandboxes template; omitted uses PredictRLM's SbxConfig default",
+    )
+    parser.add_argument(
+        "--no-sbx-preinstall-packages",
+        dest="sbx_preinstall_packages",
+        action="store_false",
+        default=True,
+        help="skip package preinstall during SbxPool startup",
     )
     parser.add_argument(
         "--output",

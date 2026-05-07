@@ -26,7 +26,7 @@ import dspy
 import nest_asyncio
 from tqdm import tqdm
 
-from predict_rlm import File, PredictRLM, Skill
+from predict_rlm import File, PredictRLM, SbxConfig, SbxPool, Skill
 from rlm_gepa.runtime.lm_config import get_lm_config, get_sub_lm_config
 
 from ..agent.signature import ManipulateSpreadsheet
@@ -603,6 +603,7 @@ async def _run_case(
     sem: asyncio.Semaphore,
     tmp_dir: str,
     config: EvalConfig,
+    sbx_pool: SbxPool | None = None,
 ) -> CaseResult:
     output_path = os.path.join(tmp_dir, f"{idx}_{task.task_id}_output.xlsx")
 
@@ -644,6 +645,7 @@ async def _run_case(
                 max_iterations=config.max_iterations,
                 verbose=config.log_dir is not None,
                 debug=False,
+                **_predict_rlm_sandbox_kwargs(config, sbx_pool),
             )
             result = await asyncio.wait_for(
                 predictor.acall(
@@ -728,6 +730,18 @@ async def _run_case(
         return cr
 
 
+def _predict_rlm_sandbox_kwargs(
+    config: EvalConfig,
+    sbx_pool: SbxPool | None,
+) -> dict[str, Any]:
+    if config.sandbox_backend != "sbx":
+        return {}
+    kwargs: dict[str, Any] = {"sandbox_backend": "sbx"}
+    if sbx_pool is not None:
+        kwargs["sbx_pool"] = sbx_pool
+    return kwargs
+
+
 async def _run_tasks_async(
     tasks: list[SpreadsheetTask],
     sig_cls: type[dspy.Signature],
@@ -740,11 +754,12 @@ async def _run_tasks_async(
     sem = asyncio.Semaphore(config.concurrency)
     pbar = tqdm(total=len(tasks), desc="Evaluating", unit="task")
 
-    async def _process(task: SpreadsheetTask) -> TaskResult:
+    async def _process(task: SpreadsheetTask, sbx_pool: SbxPool | None) -> TaskResult:
         case_coros = [
             _run_case(
                 task, idx, input_path, answer_path,
                 sig_cls, skill, lm, sub_lm, sem, tmp_dir, config,
+                sbx_pool=sbx_pool,
             )
             for idx, input_path, answer_path in task.test_cases
         ]
@@ -757,8 +772,25 @@ async def _run_tasks_async(
         pbar.update(1)
         return TaskResult(task_id=task.task_id, soft=soft, hard=hard, cases=list(cases))
 
+    async def _run_all(sbx_pool: SbxPool | None) -> list[TaskResult]:
+        return list(await asyncio.gather(*(_process(t, sbx_pool) for t in tasks)))
+
     try:
-        results = await asyncio.gather(*(_process(t) for t in tasks))
+        if config.sbx_pool_size is not None:
+            sbx_config = (
+                SbxConfig(template=config.sbx_template)
+                if config.sbx_template is not None
+                else SbxConfig()
+            )
+            with SbxPool(
+                size=config.sbx_pool_size,
+                config=sbx_config,
+                preinstall_packages=config.sbx_preinstall_packages,
+                skill_packages=skill.packages,
+            ) as sbx_pool:
+                results = await _run_all(sbx_pool)
+        else:
+            results = await _run_all(None)
     finally:
         pbar.close()
         shutil.rmtree(tmp_dir, ignore_errors=True)
