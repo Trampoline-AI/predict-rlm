@@ -10,6 +10,13 @@ File I/O:
 """
 
 from .files import File, LocalDir, LocalFile, OutputDir, OutputFile, SyncedFile
+from .interpreters import (
+    DEFAULT_SBX_TEMPLATE,
+    SandboxBackend,
+    SbxConfig,
+    SbxInterpreter,
+    SbxPool,
+)
 from .predict_rlm import PredictRLM
 from .rlm_skills import Skill
 from .trace import RunTrace
@@ -22,6 +29,11 @@ __all__ = [
     "OutputFile",
     "PredictRLM",
     "RunTrace",
+    "DEFAULT_SBX_TEMPLATE",
+    "SandboxBackend",
     "Skill",
+    "SbxConfig",
+    "SbxInterpreter",
+    "SbxPool",
     "SyncedFile",
 ]

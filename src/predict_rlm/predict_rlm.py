@@ -37,6 +37,13 @@ from pydantic import ConfigDict, ValidationError, create_model
 from ._shared import build_rlm_signatures, format_tool_docs_full
 from .files import File, build_file_plan, scan_file_fields
 from .interpreter import JspiInterpreter, SandboxFatalError
+from .interpreters import (
+    PredictRLMInterpreter,
+    SandboxBackend,
+    SbxConfig,
+    SbxInterpreter,
+    SbxPool,
+)
 from .rlm_skills import Skill, merge_skills
 from .telemetry import TelemetryContext, make_span_id
 from .trace import (
@@ -705,6 +712,9 @@ class PredictRLM(dspy.RLM):
         verbose: bool = False,
         tools: dict[str, Callable[..., str]] | list[Callable] | None = None,
         interpreter: CodeInterpreter | None = None,
+        sandbox_backend: SandboxBackend | str | None = None,
+        sbx_config: SbxConfig | None = None,
+        sbx_pool: SbxPool | None = None,
         allowed_domains: list[str] | None = None,
         skills: list[Skill] | None = None,
         debug: bool = False,
@@ -731,6 +741,12 @@ class PredictRLM(dspy.RLM):
                   predict is added automatically if not already provided.
             interpreter: CodeInterpreter implementation to use. Defaults to
                         JSPI-enabled JspiInterpreter.
+            sandbox_backend: Named sandbox backend to create when interpreter
+                            is not provided. Defaults to "jspi"; pass "sbx"
+                            to opt into Docker Sandboxes.
+            sbx_config: Docker Sandboxes backend configuration.
+            sbx_pool: Prewarmed Docker Sandboxes interpreter pool. Requires
+                      ``sandbox_backend="sbx"`` and owns its interpreter config.
             allowed_domains: Domains/IPs the sandbox can access via network.
                             By default, no network access is allowed.
                             Example: ["api.example.com", "192.168.1.100:8080"]
@@ -747,6 +763,24 @@ class PredictRLM(dspy.RLM):
                        OTel-shaped local JSONL events. Disabled/failed
                        telemetry writes are always ignored.
         """
+        if interpreter is not None and sbx_pool is not None:
+            raise ValueError(
+                "Pass either interpreter or sbx_pool, not both. "
+                "A custom interpreter is already a complete sandbox backend."
+            )
+        if interpreter is not None and sandbox_backend is not None:
+            raise ValueError(
+                "Pass either interpreter or sandbox_backend, not both. "
+                "A custom interpreter is already a complete sandbox backend."
+            )
+        self._sandbox_backend = SandboxBackend(sandbox_backend or SandboxBackend.JSPI)
+        if sbx_pool is not None and self._sandbox_backend is not SandboxBackend.SBX:
+            raise ValueError("sbx_pool requires sandbox_backend='sbx'.")
+        if sbx_pool is not None and sbx_config is not None:
+            raise ValueError("Pass sbx_config to SbxPool when using sbx_pool.")
+        self._sbx_pool = sbx_pool
+        self._sbx_config = sbx_config or SbxConfig()
+
         # Store main LM. ``dspy.LM.copy()`` gives a fresh history so
         # concurrent PredictRLM instances don't share mutable state —
         # without this, running N RLMs in parallel (asyncio.gather) would
@@ -1237,8 +1271,8 @@ class PredictRLM(dspy.RLM):
         self,
         execution_tools: dict[str, Callable],
         file_plan: dict[str, Any] | None = None,
-    ) -> Iterator[CodeInterpreter]:
-        """Yield interpreter, creating JspiInterpreter if none provided."""
+    ) -> Iterator[PredictRLMInterpreter]:
+        """Yield interpreter, creating the configured backend if none provided."""
         if self._interpreter is not None:
             self._inject_execution_context(self._interpreter, execution_tools)
             yield self._interpreter
@@ -1252,16 +1286,29 @@ class PredictRLM(dspy.RLM):
             for mod_path in self._skill_modules.values():
                 extra_read.append(mod_path)
 
-            repl = JspiInterpreter(
-                tools=execution_tools,
-                output_fields=self._get_output_fields_info(),
-                allowed_domains=self._allowed_domains,
-                skill_packages=self._skill_packages or None,
-                debug=self._debug,
-                extra_read_paths=extra_read or None,
-                extra_write_paths=extra_write,
-                telemetry_context=self._current_telemetry_context,
-            )
+            interpreter_kwargs = {
+                "tools": execution_tools,
+                "output_fields": self._get_output_fields_info(),
+                "allowed_domains": self._allowed_domains,
+                "skill_packages": self._skill_packages or None,
+                "debug": self._debug,
+                "extra_read_paths": extra_read or None,
+                "extra_write_paths": extra_write,
+            }
+            if self._sbx_pool is not None:
+                with self._sbx_pool.lease(
+                    tools=execution_tools,
+                    output_fields=self._get_output_fields_info(),
+                ) as repl:
+                    yield repl
+                return
+            if self._sandbox_backend is SandboxBackend.SBX:
+                repl = SbxInterpreter(config=self._sbx_config, **interpreter_kwargs)
+            else:
+                repl = JspiInterpreter(
+                    **interpreter_kwargs,
+                    telemetry_context=self._current_telemetry_context,
+                )
             try:
                 yield repl
             finally:
@@ -1814,9 +1861,12 @@ class PredictRLM(dspy.RLM):
 
         return file_plan, transformed
 
-    def _setup_sandbox_files(self, repl: JspiInterpreter, file_plan: dict[str, Any]) -> None:
+    def _setup_sandbox_files(
+        self, repl: PredictRLMInterpreter, file_plan: dict[str, Any]
+    ) -> None:
         """Mount input files, skill modules, and create output dirs in the sandbox."""
-        repl._ensure_deno_process()
+        if hasattr(repl, "_ensure_deno_process"):
+            repl._ensure_deno_process()
 
         for host_path, virtual_path in file_plan["mounts"]:
             repl.mount_file_at(host_path, virtual_path)
@@ -1833,7 +1883,7 @@ class PredictRLM(dspy.RLM):
 
     def _sync_output_files(
         self,
-        repl: JspiInterpreter,
+        repl: PredictRLMInterpreter,
         prediction: dspy.Prediction,
         output_file_fields: dict[str, str],
         file_plan: dict[str, Any],

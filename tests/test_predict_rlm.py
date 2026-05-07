@@ -11,7 +11,7 @@ import pytest
 from dspy.primitives.repl_types import REPLEntry, REPLHistory
 from pydantic import BaseModel
 
-from predict_rlm import PredictRLM
+from predict_rlm import PredictRLM, SbxPool
 from predict_rlm.predict_rlm import _models_from_schema
 from predict_rlm.rlm_skills import Skill
 from predict_rlm.telemetry import TelemetryContext, classify_failure
@@ -58,6 +58,109 @@ class ListTelemetrySink:
 
     def write(self, record: dict[str, Any]) -> None:
         self.records.append(record)
+
+
+class TestSandboxBackendSelection:
+    """Tests for PredictRLM sandbox backend selection."""
+
+    def test_default_backend_remains_jspi(self):
+        rlm = PredictRLM(ImageAnalysisSignature, sub_lm=MagicMock(), max_iterations=1)
+        execution_tools = {"predict": MagicMock()}
+
+        with patch("predict_rlm.predict_rlm.JspiInterpreter") as mock_jspi:
+            mock_repl = MagicMock()
+            mock_jspi.return_value = mock_repl
+
+            with rlm._interpreter_context(execution_tools=execution_tools) as repl:
+                assert repl is mock_repl
+
+        mock_jspi.assert_called_once()
+        assert mock_jspi.call_args.kwargs["tools"] == execution_tools
+
+    def test_explicit_sbx_backend_uses_sbx_interpreter(self):
+        from predict_rlm import SandboxBackend, SbxConfig
+
+        rlm = PredictRLM(
+            ImageAnalysisSignature,
+            sub_lm=MagicMock(),
+            max_iterations=1,
+            sandbox_backend=SandboxBackend.SBX,
+            sbx_config=SbxConfig(name="test-sbx"),
+        )
+        execution_tools = {"predict": MagicMock()}
+
+        with patch("predict_rlm.predict_rlm.SbxInterpreter") as mock_sbx:
+            mock_repl = MagicMock()
+            mock_sbx.return_value = mock_repl
+
+            with rlm._interpreter_context(execution_tools=execution_tools) as repl:
+                assert repl is mock_repl
+
+        mock_sbx.assert_called_once()
+        assert mock_sbx.call_args.kwargs["tools"] == execution_tools
+        assert mock_sbx.call_args.kwargs["config"].name == "test-sbx"
+
+    def test_custom_interpreter_conflicts_with_explicit_backend(self):
+        with pytest.raises(ValueError, match="interpreter.*sandbox_backend"):
+            PredictRLM(
+                ImageAnalysisSignature,
+                sub_lm=MagicMock(),
+                max_iterations=1,
+                interpreter=MagicMock(),
+                sandbox_backend="sbx",
+            )
+
+    def test_sbx_pool_requires_sbx_backend(self):
+        with pytest.raises(ValueError, match="sbx_pool.*sandbox_backend='sbx'"):
+            PredictRLM(
+                ImageAnalysisSignature,
+                sub_lm=MagicMock(),
+                max_iterations=1,
+                sbx_pool=MagicMock(spec=SbxPool),
+            )
+
+    def test_sbx_pool_conflicts_with_custom_interpreter(self):
+        with pytest.raises(ValueError, match="interpreter.*sbx_pool"):
+            PredictRLM(
+                ImageAnalysisSignature,
+                sub_lm=MagicMock(),
+                max_iterations=1,
+                sandbox_backend="sbx",
+                interpreter=MagicMock(),
+                sbx_pool=MagicMock(spec=SbxPool),
+            )
+
+    def test_sbx_pool_leases_without_constructing_or_shutting_down_interpreter(self):
+        from contextlib import contextmanager
+
+        leased = MagicMock()
+        leased.shutdown = MagicMock()
+        pool = MagicMock(spec=SbxPool)
+
+        @contextmanager
+        def lease(**kwargs):
+            pool.lease_kwargs = kwargs
+            yield leased
+
+        pool.lease.side_effect = lease
+        rlm = PredictRLM(
+            ImageAnalysisSignature,
+            sub_lm=MagicMock(),
+            max_iterations=1,
+            sandbox_backend="sbx",
+            sbx_pool=pool,
+        )
+        execution_tools = {"predict": MagicMock()}
+
+        with patch("predict_rlm.predict_rlm.SbxInterpreter") as mock_sbx:
+            with rlm._interpreter_context(execution_tools=execution_tools) as repl:
+                assert repl is leased
+
+        pool.lease.assert_called_once()
+        assert pool.lease_kwargs["tools"] == execution_tools
+        mock_sbx.assert_not_called()
+        leased.shutdown.assert_not_called()
+
 
 
 class TestPredictTool:
