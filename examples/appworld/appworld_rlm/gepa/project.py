@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 
 from predict_rlm.trace import RunTrace, extract_trace_from_exc
 from rlm_gepa import EvaluationContext, RLMGepaExampleResult, RLMGepaProject
@@ -8,10 +9,25 @@ from rlm_gepa import EvaluationContext, RLMGepaExampleResult, RLMGepaProject
 from ..agent.service import AppWorldRLM
 from ..agent.skills import appworld_skill
 from ..bench.dataset import AppWorldExample, load_dataset, split_train_validation
-from ..bench.scoring import score_runner_result
 from .config import APPWORLD_SPEC, AppWorldGepaConfig, default_config
 
 COMPONENT_SKILL = "skill_instructions"
+
+
+def score_runner_result(payload: str | dict[str, object]) -> tuple[float, str]:
+    data = json.loads(payload) if isinstance(payload, str) else payload
+    score = max(0.0, min(1.0, float(data.get("score", 0.0) or 0.0)))
+    success = bool(data.get("success", score >= 1.0))
+    feedback = str(data.get("feedback") or "")
+    stderr = str(data.get("stderr") or "")
+    if success and score >= 1.0:
+        return 1.0, feedback or "AppWorld evaluator reported success"
+    parts = [f"AppWorld score={score:.3f}"]
+    if feedback:
+        parts.append(feedback)
+    if stderr:
+        parts.append(stderr)
+    return score, "\n".join(parts)
 
 
 class AppWorldGepaProject(RLMGepaProject):
@@ -54,7 +70,13 @@ class AppWorldGepaProject(RLMGepaProject):
         )
         try:
             result = await asyncio.wait_for(
-                agent.acall(task_id=example.task_id, instruction=example.instruction or example.task_id),
+                agent.acall(
+                    task_id=example.task_id,
+                    instruction=example.instruction or example.task_id,
+                    supervisor_name=example.supervisor_name,
+                    supervisor_email=example.supervisor_email,
+                    supervisor_phone_number=example.supervisor_phone_number,
+                ),
                 timeout=context.task_timeout,
             )
             trace = getattr(result, "trace", None)

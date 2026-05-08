@@ -16,57 +16,8 @@ from typing import Any
 def main() -> int:
     if len(sys.argv) > 1 and sys.argv[1] == "--jsonl":
         return run_jsonl_worker()
-    request = json.loads(input())
-    result = run_request(request)
-    print(json.dumps(result, sort_keys=True))
-    return 0
-
-
-def run_request(request: dict[str, Any]) -> dict[str, Any]:
-    task_id = str(request["task_id"])
-    program = str(request["program"])
-    data_root = str(request.get("data_root") or "")
-    experiment_name = str(request.get("experiment_name") or "predict_rlm")
-    if data_root:
-        os.environ.setdefault("APPWORLD_ROOT", _appworld_root_from_data_root(data_root))
-
-    with tempfile.TemporaryFile(mode="w+", encoding="utf-8") as stdout:
-        with tempfile.TemporaryFile(mode="w+", encoding="utf-8") as stderr:
-            try:
-                from appworld import AppWorld
-
-                with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
-                    with AppWorld(task_id=task_id, experiment_name=experiment_name) as world:
-                        output = world.execute(program)
-                        score = 0.0
-                        feedback = "program executed"
-                        success = False
-                        if hasattr(world, "evaluate"):
-                            evaluation = world.evaluate()
-                            score, feedback, success = _parse_evaluation(evaluation)
-                        return {
-                            "task_id": task_id,
-                            "session_id": task_id,
-                            "operation": "run_appworld_program",
-                            "success": success,
-                            "score": score,
-                            "stdout": _read_tempfile(stdout),
-                            "stderr": _read_tempfile(stderr),
-                            "feedback": feedback,
-                            "output": to_jsonable(output),
-                        }
-            except Exception:
-                return {
-                    "task_id": task_id,
-                    "session_id": task_id,
-                    "operation": "run_appworld_program",
-                    "success": False,
-                    "score": 0.0,
-                    "stdout": _read_tempfile(stdout),
-                    "stderr": _read_tempfile(stderr),
-                    "feedback": traceback.format_exc(),
-                    "output": None,
-                }
+    sys.stderr.write("appworld_worker supports only --jsonl session mode\n")
+    return 2
 
 
 class JsonlAppWorldWorker:

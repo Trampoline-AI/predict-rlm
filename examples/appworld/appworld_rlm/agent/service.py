@@ -10,7 +10,7 @@ import dspy
 from predict_rlm import PredictRLM, Skill
 
 from ..tools.runner import AppWorldSessionClient
-from .signature import SolveAppWorldTask
+from .signature import build_solve_appworld_task_signature
 from .skills import appworld_skill
 
 
@@ -24,7 +24,6 @@ class AppWorldRLM(dspy.Module):
         debug: bool = False,
         skill: Skill | None = None,
         data_root: str | Path | None = None,
-        run_appworld_program: Callable[[str, str], str] | None = None,
         appworld_client: AppWorldSessionClient | None = None,
     ):
         self.lm = lm
@@ -34,16 +33,24 @@ class AppWorldRLM(dspy.Module):
         self.debug = debug
         self.skill = skill or appworld_skill
         self.appworld_client = appworld_client or AppWorldSessionClient(data_root=data_root)
-        self.run_appworld_program = run_appworld_program or self.appworld_client.run_appworld_program
 
     def build_predictor(
-        self, skill: Skill | None = None, task_id: str = "__current_task__"
+        self,
+        skill: Skill | None = None,
+        task_id: str = "__current_task__",
+        supervisor_name: str = "",
+        supervisor_email: str = "",
+        supervisor_phone_number: str = "",
     ) -> PredictRLM:
         skill = (skill or self.skill).model_copy(
             update={"tools": self._current_task_tools(task_id)}
         )
         return PredictRLM(
-            SolveAppWorldTask,
+            build_solve_appworld_task_signature(
+                supervisor_name=supervisor_name,
+                supervisor_email=supervisor_email,
+                supervisor_phone_number=supervisor_phone_number,
+            ),
             lm=self.lm,
             sub_lm=self.sub_lm,
             skills=[skill],
@@ -52,9 +59,21 @@ class AppWorldRLM(dspy.Module):
             debug=self.debug,
         )
 
-    async def aforward(self, task_id: str, instruction: str):
-        predictor = self.build_predictor(task_id=task_id)
-        prediction = await predictor.acall(task_id=task_id, instruction=instruction)
+    async def aforward(
+        self,
+        task_id: str,
+        instruction: str,
+        supervisor_name: str = "",
+        supervisor_email: str = "",
+        supervisor_phone_number: str = "",
+    ):
+        predictor = self.build_predictor(
+            task_id=task_id,
+            supervisor_name=supervisor_name,
+            supervisor_email=supervisor_email,
+            supervisor_phone_number=supervisor_phone_number,
+        )
+        prediction = await predictor.acall(instruction=instruction)
         if not _trace_has_successful_complete_task(prediction):
             self._complete_task_from_prediction(task_id, prediction)
         return prediction
@@ -94,13 +113,17 @@ class AppWorldRLM(dspy.Module):
         }
 
     def _complete_task_from_prediction(self, task_id: str, prediction: Any) -> None:
-        kwargs_json = json.dumps(_complete_task_kwargs(getattr(prediction, "final_answer", None)))
-        result = self.appworld_client.call_appworld_api(
-            task_id,
-            "supervisor",
-            "complete_task",
-            kwargs_json,
-        )
+        kwargs_json = json.dumps(_completion_payload_from_prediction(prediction))
+        complete_task = getattr(self.appworld_client, "complete_appworld_task", None)
+        if callable(complete_task):
+            result = complete_task(task_id, kwargs_json)
+        else:
+            result = self.appworld_client.call_appworld_api(
+                task_id,
+                "supervisor",
+                "complete_task",
+                kwargs_json,
+            )
         payload = _parse_tool_result(result)
         if payload is None:
             raise RuntimeError(f"AppWorld auto complete_task returned unsupported payload: {result!r}")
@@ -109,12 +132,14 @@ class AppWorldRLM(dspy.Module):
             raise RuntimeError(f"AppWorld auto complete_task failed: {feedback}")
 
 
-def _complete_task_kwargs(final_answer: Any) -> dict[str, str]:
-    if final_answer is None:
-        return {}
-    answer = str(final_answer)
-    normalized = answer.strip().lower()
-    if not normalized or normalized in {"null", "none"}:
+def _completion_payload_from_prediction(prediction: Any) -> dict[str, Any]:
+    if hasattr(prediction, "answer"):
+        return _completion_payload_from_answer(getattr(prediction, "answer"))
+    return {}
+
+
+def _completion_payload_from_answer(answer: Any) -> dict[str, Any]:
+    if answer is None:
         return {}
     return {"answer": answer}
 

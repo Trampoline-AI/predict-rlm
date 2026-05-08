@@ -8,7 +8,9 @@ from types import SimpleNamespace
 
 from appworld_rlm import AppWorldRLM
 from appworld_rlm.agent import service as service_module
+from appworld_rlm.agent.signature import SolveAppWorldTask, build_solve_appworld_task_signature
 from appworld_rlm.agent.skills import (
+    APPWORLD_SKILL_BASE_INSTRUCTIONS,
     APPWORLD_SKILL_INSTRUCTIONS,
     load_official_icl_demo_task_ids,
     render_official_icl_demos,
@@ -17,11 +19,10 @@ from appworld_rlm.bench import cli as bench_cli
 from appworld_rlm.bench import evaluation
 from appworld_rlm.bench.config import EvalConfig
 from appworld_rlm.bench.dataset import load_dataset, load_train_validation
-from appworld_rlm.bench.scoring import score_prediction_result, score_runner_result
 from appworld_rlm.gepa import cli as gepa_cli
 from appworld_rlm.gepa import project as gepa_project_module
 from appworld_rlm.gepa.config import APPWORLD_SPEC, AppWorldGepaConfig
-from appworld_rlm.gepa.project import COMPONENT_SKILL, AppWorldGepaProject
+from appworld_rlm.gepa.project import COMPONENT_SKILL, AppWorldGepaProject, score_runner_result
 from appworld_rlm.tools.appworld_worker import (
     JsonlAppWorldWorker,
     _appworld_root_from_data_root,
@@ -29,8 +30,8 @@ from appworld_rlm.tools.appworld_worker import (
 )
 from appworld_rlm.tools.runner import (
     AppWorldSessionClient,
-    RunnerResult,
     _default_appworld_python,
+    _tool_text,
 )
 
 from appworld_rlm.bench.cli import appworld_eval_header_summary
@@ -38,6 +39,28 @@ from rlm_gepa.reporting.stats import render_stats
 from rlm_gepa.schema import EvaluationContext, validate_project
 
 FIXTURE_ROOT = Path(__file__).parent / "fixtures" / "appworld_data"
+
+
+def _runner_result_text(
+    *,
+    success: bool,
+    score: float,
+    feedback: str,
+    stdout: str = "",
+    stderr: str = "",
+    output=None,
+) -> str:
+    return json.dumps(
+        {
+            "success": success,
+            "score": score,
+            "stdout": stdout,
+            "stderr": stderr,
+            "feedback": feedback,
+            "output": output,
+        },
+        sort_keys=True,
+    )
 
 
 def test_service_constructs():
@@ -62,13 +85,76 @@ def test_official_icl_demo_asset_loads_and_renders(tmp_path):
         )
 
     rendered = render_official_icl_demos(manifest, data_root=data_root)
-    for task_id in task_ids:
-        assert f"official demo task ID `{task_id}`" in rendered
+    assert (
+        "Next, I will show you some worked-out examples as a tutorial before we proceed "
+        "with the real task instruction."
+    ) in rendered
+    assert "----------------------------------------------------------------------------" in rendered
+    assert rendered.count("Disclaimer: This is not a real task, only a tutorial with fake data values.") == 3
+    for index, task_id in enumerate(task_ids, start=1):
+        assert f"# Tutorial Task Instruction {index}" in rendered
         assert f"fixture instruction for {task_id}" in rendered
-    assert "data/tasks/<task_id>/specs.json" not in rendered
+        assert f"Example {index} instruction:" not in rendered
     assert "canary" not in rendered.lower()
-    assert "private data" in rendered.lower()
-    assert "Stock task-ID examples" in APPWORLD_SKILL_INSTRUCTIONS
+    assert "ground-truth" not in rendered.lower()
+    assert "reference answers" not in rendered.lower()
+    assert "required API hints" not in rendered
+    assert "official demo task ID" not in rendered
+    assert "data/tasks/<task_id>/specs.json" not in rendered
+    assert "Stock task-ID examples" not in APPWORLD_SKILL_INSTRUCTIONS
+
+
+def test_model_facing_prompt_is_stock_style_and_task_bound_by_host():
+    text = SolveAppWorldTask.instructions + "\n" + APPWORLD_SKILL_INSTRUCTIONS
+    normalized_text = " ".join(text.split())
+    forbidden = [
+        "Solve an AppWorld task",
+        "AppWorld completion semantics",
+        "Stock task-ID examples",
+        "benchmark cleanup",
+        "behavioral patterns",
+        "memorize task IDs",
+        "split files",
+        "released train/dev",
+        "ground-truth",
+        "reference answers",
+        "evaluate_appworld_task",
+        "close_appworld_task",
+        "run_appworld_program",
+        "fallback program",
+        "direct `app__api` tools",
+        "task_id",
+        "session_id",
+        "wrapper",
+        "host-bound",
+        "current task",
+        "return nothing",
+        "submit nothing",
+    ]
+
+    assert "I am your supervisor" in SolveAppWorldTask.instructions
+    assert "I am your supervisor" not in APPWORLD_SKILL_BASE_INSTRUCTIONS
+    assert "day-to-day tasks fully autonomously" in SolveAppWorldTask.instructions
+    assert "day-to-day tasks fully autonomously" not in APPWORLD_SKILL_BASE_INSTRUCTIONS
+    contextual_signature = build_solve_appworld_task_signature(
+        supervisor_name="Ada Lovelace",
+        supervisor_email="ada@example.com",
+        supervisor_phone_number="555-0100",
+    )
+    assert "My name is: Ada Lovelace" in contextual_signature.instructions
+    assert "supervisor_context" not in SolveAppWorldTask.input_fields
+    assert "answer" in SolveAppWorldTask.output_fields
+    assert not SolveAppWorldTask.output_fields["answer"].is_required()
+    assert SolveAppWorldTask.output_fields["answer"].get_default(
+        call_default_factory=True
+    ) is None
+    assert "submission" not in SolveAppWorldTask.output_fields
+    assert "final_answer" not in SolveAppWorldTask.output_fields
+    assert "Use API documentation to understand how to interact with the apps" in normalized_text
+    assert "The functions correspond to APIs from various apps you have access to" in normalized_text
+    assert "task_id" not in SolveAppWorldTask.input_fields
+    for phrase in forbidden:
+        assert phrase not in normalized_text
 
 
 def test_load_official_split_files():
@@ -82,6 +168,9 @@ def test_load_dataset_reads_task_instruction_from_specs_json():
     train = load_dataset("train", FIXTURE_ROOT)
 
     assert train[0].instruction == "Use the fixture apps to complete task aaa111_1."
+    assert train[0].supervisor_name == "Ada Lovelace"
+    assert train[0].supervisor_email == "ada@example.com"
+    assert train[0].supervisor_phone_number == "555-0100"
     assert train[1].task_id == "aaa111_2"
     assert train[1].instruction == ""
 
@@ -101,15 +190,8 @@ def test_score_runner_result_feedback():
     assert "missing email" in feedback
 
 
-def test_runner_result_tool_text_round_trip():
-    text = RunnerResult(
-        task_id="aaa111_1",
-        success=True,
-        score=1.0,
-        stdout="ok",
-        stderr="",
-        feedback="done",
-    ).to_tool_text()
+def test_score_runner_result_parses_evaluator_json():
+    text = _runner_result_text(success=True, score=1.0, stdout="ok", feedback="done")
     assert score_runner_result(text) == (1.0, "done")
 
 
@@ -145,6 +227,153 @@ def test_session_client_call_api_rejects_non_object_kwargs():
     assert "JSON object" in payload["feedback"]
 
 
+def test_session_client_blocks_model_facing_complete_task(monkeypatch):
+    client = AppWorldSessionClient()
+    monkeypatch.setattr(
+        client,
+        "_ensure_task",
+        lambda _task_id: (_ for _ in ()).throw(AssertionError("worker should not be called")),
+    )
+
+    text = client.call_appworld_api(
+        "aaa111_1",
+        "supervisor",
+        "complete_task",
+        json.dumps({"answer": "foo"}),
+    )
+
+    payload = json.loads(text)
+    assert payload["success"] is False
+    assert payload["feedback"] == "Use SUBMIT(answer=value) or SUBMIT() to finish the task."
+    assert "task_id" not in payload
+    assert "session_id" not in payload
+    assert "operation" not in payload
+    assert "score" not in payload
+
+
+def test_session_client_internal_complete_task_bypasses_model_facing_block(monkeypatch):
+    client = AppWorldSessionClient()
+    calls = []
+    monkeypatch.setattr(client, "_ensure_task", lambda task_id: calls.append(("ensure", task_id)))
+    monkeypatch.setattr(
+        client,
+        "request",
+        lambda payload: {
+            "task_id": payload["task_id"],
+            "session_id": payload["session_id"],
+            "operation": payload["op"],
+            "success": True,
+            "feedback": "completed",
+            "result": payload,
+        },
+    )
+
+    text = client.complete_appworld_task("aaa111_1", json.dumps({"answer": "foo"}))
+
+    payload = json.loads(text)
+    assert payload["success"] is True
+    assert payload["result"]["app_name"] == "supervisor"
+    assert payload["result"]["api_name"] == "complete_task"
+    assert payload["result"]["kwargs"] == {"answer": "foo"}
+    assert calls == [("ensure", "aaa111_1")]
+
+
+def test_session_client_hides_complete_task_from_model_facing_docs(monkeypatch):
+    client = AppWorldSessionClient()
+    monkeypatch.setattr(client, "_ensure_task", lambda task_id: None)
+
+    def fake_request(payload):
+        if payload["op"] == "show_api_descriptions":
+            return {
+                "success": True,
+                "result": {
+                    "show_profile": "Show supervisor profile.",
+                    "complete_task": "Mark the task complete.",
+                },
+            }
+        if payload["op"] == "show_api_doc":
+            return {
+                "success": True,
+                "result": {
+                    "app_name": payload["app_name"],
+                    "api_name": payload["api_name"],
+                    "description": "Show supervisor profile.",
+                },
+            }
+        if payload["op"] == "search_api_docs":
+            return {
+                "success": True,
+                "result": [
+                    {
+                        "app_name": "supervisor",
+                        "api_name": "complete_task",
+                        "description": "supervisor.complete_task",
+                    },
+                    {
+                        "app_name": "supervisor",
+                        "api_name": "show_profile",
+                        "description": "Show supervisor profile.",
+                    },
+                ],
+            }
+        raise AssertionError(payload)
+
+    monkeypatch.setattr(client, "request", fake_request)
+
+    descriptions = json.loads(client.show_appworld_api_descriptions("aaa111_1", "supervisor"))
+    blocked_doc = json.loads(client.show_appworld_api_doc("aaa111_1", "supervisor", "complete_task"))
+    allowed_doc = json.loads(client.show_appworld_api_doc("aaa111_1", "supervisor", "show_profile"))
+    search = json.loads(client.search_appworld_api_docs("aaa111_1", "complete task"))
+
+    assert descriptions["success"] is True
+    assert descriptions["result"] == {"show_profile": "Show supervisor profile."}
+    assert blocked_doc["success"] is False
+    assert blocked_doc["feedback"] == "Use SUBMIT(answer=value) or SUBMIT() to finish the task."
+    assert allowed_doc["success"] is True
+    assert allowed_doc["result"]["api_name"] == "show_profile"
+    assert search["success"] is True
+    assert search["result"] == [
+        {
+            "app_name": "supervisor",
+            "api_name": "show_profile",
+            "description": "Show supervisor profile.",
+        }
+    ]
+    rendered = json.dumps([descriptions, blocked_doc, allowed_doc, search])
+    assert "supervisor.complete_task" not in rendered
+    assert "supervisor__complete_task" not in rendered
+
+
+def test_tool_text_strips_internal_wrapper_fields():
+    text = _tool_text(
+        {
+            "task_id": "aaa111_1",
+            "session_id": "aaa111_1",
+            "operation": "list_apps",
+            "success": True,
+            "score": None,
+            "result": {"apps": ["venmo"]},
+            "stdout": "ok",
+            "stderr": "",
+            "feedback": "done",
+        }
+    )
+
+    payload = json.loads(text)
+
+    assert payload == {
+        "success": True,
+        "result": {"apps": ["venmo"]},
+        "stdout": "ok",
+        "stderr": "",
+        "feedback": "done",
+    }
+    assert "task_id" not in payload
+    assert "session_id" not in payload
+    assert "operation" not in payload
+    assert "score" not in payload
+
+
 def test_session_client_formats_direct_tool_response(monkeypatch):
     client = AppWorldSessionClient()
     monkeypatch.setattr(client, "_ensure_task", lambda task_id: None)
@@ -165,7 +394,10 @@ def test_session_client_formats_direct_tool_response(monkeypatch):
 
     payload = __import__("json").loads(client.list_appworld_apps("aaa111_1"))
 
-    assert payload["operation"] == "list_apps"
+    assert "task_id" not in payload
+    assert "session_id" not in payload
+    assert "operation" not in payload
+    assert "score" not in payload
     assert payload["result"] == {"apps": ["venmo"]}
 
 
@@ -231,77 +463,6 @@ def test_direct_api_call_persists_before_evaluate():
     assert eval_response["score"] == 1.0
 
 
-def test_score_prediction_result_uses_last_runner_tool_result():
-    prediction = SimpleNamespace(
-        final_answer="looks good",
-        trace=SimpleNamespace(
-            steps=[
-                SimpleNamespace(
-                    tool_calls=[
-                        SimpleNamespace(
-                            name="run_appworld_program",
-                            result=RunnerResult(
-                                task_id="aaa111_1",
-                                success=False,
-                                score=0.25,
-                                stdout="",
-                                stderr="",
-                                feedback="missing email",
-                            ).to_tool_text(),
-                            error=None,
-                        )
-                    ]
-                )
-            ]
-        ),
-    )
-
-    score, feedback = score_prediction_result(prediction)
-
-    assert score == 0.25
-    assert "missing email" in feedback
-
-
-def test_score_prediction_result_uses_evaluate_appworld_task_result():
-    prediction = SimpleNamespace(
-        final_answer="looks good",
-        trace=SimpleNamespace(
-            steps=[
-                SimpleNamespace(
-                    tool_calls=[
-                        SimpleNamespace(
-                            name="evaluate_appworld_task",
-                            result=RunnerResult(
-                                task_id="aaa111_1",
-                                success=True,
-                                score=1.0,
-                                stdout="",
-                                stderr="",
-                                feedback="done",
-                            ).to_tool_text(),
-                            error=None,
-                        )
-                    ]
-                )
-            ]
-        ),
-    )
-
-    score, feedback = score_prediction_result(prediction)
-
-    assert score == 1.0
-    assert feedback == "done"
-
-
-def test_score_prediction_result_rejects_final_answer_without_runner_tool():
-    prediction = SimpleNamespace(final_answer="done", trace=SimpleNamespace(steps=[]))
-
-    score, feedback = score_prediction_result(prediction)
-
-    assert score == 0.0
-    assert "did not call evaluate_appworld_task or run_appworld_program" in feedback
-
-
 class _AutoCompleteClient:
     def __init__(self):
         self.calls = []
@@ -325,9 +486,6 @@ class _AutoCompleteClient:
     def close_appworld_task(self, task_id):
         return task_id
 
-    def run_appworld_program(self, task_id, program):
-        return task_id + program
-
 
 def _run_appworld_rlm_with_prediction(monkeypatch, prediction, client):
     class FakePredictRLM:
@@ -342,38 +500,94 @@ def _run_appworld_rlm_with_prediction(monkeypatch, prediction, client):
     return asyncio.run(agent.aforward(task_id="aaa111_1", instruction="do it"))
 
 
-def test_appworld_rlm_completes_task_from_final_answer(monkeypatch):
+def test_appworld_rlm_completes_task_from_answer(monkeypatch):
     client = _AutoCompleteClient()
 
     result = _run_appworld_rlm_with_prediction(
         monkeypatch,
-        SimpleNamespace(final_answer="foo"),
+        SimpleNamespace(answer="foo"),
         client,
     )
 
-    assert result.final_answer == "foo"
+    assert result.answer == "foo"
     assert client.calls == [
         ("aaa111_1", "supervisor", "complete_task", json.dumps({"answer": "foo"}))
     ]
 
 
-def test_appworld_rlm_completes_task_without_answer_for_empty_submission(monkeypatch):
-    for final_answer in ("null", " NULL ", "none", " None ", None):
+def test_appworld_rlm_completes_task_from_raw_string_answer(monkeypatch):
+    cases = [
+        ("{}", {"answer": "{}"}),
+        ('{"answer": 6}', {"answer": '{"answer": 6}'}),
+        ("{'answer': 6}", {"answer": "{'answer': 6}"}),
+        ('{"answer": null}', {"answer": '{"answer": null}'}),
+        ("{'answer': None}", {"answer": "{'answer': None}"}),
+        ("null", {"answer": "null"}),
+        ("None", {"answer": "None"}),
+        ("", {"answer": ""}),
+        ("plain answer", {"answer": "plain answer"}),
+    ]
+
+    for answer, expected_payload in cases:
         client = _AutoCompleteClient()
 
         _run_appworld_rlm_with_prediction(
             monkeypatch,
-            SimpleNamespace(final_answer=final_answer),
+            SimpleNamespace(answer=answer),
+            client,
+        )
+
+        assert client.calls == [
+            ("aaa111_1", "supervisor", "complete_task", json.dumps(expected_payload))
+        ]
+
+
+def test_appworld_rlm_completes_task_from_nested_answer_as_raw_value(monkeypatch):
+    client = _AutoCompleteClient()
+
+    _run_appworld_rlm_with_prediction(
+        monkeypatch,
+        SimpleNamespace(answer={"answer": 1}),
+        client,
+    )
+
+    assert client.calls == [
+        ("aaa111_1", "supervisor", "complete_task", json.dumps({"answer": {"answer": 1}}))
+    ]
+
+
+def test_appworld_rlm_completes_task_without_answer_for_missing_or_default_answer(monkeypatch):
+    for prediction in (
+        SimpleNamespace(),
+        SimpleNamespace(answer=None),
+    ):
+        client = _AutoCompleteClient()
+
+        _run_appworld_rlm_with_prediction(
+            monkeypatch,
+            prediction,
             client,
         )
 
         assert client.calls == [("aaa111_1", "supervisor", "complete_task", "{}")]
 
 
+def test_appworld_rlm_does_not_fall_back_to_submission(monkeypatch):
+    client = _AutoCompleteClient()
+
+    _run_appworld_rlm_with_prediction(
+        monkeypatch,
+        SimpleNamespace(submission={"answer": "legacy"}),
+        client,
+    )
+
+    assert client.calls == [("aaa111_1", "supervisor", "complete_task", "{}")]
+
+
 def test_appworld_rlm_does_not_double_complete_after_successful_trace_call(monkeypatch):
     client = _AutoCompleteClient()
     prediction = SimpleNamespace(
-        final_answer="foo",
+        answer="foo",
         trace=SimpleNamespace(
             steps=[
                 SimpleNamespace(
@@ -402,6 +616,7 @@ def test_appworld_rlm_does_not_double_complete_after_successful_trace_call(monke
 
 def test_service_binds_current_task_appworld_tools(monkeypatch):
     captured_tools = {}
+    captured_prediction_kwargs = {}
 
     class FakeClient:
         def __init__(self):
@@ -435,15 +650,13 @@ def test_service_binds_current_task_appworld_tools(monkeypatch):
         def close_appworld_task(self, task_id):
             return task_id
 
-        def run_appworld_program(self, task_id, program):
-            return task_id + program
-
     class FakePredictRLM:
         def __init__(self, _signature, *, skills, **_kwargs):
             captured_tools.update(skills[0].tools)
 
-        async def acall(self, **_kwargs):
-            return SimpleNamespace(final_answer="done")
+        async def acall(self, **kwargs):
+            captured_prediction_kwargs.update(kwargs)
+            return SimpleNamespace(answer=None)
 
     monkeypatch.setattr(service_module, "PredictRLM", FakePredictRLM)
     client = FakeClient()
@@ -486,6 +699,7 @@ def test_service_binds_current_task_appworld_tools(monkeypatch):
     assert "evaluate_appworld_task" not in captured_tools
     assert "run_appworld_program" not in captured_tools
     assert "venmo__search" not in captured_tools
+    assert captured_prediction_kwargs == {"instruction": "do it"}
 
 
 def test_gepa_project_validates_with_fixture_data():
@@ -510,7 +724,7 @@ def test_gepa_agent_spec_is_derived_from_clean_rlm_tools():
     assert "evaluate_appworld_task" not in APPWORLD_SPEC.tool_signatures
     assert "run_appworld_program" not in APPWORLD_SPEC.tool_signatures
     assert "venmo__search" not in APPWORLD_SPEC.tool_signatures
-    assert "SolveAppWorldTask" in APPWORLD_SPEC.target_signature
+    assert "Complete the supervisor's task" in APPWORLD_SPEC.target_signature
     assert "harness-side" in APPWORLD_SPEC.scoring_description
 
 
@@ -520,14 +734,7 @@ def test_gepa_project_scores_from_harness_side_evaluator(monkeypatch, tmp_path):
     class FakeAppWorldClient:
         def evaluate_appworld_task(self, task_id):
             events.append(("evaluate", task_id))
-            return RunnerResult(
-                task_id=task_id,
-                success=True,
-                score=1.0,
-                stdout="",
-                stderr="",
-                feedback="harness score",
-            ).to_tool_text()
+            return _runner_result_text(success=True, score=1.0, feedback="harness score")
 
         def close_appworld_task(self, task_id):
             events.append(("close_task", task_id))
@@ -549,14 +756,7 @@ def test_gepa_project_scores_from_harness_side_evaluator(monkeypatch, tmp_path):
                             tool_calls=[
                                 SimpleNamespace(
                                     name="evaluate_appworld_task",
-                                    result=RunnerResult(
-                                        task_id=kwargs["task_id"],
-                                        success=False,
-                                        score=0.0,
-                                        stdout="",
-                                        stderr="",
-                                        feedback="stale trace result",
-                                    ).to_tool_text(),
+                                    result=_runner_result_text(success=False, score=0.0, feedback="stale trace result"),
                                     error=None,
                                 )
                             ]
@@ -610,14 +810,7 @@ def test_eval_builds_lms_before_constructing_appworld_rlm(monkeypatch, tmp_path)
         def __init__(self, *, lm, sub_lm, max_iterations, verbose, skill, data_root):
             self.appworld_client = SimpleNamespace(
                 evaluate_appworld_task=lambda task_id: eval_calls.append(task_id)
-                or RunnerResult(
-                    task_id=task_id,
-                    success=True,
-                    score=1.0,
-                    stdout="",
-                    stderr="",
-                    feedback="ok",
-                ).to_tool_text(),
+                or _runner_result_text(success=True, score=1.0, feedback="ok"),
                 close_appworld_task=lambda task_id: close_calls.append(task_id) or "",
             )
             agent_calls.append(
@@ -639,14 +832,7 @@ def test_eval_builds_lms_before_constructing_appworld_rlm(monkeypatch, tmp_path)
                             tool_calls=[
                                 SimpleNamespace(
                                     name="evaluate_appworld_task",
-                                    result=RunnerResult(
-                                        task_id="aaa111_1",
-                                        success=False,
-                                        score=0.0,
-                                        stdout="",
-                                        stderr="",
-                                        feedback="stale trace result",
-                                    ).to_tool_text(),
+                                    result=_runner_result_text(success=False, score=0.0, feedback="stale trace result"),
                                     error=None,
                                 )
                             ]
@@ -694,14 +880,7 @@ def test_run_evaluation_scores_from_harness_side_evaluator(monkeypatch, tmp_path
     class FakeAppWorldClient:
         def evaluate_appworld_task(self, task_id):
             events.append(("evaluate", task_id))
-            return RunnerResult(
-                task_id=task_id,
-                success=True,
-                score=1.0,
-                stdout="",
-                stderr="",
-                feedback="harness score",
-            ).to_tool_text()
+            return _runner_result_text(success=True, score=1.0, feedback="harness score")
 
         def close_appworld_task(self, task_id):
             events.append(("close", task_id))
@@ -714,21 +893,14 @@ def test_run_evaluation_scores_from_harness_side_evaluator(monkeypatch, tmp_path
         async def acall(self, **kwargs):
             events.append(("agent", kwargs["task_id"]))
             return SimpleNamespace(
-                final_answer="done",
+                answer="done",
                 trace=SimpleNamespace(
                     steps=[
                         SimpleNamespace(
                             tool_calls=[
                                 SimpleNamespace(
                                     name="evaluate_appworld_task",
-                                    result=RunnerResult(
-                                        task_id=kwargs["task_id"],
-                                        success=False,
-                                        score=0.0,
-                                        stdout="",
-                                        stderr="",
-                                        feedback="rlm trace should be ignored",
-                                    ).to_tool_text(),
+                                    result=_runner_result_text(success=False, score=0.0, feedback="rlm trace should be ignored"),
                                     error=None,
                                 )
                             ]

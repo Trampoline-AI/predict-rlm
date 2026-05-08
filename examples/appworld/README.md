@@ -106,18 +106,18 @@ task in the host. The adapter does not expose generated `app__api` wrappers such
 as `spotify__login` or `venmo__search`.
 
 The prompt and few-shot protocol are matched where possible. Task instructions
-come from local `specs.json` and include the supervisor profile context that
-stock AppWorld prompts provide. The ICL examples use the same official demo task
-IDs (`82e2fac_1`, `29caf6f_1`, `d0b1f43_1`) used by the official function-
-calling config's API predictor. To avoid committing extracted release data, this
-repo stores only those IDs and renders the demo text from the local AppWorld
-download at runtime, rather than checking in `demos.json` content.
+come from local `specs.json`, and the supervisor profile context that stock
+AppWorld prompts provide is passed into the RLM signature separately. For ICL,
+the repo stores only the official demo task IDs (`82e2fac_1`, `29caf6f_1`,
+`d0b1f43_1`) and loads tutorial task instructions from the user's local AppWorld
+download at runtime. It does not check in worked demo traces, `demos.json`
+content, generated app state, ground truth, or reference answers.
 
 The completion protocol is also adapted to the RLM interface. The RLM terminates
-with `SUBMIT(final_answer=...)`; immediately before harness scoring, the wrapper
-maps that terminal action onto AppWorld's required `supervisor.complete_task`
-call unless the trace already completed successfully through
-`call_appworld_api("supervisor", "complete_task", ...)`.
+with `SUBMIT(answer=value)` for answer tasks or `SUBMIT()` for state-change-only
+tasks. Immediately before harness scoring, the wrapper passes that optional raw
+answer value to AppWorld's required `supervisor.complete_task({"answer": value})`
+call through a host-only completion path; bare `SUBMIT()` sends `{}`.
 
 The model is not given the evaluator, reference answers, score feedback,
 `run_appworld_program`, generated direct `app__api` wrappers, or cleanup tools

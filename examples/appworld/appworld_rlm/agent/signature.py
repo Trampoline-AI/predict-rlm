@@ -1,33 +1,58 @@
 import dspy
 
 
-class SolveAppWorldTask(dspy.Signature):
-    """Solve an AppWorld task through persistent AppWorld API tools.
+Answer = int | float | str | None
 
-    You are an AI Assistant whose job is to complete the supervisor's day-to-day
-    AppWorld tasks fully autonomously. Do not ask for clarification or describe
-    what the supervisor should do. Use the AppWorld tools to inspect apps, read
-    API docs, retrieve exact IDs/credentials/state, and perform the requested
-    side effects.
 
-    The wrapper exposes a small host-bound AppWorld interface:
-    `list_appworld_apps()`, `show_appworld_api_descriptions(app_name)`,
-    `show_appworld_api_doc(app_name, api_name)`,
-    `search_appworld_api_docs(query)`, and
-    `call_appworld_api(app_name, api_name, kwargs_json)`. The model discovers
-    API names and schemas through the documentation tools, then calls APIs with
-    JSON-object kwargs. The harness binds every call to the current task; the
-    model does not pass task IDs.
+_SIGNATURE_TEMPLATE = """Complete the supervisor's task through app API tools.
 
-    Follow stock AppWorld completion semantics: return the exact minimal answer
-    requested by the task, not a prose summary. If the task requires only state
-    changes and no answer, return `null` exactly. The wrapper bridges the returned
-    final_answer to `supervisor.complete_task`; the harness then evaluates the
-    final AppWorld environment.
-    """
+I am your supervisor, and you are an AI Assistant whose job is to complete
+my day-to-day tasks fully autonomously.
 
-    task_id: str = dspy.InputField(desc="AppWorld task id, e.g. '82e2fac_1'.")
-    instruction: str = dspy.InputField(desc="Natural-language AppWorld task instruction.")
-    final_answer: str = dspy.OutputField(
-        desc="Exact minimal AppWorld completion answer; use literal null for no-answer tasks."
+My name is: {name}. My personal email is {email} and phone number is {phone}.
+
+Do not ask for clarification or describe what I should do. Use API documentation
+to understand how to interact with the apps, retrieve exact IDs/credentials/state,
+and perform the requested side effects.
+
+You have access to five tools:
+`list_appworld_apps()`, `show_appworld_api_descriptions(app_name)`,
+`show_appworld_api_doc(app_name, api_name)`, `search_appworld_api_docs(query)`,
+and `call_appworld_api(app_name, api_name, kwargs_json)`. The functions
+correspond to APIs from various apps you have access to. Discover API names and
+schemas through the documentation tools, then call APIs with JSON-object kwargs.
+No extra routing argument is needed.
+
+When the task is complete, make the terminal submission call. For answer tasks,
+use `SUBMIT(answer=<exact minimal answer>)`. For no-answer or state-change-only
+tasks, use `SUBMIT()`, which leaves the optional answer unset.
+"""
+
+
+def build_solve_appworld_task_signature(
+    supervisor_name: str = "",
+    supervisor_email: str = "",
+    supervisor_phone_number: str = "",
+) -> type[dspy.Signature]:
+    return dspy.Signature(
+        {
+            "instruction": dspy.InputField(
+                desc="Natural-language task instruction from the supervisor."
+            ),
+            "answer": (
+                Answer,
+                dspy.OutputField(
+                    default=None,
+                    desc="Exact minimal answer when the task requests one; leave unset for no-answer/state-change-only tasks.",
+                ),
+            ),
+        },
+        _SIGNATURE_TEMPLATE.format(
+            name=supervisor_name.strip(),
+            email=supervisor_email.strip(),
+            phone=supervisor_phone_number.strip(),
+        ),
     )
+
+
+SolveAppWorldTask = build_solve_appworld_task_signature()

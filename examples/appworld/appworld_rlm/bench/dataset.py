@@ -19,6 +19,9 @@ class AppWorldExample:
     task_id: str
     dataset: str
     instruction: str = ""
+    supervisor_name: str = ""
+    supervisor_email: str = ""
+    supervisor_phone_number: str = ""
 
     @property
     def group_id(self) -> str:
@@ -43,6 +46,7 @@ def load_dataset(dataset: str, data_root: str | Path = "data") -> list[AppWorldE
             task_id=task_id,
             dataset=dataset,
             instruction=_load_instruction(root, task_id),
+            **_load_supervisor_identity(root, task_id),
         )
         for task_id in _read_split_task_ids(path)
     ]
@@ -64,26 +68,32 @@ def _load_instruction(data_root: Path, task_id: str) -> str:
     instruction = specs.get("instruction", "")
     if not isinstance(instruction, str):
         instruction = ""
-    return _format_instruction_with_supervisor_context(instruction, specs)
+    return instruction
 
 
-def _format_instruction_with_supervisor_context(instruction: str, specs: dict) -> str:
+def _load_supervisor_identity(data_root: Path, task_id: str) -> dict[str, str]:
+    specs_path = data_root / "tasks" / task_id / "specs.json"
+    if not specs_path.is_file():
+        return {}
+    specs = json.loads(specs_path.read_text())
+    return _extract_supervisor_identity(specs)
+
+
+def _extract_supervisor_identity(specs: dict) -> dict[str, str]:
     supervisor = specs.get("supervisor") or specs.get("main_user") or {}
     if not isinstance(supervisor, dict):
-        return instruction
+        return {}
     first_name = supervisor.get("first_name")
     last_name = supervisor.get("last_name")
     email = supervisor.get("email")
     phone_number = supervisor.get("phone_number")
     if not all(isinstance(value, str) and value for value in (first_name, last_name, email, phone_number)):
-        return instruction
-    return (
-        "I am your supervisor. "
-        f"My name is: {first_name} {last_name}. "
-        f"My personal email is {email} and phone number is {phone_number}.\n\n"
-        "# Real Task Instruction\n"
-        f"{instruction}"
-    )
+        return {}
+    return {
+        "supervisor_name": f"{first_name} {last_name}",
+        "supervisor_email": email,
+        "supervisor_phone_number": phone_number,
+    }
 
 
 def load_train_validation(

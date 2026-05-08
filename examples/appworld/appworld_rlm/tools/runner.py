@@ -5,7 +5,6 @@ import json
 import os
 import subprocess
 import sys
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -14,105 +13,21 @@ class AppWorldRunnerError(RuntimeError):
     pass
 
 
-@dataclass(frozen=True)
-class RunnerResult:
-    task_id: str
-    success: bool
-    score: float
-    stdout: str
-    stderr: str
-    feedback: str
-    output: Any | None = None
-
-    @classmethod
-    def from_json(cls, payload: str) -> "RunnerResult":
-        data = json.loads(payload)
-        return cls(
-            task_id=str(data.get("task_id", "")),
-            success=bool(data.get("success", False)),
-            score=float(data.get("score", 0.0)),
-            stdout=str(data.get("stdout", "")),
-            stderr=str(data.get("stderr", "")),
-            feedback=str(data.get("feedback", "")),
-            output=data.get("output"),
-        )
-
-    def to_tool_text(self) -> str:
-        return json.dumps(
-            {
-                "task_id": self.task_id,
-                "success": self.success,
-                "score": self.score,
-                "stdout": self.stdout[-4000:],
-                "stderr": self.stderr[-4000:],
-                "feedback": self.feedback[-4000:],
-                "output": self.output,
-            },
-            sort_keys=True,
-        )
+_COMPLETE_TASK_FEEDBACK = "Use SUBMIT(answer=value) or SUBMIT() to finish the task."
+_DROP_COMPLETE_TASK = object()
 
 
-class AppWorldRunnerClient:
+class AppWorldSessionClient:
     def __init__(
         self,
         python: str | None = None,
         data_root: str | Path | None = None,
-        timeout: int = 300,
+        experiment_name: str = "predict_rlm",
     ):
         self.python = python or os.environ.get("APPWORLD_PYTHON") or _default_appworld_python()
         self.data_root = Path(data_root or os.environ.get("APPWORLD_DATA_ROOT", "data"))
-        self.timeout = timeout
-        self.worker = Path(__file__).with_name("appworld_worker.py")
-
-    def run(self, task_id: str, program: str, experiment_name: str = "predict_rlm") -> RunnerResult:
-        request = {
-            "task_id": task_id,
-            "program": program,
-            "experiment_name": experiment_name,
-            "data_root": str(self.data_root),
-        }
-        proc = subprocess.run(
-            [self.python, str(self.worker)],
-            input=json.dumps(request),
-            text=True,
-            capture_output=True,
-            timeout=self.timeout,
-            check=False,
-        )
-        if proc.returncode != 0:
-            raise AppWorldRunnerError(
-                f"AppWorld runner exited {proc.returncode}: {proc.stderr.strip()}"
-            )
-        try:
-            return RunnerResult.from_json(proc.stdout)
-        except json.JSONDecodeError as exc:
-            raise AppWorldRunnerError(f"AppWorld runner returned non-JSON: {proc.stdout[:500]}") from exc
-
-    def run_appworld_program(self, task_id: str, program: str) -> str:
-        """Execute a self-contained Python program against an AppWorld task.
-
-        Args:
-            task_id: AppWorld task id such as "82e2fac_1".
-            program: Python source to run inside an isolated AppWorld environment.
-
-        Returns:
-            JSON string with success, normalized score, stdout, stderr, feedback,
-            and optional evaluator output. The program runs in a fresh environment
-            for each call.
-        """
-        return self.run(task_id=task_id, program=program).to_tool_text()
-
-
-class AppWorldSessionClient(AppWorldRunnerClient):
-    def __init__(
-        self,
-        python: str | None = None,
-        data_root: str | Path | None = None,
-        timeout: int = 300,
-        experiment_name: str = "predict_rlm",
-    ):
-        super().__init__(python=python, data_root=data_root, timeout=timeout)
         self.experiment_name = experiment_name
+        self.worker = Path(__file__).with_name("appworld_worker.py")
         self._proc: subprocess.Popen[str] | None = None
         self._started_tasks: set[str] = set()
         atexit.register(self.close)
@@ -186,10 +101,12 @@ class AppWorldSessionClient(AppWorldRunnerClient):
             raise AppWorldRunnerError(str(response.get("feedback") or response))
         self._started_tasks.add(task_id)
 
-    def _tool_request(self, task_id: str, op: str, **kwargs: Any) -> str:
+    def _tool_response(self, task_id: str, op: str, **kwargs: Any) -> dict[str, Any]:
         self._ensure_task(task_id)
-        response = self.request({"op": op, "task_id": task_id, "session_id": task_id, **kwargs})
-        return _tool_text(response)
+        return self.request({"op": op, "task_id": task_id, "session_id": task_id, **kwargs})
+
+    def _tool_request(self, task_id: str, op: str, **kwargs: Any) -> str:
+        return _tool_text(self._tool_response(task_id, op, **kwargs))
 
     def list_appworld_apps(self, task_id: str) -> str:
         """List AppWorld apps and short app descriptions for a task."""
@@ -197,15 +114,21 @@ class AppWorldSessionClient(AppWorldRunnerClient):
 
     def show_appworld_api_descriptions(self, task_id: str, app_name: str) -> str:
         """Show available AppWorld APIs for one app."""
-        return self._tool_request(task_id, "show_api_descriptions", app_name=app_name)
+        response = self._tool_response(task_id, "show_api_descriptions", app_name=app_name)
+        if _is_supervisor_app(app_name):
+            response = _filter_model_facing_completion_docs(response, in_supervisor=True)
+        return _tool_text(response)
 
     def show_appworld_api_doc(self, task_id: str, app_name: str, api_name: str) -> str:
         """Show detailed AppWorld API documentation for one app API."""
+        if _is_completion_api(app_name, api_name):
+            return _blocked_completion_tool_text(task_id)
         return self._tool_request(task_id, "show_api_doc", app_name=app_name, api_name=api_name)
 
     def search_appworld_api_docs(self, task_id: str, query: str) -> str:
         """Search AppWorld API documentation for relevant apps and API names."""
-        return self._tool_request(task_id, "search_api_docs", query=query)
+        response = self._tool_response(task_id, "search_api_docs", query=query)
+        return _tool_text(_filter_model_facing_completion_docs(response))
 
     def call_appworld_api(
         self,
@@ -223,8 +146,37 @@ class AppWorldSessionClient(AppWorldRunnerClient):
             kwargs_json: JSON object string containing keyword arguments for the API.
 
         Returns:
-            JSON string with success, operation, result/output, stdout, stderr, and feedback.
+            JSON string with success, result/output, stdout, stderr, and feedback.
         """
+        return self._call_appworld_api(
+            task_id,
+            app_name,
+            api_name,
+            kwargs_json,
+            allow_complete_task=False,
+        )
+
+    def complete_appworld_task(self, task_id: str, kwargs_json: str) -> str:
+        """Internal host-side AppWorld completion path."""
+        return self._call_appworld_api(
+            task_id,
+            "supervisor",
+            "complete_task",
+            kwargs_json,
+            allow_complete_task=True,
+        )
+
+    def _call_appworld_api(
+        self,
+        task_id: str,
+        app_name: str,
+        api_name: str,
+        kwargs_json: str,
+        *,
+        allow_complete_task: bool,
+    ) -> str:
+        if _is_completion_api(app_name, api_name) and not allow_complete_task:
+            return _blocked_completion_tool_text(task_id)
         try:
             kwargs = json.loads(kwargs_json or "{}")
         except json.JSONDecodeError as exc:
@@ -294,19 +246,112 @@ def _default_appworld_python() -> str:
 
 
 def _tool_text(payload: dict[str, Any]) -> str:
-    return json.dumps(
+    text = {
+        "success": bool(payload.get("success", False)),
+        "stdout": str(payload.get("stdout") or "")[-4000:],
+        "stderr": str(payload.get("stderr") or "")[-4000:],
+        "feedback": str(payload.get("feedback") or "")[-4000:],
+    }
+    for field in ("score", "error", "result", "output"):
+        if field in payload and payload[field] is not None:
+            text[field] = payload[field]
+    return json.dumps(text, sort_keys=True)
+
+
+def _is_supervisor_app(app_name: Any) -> bool:
+    return str(app_name).strip().lower() == "supervisor"
+
+
+def _is_completion_api(app_name: Any, api_name: Any) -> bool:
+    return _is_supervisor_app(app_name) and str(api_name).strip().lower() == "complete_task"
+
+
+def _blocked_completion_tool_text(task_id: str) -> str:
+    return _tool_text(
         {
-            "task_id": payload.get("task_id", ""),
-            "session_id": payload.get("session_id", ""),
-            "operation": payload.get("operation", ""),
-            "success": bool(payload.get("success", False)),
-            "score": payload.get("score"),
-            "stdout": str(payload.get("stdout") or "")[-4000:],
-            "stderr": str(payload.get("stderr") or "")[-4000:],
-            "feedback": str(payload.get("feedback") or "")[-4000:],
-            "error": payload.get("error"),
-            "result": payload.get("result"),
-            "output": payload.get("output"),
-        },
-        sort_keys=True,
+            "task_id": task_id,
+            "session_id": task_id,
+            "operation": "call_api",
+            "success": False,
+            "feedback": _COMPLETE_TASK_FEEDBACK,
+            "result": None,
+            "output": None,
+        }
     )
+
+
+def _filter_model_facing_completion_docs(
+    response: dict[str, Any],
+    *,
+    in_supervisor: bool = False,
+) -> dict[str, Any]:
+    filtered = dict(response)
+    for field in ("result", "output"):
+        if field in filtered:
+            value = _filter_completion_doc_value(filtered[field], in_supervisor=in_supervisor)
+            filtered[field] = [] if value is _DROP_COMPLETE_TASK else value
+    return filtered
+
+
+def _filter_completion_doc_value(value: Any, *, in_supervisor: bool = False) -> Any:
+    if isinstance(value, dict):
+        if _dict_is_completion_doc(value, in_supervisor=in_supervisor):
+            return _DROP_COMPLETE_TASK
+        result = {}
+        next_in_supervisor = in_supervisor or _dict_names_supervisor(value)
+        for key, item in value.items():
+            key_text = str(key)
+            key_in_supervisor = next_in_supervisor or key_text.lower() == "supervisor"
+            if _is_completion_doc_key(key_text, in_supervisor=key_in_supervisor):
+                continue
+            filtered = _filter_completion_doc_value(item, in_supervisor=key_in_supervisor)
+            if filtered is not _DROP_COMPLETE_TASK:
+                result[key] = filtered
+        return result
+    if isinstance(value, list):
+        result = []
+        for item in value:
+            filtered = _filter_completion_doc_value(item, in_supervisor=in_supervisor)
+            if filtered is not _DROP_COMPLETE_TASK:
+                result.append(filtered)
+        return result
+    if isinstance(value, str) and _mentions_completion_doc(value):
+        return "\n".join(
+            line for line in value.splitlines() if not _mentions_completion_doc(line)
+        )
+    return value
+
+
+def _dict_names_supervisor(value: dict[Any, Any]) -> bool:
+    for field in ("app_name", "app", "namespace"):
+        if _is_supervisor_app(value.get(field)):
+            return True
+    return False
+
+
+def _dict_is_completion_doc(value: dict[Any, Any], *, in_supervisor: bool) -> bool:
+    app_name = None
+    for field in ("app_name", "app", "namespace"):
+        if field in value:
+            app_name = value[field]
+            break
+    api_name = None
+    for field in ("api_name", "api", "name"):
+        if field in value:
+            api_name = value[field]
+            break
+    if api_name is None:
+        return False
+    return _is_completion_api(app_name or ("supervisor" if in_supervisor else ""), api_name)
+
+
+def _is_completion_doc_key(key: str, *, in_supervisor: bool) -> bool:
+    normalized = key.strip().lower()
+    if normalized in {"supervisor.complete_task", "supervisor__complete_task"}:
+        return True
+    return in_supervisor and normalized == "complete_task"
+
+
+def _mentions_completion_doc(text: str) -> bool:
+    normalized = text.lower()
+    return "supervisor.complete_task" in normalized or "supervisor__complete_task" in normalized

@@ -46,8 +46,8 @@ def build_appworld_spec() -> AgentSpec:
     return agent_spec_from_rlm(
         rlm,
         agent_type=(
-            "an AppWorld task-solving RLM that writes Python against clean, "
-            "direct AppWorld API tools in an isolated app environment"
+            "an AppWorld task-solving RLM that uses documentation tools plus a "
+            "generic AppWorld API caller in an isolated app environment"
         ),
         use_cases=[
             "realistic multi-app personal-assistant workflows with persistent state",
@@ -60,7 +60,7 @@ def build_appworld_spec() -> AgentSpec:
                 "test_normal and test_challenge remain held out for reporting",
             ],
             "runner contract": [
-                "direct AppWorld tools keep persistent task state and return JSON strings",
+                "host-bound AppWorld tools keep persistent task state and return JSON strings",
                 "the RLM must complete tasks through the supervisor API, not evaluator feedback",
                 "the AppWorld evaluator is called only by the GEPA/eval harness after the attempt finishes",
             ],
