@@ -1306,6 +1306,9 @@ class JspiInterpreter(PythonInterpreter):
         """Execute a tool asynchronously and return the response dict."""
         from .trace import ToolCall, ms_since, record_tool_call
 
+        if not hasattr(self, "_execution_gate"):
+            self._execution_gate = InterpreterExecutionGate("JSPI interpreter")
+
         if self._debug:
             import sys
 
