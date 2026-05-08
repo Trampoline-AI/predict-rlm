@@ -18,7 +18,7 @@ from typing import Any
 
 REAL_STDOUT = sys.stdout
 REAL_OPEN = builtins.open
-REAL_PATH = pathlib.Path
+REAL_PATH = type(pathlib.Path())
 SANDBOX_ROOT = REAL_PATH(
     os.environ.get("PREDICT_RLM_SBX_ROOT")
     or tempfile.mkdtemp(prefix="predict-rlm-sbx-runner-")
