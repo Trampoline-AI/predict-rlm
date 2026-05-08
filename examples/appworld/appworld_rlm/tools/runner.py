@@ -286,7 +286,10 @@ class AppWorldSessionClient(AppWorldRunnerClient):
 def _default_appworld_python() -> str:
     local_appworld_python = Path.cwd() / ".appworld-venv" / "bin" / "python"
     if local_appworld_python.is_file():
-        return str(local_appworld_python.resolve())
+        # Do not resolve the venv interpreter symlink: on macOS/uv venvs the
+        # symlink target can be the base Python binary, and executing the
+        # resolved target loses the venv site-packages (including appworld).
+        return str(local_appworld_python)
     return sys.executable
 
 

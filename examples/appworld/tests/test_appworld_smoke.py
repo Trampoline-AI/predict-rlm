@@ -132,7 +132,7 @@ def test_default_appworld_python_prefers_local_runtime(tmp_path, monkeypatch):
     appworld_python.write_text("")
     monkeypatch.chdir(tmp_path)
 
-    assert _default_appworld_python() == str(appworld_python.resolve())
+    assert _default_appworld_python() == str(appworld_python)
 
 
 def test_session_client_call_api_rejects_non_object_kwargs():
