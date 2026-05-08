@@ -7,6 +7,7 @@ from typing import Any
 from rlm_gepa import AgentSpec, OptimizeConfig, agent_spec_from_rlm
 
 from ..agent.service import AppWorldRLM
+from ..bench.config import DEFAULT_CONCURRENCY
 
 
 @dataclass
@@ -37,7 +38,7 @@ def default_config() -> AppWorldGepaConfig:
         proposer_sub_lm="openai/gpt-5.4-mini",
         seed=13,
         minibatch_size=5,
-        concurrency=2,
+        concurrency=DEFAULT_CONCURRENCY,
     )
 
 

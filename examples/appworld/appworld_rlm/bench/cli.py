@@ -6,7 +6,7 @@ import json
 import os
 from pathlib import Path
 
-from .config import EvalConfig
+from .config import DEFAULT_CONCURRENCY, EvalConfig
 from .evaluation import run_evaluation_sync
 
 
@@ -22,7 +22,7 @@ def add_eval_subcommand(subparsers: argparse._SubParsersAction) -> None:
     parser.add_argument("--lm", default="openai/gpt-5.4")
     parser.add_argument("--sub-lm", default="openai/gpt-5.4-mini")
     parser.add_argument("--reasoning-effort", default="low")
-    parser.add_argument("--concurrency", type=int, default=2)
+    parser.add_argument("--concurrency", type=int, default=DEFAULT_CONCURRENCY)
     parser.add_argument("--max-iterations", type=int, default=50)
     parser.add_argument("--task-timeout", type=int, default=300)
     parser.add_argument("--val-ratio", type=float, default=0.20)

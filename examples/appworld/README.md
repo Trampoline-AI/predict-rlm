@@ -196,9 +196,12 @@ SGC for comparisons to AppWorld/HALO charts labeled "Scenario Goal Completion".
 
 ## Commands
 
+Optimize and eval use default concurrency 30. Pass `--concurrency` only when a
+run needs a different worker count.
+
 ```bash
 uv run rlm-gepa optimize --check --data-root data --val-ratio 0.2
-uv run rlm-gepa optimize --data-root data --max-metric-calls 100 --minibatch-size 5 --concurrency 2
+uv run rlm-gepa optimize --data-root data --max-metric-calls 100 --minibatch-size 5
 uv run rlm-gepa eval --dataset test_normal --data-root data --limit 5
 uv run rlm-gepa eval --dataset test_challenge --data-root data --run-dir runs/<run> --cand-idx <idx>
 ```

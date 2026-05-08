@@ -5,6 +5,7 @@ from pathlib import Path
 
 DEFAULT_EVAL_LM = "openai/gpt-5.4"
 DEFAULT_EVAL_SUB_LM = "openai/gpt-5.4-mini"
+DEFAULT_CONCURRENCY = 30
 DEFAULT_SEED = 13
 
 
@@ -20,7 +21,7 @@ class EvalConfig:
     cand_idx: int | None = None
     limit: int | None = None
     task_ids: tuple[str, ...] | None = None
-    concurrency: int = 2
+    concurrency: int = DEFAULT_CONCURRENCY
     max_iterations: int = 50
     task_timeout: int = 300
     val_ratio: float = 0.20

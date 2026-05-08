@@ -21,7 +21,7 @@ from appworld_rlm.bench.config import EvalConfig
 from appworld_rlm.bench.dataset import load_dataset, load_train_validation
 from appworld_rlm.gepa import cli as gepa_cli
 from appworld_rlm.gepa import project as gepa_project_module
-from appworld_rlm.gepa.config import APPWORLD_SPEC, AppWorldGepaConfig
+from appworld_rlm.gepa.config import APPWORLD_SPEC, AppWorldGepaConfig, default_config
 from appworld_rlm.gepa.project import COMPONENT_SKILL, AppWorldGepaProject, score_runner_result
 from appworld_rlm.tools.appworld_worker import (
     JsonlAppWorldWorker,
@@ -966,6 +966,20 @@ def test_codex_lm_args_are_registered_for_eval_and_optimize():
     gepa_cli._add_project_args(optimize_parser)
     optimize_args = optimize_parser.parse_args(["--no-codex-lm"])
     assert optimize_args.codex_lm is False
+
+
+def test_appworld_eval_and_gepa_concurrency_defaults_to_30_and_eval_override_works():
+    parser = argparse.ArgumentParser()
+    subparsers = parser.add_subparsers(dest="command", required=True)
+    bench_cli.add_eval_subcommand(subparsers)
+
+    eval_args = parser.parse_args(["eval"])
+    override_args = parser.parse_args(["eval", "--concurrency", "7"])
+
+    assert EvalConfig().concurrency == 30
+    assert eval_args.concurrency == 30
+    assert default_config().concurrency == 30
+    assert override_args.concurrency == 7
 
 
 def test_install_codex_lm_explicit_missing_has_appworld_uv_hint(monkeypatch):
