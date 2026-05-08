@@ -71,6 +71,33 @@ _ImageType = dspy.Image
 
 _PARENT_TAKES_CODE = "code" in inspect.signature(dspy.RLM._process_execution_result).parameters
 
+_NO_FIELD_DEFAULT = object()
+
+
+def _get_field_default(field: Any) -> Any:
+    if hasattr(field, "is_required") and field.is_required():
+        return _NO_FIELD_DEFAULT
+    if hasattr(field, "get_default"):
+        return field.get_default(call_default_factory=True)
+    if hasattr(field, "default_factory") and field.default_factory is not None:
+        return field.default_factory()
+    default = getattr(field, "default", _NO_FIELD_DEFAULT)
+    if type(default).__name__ == "PydanticUndefinedType":
+        return _NO_FIELD_DEFAULT
+    return default
+
+
+def _to_json_safe(value: Any) -> Any:
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if hasattr(value, "model_dump"):
+        return _to_json_safe(value.model_dump(mode="python"))
+    if isinstance(value, dict):
+        return {k: _to_json_safe(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return [_to_json_safe(v) for v in value]
+    return value
+
 
 def _strip_code_fences(code: str) -> str:
     """Extract code from markdown fences, accepting python/py/repl tags."""
@@ -1232,6 +1259,10 @@ class PredictRLM(dspy.RLM):
                 field_info["type"] = "list" if _is_list_annotation(annotation) else "str"
             elif annotation in SIMPLE_TYPES:
                 field_info["type"] = annotation.__name__
+            default = _get_field_default(field)
+            if default is not _NO_FIELD_DEFAULT:
+                field_info["has_default"] = True
+                field_info["default"] = _to_json_safe(default)
             fields.append(field_info)
         return fields
 

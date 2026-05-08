@@ -1,11 +1,44 @@
 """Tests for JspiInterpreter with concurrent async tool execution."""
 
 import pytest
-from dspy.primitives.code_interpreter import CodeInterpreterError
+from dspy.primitives.code_interpreter import CodeInterpreterError, FinalOutput
 
 from predict_rlm.interpreter import JspiInterpreter, SandboxFatalError
 
 pytestmark = pytest.mark.integration
+
+
+class TestSubmitDefaults:
+    def test_bare_submit_uses_single_output_default(self):
+        interpreter = JspiInterpreter(
+            preinstall_packages=False,
+            output_fields=[
+                {
+                    "name": "answer",
+                    "type": "str",
+                    "has_default": True,
+                    "default": None,
+                }
+            ],
+        )
+        try:
+            result = interpreter.execute("SUBMIT()")
+        finally:
+            interpreter.shutdown()
+
+        assert isinstance(result, FinalOutput)
+        assert result.output == {"answer": None}
+
+    def test_bare_submit_without_default_still_errors(self):
+        interpreter = JspiInterpreter(
+            preinstall_packages=False,
+            output_fields=[{"name": "answer", "type": "str"}],
+        )
+        try:
+            with pytest.raises(CodeInterpreterError, match="missing.*answer"):
+                interpreter.execute("SUBMIT()")
+        finally:
+            interpreter.shutdown()
 
 
 class TestCodeFenceStripping:

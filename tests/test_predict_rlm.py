@@ -35,6 +35,13 @@ class ImageAnalysisSignature(dspy.Signature):
     answer: str = dspy.OutputField(desc="Answer to the query")
 
 
+class DefaultAnswerSignature(dspy.Signature):
+    """Return an optional answer."""
+
+    instruction: str = dspy.InputField()
+    answer: str | None = dspy.OutputField(default=None)
+
+
 class MockLM:
     """Mock LM that returns predictable responses for testing."""
 
@@ -161,6 +168,18 @@ class TestSandboxBackendSelection:
         mock_sbx.assert_not_called()
         leased.shutdown.assert_not_called()
 
+
+class TestPredictRLMOutputDefaults:
+    def test_output_field_defaults_are_registered_for_submit(self):
+        rlm = PredictRLM(DefaultAnswerSignature, max_iterations=1)
+
+        assert rlm._get_output_fields_info() == [
+            {
+                "name": "answer",
+                "has_default": True,
+                "default": None,
+            }
+        ]
 
 
 class TestPredictTool:

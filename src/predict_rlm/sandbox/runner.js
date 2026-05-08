@@ -471,16 +471,27 @@ def SUBMIT(output):
 `;
   }
 
+  const allowDefaults = outputs.length === 1;
   const sigParts = outputs.map(o => {
     let part = o.name;
     if (o.type) part += `: ${o.type}`;
+    if (allowDefaults && o.has_default) part += `=_SUBMIT_MISSING`;
     return part;
   });
+  const defaultLines = allowDefaults
+    ? outputs
+        .filter(o => o.has_default)
+        .map(o => {
+          const defaultJson = JSON.stringify(JSON.stringify(o.default));
+          return `    if ${o.name} is _SUBMIT_MISSING:\n        ${o.name} = _submit_json.loads(${defaultJson})`;
+        })
+    : [];
   const dictParts = outputs.map(o => `"${o.name}": ${o.name}`);
 
   return `${serializerDef}
+_SUBMIT_MISSING = object()
 def SUBMIT(${sigParts.join(', ')}):
-    raise FinalOutput(_submit_to_jsonsafe({${dictParts.join(', ')}}))
+${defaultLines.length ? defaultLines.join('\n') + '\n' : ''}    raise FinalOutput(_submit_to_jsonsafe({${dictParts.join(', ')}}))
 `;
 };
 
