@@ -444,6 +444,89 @@ class TestSbxInterpreterLocalRunner:
             "sandbox + configured"
         )
 
+    def test_execute_serializes_concurrent_requests(self, tmp_path: Path):
+        runner_script = tmp_path / "detect_concurrent_requests.py"
+        runner_script.write_text(
+            """
+import json
+import select
+import sys
+import time
+
+
+def send(message):
+    sys.stdout.write(json.dumps(message) + "\\n")
+    sys.stdout.flush()
+
+
+while True:
+    line = sys.stdin.readline()
+    if not line:
+        break
+    request = json.loads(line)
+    request_id = request.get("id")
+    method = request.get("method")
+    if method == "shutdown":
+        send({"jsonrpc": "2.0", "result": {"shutdown": True}, "id": request_id})
+        break
+    if method != "execute":
+        send({"jsonrpc": "2.0", "result": {}, "id": request_id})
+        continue
+    time.sleep(0.2)
+    readable, _, _ = select.select([sys.stdin], [], [], 0)
+    if readable:
+        send({
+            "jsonrpc": "2.0",
+            "error": {
+                "code": -32000,
+                "message": "concurrent request detected",
+                "data": {"type": "RuntimeError", "args": ["concurrent request detected"]},
+            },
+            "id": request_id,
+        })
+        continue
+    send({
+        "jsonrpc": "2.0",
+        "result": {"output": request.get("params", {}).get("code", "") + "\\n"},
+        "id": request_id,
+    })
+""".lstrip(),
+            encoding="utf-8",
+        )
+        interpreter = SbxInterpreter(
+            config=SbxConfig(name="local-test", exec_timeout=2),
+            preinstall_packages=False,
+            _runner_command=[sys.executable, "-u", str(runner_script)],
+            _staging_root=tmp_path / "staging",
+        )
+        barrier = threading.Barrier(3)
+        results: list[str] = []
+        errors: list[BaseException] = []
+
+        def execute(code: str) -> None:
+            barrier.wait()
+            try:
+                results.append(interpreter.execute(code).strip())
+            except BaseException as exc:
+                errors.append(exc)
+
+        threads = [
+            threading.Thread(target=execute, args=("first",)),
+            threading.Thread(target=execute, args=("second",)),
+        ]
+        try:
+            for thread in threads:
+                thread.start()
+            barrier.wait()
+            for thread in threads:
+                thread.join(timeout=3)
+        finally:
+            interpreter.shutdown()
+
+        assert [thread.is_alive() for thread in threads] == [False, False]
+        assert errors == []
+        assert sorted(results) == ["first", "second"]
+
     def test_concurrent_host_tool_calls_do_not_run_serially(self, tmp_path: Path):
         async def slow(value: int) -> int:
             await asyncio.sleep(0.35)
@@ -469,6 +552,30 @@ class TestSbxInterpreterLocalRunner:
 
         assert output.strip() == "[1, 2]"
         assert elapsed < 0.6
+
+    def test_same_interpreter_tool_reentry_raises_runtimeerror(self, tmp_path: Path):
+        observed_errors: list[str] = []
+
+        def reenter() -> str:
+            with pytest.raises(RuntimeError, match="host tool callback") as exc_info:
+                interpreter.execute("print('nested')")
+            observed_errors.append(str(exc_info.value))
+            return "blocked"
+
+        interpreter = SbxInterpreter(
+            config=SbxConfig(name="local-test", exec_timeout=3),
+            tools={"reenter": reenter},
+            preinstall_packages=False,
+            _runner_command=[sys.executable, "-u", str(RUNNER_PATH)],
+            _staging_root=tmp_path / "staging",
+        )
+        try:
+            output = interpreter.execute("result = await reenter()\nprint(result)")
+        finally:
+            interpreter.shutdown()
+
+        assert output.strip() == "blocked"
+        assert len(observed_errors) == 1
 
     def test_request_timeout_fires_when_runner_stays_silent(self, tmp_path: Path):
         interpreter = SbxInterpreter(

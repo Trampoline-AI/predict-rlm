@@ -16,7 +16,6 @@ from __future__ import annotations
 import asyncio
 import concurrent.futures
 import contextvars
-import functools
 import inspect
 import json
 import logging
@@ -32,6 +31,11 @@ from typing import TYPE_CHECKING, Any
 from dspy.primitives.code_interpreter import CodeInterpreterError, FinalOutput
 from dspy.primitives.python_interpreter import PythonInterpreter
 from pydantic import BaseModel
+
+from predict_rlm.interpreters.base import (
+    STALE_RESPONSE_DISCARD_LIMIT,
+    InterpreterExecutionGate,
+)
 
 from .telemetry import (
     TelemetryContext,
@@ -344,6 +348,7 @@ class JspiInterpreter(PythonInterpreter):
         self._active_tool_count = 0
         # Per-execute wall-clock timeout (see __init__ docstring).
         self._exec_timeout = exec_timeout
+        self._execution_gate = InterpreterExecutionGate("JSPI interpreter")
 
     def _telemetry_process_pid(self) -> int | None:
         process = getattr(self, "deno_process", None)
@@ -587,7 +592,7 @@ class JspiInterpreter(PythonInterpreter):
         # thinks the mismatch is a code-format bug), discard any
         # stale-id responses until we find one that matches or hit the
         # safety cap.
-        max_stale_discards = 50
+        max_stale_discards = STALE_RESPONSE_DISCARD_LIMIT
         for _attempt in range(max_stale_discards + 1):
             response_line = self._read_with_timeout(
                 timeout=DENO_REQUEST_TIMEOUT_SEC
@@ -770,27 +775,28 @@ class JspiInterpreter(PythonInterpreter):
         code = self._strip_code_fences(code)
         code = self._inject_variables(code, variables)
 
-        # Limit concurrent Deno sandboxes to prevent OOM.
-        # Acquired per-execute, released when done — allows other
-        # interpreters to run between iterations.
-        sem = self._get_semaphore()
-        wait_start = time.perf_counter()
-        await sem.acquire()
-        wait_ms = round((time.perf_counter() - wait_start) * 1000)
-        sem_value = getattr(sem, "_value", None)
-        self._last_semaphore_attrs = {
-            "sandbox.semaphore_wait_ms": wait_ms,
-            "sandbox.active_count": (
-                self.MAX_CONCURRENT_SANDBOXES - sem_value
-                if isinstance(sem_value, int)
-                else None
-            ),
-        }
-        try:
-            return await self._aexecute_inner(code, variables)
-        finally:
-            self._last_semaphore_attrs = {}
-            sem.release()
+        async with self._execution_gate.atop_level():
+            # Limit concurrent Deno sandboxes to prevent OOM.
+            # Acquired per-execute, released when done — allows other
+            # interpreters to run between iterations.
+            sem = self._get_semaphore()
+            wait_start = time.perf_counter()
+            await sem.acquire()
+            wait_ms = round((time.perf_counter() - wait_start) * 1000)
+            sem_value = getattr(sem, "_value", None)
+            self._last_semaphore_attrs = {
+                "sandbox.semaphore_wait_ms": wait_ms,
+                "sandbox.active_count": (
+                    self.MAX_CONCURRENT_SANDBOXES - sem_value
+                    if isinstance(sem_value, int)
+                    else None
+                ),
+            }
+            try:
+                return await self._aexecute_inner(code, variables)
+            finally:
+                self._last_semaphore_attrs = {}
+                sem.release()
 
     async def _aexecute_inner(self, code: str, variables: dict[str, Any] | None) -> Any:
         """Inner async execute — runs within the sandbox semaphore."""
@@ -932,6 +938,14 @@ class JspiInterpreter(PythonInterpreter):
         All tools are async. Multiple tool calls via asyncio.gather()
         are executed concurrently on the host side.
         """
+        with self._execution_gate.top_level():
+            return self._execute_top_level(code, variables)
+
+    def _execute_top_level(
+        self,
+        code: str,
+        variables: dict[str, Any] | None = None,
+    ) -> Any:
         variables = variables or {}
 
         # Strip markdown code fences that models often add
@@ -986,6 +1000,7 @@ class JspiInterpreter(PythonInterpreter):
     async def _execute_async(self, execute_request_id: int) -> Any:
         """Read messages and handle tool calls concurrently using asyncio."""
         pending_tasks: dict[str, asyncio.Task] = {}  # request_id -> Task
+        stale_discards = 0
 
         while True:
             self._active_tool_count = len(pending_tasks)
@@ -1041,16 +1056,44 @@ class JspiInterpreter(PythonInterpreter):
                     self._active_tool_count = len(pending_tasks)
                     continue
 
+            if "result" in result and result.get("id") != execute_request_id:
+                stale_discards += 1
+                if stale_discards > STALE_RESPONSE_DISCARD_LIMIT:
+                    raise CodeInterpreterError(
+                        "Too many stale top-level responses while resyncing "
+                        f"execute request id={execute_request_id}"
+                    )
+                logger.warning(
+                    "Discarding stale deno execute response (id=%s, expected %s)",
+                    result.get("id"),
+                    execute_request_id,
+                )
+                continue
+
+            if (
+                "error" in result
+                and result.get("id") is not None
+                and result.get("id") != execute_request_id
+            ):
+                stale_discards += 1
+                if stale_discards > STALE_RESPONSE_DISCARD_LIMIT:
+                    raise CodeInterpreterError(
+                        "Too many stale top-level errors while resyncing "
+                        f"execute request id={execute_request_id}"
+                    )
+                logger.warning(
+                    "Discarding stale deno execute error (id=%s, expected %s)",
+                    result.get("id"),
+                    execute_request_id,
+                )
+                continue
+
             # Before returning, ensure all pending tool calls complete
             await self._wait_and_send_all_responses(pending_tasks)
             self._active_tool_count = len(pending_tasks)
 
             # JSON-RPC success response
             if "result" in result:
-                if result.get("id") != execute_request_id:
-                    raise CodeInterpreterError(
-                        f"Response ID mismatch: expected {execute_request_id}, got {result.get('id')}"
-                    )
                 res = result["result"]
                 self._sync_files()
                 if self._debug:
@@ -1074,10 +1117,6 @@ class JspiInterpreter(PythonInterpreter):
 
             # JSON-RPC error response
             if "error" in result:
-                if result.get("id") is not None and result.get("id") != execute_request_id:
-                    raise CodeInterpreterError(
-                        f"Response ID mismatch: expected {execute_request_id}, got {result.get('id')}"
-                    )
                 error = result["error"]
                 error_data = error.get("data", {})
                 error_type = error_data.get("type", "Sandbox Error")
@@ -1363,10 +1402,11 @@ class JspiInterpreter(PythonInterpreter):
                 telemetry_context = getattr(self, "_telemetry_context", None)
                 token = set_current_telemetry_context(telemetry_context)
                 try:
-                    result = await asyncio.wait_for(
-                        tool_fn(*args, **kwargs),
-                        timeout=TOOL_CALL_TIMEOUT_SEC,
-                    )
+                    with self._execution_gate.async_tool_callback():
+                        result = await asyncio.wait_for(
+                            tool_fn(*args, **kwargs),
+                            timeout=TOOL_CALL_TIMEOUT_SEC,
+                        )
                 except asyncio.TimeoutError as e:
                     raise TimeoutError(
                         f"tool {tool_name!r} timed out after "
@@ -1380,10 +1420,15 @@ class JspiInterpreter(PythonInterpreter):
                 token = set_current_telemetry_context(telemetry_context)
                 ctx = contextvars.copy_context()
                 reset_current_telemetry_context(token)
+
+                def call_tool() -> Any:
+                    with self._execution_gate.tool_callback():
+                        return tool_fn(*args, **kwargs)
+
                 future = loop.run_in_executor(
                     self._executor,
                     ctx.run,
-                    functools.partial(tool_fn, *args, **kwargs),
+                    call_tool,
                 )
                 try:
                     result = await asyncio.wait_for(

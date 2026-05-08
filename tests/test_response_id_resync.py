@@ -32,13 +32,17 @@ GREEN: stale frame discarded, real response returned cleanly
 
 from __future__ import annotations
 
+import asyncio
 import json
+import queue
 import types
 
 import pytest
 
 import predict_rlm.interpreter as rlm_interpreter
 from predict_rlm.interpreter import CodeInterpreterError, JspiInterpreter
+from predict_rlm.interpreters import SbxConfig, SbxInterpreter
+from predict_rlm.interpreters.base import STALE_RESPONSE_DISCARD_LIMIT
 
 
 def _build_interp(stdout_lines: list[str]):
@@ -155,3 +159,182 @@ def test_matching_response_passes_through_unchanged():
     interp = _build_interp([good])
     result = interp._send_request("m", {}, context="t")
     assert result.get("result", {}).get("output") == "hi"
+
+
+def _build_execute_loop_interp(stdout_lines: list[str]):
+    interp = JspiInterpreter.__new__(JspiInterpreter)
+    interp._pending_file_ops = {}
+    interp._debug = False
+    interp._sync_files = lambda: None
+    interp.deno_process = types.SimpleNamespace(
+        stderr=types.SimpleNamespace(read=lambda: ""),
+    )
+    lines = list(stdout_lines)
+
+    async def _mock_read(timeout):
+        if not lines:
+            return None
+        return lines.pop(0).rstrip("\n")
+
+    async def _noop_responses(pending):
+        return None
+
+    interp._read_with_timeout_async = _mock_read  # type: ignore[assignment]
+    interp._send_completed_responses = _noop_responses  # type: ignore[assignment]
+    interp._wait_and_send_all_responses = _noop_responses  # type: ignore[assignment]
+    return interp
+
+
+@pytest.mark.asyncio
+async def test_jspi_execute_loop_discards_stale_top_level_response():
+    stale = json.dumps({"jsonrpc": "2.0", "id": 5, "result": {"output": "stale"}})
+    fresh = json.dumps({"jsonrpc": "2.0", "id": 7, "result": {"output": "fresh"}})
+    interp = _build_execute_loop_interp([stale, fresh])
+
+    result = await interp._execute_async(7)
+
+    assert result == "fresh"
+
+
+@pytest.mark.asyncio
+async def test_jspi_execute_loop_exhausted_resync_raises_cleanly():
+    stale = json.dumps({"jsonrpc": "2.0", "id": 5, "result": {"output": "stale"}})
+    interp = _build_execute_loop_interp([stale] * (STALE_RESPONSE_DISCARD_LIMIT + 1))
+
+    with pytest.raises(CodeInterpreterError, match="stale|resync"):
+        await interp._execute_async(7)
+
+
+@pytest.mark.asyncio
+async def test_jspi_execute_loop_routes_file_operation_response_before_resync():
+    file_op = json.dumps({"jsonrpc": "2.0", "id": 5, "result": {}})
+    fresh = json.dumps({"jsonrpc": "2.0", "id": 7, "result": {"output": "fresh"}})
+    interp = _build_execute_loop_interp([file_op, fresh])
+    future = asyncio.get_running_loop().create_future()
+    interp._pending_file_ops = {5: future}
+
+    result = await interp._execute_async(7)
+
+    assert result == "fresh"
+    assert future.result()["id"] == 5
+
+
+@pytest.mark.asyncio
+async def test_jspi_execute_loop_routes_tool_calls_without_counting_them_stale():
+    tool_calls = [
+        json.dumps({
+            "jsonrpc": "2.0",
+            "method": "tool_call",
+            "params": {"name": "tool", "args": [], "kwargs": {}},
+            "id": f"tool-{idx}",
+        })
+        for idx in range(STALE_RESPONSE_DISCARD_LIMIT + 1)
+    ]
+    fresh = json.dumps({"jsonrpc": "2.0", "id": 7, "result": {"output": "fresh"}})
+    interp = _build_execute_loop_interp([*tool_calls, fresh])
+    called: list[str] = []
+
+    async def _execute_tool(name, params, request_id=None):
+        called.append(request_id if request_id is not None else name)
+        return {"value": "ok", "type": "string"}
+
+    async def _wait_all(pending):
+        await asyncio.gather(*pending.values())
+        pending.clear()
+
+    interp._execute_tool_async = _execute_tool  # type: ignore[assignment]
+    interp._wait_and_send_all_responses = _wait_all  # type: ignore[assignment]
+
+    result = await interp._execute_async(7)
+
+    assert result == "fresh"
+    assert len(called) == STALE_RESPONSE_DISCARD_LIMIT + 1
+
+
+class _BufferingStdin:
+    def __init__(self) -> None:
+        self.data: list[str] = []
+
+    def write(self, data: str) -> None:
+        self.data.append(data)
+
+    def flush(self) -> None:
+        return None
+
+
+def _build_sbx_request_interp(tmp_path, stdout_lines: list[str]) -> SbxInterpreter:
+    interp = SbxInterpreter(
+        config=SbxConfig(name="resync-test", exec_timeout=1),
+        preinstall_packages=False,
+        _runner_command=["unused"],
+        _staging_root=tmp_path / "staging",
+    )
+    interp._ensure_process_for_method = lambda method: None  # type: ignore[method-assign]
+    interp._proc = types.SimpleNamespace(
+        stdin=_BufferingStdin(),
+        stdout=types.SimpleNamespace(),
+        stderr=None,
+        poll=lambda: None,
+    )
+    interp._stdout_lines = queue.Queue()
+    for line in stdout_lines:
+        interp._stdout_lines.put(line)
+    return interp
+
+
+def _close_sbx_request_interp(interp: SbxInterpreter) -> None:
+    interp._proc = None
+    interp._tool_executor.shutdown(wait=False, cancel_futures=True)
+
+
+def test_sbx_send_request_discards_stale_top_level_response(tmp_path):
+    stale = json.dumps({"jsonrpc": "2.0", "id": 5, "result": {"output": "stale"}})
+    fresh = json.dumps({"jsonrpc": "2.0", "id": 1, "result": {"output": "fresh"}})
+    interp = _build_sbx_request_interp(tmp_path, [stale, fresh])
+
+    try:
+        result = interp._send_request("execute", {"code": "print('fresh')"})
+    finally:
+        _close_sbx_request_interp(interp)
+
+    assert result["result"]["output"] == "fresh"
+
+
+def test_sbx_send_request_exhausted_resync_raises_cleanly(tmp_path):
+    stale = json.dumps({"jsonrpc": "2.0", "id": 5, "result": {"output": "stale"}})
+    interp = _build_sbx_request_interp(
+        tmp_path,
+        [stale] * (STALE_RESPONSE_DISCARD_LIMIT + 1),
+    )
+
+    try:
+        with pytest.raises(CodeInterpreterError, match="stale|resync"):
+            interp._send_request("execute", {"code": "print('fresh')"})
+    finally:
+        _close_sbx_request_interp(interp)
+
+
+def test_sbx_send_request_routes_tool_calls_without_counting_them_stale(
+    tmp_path, monkeypatch
+):
+    tool_calls = [
+        json.dumps({
+            "jsonrpc": "2.0",
+            "method": "tool_call",
+            "params": {"name": "tool", "args": [], "kwargs": {}},
+            "id": f"tool-{idx}",
+        })
+        for idx in range(STALE_RESPONSE_DISCARD_LIMIT + 1)
+    ]
+    fresh = json.dumps({"jsonrpc": "2.0", "id": 1, "result": {"output": "fresh"}})
+    interp = _build_sbx_request_interp(tmp_path, [*tool_calls, fresh])
+    submitted: list[dict] = []
+    monkeypatch.setattr(interp, "_submit_tool_call", submitted.append)
+
+    try:
+        result = interp._send_request("execute", {"code": "print('fresh')"})
+    finally:
+        _close_sbx_request_interp(interp)
+
+    assert result["result"]["output"] == "fresh"
+    assert len(submitted) == STALE_RESPONSE_DISCARD_LIMIT + 1

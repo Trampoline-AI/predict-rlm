@@ -3,6 +3,8 @@ import errno
 import json
 import os
 import subprocess
+import threading
+import time
 import types
 
 import pytest
@@ -387,6 +389,118 @@ def test_send_request_error_in_response():
 
     with pytest.raises(CodeInterpreterError, match="tool failed"):
         interpreter._send_request("execute", {"code": "1+1"}, "during test")
+
+
+# ---------------------------------------------------------------------------
+# top-level execution gate
+# ---------------------------------------------------------------------------
+
+
+def test_execute_serializes_concurrent_calls_without_real_deno(monkeypatch):
+    interpreter = JspiInterpreter(preinstall_packages=False)
+    interpreter.deno_process = types.SimpleNamespace(
+        stdin=_BufferingStdin(),
+        stderr=_SilentStderr(),
+        poll=lambda: None,
+    )
+    interpreter._stdin_fd = -1
+    interpreter._ensure_deno_process = lambda: None
+    interpreter._mount_files = lambda: None
+    interpreter._register_tools = lambda: None
+
+    active = 0
+    max_active = 0
+    active_lock = threading.Lock()
+    loops: list[asyncio.AbstractEventLoop] = []
+
+    async def fake_execute_with_timeout(request_id, execute_start_time=None):
+        nonlocal active, max_active
+        with active_lock:
+            active += 1
+            max_active = max(max_active, active)
+        try:
+            await asyncio.sleep(0.1)
+            return f"result-{request_id}"
+        finally:
+            with active_lock:
+                active -= 1
+
+    def new_event_loop():
+        loop = asyncio.new_event_loop()
+        loops.append(loop)
+        return loop
+
+    interpreter._execute_with_timeout = fake_execute_with_timeout  # type: ignore[assignment]
+    monkeypatch.setattr(asyncio, "get_event_loop", new_event_loop)
+
+    barrier = threading.Barrier(3)
+    results: list[str] = []
+    errors: list[BaseException] = []
+
+    def run_execute() -> None:
+        barrier.wait()
+        try:
+            results.append(interpreter.execute("print('hi')"))
+        except BaseException as exc:
+            errors.append(exc)
+
+    threads = [threading.Thread(target=run_execute) for _ in range(2)]
+    try:
+        for thread in threads:
+            thread.start()
+        barrier.wait()
+        for thread in threads:
+            thread.join(timeout=2)
+    finally:
+        for loop in loops:
+            loop.close()
+
+    assert [thread.is_alive() for thread in threads] == [False, False]
+    assert errors == []
+    assert sorted(results) == ["result-1", "result-2"]
+    assert max_active == 1
+
+
+@pytest.mark.asyncio
+async def test_aexecute_serializes_concurrent_calls_without_real_deno():
+    JspiInterpreter._sandbox_semaphore = None
+    try:
+        interpreter = JspiInterpreter(preinstall_packages=False)
+        active = 0
+        max_active = 0
+
+        async def fake_inner(code, variables):
+            nonlocal active, max_active
+            active += 1
+            max_active = max(max_active, active)
+            try:
+                await asyncio.sleep(0.1)
+                return code
+            finally:
+                active -= 1
+
+        interpreter._aexecute_inner = fake_inner  # type: ignore[assignment]
+
+        start = time.monotonic()
+        results = await asyncio.gather(
+            interpreter.aexecute("print('one')"),
+            interpreter.aexecute("print('two')"),
+        )
+
+        assert sorted(results) == ["print('one')", "print('two')"]
+        assert max_active == 1
+        assert time.monotonic() - start >= 0.18
+    finally:
+        JspiInterpreter._sandbox_semaphore = None
+
+
+@pytest.mark.asyncio
+async def test_aexecute_from_tool_callback_context_raises_runtimeerror():
+    interpreter = JspiInterpreter(preinstall_packages=False)
+
+    with interpreter._execution_gate.async_tool_callback():
+        with pytest.raises(RuntimeError, match="host tool callback"):
+            await interpreter.aexecute("print('nested')")
 
 
 # ---------------------------------------------------------------------------

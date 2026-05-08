@@ -23,7 +23,12 @@ from dspy.primitives.code_interpreter import CodeInterpreterError, FinalOutput
 from predict_rlm.files import get_synced_file_params
 from predict_rlm.interpreter import SandboxFatalError
 
-from .base import PredictRLMInterpreter, SbxConfig
+from .base import (
+    STALE_RESPONSE_DISCARD_LIMIT,
+    InterpreterExecutionGate,
+    PredictRLMInterpreter,
+    SbxConfig,
+)
 
 RUNNER_PATH = Path(__file__).parents[1] / "sandbox" / "python_runner.py"
 DEFAULT_PACKAGE_DOMAINS = ["pypi.org", "files.pythonhosted.org"]
@@ -75,11 +80,18 @@ class SbxInterpreter(PredictRLMInterpreter):
             max_workers=max(4, len(self.tools) or 1)
         )
         self._pending_tool_calls: dict[concurrent.futures.Future[dict[str, Any]], int] = {}
+        self._execution_gate = InterpreterExecutionGate("SBX interpreter")
         self._sandbox_name: str | None = None
         self._request_id = 0
         self._shutdown = False
 
     def execute(
+        self, code: str, variables: dict[str, Any] | None = None
+    ) -> Any:
+        with self._execution_gate.top_level():
+            return self._execute_top_level(code, variables)
+
+    def _execute_top_level(
         self, code: str, variables: dict[str, Any] | None = None
     ) -> Any:
         if variables:
@@ -433,9 +445,10 @@ class SbxInterpreter(PredictRLMInterpreter):
                 args,
                 kwargs,
             )
-            result = tool(*args, **kwargs)
-            if inspect.isawaitable(result):
-                result = asyncio.run(result)
+            with self._execution_gate.tool_callback():
+                result = tool(*args, **kwargs)
+                if inspect.isawaitable(result):
+                    result = asyncio.run(result)
             for sandbox_path, host_path, writeback in synced_entries:
                 if writeback and os.path.isfile(host_path):
                     self.mount_file_at(host_path, sandbox_path)
@@ -529,6 +542,7 @@ class SbxInterpreter(PredictRLMInterpreter):
             raise SandboxFatalError("Sbx runner pipe broke while sending request") from exc
 
         deadline = time.monotonic() + self.config.exec_timeout
+        stale_discards = 0
         while True:
             self._drain_completed_tool_calls()
             if self._proc.poll() is not None:
@@ -547,6 +561,12 @@ class SbxInterpreter(PredictRLMInterpreter):
                 continue
             if response.get("id") == request_id:
                 return response
+            stale_discards += 1
+            if stale_discards > STALE_RESPONSE_DISCARD_LIMIT:
+                raise CodeInterpreterError(
+                    "Too many stale top-level responses while resyncing "
+                    f"SBX request id={request_id}"
+                )
 
     def _ensure_process_for_method(self, method: str) -> None:
         if method == "shutdown" and self._proc is not None:

@@ -2,12 +2,104 @@
 
 from __future__ import annotations
 
+import asyncio
+import contextvars
+import threading
+from contextlib import asynccontextmanager, contextmanager
 from enum import Enum
 from typing import Any, Protocol
 
 from pydantic import BaseModel, Field
 
 DEFAULT_SBX_TEMPLATE = "docker.io/docker/sandbox-templates:shell"
+STALE_RESPONSE_DISCARD_LIMIT = 50
+
+_TOOL_CALLBACK_GATES: contextvars.ContextVar[frozenset[int]] = (
+    contextvars.ContextVar("_TOOL_CALLBACK_GATES", default=frozenset())
+)
+_THREAD_LOCAL_TOOL_CALLBACKS = threading.local()
+
+
+class InterpreterExecutionGate:
+    """Serialize top-level interpreter execution and reject tool reentry."""
+
+    def __init__(self, interpreter_name: str) -> None:
+        self._interpreter_name = interpreter_name
+        self._condition = threading.Condition()
+        self._running = False
+
+    @contextmanager
+    def top_level(self):
+        self._raise_if_in_tool_callback()
+        self._acquire()
+        try:
+            yield
+        finally:
+            self._release()
+
+    @asynccontextmanager
+    async def atop_level(self):
+        self._raise_if_in_tool_callback()
+        await self._acquire_async()
+        try:
+            yield
+        finally:
+            self._release()
+
+    @contextmanager
+    def tool_callback(self):
+        token = self._enter_contextvar_tool_callback()
+        stack = getattr(_THREAD_LOCAL_TOOL_CALLBACKS, "stack", ())
+        _THREAD_LOCAL_TOOL_CALLBACKS.stack = (*stack, id(self))
+        try:
+            yield
+        finally:
+            _THREAD_LOCAL_TOOL_CALLBACKS.stack = stack
+            _TOOL_CALLBACK_GATES.reset(token)
+
+    @contextmanager
+    def async_tool_callback(self):
+        token = self._enter_contextvar_tool_callback()
+        try:
+            yield
+        finally:
+            _TOOL_CALLBACK_GATES.reset(token)
+
+    def _acquire(self) -> None:
+        with self._condition:
+            while self._running:
+                self._condition.wait()
+            self._running = True
+
+    async def _acquire_async(self) -> None:
+        while True:
+            with self._condition:
+                if not self._running:
+                    self._running = True
+                    return
+            await asyncio.sleep(0.01)
+
+    def _release(self) -> None:
+        with self._condition:
+            self._running = False
+            self._condition.notify_all()
+
+    def _raise_if_in_tool_callback(self) -> None:
+        gate_id = id(self)
+        if gate_id in _TOOL_CALLBACK_GATES.get():
+            raise RuntimeError(self._tool_reentry_message())
+        if gate_id in getattr(_THREAD_LOCAL_TOOL_CALLBACKS, "stack", ()):
+            raise RuntimeError(self._tool_reentry_message())
+
+    def _enter_contextvar_tool_callback(self) -> contextvars.Token[frozenset[int]]:
+        gates = _TOOL_CALLBACK_GATES.get()
+        return _TOOL_CALLBACK_GATES.set(gates | {id(self)})
+
+    def _tool_reentry_message(self) -> str:
+        return (
+            f"Cannot call execute/aexecute on the same {self._interpreter_name} "
+            "from a host tool callback"
+        )
 
 
 class SandboxBackend(str, Enum):
