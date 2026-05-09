@@ -4,9 +4,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from predict_rlm import Skill
 from rlm_gepa import AgentSpec, OptimizeConfig, agent_spec_from_rlm
 
 from ..agent.service import AppWorldRLM
+from ..agent.skills import APPWORLD_SKILL_BASE_INSTRUCTIONS
 from ..bench.config import DEFAULT_CONCURRENCY
 
 
@@ -43,7 +45,8 @@ def default_config() -> AppWorldGepaConfig:
 
 
 def build_appworld_spec() -> AgentSpec:
-    rlm = AppWorldRLM(max_iterations=1).build_predictor()
+    spec_skill = Skill(name="appworld", instructions=APPWORLD_SKILL_BASE_INSTRUCTIONS)
+    rlm = AppWorldRLM(max_iterations=1, skill=spec_skill).build_predictor()
     return agent_spec_from_rlm(
         rlm,
         agent_type=(

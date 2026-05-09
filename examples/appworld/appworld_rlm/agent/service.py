@@ -11,7 +11,7 @@ from predict_rlm import PredictRLM, Skill
 
 from ..tools.runner import AppWorldSessionClient
 from .signature import build_solve_appworld_task_signature
-from .skills import appworld_skill
+from .skills import get_appworld_skill
 
 
 class AppWorldRLM(dspy.Module):
@@ -31,7 +31,7 @@ class AppWorldRLM(dspy.Module):
         self.max_iterations = max_iterations
         self.verbose = verbose
         self.debug = debug
-        self.skill = skill or appworld_skill
+        self.skill = skill
         self.appworld_client = appworld_client or AppWorldSessionClient(data_root=data_root)
 
     def build_predictor(
@@ -42,9 +42,8 @@ class AppWorldRLM(dspy.Module):
         supervisor_email: str = "",
         supervisor_phone_number: str = "",
     ) -> PredictRLM:
-        skill = (skill or self.skill).model_copy(
-            update={"tools": self._current_task_tools(task_id)}
-        )
+        base_skill = skill or self.skill or get_appworld_skill()
+        skill = base_skill.model_copy(update={"tools": self._current_task_tools(task_id)})
         return PredictRLM(
             build_solve_appworld_task_signature(
                 supervisor_name=supervisor_name,

@@ -3,11 +3,12 @@ from __future__ import annotations
 import asyncio
 import json
 
+from predict_rlm import Skill
 from predict_rlm.trace import RunTrace, extract_trace_from_exc
 from rlm_gepa import EvaluationContext, RLMGepaExampleResult, RLMGepaProject
 
 from ..agent.service import AppWorldRLM
-from ..agent.skills import appworld_skill
+from ..agent.skills import get_appworld_skill
 from ..bench.dataset import AppWorldExample, load_dataset, split_train_validation
 from .config import APPWORLD_SPEC, AppWorldGepaConfig, default_config
 
@@ -40,7 +41,7 @@ class AppWorldGepaProject(RLMGepaProject):
         self._split: tuple[list[AppWorldExample], list[AppWorldExample]] | None = None
 
     def seed_candidate(self) -> dict[str, str]:
-        return {COMPONENT_SKILL: appworld_skill.instructions}
+        return {COMPONENT_SKILL: get_appworld_skill().instructions}
 
     def load_trainset(self) -> list[AppWorldExample]:
         train, _validation = self._load_split()
@@ -56,9 +57,7 @@ class AppWorldGepaProject(RLMGepaProject):
         example: AppWorldExample,
         context: EvaluationContext,
     ) -> RLMGepaExampleResult:
-        skill = appworld_skill.model_copy(
-            update={"instructions": candidate[COMPONENT_SKILL]}
-        )
+        skill = Skill(name="appworld", instructions=candidate[COMPONENT_SKILL])
         trace: RunTrace | None = None
         agent = AppWorldRLM(
             lm=context.lm,

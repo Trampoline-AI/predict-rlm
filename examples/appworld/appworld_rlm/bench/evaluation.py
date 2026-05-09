@@ -15,7 +15,7 @@ from rlm_gepa.runtime.adapter import RLMGepaAdapter
 from rlm_gepa.runtime.lm_config import build_lm
 from rlm_gepa.runtime.utils import atomic_write_json
 
-from ..agent.skills import appworld_skill
+from ..agent.skills import get_appworld_skill
 from ..gepa.config import AppWorldGepaConfig
 from ..gepa.project import COMPONENT_SKILL, AppWorldGepaProject
 from .config import EvalConfig
@@ -80,7 +80,7 @@ def extract_candidate(run_dir: str | Path, cand_idx: int | None = None) -> tuple
 
 async def run_evaluation(config: EvalConfig) -> EvalReport:
     examples = load_eval_dataset(config)
-    candidate = {COMPONENT_SKILL: appworld_skill.instructions}
+    candidate = {COMPONENT_SKILL: get_appworld_skill().instructions}
     if config.run_dir is not None:
         candidate, _idx = extract_candidate(config.run_dir, config.cand_idx)
 

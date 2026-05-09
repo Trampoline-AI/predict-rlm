@@ -181,18 +181,29 @@ When an answer is given:
 - Numbers must be numeric, not words. Return `10`, not `ten`.
 """
 
-APPWORLD_SKILL_INSTRUCTIONS = (
-    APPWORLD_SKILL_BASE_INSTRUCTIONS + "\n" + render_official_icl_demos()
-)
+def get_appworld_skill_instructions(data_root: Path | str | None = None) -> str:
+    return APPWORLD_SKILL_BASE_INSTRUCTIONS + "\n" + render_official_icl_demos(data_root=data_root)
 
-appworld_skill = Skill(
-    name="appworld",
-    instructions=APPWORLD_SKILL_INSTRUCTIONS,
-)
+
+def get_appworld_skill(data_root: Path | str | None = None) -> Skill:
+    return Skill(
+        name="appworld",
+        instructions=get_appworld_skill_instructions(data_root=data_root),
+    )
+
+
+def __getattr__(name: str) -> Any:
+    if name == "APPWORLD_SKILL_INSTRUCTIONS":
+        return get_appworld_skill_instructions()
+    if name == "appworld_skill":
+        return get_appworld_skill()
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
 
 __all__ = [
-    "APPWORLD_SKILL_INSTRUCTIONS",
-    "appworld_skill",
+    "APPWORLD_SKILL_BASE_INSTRUCTIONS",
+    "get_appworld_skill",
+    "get_appworld_skill_instructions",
     "load_official_icl_demo_task_ids",
     "render_official_icl_demos",
 ]
