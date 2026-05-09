@@ -98,21 +98,26 @@ The model discovers apps and API schemas through the documentation tools, then
 calls an API with `call_appworld_api`. `kwargs_json` must be a JSON object
 string containing the documented API parameters:
 
-```text
-call_appworld_api("spotify", "login", "{\"username\": \"...\", \"password\": \"...\"}")
+```python
+import json
+await call_appworld_api("spotify", "login", json.dumps({"username": "...", "password": "..."}))
 ```
 
 The model never supplies `task_id`; each exposed tool closes over the current
 task in the host. The adapter does not expose generated `app__api` wrappers such
 as `spotify__login` or `venmo__search`.
 
-The prompt and few-shot protocol are matched where possible. Task instructions
-come from local `specs.json`, and the supervisor profile context that stock
-AppWorld prompts provide is passed into the RLM signature separately. For ICL,
-the repo stores only the official demo task IDs (`82e2fac_1`, `29caf6f_1`,
-`d0b1f43_1`) and loads tutorial task instructions from the user's local AppWorld
-download at runtime. It does not check in worked demo traces, `demos.json`
-content, generated app state, ground truth, or reference answers.
+The prompt and few-shot protocol are matched where possible. The supervisor
+profile context that stock AppWorld prompts provide is passed into the RLM
+signature separately. For ICL, the repo stores only the official demo task ID
+manifest for provenance. At runtime, it loads those demo tasks from the user's
+local AppWorld data and renders their ground-truth compiled solutions as tutorial
+solution sketches. Those sketches translate direct `apis.app.api(...)` calls into
+an RLM-facing `await call_appworld_api(app_name, api_name, json.dumps(kwargs))`
+helper and translate `apis.supervisor.complete_task(...)` into the terminal
+`SUBMIT(...)` interface. The checked-in repo does not contain worked demo traces,
+`demos.json` content, generated app state, train/dev/test evaluator feedback, or
+reference answers for non-demo benchmark tasks.
 
 The completion protocol is also adapted to the RLM interface. The RLM terminates
 with `SUBMIT(answer=value)` for answer tasks or `SUBMIT()` for state-change-only
@@ -131,8 +136,7 @@ evaluation.
 References:
 
 - Official AppWorld function-calling config: typed direct functions,
-  `direct_function_separator="__"`, API predictor, demo task IDs, and
-  `demos.json`:
+  `direct_function_separator="__"`, API predictor, and demo task IDs:
   [`experiments/configs/simplified_function_calling_agent/openai/gpt-5-2025-08-07-high-reasoning/test_normal.jsonnet#L20-L49`](https://github.com/stonybrooknlp/appworld/blob/a072b7a86e7c1d5b1d7175659d750ebb9b79f10a/experiments/configs/simplified_function_calling_agent/openai/gpt-5-2025-08-07-high-reasoning/test_normal.jsonnet#L20-L49).
 - Official AppWorld API docs can be rendered in function-calling format:
   [`src/appworld/collections/api_docs.py#L168-L182`](https://github.com/stonybrooknlp/appworld/blob/a072b7a86e7c1d5b1d7175659d750ebb9b79f10a/src/appworld/collections/api_docs.py#L168-L182).

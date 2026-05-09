@@ -8,15 +8,17 @@ from types import SimpleNamespace
 
 from appworld_rlm import AppWorldRLM
 from appworld_rlm.agent import service as service_module
+from appworld_rlm.agent import skills as skills_module
 from appworld_rlm.agent.signature import SolveAppWorldTask, build_solve_appworld_task_signature
 from appworld_rlm.agent.skills import (
     APPWORLD_SKILL_BASE_INSTRUCTIONS,
-    APPWORLD_SKILL_INSTRUCTIONS,
+    get_appworld_skill_instructions,
     load_official_icl_demo_task_ids,
     render_official_icl_demos,
 )
 from appworld_rlm.bench import cli as bench_cli
 from appworld_rlm.bench import evaluation
+from appworld_rlm.bench.cli import appworld_eval_header_summary
 from appworld_rlm.bench.config import EvalConfig
 from appworld_rlm.bench.dataset import load_dataset, load_train_validation
 from appworld_rlm.gepa import cli as gepa_cli
@@ -34,7 +36,7 @@ from appworld_rlm.tools.runner import (
     _tool_text,
 )
 
-from appworld_rlm.bench.cli import appworld_eval_header_summary
+from predict_rlm import Skill
 from rlm_gepa.reporting.stats import render_stats
 from rlm_gepa.schema import EvaluationContext, validate_project
 
@@ -63,49 +65,100 @@ def _runner_result_text(
     )
 
 
+def _base_test_skill() -> Skill:
+    return Skill(name="appworld", instructions=APPWORLD_SKILL_BASE_INSTRUCTIONS)
+
+
+
+def _write_synthetic_demo_data_root(path: Path) -> Path:
+    task_ids = load_official_icl_demo_task_ids()["demo_task_ids"]
+    for index, task_id in enumerate(task_ids, start=1):
+        task_dir = path / "tasks" / task_id
+        ground_truth_dir = task_dir / "ground_truth"
+        ground_truth_dir.mkdir(parents=True)
+        (task_dir / "specs.json").write_text(
+            json.dumps({"instruction": f"Synthetic task {index}."})
+        )
+        (ground_truth_dir / "compiled_solution.py").write_text(
+            """
+def solution(apis, requester):
+    lookup_result = apis.sample_app.lookup_item(query="synthetic")
+    apis.supervisor.complete_task(status="success", answer=lookup_result["value"])
+""".strip()
+        )
+    return path
+
+
+
 def test_service_constructs():
     service = AppWorldRLM(max_iterations=3, verbose=False)
     assert service.max_iterations == 3
 
 
-def test_official_icl_demo_asset_loads_and_renders(tmp_path):
+def test_official_icl_demo_asset_loads_manifest_only(tmp_path):
     manifest = load_official_icl_demo_task_ids()
-    task_ids = manifest["demo_task_ids"]
+    data_root = _write_synthetic_demo_data_root(tmp_path / "appworld_data")
 
-    assert task_ids == ["82e2fac_1", "29caf6f_1", "d0b1f43_1"]
+    assert manifest["demo_task_ids"] == ["82e2fac_1", "29caf6f_1", "d0b1f43_1"]
     assert "demos" not in manifest
     assert "official_appworld_demo_task_ids" == manifest["source"]["type"]
+    assert "Stock task-ID examples" not in get_appworld_skill_instructions(data_root)
 
-    data_root = tmp_path / "appworld_data"
-    for task_id in task_ids:
-        task_dir = data_root / "tasks" / task_id
-        task_dir.mkdir(parents=True)
-        (task_dir / "specs.json").write_text(
-            json.dumps({"instruction": f"fixture instruction for {task_id}"})
-        )
+
+def test_official_icl_demos_require_official_demo_task_data(tmp_path):
+    missing_path = tmp_path / "missing-appworld-data"
+
+    try:
+        render_official_icl_demos(data_root=missing_path)
+    except FileNotFoundError as exc:
+        message = str(exc)
+    else:  # pragma: no cover
+        raise AssertionError("render_official_icl_demos should require official AppWorld data")
+
+    assert str(missing_path) in message
+    assert "APPWORLD_DATA_ROOT" in message
+
+
+def test_official_icl_demos_render_from_runtime_file_without_checked_in_trajectories(tmp_path):
+    manifest = load_official_icl_demo_task_ids()
+    data_root = _write_synthetic_demo_data_root(tmp_path / "appworld_data")
 
     rendered = render_official_icl_demos(manifest, data_root=data_root)
-    assert (
-        "Next, I will show you some worked-out examples as a tutorial before we proceed "
-        "with the real task instruction."
-    ) in rendered
-    assert "----------------------------------------------------------------------------" in rendered
-    assert rendered.count("Disclaimer: This is not a real task, only a tutorial with fake data values.") == 3
-    for index, task_id in enumerate(task_ids, start=1):
-        assert f"# Tutorial Task Instruction {index}" in rendered
-        assert f"fixture instruction for {task_id}" in rendered
-        assert f"Example {index} instruction:" not in rendered
-    assert "canary" not in rendered.lower()
-    assert "ground-truth" not in rendered.lower()
-    assert "reference answers" not in rendered.lower()
-    assert "required API hints" not in rendered
-    assert "official demo task ID" not in rendered
-    assert "data/tasks/<task_id>/specs.json" not in rendered
-    assert "Stock task-ID examples" not in APPWORLD_SKILL_INSTRUCTIONS
+
+    assert "Synthetic task 1." in rendered
+    assert "Synthetic task 2." in rendered
+    assert "Synthetic task 3." in rendered
+    assert rendered.count("# Tutorial Task Instruction") == 3
 
 
-def test_model_facing_prompt_is_stock_style_and_task_bound_by_host():
-    text = SolveAppWorldTask.instructions + "\n" + APPWORLD_SKILL_INSTRUCTIONS
+def test_official_icl_adapter_rewrites_function_call_syntax_without_demo_trajectory():
+    call = skills_module._adapt_function_call("sample_app__sample_api", '{"value": "x"}')
+
+    assert call == (
+        'sample_api_response = await call_appworld_api('
+        '"sample_app", "sample_api", json.dumps({"value": "x"})'
+        ")"
+    )
+    assert skills_module._adapt_function_call("supervisor__complete_task", '{"answer": 1}') == "SUBMIT(answer=1)"
+    assert skills_module._adapt_function_call("supervisor__complete_task", "{}") == "SUBMIT()"
+
+
+def test_official_icl_renderer_uses_code_blocks_and_adapted_ground_truth_solution(tmp_path):
+    data_root = _write_synthetic_demo_data_root(tmp_path / "appworld_data")
+
+    rendered = render_official_icl_demos(data_root=data_root)
+
+    assert "```python" in rendered
+    assert "async def appworld_api" in rendered
+    assert "await call_appworld_api(app_name, api_name, json.dumps(kwargs))" in rendered
+    assert "lookup_result = await appworld_api('sample_app', 'lookup_item', query='synthetic')" in rendered
+    assert "SUBMIT(answer=lookup_result['value'])" in rendered
+    assert "apis.sample_app" not in rendered
+
+
+def test_model_facing_prompt_is_stock_style_and_task_bound_by_host(tmp_path):
+    skill_instructions = get_appworld_skill_instructions(_write_synthetic_demo_data_root(tmp_path / "appworld_data"))
+    text = SolveAppWorldTask.instructions + "\n" + skill_instructions
     normalized_text = " ".join(text.split())
     forbidden = [
         "Solve an AppWorld task",
@@ -496,7 +549,7 @@ def _run_appworld_rlm_with_prediction(monkeypatch, prediction, client):
             return prediction
 
     monkeypatch.setattr(service_module, "PredictRLM", FakePredictRLM)
-    agent = AppWorldRLM(appworld_client=client)
+    agent = AppWorldRLM(appworld_client=client, skill=_base_test_skill())
     return asyncio.run(agent.aforward(task_id="aaa111_1", instruction="do it"))
 
 
@@ -660,7 +713,7 @@ def test_service_binds_current_task_appworld_tools(monkeypatch):
 
     monkeypatch.setattr(service_module, "PredictRLM", FakePredictRLM)
     client = FakeClient()
-    agent = AppWorldRLM(appworld_client=client)
+    agent = AppWorldRLM(appworld_client=client, skill=_base_test_skill())
 
     asyncio.run(agent.aforward(task_id="aaa111_1", instruction="do it"))
 
@@ -702,7 +755,8 @@ def test_service_binds_current_task_appworld_tools(monkeypatch):
     assert captured_prediction_kwargs == {"instruction": "do it"}
 
 
-def test_gepa_project_validates_with_fixture_data():
+def test_gepa_project_validates_with_fixture_data(monkeypatch, tmp_path):
+    monkeypatch.setenv("APPWORLD_DATA_ROOT", str(_write_synthetic_demo_data_root(tmp_path / "appworld_data")))
     config = AppWorldGepaConfig(data_root=FIXTURE_ROOT, val_ratio=0.25, val_limit=3)
     project = AppWorldGepaProject(config)
     validation = validate_project(project)
@@ -766,6 +820,7 @@ def test_gepa_project_scores_from_harness_side_evaluator(monkeypatch, tmp_path):
             )
 
     monkeypatch.setattr(gepa_project_module, "AppWorldRLM", FakeAppWorldRLM)
+    monkeypatch.setenv("APPWORLD_DATA_ROOT", str(_write_synthetic_demo_data_root(tmp_path / "appworld_data")))
     project = AppWorldGepaProject(AppWorldGepaConfig(data_root=FIXTURE_ROOT))
     result = asyncio.run(
         project.evaluate_example(
@@ -843,6 +898,7 @@ def test_eval_builds_lms_before_constructing_appworld_rlm(monkeypatch, tmp_path)
 
     monkeypatch.setattr(evaluation, "build_lm", fake_build_lm)
     monkeypatch.setattr(gepa_project_module, "AppWorldRLM", FakeAppWorldRLM)
+    monkeypatch.setenv("APPWORLD_DATA_ROOT", str(_write_synthetic_demo_data_root(tmp_path / "appworld_data")))
 
     report = asyncio.run(
         evaluation.run_evaluation(
@@ -911,6 +967,7 @@ def test_run_evaluation_scores_from_harness_side_evaluator(monkeypatch, tmp_path
 
     monkeypatch.setattr(evaluation, "build_lm", lambda *_args, **_kwargs: object())
     monkeypatch.setattr(gepa_project_module, "AppWorldRLM", FakeAppWorldRLM)
+    monkeypatch.setenv("APPWORLD_DATA_ROOT", str(_write_synthetic_demo_data_root(tmp_path / "appworld_data")))
     monkeypatch.setattr(
         evaluation,
         "load_eval_dataset",
