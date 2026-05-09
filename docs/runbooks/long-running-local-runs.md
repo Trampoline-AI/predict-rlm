@@ -14,20 +14,26 @@ Choose the observability mode before launch:
 
 ## Tmux pattern
 
-For inspectable runs, use one session per run family with separate windows:
+For inspectable runs, use one session per run family and make the default user
+entry point a split-pane `dashboard` window:
 
-1. `run` — executes the job and leaves a shell open after exit.
-2. `stats` — shows canonical result stats once artifacts exist, otherwise tails
-   recent logs.
+1. `dashboard` — two panes visible at once in a side-by-side vertical split:
+   live job log/output on the left and stats/artifact watcher on the right. Use
+   `tmux split-window -h` and `tmux select-layout even-horizontal`; avoid making
+   these separate tmux windows/tabs.
+2. Optional raw windows such as `run` or `stats` are fine for recovery and
+   debugging, but do not make the user switch between windows just to understand
+   progress.
 
 Before creating or reusing a session, inspect existing sessions and avoid
 clobbering attached or unrelated work.
 
 When relaunching the same run family after a fix, prefer reusing the existing
-`run` and `stats` windows if that keeps artifacts understandable. Create a fresh
+session and dashboard if that keeps artifacts understandable. Create a fresh
 session when reuse would confuse materially different runs.
 
-Always give the user the attach command:
+After launch, select the dashboard window so attaching users land on the useful
+view. Always give the user the attach command:
 
 ```bash
 tmux attach -t <session>
@@ -65,7 +71,8 @@ Before launching expensive or long runs:
 
 Immediately after launch, verify:
 
-- the `run` and `stats` windows/processes exist.
+- the `dashboard` window exists and has both panes running.
+- attaching lands on the dashboard, not a raw helper window.
 - the first log lines show the expected command, environment, and output path.
 - failures remain visible instead of closing the shell/window.
 - the user has the attach command or the Hermes background process id.
