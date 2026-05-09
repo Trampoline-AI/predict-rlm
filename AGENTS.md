@@ -1,7 +1,7 @@
-# CLAUDE.md
+# AGENTS.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with
-code in this repository.
+This file provides guidance to coding agents when working with code in this
+repository.
 
 ## Workflow Orchestration
 
@@ -188,3 +188,15 @@ Module wiring PredictRLM) -> `run.py` (CLI entry point).
 
 - **Context rot awareness** - Don't send unnecessary data to LLMs (e.g.,
   internal IDs the model doesn't need for its task)
+
+## Project Skills / Runbooks
+
+Repo-local guidance files for agents. Read the linked Markdown directly when the
+trigger applies.
+
+### Long-running local runs
+
+- **When to load:** before starting, monitoring, or recovering evals,
+  benchmarks, training-like jobs, release checks, or other local runs likely to
+  outlive one assistant turn.
+- **Path:** `docs/runbooks/long-running-local-runs.md`
