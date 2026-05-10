@@ -199,7 +199,7 @@ SGC for comparisons to AppWorld/HALO charts labeled "Scenario Goal Completion".
 
 ## Commands
 
-Optimize and eval use default concurrency 30. Pass `--concurrency` only when a
+Optimize and eval use default concurrency 20. Pass `--concurrency` only when a
 run needs a different worker count.
 
 ```bash

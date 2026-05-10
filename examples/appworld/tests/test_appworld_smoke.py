@@ -1025,18 +1025,23 @@ def test_codex_lm_args_are_registered_for_eval_and_optimize():
     assert optimize_args.codex_lm is False
 
 
-def test_appworld_eval_and_gepa_concurrency_defaults_to_30_and_eval_override_works():
+def test_appworld_eval_defaults_and_overrides_are_wired():
     parser = argparse.ArgumentParser()
     subparsers = parser.add_subparsers(dest="command", required=True)
     bench_cli.add_eval_subcommand(subparsers)
 
     eval_args = parser.parse_args(["eval"])
-    override_args = parser.parse_args(["eval", "--concurrency", "7"])
+    override_args = parser.parse_args(
+        ["eval", "--concurrency", "7", "--task-timeout", "42"]
+    )
 
-    assert EvalConfig().concurrency == 30
-    assert eval_args.concurrency == 30
-    assert default_config().concurrency == 30
+    assert EvalConfig().concurrency == 20
+    assert EvalConfig().task_timeout == 600
+    assert eval_args.concurrency == 20
+    assert eval_args.task_timeout == 600
+    assert default_config().concurrency == 20
     assert override_args.concurrency == 7
+    assert override_args.task_timeout == 42
 
 
 def test_install_codex_lm_explicit_missing_has_appworld_uv_hint(monkeypatch):

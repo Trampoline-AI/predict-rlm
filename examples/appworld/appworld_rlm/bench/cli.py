@@ -6,7 +6,7 @@ import json
 import os
 from pathlib import Path
 
-from .config import DEFAULT_CONCURRENCY, EvalConfig
+from .config import DEFAULT_CONCURRENCY, DEFAULT_TASK_TIMEOUT, EvalConfig
 from .evaluation import run_evaluation_sync
 
 
@@ -24,7 +24,7 @@ def add_eval_subcommand(subparsers: argparse._SubParsersAction) -> None:
     parser.add_argument("--reasoning-effort", default="low")
     parser.add_argument("--concurrency", type=int, default=DEFAULT_CONCURRENCY)
     parser.add_argument("--max-iterations", type=int, default=50)
-    parser.add_argument("--task-timeout", type=int, default=300)
+    parser.add_argument("--task-timeout", type=int, default=DEFAULT_TASK_TIMEOUT)
     parser.add_argument("--val-ratio", type=float, default=0.20)
     parser.add_argument("--seed", type=int, default=13)
     parser.add_argument("--verbose-rlm", action="store_true")

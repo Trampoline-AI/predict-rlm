@@ -2521,6 +2521,112 @@ def test_eval_stats_from_eval_artifact(tmp_path: Path):
     assert "costs:" in rendered
 
 
+def test_eval_stats_reports_attempt_outcomes_and_latency_percentiles(tmp_path: Path):
+    report = {
+        "total_tasks": 4,
+        "soft_restriction_avg": 0.25,
+        "hard_restriction_avg": 0.25,
+        "tasks_all_passing": 1,
+        "duration_seconds": 10,
+        "total_cost_usd": 0.0,
+        "per_task": [],
+    }
+    (tmp_path / "eval.json").write_text(json.dumps(report))
+    trace_dir = tmp_path / "task_traces"
+    trace_dir.mkdir()
+    (trace_dir / "eval_attempts.jsonl").write_text(
+        "\n".join(
+            json.dumps(row)
+            for row in [
+                {
+                    "example_id": "ok",
+                    "status": "completed",
+                    "feedback": "passed",
+                    "trace": {"status": "completed", "iterations": 2, "max_iterations": 5, "duration_ms": 1000},
+                },
+                {
+                    "example_id": "outer-timeout",
+                    "status": "error",
+                    "feedback": "evaluation timeout at 300s",
+                    "trace": None,
+                },
+                {
+                    "example_id": "maxed",
+                    "status": "completed",
+                    "feedback": "submitted by fallback",
+                    "trace": {
+                        "status": "max_iterations",
+                        "iterations": 5,
+                        "max_iterations": 5,
+                        "duration_ms": 5000,
+                    },
+                },
+                {
+                    "example_id": "project-timeout",
+                    "status": "error",
+                    "error": "RLM timeout at 300s",
+                    "trace": {"status": "error", "iterations": 1, "max_iterations": 5, "duration_ms": 2000},
+                },
+            ]
+        )
+    )
+
+    terminal = render_stats(tmp_path, table="all")
+    markdown = render_stats(tmp_path, table="all", output_format="markdown")
+
+    expected = (
+        "attempts=4, timeouts=2, max_iter_hits=1, "
+        "latency p50=2.0s p90=5.0s p95=5.0s"
+    )
+    assert expected in terminal
+    assert expected in markdown
+
+
+def test_optimize_stats_reports_attempt_outcomes_and_latency_percentiles(tmp_path: Path):
+    with (tmp_path / "gepa_state.bin").open("wb") as f:
+        pickle.dump(
+            {
+                "i": 0,
+                "program_candidates": [],
+                "total_num_evals": 2,
+                "prog_candidate_val_subscores": [],
+            },
+            f,
+        )
+    trace_dir = tmp_path / "task_traces"
+    trace_dir.mkdir()
+    (trace_dir / "eval_minibatch_attempts.jsonl").write_text(
+        "\n".join(
+            json.dumps(row)
+            for row in [
+                {
+                    "example_id": "a",
+                    "status": "completed",
+                    "trace": {"status": "completed", "iterations": 1, "max_iterations": 3, "duration_ms": 2500},
+                },
+                {
+                    "example_id": "b",
+                    "status": "completed",
+                    "trace": {"status": "completed", "iterations": 3, "max_iterations": 3, "duration_ms": 7500},
+                },
+                {
+                    "example_id": "c",
+                    "status": "timeout",
+                    "feedback": "timed out",
+                    "trace": None,
+                },
+            ]
+        )
+    )
+
+    rendered = render_stats(tmp_path, table="costs")
+
+    assert (
+        "attempts=3, timeouts=1, max_iter_hits=1, "
+        "latency p50=2.5s p90=7.5s p95=7.5s"
+    ) in rendered
+
+
 def test_render_table_outputs_github_markdown():
     rendered = render_table([{"a": "x|y", "b": "z\nw"}], output_format="markdown")
 

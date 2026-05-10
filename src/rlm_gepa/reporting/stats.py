@@ -120,10 +120,14 @@ def header_summary(run_dir: str | Path) -> str:
     means = [_mean_scores(scores) for scores in subscores]
     best = max(means) if means else 0.0
     fire = " 🔥" if best >= 0.80 else ""
-    return (
+    summary = (
         f"iter={state.get('i', 0)}, candidates={len(state.get('program_candidates') or [])}, "
         f"evals={state.get('total_num_evals', 0)}, mb-score agg={best:.4f}{fire}"
     )
+    attempt_summary = _format_attempt_summary(_attempt_summary(run_dir))
+    if attempt_summary:
+        summary = f"{summary}, {attempt_summary}"
+    return summary
 
 
 def iteration_rows(run_dir: str | Path) -> list[dict[str, Any]]:
@@ -1572,11 +1576,144 @@ def eval_header_summary(run_dir: str | Path) -> str:
     total_cost = float(report.get("total_cost_usd") or 0.0)
     duration_seconds = float(report.get("duration_seconds") or 0.0)
     minutes, seconds = divmod(int(duration_seconds), 60)
-    return (
+    summary = (
         f"eval: tasks={total_tasks}, soft={float(report.get('soft_restriction_avg') or 0.0):.3f}, "
         f"hard={float(report.get('hard_restriction_avg') or 0.0):.3f} "
         f"({passing}/{total_tasks}), cost=${total_cost:.2f}, duration={minutes}m {seconds}s"
     )
+    attempt_summary = _format_attempt_summary(_attempt_summary(run_dir))
+    if attempt_summary:
+        summary = f"{summary}, {attempt_summary}"
+    return summary
+
+
+def _attempt_summary(run_dir: str | Path) -> dict[str, Any]:
+    rows = _task_trace_rows(run_dir)
+    traces = [_primary_trace(row) for row in rows]
+    durations_ms = [
+        duration_ms
+        for trace in traces
+        if trace is not None
+        for duration_ms in [_trace_duration_ms(trace)]
+        if duration_ms is not None
+    ]
+    return {
+        "attempts": len(rows),
+        "timeouts": sum(1 for row in rows if _is_timeout_attempt(row)),
+        "max_iterations": sum(
+            1 for trace in traces if trace is not None and _trace_hit_max_iterations(trace)
+        ),
+        "durations_ms": durations_ms,
+    }
+
+
+def _format_attempt_summary(summary: dict[str, Any]) -> str:
+    attempts = int(summary["attempts"])
+    if attempts <= 0:
+        return ""
+    durations_ms = [float(duration) for duration in summary["durations_ms"]]
+    latency = "latency p50=- p90=- p95=-"
+    if durations_ms:
+        latency = " ".join(
+            [
+                f"latency p50={_format_seconds(_percentile(durations_ms, 50) / 1000)}",
+                f"p90={_format_seconds(_percentile(durations_ms, 90) / 1000)}",
+                f"p95={_format_seconds(_percentile(durations_ms, 95) / 1000)}",
+            ]
+        )
+    return (
+        f"attempts={attempts}, timeouts={int(summary['timeouts'])}, "
+        f"max_iter_hits={int(summary['max_iterations'])}, {latency}"
+    )
+
+
+def _task_trace_rows(run_dir: str | Path) -> list[dict[str, Any]]:
+    base = Path(run_dir)
+    paths: list[Path] = []
+    trace_dir = base / "task_traces"
+    if trace_dir.exists():
+        paths.extend(sorted(trace_dir.glob("*.jsonl")))
+    legacy_path = base / "task_traces.jsonl"
+    if legacy_path.exists():
+        paths.append(legacy_path)
+
+    rows: list[dict[str, Any]] = []
+    for path in paths:
+        for line in path.read_text().splitlines():
+            if not line.strip():
+                continue
+            row = json.loads(line)
+            if isinstance(row, dict):
+                rows.append(row)
+    return rows
+
+
+def _primary_trace(row: dict[str, Any]) -> dict[str, Any] | None:
+    trace = _coerce_trace(row.get("trace"))
+    if trace is not None:
+        return trace
+    traces = row.get("traces")
+    if isinstance(traces, list):
+        for item in traces:
+            trace = _coerce_trace(item)
+            if trace is not None:
+                return trace
+    return None
+
+
+def _coerce_trace(value: Any) -> dict[str, Any] | None:
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, str) and value.strip():
+        try:
+            parsed = json.loads(value)
+        except json.JSONDecodeError:
+            return None
+        if isinstance(parsed, dict):
+            return parsed
+    return None
+
+
+def _trace_duration_ms(trace: dict[str, Any]) -> float | None:
+    duration_ms = trace.get("duration_ms")
+    if duration_ms is None:
+        return None
+    try:
+        return float(duration_ms)
+    except (TypeError, ValueError):
+        return None
+
+
+def _trace_hit_max_iterations(trace: dict[str, Any]) -> bool:
+    try:
+        iterations = int(trace["iterations"])
+        max_iterations = int(trace["max_iterations"])
+    except (KeyError, TypeError, ValueError):
+        return False
+    return iterations >= max_iterations
+
+
+def _is_timeout_attempt(row: dict[str, Any]) -> bool:
+    for key in ("status", "error_type", "error", "feedback", "message"):
+        value = row.get(key)
+        if value is not None and _mentions_timeout(str(value)):
+            return True
+    return False
+
+
+def _mentions_timeout(value: str) -> bool:
+    lowered = value.lower()
+    return "timeout" in lowered or "timed out" in lowered
+
+
+def _percentile(values: list[float], percentile: int) -> float:
+    ordered = sorted(values)
+    index = max(0, math.ceil((percentile / 100) * len(ordered)) - 1)
+    return ordered[index]
+
+
+def _format_seconds(seconds: float) -> str:
+    return f"{seconds:.1f}s"
 
 
 def _is_eval_run(run_dir: str | Path) -> bool:
