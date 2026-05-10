@@ -64,11 +64,8 @@ class AppWorldSessionClient:
         proc.stdin.flush()
         line = proc.stdout.readline()
         if not line:
-            stderr = ""
-            if proc.poll() is not None and proc.stderr is not None:
-                stderr = proc.stderr.read()
             self.close()
-            raise AppWorldRunnerError(f"AppWorld JSONL worker exited without a response: {stderr[-1000:]}")
+            raise AppWorldRunnerError("AppWorld JSONL worker exited without a response")
         try:
             return json.loads(line)
         except json.JSONDecodeError as exc:

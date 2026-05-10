@@ -80,3 +80,20 @@ Immediately after launch, verify:
 If recurring progress updates are promised, verify the first interval actually
 emits fresh progress. Do not rely on cron-only progress monitoring unless the
 scheduler has been observed firing.
+
+## AppWorld JSONL worker EOF hangs
+
+For AppWorld evals, a run can look alive while doing no work: parent Python,
+Deno sandbox, and `appworld_worker.py` processes remain present with near-zero
+CPU, `eval_progress.jsonl` contains only `started` rows, and no `eval.json` is
+written. On macOS, `sample <parent-python-pid> 3` showing the main thread in
+`_io_TextIOWrapper_read` / `_io_FileIO_readall` indicates the parent is blocked
+reading a pipe, not making model or sandbox progress.
+
+One concrete root cause was the JSONL client reading `proc.stderr.read()` after
+worker stdout EOF. Even when `proc.poll()` reports the direct worker has exited,
+that read can still block if a descendant inherited the stderr fd and keeps the
+pipe open. The safe recovery/fix pattern is to close/terminate the worker and
+raise an error without doing an unbounded stderr read on the EOF path. Cover both
+cases in tests: `poll() is None` and `poll() == 0` with stderr reads that would
+block.

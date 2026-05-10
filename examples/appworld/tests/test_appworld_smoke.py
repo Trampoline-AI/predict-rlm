@@ -304,17 +304,18 @@ def test_session_client_does_not_block_reading_stderr_after_stdout_eof():
             self.closed = True
 
     class FakeProc:
-        def __init__(self):
+        def __init__(self, poll_result=None):
             self.stdin = FakePipe()
             self.stdout = FakePipe("")
             self.stderr = FakePipe()
+            self.poll_result = poll_result
             self.terminated = False
 
         def poll(self):
-            return None
+            return self.poll_result
 
         def wait(self, timeout=None):
-            if not self.terminated:
+            if self.poll_result is None and not self.terminated:
                 raise subprocess.TimeoutExpired("worker", timeout)
             return 0
 
@@ -324,15 +325,18 @@ def test_session_client_does_not_block_reading_stderr_after_stdout_eof():
         def kill(self):
             self.terminated = True
 
-    client = AppWorldSessionClient()
-    client._proc = FakeProc()
+    for poll_result in (None, 0):
+        client = AppWorldSessionClient()
+        proc = FakeProc(poll_result=poll_result)
+        client._proc = proc
+        client._ensure_process = lambda proc=proc: proc
 
-    try:
-        client.request({"op": "list_apps", "task_id": "aaa111_1"})
-    except AppWorldRunnerError as exc:
-        assert "exited without a response" in str(exc)
-    else:
-        raise AssertionError("expected AppWorldRunnerError")
+        try:
+            client.request({"op": "list_apps", "task_id": "aaa111_1"})
+        except AppWorldRunnerError as exc:
+            assert "exited without a response" in str(exc)
+        else:
+            raise AssertionError("expected AppWorldRunnerError")
 
 
 def test_session_client_blocks_model_facing_complete_task(monkeypatch):
