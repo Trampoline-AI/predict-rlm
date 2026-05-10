@@ -1021,8 +1021,11 @@ class JspiInterpreter(PythonInterpreter):
                     continue
 
             if not output_line:
-                raise CodeInterpreterError(
-                    "No output from Deno subprocess."
+                self._kill_sandbox()
+                raise SandboxFatalError(
+                    "Deno subprocess stopped producing stdout during async execute. "
+                    "The sandbox was force-killed; per-run mounts are gone, so "
+                    "this interpreter is dead."
                 )
 
             # Skip non-JSON lines (e.g., Pyodide package loading messages)

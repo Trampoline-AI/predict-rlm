@@ -4,6 +4,7 @@ import asyncio
 import subprocess
 import tempfile
 import types
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import patch
 
@@ -288,3 +289,30 @@ class TestJspiTelemetry:
         assert timeout["attributes"]["failure.class"] == "host_tool_timeout_or_leak"
         assert timeout["attributes"]["tool.name"] == "slow_tool"
         assert timeout["attributes"]["tool.id"] == "tool-1"
+
+
+class TestAsyncExecuteEof:
+    def test_stdout_eof_does_not_drain_stderr_with_unbounded_read(self):
+        interp = _make_interpreter()
+
+        class BlockingStderr:
+            def read(self):
+                raise AssertionError("stderr.read() would block if the pipe is still open")
+
+        async def no_completed_responses(_pending_tasks):
+            return None
+
+        async def stdout_eof(_timeout):
+            return ""
+
+        interp.deno_process = SimpleNamespace(stderr=BlockingStderr())
+        interp._pending_file_ops = {}
+        interp._send_completed_responses = no_completed_responses
+        interp._read_with_timeout_async = stdout_eof
+
+        try:
+            asyncio.run(interp._execute_async(execute_request_id=1))
+        except SandboxFatalError as exc:
+            assert "Deno subprocess stopped producing stdout" in str(exc)
+        else:
+            raise AssertionError("expected SandboxFatalError on Deno stdout EOF")
