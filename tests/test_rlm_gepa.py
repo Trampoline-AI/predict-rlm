@@ -2576,7 +2576,7 @@ def test_eval_stats_reports_attempt_outcomes_and_latency_percentiles(tmp_path: P
 
     expected = (
         "attempts=4, timeouts=2, max_iter_hits=1, "
-        "latency p50=2.0s p90=5.0s p95=5.0s"
+        "latency p50=2.0s p90=5.0s p95=5.0s max=5.0s"
     )
     assert expected in terminal
     assert expected in markdown
@@ -2623,7 +2623,7 @@ def test_optimize_stats_reports_attempt_outcomes_and_latency_percentiles(tmp_pat
 
     assert (
         "attempts=3, timeouts=1, max_iter_hits=1, "
-        "latency p50=2.5s p90=7.5s p95=7.5s"
+        "latency p50=2.5s p90=7.5s p95=7.5s max=7.5s"
     ) in rendered
 
 
@@ -2793,6 +2793,35 @@ def test_adapter_progress_bar_updates_per_example(tmp_path: Path, monkeypatch):
     )
     assert [event for event in events if event[0] == "update"] == [("update", 1), ("update", 1)]
     assert events[-1] == ("close", None)
+
+
+def test_adapter_writes_eval_progress_events(tmp_path: Path):
+    adapter = RLMGepaAdapter(
+        project=_ImmediateProject(),
+        lm=_DummyLM(),
+        sub_lm=_DummyLM(),
+        max_iterations=1,
+        concurrency=2,
+        task_timeout=1,
+        output_dir=tmp_path,
+        run_id="run_test",
+    )
+
+    batch = adapter.evaluate(["a", "b"], {"skill_instructions": "seed"}, capture_traces=True)
+
+    assert batch.scores == [1.0, 1.0]
+    events = [json.loads(line) for line in (tmp_path / "eval_progress.jsonl").read_text().splitlines()]
+    seen = [(event["example_id"], event["status"]) for event in events]
+    assert sorted(seen) == sorted(
+        [
+            ("a", "started"),
+            ("b", "started"),
+            ("a", "completed"),
+            ("b", "completed"),
+        ]
+    )
+    assert all(event["label"] == "MB 0000" for event in events)
+    assert events[-1]["score"] == 1.0
 
 
 def test_adapter_progress_bar_labels_valset(tmp_path: Path, monkeypatch):

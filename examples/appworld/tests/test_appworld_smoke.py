@@ -1,6 +1,7 @@
 import argparse
 import asyncio
 import json
+import subprocess
 import sys
 import types
 from pathlib import Path
@@ -31,6 +32,7 @@ from appworld_rlm.tools.appworld_worker import (
     to_jsonable,
 )
 from appworld_rlm.tools.runner import (
+    AppWorldRunnerError,
     AppWorldSessionClient,
     _default_appworld_python,
     _tool_text,
@@ -278,6 +280,59 @@ def test_session_client_call_api_rejects_non_object_kwargs():
     payload = __import__("json").loads(text)
     assert payload["success"] is False
     assert "JSON object" in payload["feedback"]
+
+
+def test_session_client_does_not_block_reading_stderr_after_stdout_eof():
+    class FakePipe:
+        def __init__(self, line: str = ""):
+            self.line = line
+            self.closed = False
+
+        def write(self, _text):
+            pass
+
+        def flush(self):
+            pass
+
+        def readline(self):
+            return self.line
+
+        def read(self):
+            raise AssertionError("stderr.read() would block while the worker is still running")
+
+        def close(self):
+            self.closed = True
+
+    class FakeProc:
+        def __init__(self):
+            self.stdin = FakePipe()
+            self.stdout = FakePipe("")
+            self.stderr = FakePipe()
+            self.terminated = False
+
+        def poll(self):
+            return None
+
+        def wait(self, timeout=None):
+            if not self.terminated:
+                raise subprocess.TimeoutExpired("worker", timeout)
+            return 0
+
+        def terminate(self):
+            self.terminated = True
+
+        def kill(self):
+            self.terminated = True
+
+    client = AppWorldSessionClient()
+    client._proc = FakeProc()
+
+    try:
+        client.request({"op": "list_apps", "task_id": "aaa111_1"})
+    except AppWorldRunnerError as exc:
+        assert "exited without a response" in str(exc)
+    else:
+        raise AssertionError("expected AppWorldRunnerError")
 
 
 def test_session_client_blocks_model_facing_complete_task(monkeypatch):
@@ -1035,11 +1090,11 @@ def test_appworld_eval_defaults_and_overrides_are_wired():
         ["eval", "--concurrency", "7", "--task-timeout", "42"]
     )
 
-    assert EvalConfig().concurrency == 20
+    assert EvalConfig().concurrency == 10
     assert EvalConfig().task_timeout == 600
-    assert eval_args.concurrency == 20
+    assert eval_args.concurrency == 10
     assert eval_args.task_timeout == 600
-    assert default_config().concurrency == 20
+    assert default_config().concurrency == 10
     assert override_args.concurrency == 7
     assert override_args.task_timeout == 42
 

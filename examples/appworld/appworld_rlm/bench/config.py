@@ -5,7 +5,7 @@ from pathlib import Path
 
 DEFAULT_EVAL_LM = "openai/gpt-5.4"
 DEFAULT_EVAL_SUB_LM = "openai/gpt-5.4-mini"
-DEFAULT_CONCURRENCY = 20
+DEFAULT_CONCURRENCY = 10
 DEFAULT_TASK_TIMEOUT = 600
 DEFAULT_SEED = 13
 

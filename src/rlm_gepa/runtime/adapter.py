@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 from collections.abc import Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import replace
@@ -194,6 +195,8 @@ class RLMGepaAdapter:
         )
 
         semaphore = asyncio.Semaphore(self.concurrency)
+        progress_event_path = self.output_dir / "eval_progress.jsonl"
+        progress_label = self._progress_label(eval_kind, eval_idx, capture_traces)
 
         async def run_one(index: int, example: Any) -> tuple[int, RLMGepaExampleResult]:
             example_context = replace(
@@ -205,33 +208,64 @@ class RLMGepaAdapter:
                 ),
             )
             async with semaphore:
+                example_id = _example_id(example) or str(example)
+                _append_eval_progress_event(
+                    progress_event_path,
+                    event_id=event_id,
+                    operation_id=operation_id,
+                    label=progress_label,
+                    index=index,
+                    example_id=example_id,
+                    status="started",
+                )
+                status = "exception"
+                score: float | None = None
+                error: str | None = None
                 try:
-                    result = await asyncio.wait_for(
-                        self.project.evaluate_example(candidate, example, example_context),
-                        timeout=self.task_timeout,
+                    try:
+                        result = await asyncio.wait_for(
+                            self.project.evaluate_example(candidate, example, example_context),
+                            timeout=self.task_timeout,
+                        )
+                    except asyncio.TimeoutError:
+                        self._write_outer_timeout_event(example_context, example, index)
+                        result = RLMGepaExampleResult(
+                            score=0.0,
+                            feedback=f"evaluation timeout at {self.task_timeout}s",
+                            traces=[],
+                            example_id=example_id,
+                            error=f"timeout at {self.task_timeout}s",
+                        )
+                    except Exception as exc:
+                        trace = extract_trace_from_exc(exc)
+                        result = RLMGepaExampleResult(
+                            score=0.0,
+                            feedback=f"evaluation {type(exc).__name__}: {exc}",
+                            traces=[trace] if trace is not None else [],
+                            example_id=example_id,
+                            error=str(exc),
+                        )
+                    validate_example_result(result)
+                    status = "error" if result.error else "completed"
+                    score = float(result.score)
+                    error = result.error
+                    return index, result
+                except BaseException as exc:
+                    error = f"{type(exc).__name__}: {exc}"
+                    raise
+                finally:
+                    _append_eval_progress_event(
+                        progress_event_path,
+                        event_id=event_id,
+                        operation_id=operation_id,
+                        label=progress_label,
+                        index=index,
+                        example_id=example_id,
+                        status=status,
+                        score=score,
+                        error=error,
                     )
-                except asyncio.TimeoutError:
-                    self._write_outer_timeout_event(example_context, example, index)
-                    return index, RLMGepaExampleResult(
-                        score=0.0,
-                        feedback=f"evaluation timeout at {self.task_timeout}s",
-                        traces=[],
-                        example_id=_example_id(example),
-                        error=f"timeout at {self.task_timeout}s",
-                    )
-                except Exception as exc:
-                    trace = extract_trace_from_exc(exc)
-                    return index, RLMGepaExampleResult(
-                        score=0.0,
-                        feedback=f"evaluation {type(exc).__name__}: {exc}",
-                        traces=[trace] if trace is not None else [],
-                        example_id=_example_id(example),
-                        error=str(exc),
-                    )
-                validate_example_result(result)
-                return index, result
 
-        progress_label = self._progress_label(eval_kind, eval_idx, capture_traces)
         progress_bar = self._open_progress_bar(progress_label, len(batch))
         log_stream = install_rlm_log_stream(progress_label) if self.verbose_rlm else None
         tasks = [asyncio.create_task(run_one(index, example)) for index, example in enumerate(batch)]
@@ -859,6 +893,35 @@ def _compact_reason(value: Any, *, limit: int = 240) -> str:
     if len(text) <= limit:
         return text
     return text[: limit - 3] + "..."
+def _append_eval_progress_event(
+    path: Path,
+    *,
+    event_id: str,
+    operation_id: str,
+    label: str,
+    index: int,
+    example_id: str | None,
+    status: str,
+    score: float | None = None,
+    error: str | None = None,
+) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "ts": time.time(),
+        "event_id": event_id,
+        "operation_id": operation_id,
+        "label": label,
+        "index": index,
+        "example_id": example_id,
+        "status": status,
+    }
+    if score is not None:
+        payload["score"] = score
+    if error:
+        payload["error"] = error
+    with path.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(payload, default=str) + "\n")
+        f.flush()
 
 
 def _batch_signature(batch: Sequence[Any]) -> tuple[str, ...]:

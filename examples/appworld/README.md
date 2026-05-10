@@ -111,13 +111,14 @@ The prompt and few-shot protocol are matched where possible. The supervisor
 profile context that stock AppWorld prompts provide is passed into the RLM
 signature separately. For ICL, the repo stores only the official demo task ID
 manifest for provenance. At runtime, it loads those demo tasks from the user's
-local AppWorld data and renders their ground-truth compiled solutions as tutorial
-solution sketches. Those sketches translate direct `apis.app.api(...)` calls into
-an RLM-facing `await call_appworld_api(app_name, api_name, json.dumps(kwargs))`
-helper and translate `apis.supervisor.complete_task(...)` into the terminal
-`SUBMIT(...)` interface. The checked-in repo does not contain worked demo traces,
-`demos.json` content, generated app state, train/dev/test evaluator feedback, or
-reference answers for non-demo benchmark tasks.
+local AppWorld data and renders their ground-truth compiled solutions as
+tutorial solution sketches. Those sketches translate direct `apis.app.api(...)`
+calls into an RLM-facing
+`await call_appworld_api(app_name, api_name, json.dumps(kwargs))` helper and
+translate `apis.supervisor.complete_task(...)` into the terminal `SUBMIT(...)`
+interface. The checked-in repo does not contain worked demo traces, `demos.json`
+content, generated app state, train/dev/test evaluator feedback, or reference
+answers for non-demo benchmark tasks.
 
 The completion protocol is also adapted to the RLM interface. The RLM terminates
 with `SUBMIT(answer=value)` for answer tasks or `SUBMIT()` for state-change-only
@@ -199,7 +200,7 @@ SGC for comparisons to AppWorld/HALO charts labeled "Scenario Goal Completion".
 
 ## Commands
 
-Optimize and eval use default concurrency 20. Pass `--concurrency` only when a
+Optimize and eval use default concurrency 10. Pass `--concurrency` only when a
 run needs a different worker count.
 
 ```bash

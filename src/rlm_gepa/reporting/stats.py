@@ -1612,13 +1612,14 @@ def _format_attempt_summary(summary: dict[str, Any]) -> str:
     if attempts <= 0:
         return ""
     durations_ms = [float(duration) for duration in summary["durations_ms"]]
-    latency = "latency p50=- p90=- p95=-"
+    latency = "latency p50=- p90=- p95=- max=-"
     if durations_ms:
         latency = " ".join(
             [
                 f"latency p50={_format_seconds(_percentile(durations_ms, 50) / 1000)}",
                 f"p90={_format_seconds(_percentile(durations_ms, 90) / 1000)}",
                 f"p95={_format_seconds(_percentile(durations_ms, 95) / 1000)}",
+                f"max={_format_seconds(max(durations_ms) / 1000)}",
             ]
         )
     return (
