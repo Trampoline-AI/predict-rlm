@@ -106,11 +106,8 @@ def _adapt_compiled_solution(data_root: Path, task_id: str) -> list[str]:
     code = _replace_appworld_datetime(code)
     code = _strip_empty_lines(code)
     return [
-        "import json",
-        "",
         "async def appworld_api(app_name, api_name, **kwargs):",
-        "    response_text = await call_appworld_api(app_name, api_name, json.dumps(kwargs))",
-        "    response = json.loads(response_text)",
+        "    response = await call_appworld_api(app_name, api_name, kwargs)",
         "    return response.get('result', response.get('output', response))",
         "",
         *code.splitlines(),
@@ -188,7 +185,7 @@ def _adapt_function_call_code(
     variable_name = _response_variable_name(api_name, variable_counts)
     return (
         f'{variable_name} = await call_appworld_api('
-        f'"{app_name}", "{api_name}", json.dumps({kwargs_literal})'
+        f'"{app_name}", "{api_name}", {kwargs_literal}'
         ")",
         variable_name,
     )
@@ -234,17 +231,21 @@ You have access to exactly five lightweight tools:
 - `show_appworld_api_descriptions(app_name)`
 - `show_appworld_api_doc(app_name, api_name)`
 - `search_appworld_api_docs(query)`
-- `call_appworld_api(app_name, api_name, kwargs_json)`
+- `call_appworld_api(app_name, api_name, kwargs)`
 
 The functions correspond to APIs from various apps you have access to. The
 environment already knows which app data to use. No extra routing argument is
 needed. Discover API names and argument schemas through the documentation tools,
-then call APIs through `call_appworld_api` with `kwargs_json` set to a JSON object
-string. For example, use:
+then call APIs through `call_appworld_api` with `kwargs` set to a Python dict.
+Tool results are already decoded Python dictionaries in the REPL. For example,
+use:
 
 ```python
-import json
-await call_appworld_api("spotify", "login", json.dumps({"username": "...", "password": "..."}))
+login_response = await call_appworld_api(
+    "spotify", "login", {"username": "...", "password": "..."}
+)
+if login_response["success"]:
+    access_token = login_response["output"].get("access_token")
 ```
 
 A. General instructions:
@@ -295,8 +296,8 @@ C. Solving strategy:
    then log in through the target app's login API.
 4. Inspect current state with read/search/list APIs before mutating anything.
 5. Use exact IDs and values observed from API results. Pass arguments through
-   `call_appworld_api(app_name, api_name, kwargs_json)` by their documented
-   parameter names.
+   `call_appworld_api(app_name, api_name, kwargs)` by their documented parameter
+   names.
 6. Read returned `success`, `result`/`output`, `feedback`, `stdout`, `stderr`, and
    errors carefully. After a failed call, change only the part implicated by the
    error or traceback.

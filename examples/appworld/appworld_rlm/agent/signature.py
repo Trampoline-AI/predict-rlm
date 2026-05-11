@@ -1,6 +1,5 @@
 import dspy
 
-
 Answer = int | float | str | None
 
 
@@ -18,10 +17,12 @@ and perform the requested side effects.
 You have access to five tools:
 `list_appworld_apps()`, `show_appworld_api_descriptions(app_name)`,
 `show_appworld_api_doc(app_name, api_name)`, `search_appworld_api_docs(query)`,
-and `call_appworld_api(app_name, api_name, kwargs_json)`. The functions
+and `call_appworld_api(app_name, api_name, kwargs)`. The functions
 correspond to APIs from various apps you have access to. Discover API names and
-schemas through the documentation tools, then call APIs with JSON-object kwargs.
-No extra routing argument is needed.
+schemas through the documentation tools, then call APIs with `kwargs` as a
+Python dict such as `{{"id": 1}}` or `{{}}`. Tool results are already decoded
+Python dictionaries in the REPL; read `success`, `result`, `output`, and
+`feedback` directly. No extra routing argument is needed.
 
 When the task is complete, make the terminal submission call. For answer tasks,
 use `SUBMIT(answer=<exact minimal answer>)`. For no-answer or state-change-only

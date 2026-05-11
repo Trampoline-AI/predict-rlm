@@ -138,7 +138,7 @@ def test_official_icl_adapter_rewrites_function_call_syntax_without_demo_traject
 
     assert call == (
         'sample_api_response = await call_appworld_api('
-        '"sample_app", "sample_api", json.dumps({"value": "x"})'
+        '"sample_app", "sample_api", {"value": "x"}'
         ")"
     )
     assert skills_module._adapt_function_call("supervisor__complete_task", '{"answer": 1}') == "SUBMIT(answer=1)"
@@ -152,7 +152,9 @@ def test_official_icl_renderer_uses_code_blocks_and_adapted_ground_truth_solutio
 
     assert "```python" in rendered
     assert "async def appworld_api" in rendered
-    assert "await call_appworld_api(app_name, api_name, json.dumps(kwargs))" in rendered
+    assert "response = await call_appworld_api(app_name, api_name, kwargs)" in rendered
+    assert "json.dumps(kwargs)" not in rendered
+    assert "json.loads(response" not in rendered
     assert "lookup_result = await appworld_api('sample_app', 'lookup_item', query='synthetic')" in rendered
     assert "SUBMIT(answer=lookup_result['value'])" in rendered
     assert "apis.sample_app" not in rendered
@@ -207,6 +209,11 @@ def test_model_facing_prompt_is_stock_style_and_task_bound_by_host(tmp_path):
     assert "final_answer" not in SolveAppWorldTask.output_fields
     assert "Use API documentation to understand how to interact with the apps" in normalized_text
     assert "The functions correspond to APIs from various apps you have access to" in normalized_text
+    assert "call_appworld_api(app_name, api_name, kwargs)" in normalized_text
+    assert "Python dict" in normalized_text
+    assert "kwargs_json" not in normalized_text
+    assert "json.dumps" not in normalized_text
+    assert "json.loads" not in normalized_text
     assert "task_id" not in SolveAppWorldTask.input_fields
     for phrase in forbidden:
         assert phrase not in normalized_text
@@ -754,7 +761,7 @@ def test_service_binds_current_task_appworld_tools(monkeypatch):
             self.calls.append((task_id, app_name, api_name, kwargs_json))
             if app_name == "supervisor" and api_name == "complete_task":
                 return json.dumps({"success": True})
-            return task_id + app_name + api_name + kwargs_json
+            return json.dumps({"success": True, "result": {"echo": json.loads(kwargs_json)}})
 
         def evaluate_appworld_task(self, task_id):
             return task_id
@@ -783,23 +790,27 @@ def test_service_binds_current_task_appworld_tools(monkeypatch):
         "search_appworld_api_docs",
         "call_appworld_api",
     } == set(captured_tools)
-    assert captured_tools["list_appworld_apps"]() == json.dumps(
-        {"success": True, "result": {"apps": ["venmo"]}}
-    )
-    assert captured_tools["show_appworld_api_descriptions"]("venmo") == json.dumps(
-        {"success": True, "result": {"search": "Search Venmo friends."}}
-    )
-    assert captured_tools["show_appworld_api_doc"]("venmo", "search") == json.dumps(
-        {"success": True, "result": {"api_name": "search"}}
-    )
-    assert captured_tools["search_appworld_api_docs"]("friends") == json.dumps(
-        {"success": True, "result": ["venmo.search"]}
-    )
+    assert captured_tools["list_appworld_apps"]() == {
+        "success": True,
+        "result": {"apps": ["venmo"]},
+    }
+    assert captured_tools["show_appworld_api_descriptions"]("venmo") == {
+        "success": True,
+        "result": {"search": "Search Venmo friends."},
+    }
+    assert captured_tools["show_appworld_api_doc"]("venmo", "search") == {
+        "success": True,
+        "result": {"api_name": "search"},
+    }
+    assert captured_tools["search_appworld_api_docs"]("friends") == {
+        "success": True,
+        "result": ["venmo.search"],
+    }
     assert captured_tools["call_appworld_api"](
         "venmo",
         "search",
-        '{"query": "alice", "page_index": 2}',
-    ) == 'aaa111_1venmosearch{"query": "alice", "page_index": 2}'
+        {"query": "alice", "page_index": 2},
+    ) == {"success": True, "result": {"echo": {"query": "alice", "page_index": 2}}}
     assert client.calls[-5:] == [
         ("list_appworld_apps", "aaa111_1"),
         ("show_appworld_api_descriptions", "aaa111_1", "venmo"),

@@ -91,16 +91,15 @@ list_appworld_apps()
 show_appworld_api_descriptions(app_name)
 show_appworld_api_doc(app_name, api_name)
 search_appworld_api_docs(query)
-call_appworld_api(app_name, api_name, kwargs_json)
+call_appworld_api(app_name, api_name, kwargs)
 ```
 
 The model discovers apps and API schemas through the documentation tools, then
-calls an API with `call_appworld_api`. `kwargs_json` must be a JSON object
-string containing the documented API parameters:
+calls an API with `call_appworld_api`. `kwargs` must be a Python dict containing
+the documented API parameters:
 
 ```python
-import json
-await call_appworld_api("spotify", "login", json.dumps({"username": "...", "password": "..."}))
+await call_appworld_api("spotify", "login", {"username": "...", "password": "..."})
 ```
 
 The model never supplies `task_id`; each exposed tool closes over the current
@@ -114,7 +113,7 @@ manifest for provenance. At runtime, it loads those demo tasks from the user's
 local AppWorld data and renders their ground-truth compiled solutions as
 tutorial solution sketches. Those sketches translate direct `apis.app.api(...)`
 calls into an RLM-facing
-`await call_appworld_api(app_name, api_name, json.dumps(kwargs))` helper and
+`await call_appworld_api(app_name, api_name, kwargs)` helper and
 translate `apis.supervisor.complete_task(...)` into the terminal `SUBMIT(...)`
 interface. The checked-in repo does not contain worked demo traces, `demos.json`
 content, generated app state, train/dev/test evaluator feedback, or reference

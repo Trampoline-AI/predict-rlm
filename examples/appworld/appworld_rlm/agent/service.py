@@ -77,30 +77,40 @@ class AppWorldRLM(dspy.Module):
             self._complete_task_from_prediction(task_id, prediction)
         return prediction
 
-    def _current_task_tools(self, task_id: str) -> dict[str, Callable[..., str]]:
-        def list_appworld_apps() -> str:
+    def _current_task_tools(self, task_id: str) -> dict[str, Callable[..., dict[str, Any]]]:
+        def list_appworld_apps() -> dict[str, Any]:
             """List AppWorld apps available for the current task."""
-            return self.appworld_client.list_appworld_apps(task_id)
+            return _decode_tool_result(self.appworld_client.list_appworld_apps(task_id))
 
-        def show_appworld_api_descriptions(app_name: str) -> str:
+        def show_appworld_api_descriptions(app_name: str) -> dict[str, Any]:
             """Show API names and short descriptions for one AppWorld app."""
-            return self.appworld_client.show_appworld_api_descriptions(task_id, app_name)
+            return _decode_tool_result(
+                self.appworld_client.show_appworld_api_descriptions(task_id, app_name)
+            )
 
-        def show_appworld_api_doc(app_name: str, api_name: str) -> str:
+        def show_appworld_api_doc(app_name: str, api_name: str) -> dict[str, Any]:
             """Show full documentation for one AppWorld API."""
-            return self.appworld_client.show_appworld_api_doc(task_id, app_name, api_name)
+            return _decode_tool_result(
+                self.appworld_client.show_appworld_api_doc(task_id, app_name, api_name)
+            )
 
-        def search_appworld_api_docs(query: str) -> str:
+        def search_appworld_api_docs(query: str) -> dict[str, Any]:
             """Search AppWorld API documentation for the current task."""
-            return self.appworld_client.search_appworld_api_docs(task_id, query)
+            return _decode_tool_result(self.appworld_client.search_appworld_api_docs(task_id, query))
 
-        def call_appworld_api(app_name: str, api_name: str, kwargs_json: str) -> str:
-            """Call one AppWorld API for the current task with JSON-object kwargs."""
-            return self.appworld_client.call_appworld_api(
-                task_id,
-                app_name,
-                api_name,
-                kwargs_json,
+        def call_appworld_api(
+            app_name: str,
+            api_name: str,
+            kwargs: dict[str, Any],
+        ) -> dict[str, Any]:
+            """Call one AppWorld API for the current task with Python-dict kwargs."""
+            return _decode_tool_result(
+                self.appworld_client.call_appworld_api(
+                    task_id,
+                    app_name,
+                    api_name,
+                    json.dumps(kwargs),
+                )
             )
 
         return {
@@ -185,3 +195,10 @@ def _parse_tool_result(result: Any) -> dict[str, Any] | None:
         if isinstance(payload, dict):
             return payload
     return None
+
+
+def _decode_tool_result(result: Any) -> dict[str, Any]:
+    payload = _parse_tool_result(result)
+    if payload is None:
+        raise RuntimeError(f"AppWorld tool returned unsupported payload: {result!r}")
+    return payload
