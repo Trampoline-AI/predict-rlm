@@ -35,7 +35,12 @@ from ..schema import (
     validate_example_result,
 )
 from .progress import install_rlm_log_stream, progress_write, restore_rlm_log_stream
-from .trace_rendering import render_inputs, render_trace, trace_to_json
+from .trace_rendering import (
+    proposer_failure_metadata,
+    render_inputs,
+    trace_to_json,
+    trace_to_proposer_json,
+)
 from .utils import atomic_write_json, run_coro_sync
 
 try:
@@ -268,9 +273,6 @@ class RLMGepaAdapter:
                     objective_scores.append(dict(result.objective_scores))
                 else:
                     objective_scores.append({})
-                record = reflective_record(result)
-                if trajectories is not None:
-                    trajectories.append({"example_id": example_id, "task_id": example_id, "record": record})
                 row: dict[str, Any] = {
                     "schema_version": 1,
                     "event_id": event_id,
@@ -287,13 +289,15 @@ class RLMGepaAdapter:
                     "traces": [trace_to_json(trace) for trace in result.traces],
                     "error": result.error,
                 }
-                row.update(
-                    _row_failure_metadata(
-                        row,
-                        trace_events,
-                        telemetry_context=row_telemetry_context,
-                    )
+                failure_metadata = _row_failure_metadata(
+                    row,
+                    trace_events,
+                    telemetry_context=row_telemetry_context,
                 )
+                row.update(failure_metadata)
+                record = reflective_record(result, failure_metadata=failure_metadata)
+                if trajectories is not None:
+                    trajectories.append({"example_id": example_id, "task_id": example_id, "record": record})
                 f.write(json.dumps(row, default=str) + "\n")
 
         self._write_eval_cost(
@@ -516,8 +520,7 @@ class RLMGepaAdapter:
             "base_parent_id": getattr(result, "base_parent_id", base_parent_id),
             "patch_summary": getattr(result, "patch_summary", ""),
             "selected_capability": _jsonable(selected_capability),
-            "imported_from_other": _jsonable(getattr(result, "imported_from_other", []) or []),
-            "rejected_from_other": _jsonable(getattr(result, "rejected_from_other", []) or []),
+            "patch_audit": _jsonable(getattr(result, "patch_audit", None)),
             "base_instruction_chars": len(base_parent_instructions),
             "new_instruction_chars": len(new_text),
             "instruction_char_delta": len(new_text) - len(base_parent_instructions),
@@ -529,8 +532,8 @@ class RLMGepaAdapter:
             event_id=event_id,
             operation_id=operation_id,
             attempt_id=f"attempt_{attempt_idx:04d}",
-            main_role="patch_merge_proposer",
-            sub_role="patch_merge_proposer_sub_lm",
+            main_role="merge_proposer",
+            sub_role="merge_proposer_sub_lm",
             trace=trace,
         )
         payload = {
@@ -641,13 +644,21 @@ class RLMGepaAdapter:
         )
 
 
-def reflective_record(result: RLMGepaExampleResult) -> dict[str, str]:
-    traces = [render_trace(trace, f"TRACE {i + 1}") for i, trace in enumerate(result.traces)]
-    return {
+def reflective_record(
+    result: RLMGepaExampleResult,
+    *,
+    failure_metadata: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    record: dict[str, Any] = {
         "Inputs": render_inputs(result.rlm_inputs),
-        "Generated Outputs": "\n\n\n".join(traces) if traces else "(no traces)",
+        "Score": result.score,
+        "Traces": [trace_to_proposer_json(trace) for trace in result.traces],
         "Feedback": result.feedback,
+        "Error": result.error,
     }
+    if failure_metadata:
+        record["Failure Metadata"] = proposer_failure_metadata(failure_metadata)
+    return record
 
 
 def _example_id(example: Any) -> str | None:

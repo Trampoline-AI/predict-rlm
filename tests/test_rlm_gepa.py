@@ -39,7 +39,12 @@ from rlm_gepa import (
 )
 from rlm_gepa.cli import apply_optimize_args, run_project_cli
 from rlm_gepa.proposer.merge import VALID_STATUSES, RlmMergeProposer
-from rlm_gepa.proposer.rlm import SelectedCapability
+from rlm_gepa.proposer.rlm import (
+    ImproveInstructionsGeneric,
+    PatchMergeInstructionsGeneric,
+    RLMInstructionProposer,
+    SelectedCapability,
+)
 from rlm_gepa.proposer.selection import (
     PatchMergePair,
     pick_patch_merge_pair,
@@ -224,14 +229,14 @@ def test_agent_spec_from_rlm_can_omit_agent_type():
     assert "lookup" in spec.tool_signatures
 
 
-def test_proposer_signature_allows_multiple_async_predict_passes_for_concrete_edits():
+def test_proposer_signature_mentions_parallel_predict_analysis_for_concrete_edits():
     proposer = build_proposer_signature(_spec())
     instructions = " ".join(proposer.instructions.split())
 
-    assert "one or more `predict()` calls" in instructions
+    assert "predict()" in instructions
     assert "asyncio.gather" in instructions
-    assert "structured brief containing root causes and edit decisions" in instructions
-    assert "must not draft the substantive wording from scratch" in instructions
+    assert "concrete" in instructions
+    assert "new_instructions" in instructions
 
 
 def test_patch_merge_signature_uses_base_and_patch_source_without_ancestor():
@@ -249,17 +254,16 @@ def test_patch_merge_signature_uses_base_and_patch_source_without_ancestor():
 def test_patch_merge_signature_exposes_selected_capability_contract():
     patch = build_patch_merge_signature(_spec())
 
+    assert "patch_summary" in patch.output_fields
     assert "selected_capability" in patch.output_fields
-    assert "imported_from_other" in patch.output_fields
-    assert "rejected_from_other" in patch.output_fields
+    assert "patch_audit" in patch.output_fields
     assert "new_instructions" in patch.output_fields
     assert set(SelectedCapability.model_fields) == {
-        "name",
+        "decision",
+        "summary",
         "evidence_task_ids",
         "trigger",
-        "action",
         "non_application_boundary",
-        "preservation_note",
     }
 
 
@@ -626,7 +630,17 @@ class _PatchEvidenceAdapter:
                 "task_id": str(item).replace(" ", "_"),
                 "record": {
                     "Inputs": f"input for {item}",
-                    "Generated Outputs": f"trace for {item}",
+                    "Traces": [{"steps": [{"code": f"solve({item!r})", "error": False}]}],
+                    "Failure Metadata": {
+                        "failure_class": "host_tool_timeout_or_leak",
+                        "failure_reason": "tool timed out",
+                        "candidate_hash": "cand_sha256_deadbeef",
+                        "telemetry_ref": {
+                            "trace_id": "run_test:cand_sha256_deadbeef:minibatch:0:0",
+                            "candidate_hash": "cand_sha256_deadbeef",
+                            "events_path": "telemetry/events.jsonl",
+                        },
+                    },
                     "Feedback": f"score {score}",
                 },
             }
@@ -1000,7 +1014,14 @@ def test_patch_disagreement_trace_jsonl_contains_patch_schema(tmp_path: Path):
     assert records[0]["abs_delta"] == pytest.approx(1.0)
     assert records[0]["base_parent_id"] == 1
     assert records[0]["patch_source_parent_id"] == 2
-    assert records[0]["base_parent"]["generated_outputs"]
+    assert "generated_outputs" not in records[0]["base_parent"]
+    assert "trace_preview" not in records[0]["base_parent"]
+    assert records[0]["base_parent"]["traces"]
+    records_text = json.dumps(records)
+    assert "candidate_hash" not in records_text
+    assert "telemetry_ref" not in records_text
+    assert "events_path" not in records_text
+    assert "trace_id" not in records_text
     assert records[0]["patch_source_parent"]["feedback"]
 
 
@@ -1788,15 +1809,16 @@ def test_cost_rows_group_patch_merge_roles(tmp_path: Path):
 
     rows = cost_rows(tmp_path)
 
-    assert any(row.get("scope") == "patch-merge" and row.get("_category") for row in rows)
+    assert any(row.get("scope") == "merge" and row.get("_category") for row in rows)
     assert any(
-        row.get("scope") == "  - main" and row.get("model") == "dummy-patch-medium"
+        row.get("scope") == "  - proposer main" and row.get("model") == "dummy-patch-medium"
         for row in rows
     )
     assert any(
-        row.get("scope") == "  - sub" and row.get("model") == "dummy-patch-sub-low"
+        row.get("scope") == "  - proposer sub" and row.get("model") == "dummy-patch-sub-low"
         for row in rows
     )
+    assert not any(row.get("scope") == "patch-merge" for row in rows)
     assert not any(row.get("scope") == "other" for row in rows)
 
 
@@ -1842,8 +1864,8 @@ def test_terminal_cost_table_wraps_scope_and_model_to_terminal_width(monkeypatch
     assert "out_tok" in rendered
     assert "total_cost" not in rendered
     assert "  - patch" in rendered
-    assert "│     _merg" in rendered
-    assert "poser" in rendered
+    assert "│     merge_" in rendered
+    assert "propos" in rendered
 
 
 def test_terminal_merge_table_wraps_headers_and_status_to_terminal_width(monkeypatch):
@@ -2485,6 +2507,166 @@ def test_adapter_trace_rows_include_compact_failure_metadata(tmp_path: Path):
     assert row["telemetry_ref"]["trace_id"].endswith(":0")
 
 
+def test_reflective_record_visible_to_gepa_includes_failure_metadata(tmp_path: Path):
+    telemetry_context = TelemetryContext(
+        sink=JsonlTelemetrySink(tmp_path / "telemetry" / "events.jsonl"),
+        trace_id="run_test",
+        run_id="run_test",
+    )
+    adapter = RLMGepaAdapter(
+        project=_FailingTelemetryProject(),
+        lm=_DummyLM(),
+        sub_lm=_DummyLM(),
+        max_iterations=1,
+        concurrency=1,
+        task_timeout=1,
+        output_dir=tmp_path,
+        run_id="run_test",
+        telemetry_context=telemetry_context,
+    )
+
+    batch = adapter.evaluate(["example"], {"skill_instructions": "seed"}, capture_traces=True)
+
+    record = batch.trajectories[0]["record"]
+    assert record["Score"] == 0.0
+    assert record["Error"] == "tool timed out"
+    assert record["Failure Metadata"]["failure_class"] == "host_tool_timeout_or_leak"
+    assert record["Failure Metadata"]["failure_reason"] == "tool timed out"
+    assert "candidate_hash" not in record["Failure Metadata"]
+    assert "telemetry_ref" not in record["Failure Metadata"]
+
+    task_trace_path = (
+        tmp_path / "task_traces" / "run_test_eval_minibatch_attempt_0000_minibatch.jsonl"
+    )
+    task_row = json.loads(task_trace_path.read_text().splitlines()[0])
+    assert task_row["candidate_hash"].startswith("cand_sha256_")
+    assert task_row["telemetry_ref"]["trace_id"].endswith(":0")
+
+
+class _StructuredTraceProject(_Project):
+    async def evaluate_example(self, candidate, example, context):
+        trace = RunTrace(
+            status="completed",
+            model="dummy/main",
+            sub_model="dummy/sub",
+            iterations=1,
+            max_iterations=1,
+            duration_ms=25,
+            usage=LMUsage(
+                main=TokenUsage(input_tokens=100, output_tokens=50, cost=0.01),
+                sub=TokenUsage(input_tokens=20, output_tokens=10, cost=0.002),
+            ),
+            steps=[
+                IterationStep(
+                    iteration=1,
+                    reasoning="try the tool and ask the helper",
+                    code="answer = tool('x')\nSUBMIT(answer)",
+                    output="truncated output",
+                    untruncated_output="full output",
+                    duration_ms=25,
+                    lm=LMFinishMetadata(finish_reason="stop"),
+                    tool_calls=[
+                        ToolCall(
+                            name="tool",
+                            args=["x"],
+                            kwargs={"mode": "fast"},
+                            result={"raw": "tool output"},
+                            error="tool exploded",
+                            duration_ms=3,
+                        )
+                    ],
+                    predict_calls=[
+                        PredictCallGroup(
+                            signature="question -> answer",
+                            model="dummy/sub",
+                            total_usage=TokenUsage(
+                                input_tokens=20,
+                                output_tokens=10,
+                                cost=0.002,
+                            ),
+                            calls=[
+                                PredictCallDetail(
+                                    duration_ms=7,
+                                    usage=TokenUsage(
+                                        input_tokens=20,
+                                        output_tokens=10,
+                                        cost=0.002,
+                                    ),
+                                    input={"question": "q"},
+                                    output={},
+                                    error="helper failed",
+                                    lm=LMFinishMetadata(finish_reason="length"),
+                                )
+                            ],
+                        )
+                    ],
+                )
+            ],
+        )
+        return RLMGepaExampleResult(
+            score=0.5,
+            feedback="partial",
+            traces=[trace],
+            rlm_inputs={"example": example},
+            example_id=str(example),
+        )
+
+
+def test_adapter_reflective_records_include_structured_run_traces(tmp_path: Path):
+    adapter = RLMGepaAdapter(
+        project=_StructuredTraceProject(),
+        lm=_DummyLM(),
+        sub_lm=_DummyLM(),
+        max_iterations=1,
+        concurrency=1,
+        task_timeout=1,
+        output_dir=tmp_path,
+        run_id="run_test",
+    )
+
+    batch = adapter.evaluate(["example"], {"skill_instructions": "seed"}, capture_traces=True)
+
+    record = batch.trajectories[0]["record"]
+    trace = record["Traces"][0]
+    step = trace["steps"][0]
+    assert record["Score"] == 0.5
+    assert "Trace Preview" not in record
+    assert "Generated Outputs" not in record
+    assert step["code"] == "answer = tool('x')\nSUBMIT(answer)"
+    assert step["output"] == "truncated output"
+    assert step["untruncated_output"] == "full output"
+    assert step["lm"] == {"finish_reason": "stop"}
+    assert step["tool_calls"][0]["args"] == ["x"]
+    assert step["tool_calls"][0]["kwargs"] == {"mode": "fast"}
+    assert step["tool_calls"][0]["result"] == {"raw": "tool output"}
+    assert step["tool_calls"][0]["error"] == "tool exploded"
+    assert step["predict_calls"][0]["calls"][0]["error"] == "helper failed"
+    assert step["predict_calls"][0]["calls"][0]["lm"] == {"finish_reason": "length"}
+    assert "usage" not in trace
+    assert "duration_ms" not in trace
+    assert "duration_ms" not in step
+    assert "duration_ms" not in step["tool_calls"][0]
+    assert "usage" not in step["predict_calls"][0]
+    assert "total_usage" not in step["predict_calls"][0]
+    assert "duration_ms" not in step["predict_calls"][0]["calls"][0]
+    assert "usage" not in step["predict_calls"][0]["calls"][0]
+
+    task_trace_path = (
+        tmp_path / "task_traces" / "run_test_eval_minibatch_attempt_0000_minibatch.jsonl"
+    )
+    task_row = json.loads(task_trace_path.read_text().splitlines()[0])
+    archival_trace = task_row["trace"]
+    archival_step = archival_trace["steps"][0]
+    assert archival_trace["usage"]["main"]["input_tokens"] == 100
+    assert archival_trace["usage"]["main"]["cost"] == 0.01
+    assert archival_trace["duration_ms"] == 25
+    assert archival_step["duration_ms"] == 25
+    assert archival_step["tool_calls"][0]["duration_ms"] == 3
+    assert archival_step["predict_calls"][0]["total_usage"]["input_tokens"] == 20
+    assert archival_step["predict_calls"][0]["calls"][0]["usage"]["input_tokens"] == 20
+    assert task_row["traces"][0]["usage"]["sub"]["cost"] == 0.002
+
+
 def test_gepa_failure_metadata_includes_lm_truncation_fields():
     events = [
         {
@@ -2637,21 +2819,19 @@ def test_patch_merge_adapter_uses_patch_signature_and_persists_metadata(
                 base_parent_id=10,
                 patch_summary="imported one clause",
                 selected_capability={
-                    "name": "validated tool usage",
+                    "decision": "grafted",
+                    "summary": "validate inputs before invoking tools",
                     "evidence_task_ids": ["train-a"],
-                    "trigger": "inputs require tool use",
-                    "action": "validate inputs before invoking the tool",
-                    "non_application_boundary": "do not apply to unrelated formatting tasks",
-                    "preservation_note": "preserves base wins by only applying to tool-use rows",
+                    "trigger": "task requires validating user-provided tool inputs before invocation",
+                    "non_application_boundary": (
+                        "do not apply on base-win rows where direct tool invocation already succeeds"
+                    ),
                 },
-                imported_from_other=[
-                    {
-                        "clause": "Use the tool only after validating inputs.",
-                        "evidence_task_ids": ["train-a"],
-                        "reason": "source wins train-a",
-                    }
-                ],
-                rejected_from_other=["Do not copy unrelated formatting advice."],
+                patch_audit={
+                    "supported_source_win_ids": ["train-a"],
+                    "guardrail_hazards": [],
+                    "notes": "base lacks this validated-input facet",
+                },
                 new_instructions="base plus patch",
                 trace=None,
                 trajectory=[],
@@ -2690,7 +2870,15 @@ def test_patch_merge_adapter_uses_patch_signature_and_persists_metadata(
 
     assert new_text == "base plus patch"
     assert metadata["patch_summary"] == "imported one clause"
-    assert metadata["selected_capability"]["name"] == "validated tool usage"
+    assert metadata["selected_capability"]["decision"] == "grafted"
+    assert (
+        metadata["selected_capability"]["trigger"]
+        == "task requires validating user-provided tool inputs before invocation"
+    )
+    assert (
+        metadata["selected_capability"]["non_application_boundary"]
+        == "do not apply on base-win rows where direct tool invocation already succeeds"
+    )
     assert metadata["base_instruction_chars"] == len("base")
     assert metadata["new_instruction_chars"] == len("base plus patch")
     assert metadata["instruction_char_delta"] == len("base plus patch") - len("base")
@@ -2702,10 +2890,17 @@ def test_patch_merge_adapter_uses_patch_signature_and_persists_metadata(
         "paired_disagreement_traces_file",
     }
     assert "selected_capability" in captured["signature"].output_fields
+    assert "patch_audit" in captured["signature"].output_fields
+    assert "behavioral_rules" not in captured["signature"].output_fields
+    assert "patch_merge_audit" not in captured["signature"].output_fields
+    assert "rejected_from_other" not in captured["signature"].output_fields
+    assert "imported_from_other" not in captured["signature"].output_fields
     assert "common_ancestor_instructions" not in captured["inputs"]
     assert captured["inputs"]["base_parent_id"] == 10
     assert captured["inputs"]["patch_source_parent_id"] == 11
-    artifacts = list((tmp_path / "proposer_traces").glob("*_patch_from_cand_10_using_cand_11.json"))
+    artifacts = list(
+        (tmp_path / "proposer_traces").glob("*_patch_from_cand_10_using_cand_11.json")
+    )
     assert len(artifacts) == 1
     payload = json.loads(artifacts[0].read_text())
     assert payload["kind"] == "patch_merge_proposer"
@@ -2716,7 +2911,301 @@ def test_patch_merge_adapter_uses_patch_signature_and_persists_metadata(
         base_instructions="base",
         new_instructions="base plus patch",
     )
-    assert patch_output["imported_from_other"][0]["evidence_task_ids"] == ["train-a"]
+    assert patch_output["patch_audit"]["supported_source_win_ids"] == ["train-a"]
+    assert "behavioral_rules" not in patch_output
+    assert "patch_merge_audit" not in patch_output
+    assert "rejected_from_other" not in patch_output
+
+
+def test_rlm_patch_merge_no_op_patch_persists_compact_audit(
+    tmp_path: Path, monkeypatch
+):
+    import rlm_gepa.proposer.rlm as proposer_module
+    import rlm_gepa.runtime.adapter as adapter_module
+
+    base_instructions = "base rules"
+
+    class FakePredictRLM:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        async def acall(self, **_kwargs):
+            return SimpleNamespace(
+                base_parent_id=10,
+                patch_summary="left base unchanged because the source capability duplicates base",
+                selected_capability={
+                    "decision": "no-op",
+                    "summary": "source behavior duplicates the base",
+                    "evidence_task_ids": [],
+                    "trigger": "no concrete source-win-only trigger identified",
+                    "non_application_boundary": (
+                        "base-win rows already cover the proposed behavior, so leave base unchanged"
+                    ),
+                },
+                patch_audit={
+                    "supported_source_win_ids": [],
+                    "guardrail_hazards": ["candidate duplicates the base rule"],
+                    "notes": "no-op: duplicate source behavior, no clean missing facet",
+                },
+                new_instructions=base_instructions,
+                trace=None,
+                trajectory=[],
+            )
+
+    monkeypatch.setattr(adapter_module, "PredictRLM", FakePredictRLM)
+    monkeypatch.setattr(adapter_module, "progress_write", lambda _message: None)
+    monkeypatch.setattr(proposer_module, "progress_write", lambda _message: None)
+    (tmp_path / "proposer_traces").mkdir()
+    paired_trace = tmp_path / "paired_patch.jsonl"
+    paired_trace.write_text("{}\n")
+    adapter = RLMGepaAdapter(
+        project=_Project(),
+        lm=_DummyLM(),
+        sub_lm=_DummyLM(),
+        max_iterations=1,
+        concurrency=1,
+        task_timeout=1,
+        output_dir=tmp_path,
+        run_id="run_test",
+        proposer_lm=_DummyLM(),
+        proposer_sub_lm=_DummyLM(),
+        proposer_max_iterations=1,
+    )
+
+    new_text, metadata = adapter._rlm_propose_patch_merge_texts(
+        call_idx=4,
+        attempt_idx=2,
+        base_parent_id=10,
+        patch_source_parent_id=11,
+        base_parent_instructions=base_instructions,
+        patch_source_parent_instructions="source rules",
+        paired_disagreement_traces_file=SimpleNamespace(path=str(paired_trace)),
+        trace_task_ids=["train-a"],
+    )
+
+    assert new_text == base_instructions
+    assert metadata["new_instructions"] == base_instructions
+    assert metadata["selected_capability"]["evidence_task_ids"] == []
+    assert metadata["instruction_char_delta"] == 0
+    assert metadata["patch_audit"]["supported_source_win_ids"] == []
+    assert "duplicate" in metadata["patch_audit"]["notes"]
+    artifacts = list(
+        (tmp_path / "proposer_traces").glob("*_patch_from_cand_10_using_cand_11.json")
+    )
+    assert len(artifacts) == 1
+    patch_output = json.loads(artifacts[0].read_text())["patch_output"]
+    _assert_valid_patch_output(
+        patch_output,
+        trace_task_ids=["train-a"],
+        base_instructions=base_instructions,
+        new_instructions=base_instructions,
+    )
+    assert patch_output["selected_capability"]["decision"] == "no-op"
+
+
+def test_patch_merge_prompt_contains_compact_grounding_invariants():
+    instructions = build_merge_signature(_spec()).instructions
+
+    assert "# Workflow" in instructions
+    assert "# Patch Contract" not in instructions
+    assert "one coherent missing capability family" in instructions
+    assert "necessary facets of the same behavior" in instructions
+    assert "do not import unrelated source-parent behaviors" in instructions
+    assert "return\n`new_instructions` unchanged" in instructions
+    assert "no task IDs, row labels, audit labels, or" in instructions
+    assert "provenance notes in `new_instructions`" in instructions
+    assert "base wins" in instructions
+    assert "both-success rows are preservation checks" in instructions
+    assert PatchMergeInstructionsGeneric.input_fields[
+        "paired_disagreement_traces_file"
+    ].json_schema_extra["desc"] == (
+        "JSONL file carrying train disagreement evidence for the two parents"
+    )
+    assert "use those as primary behavioral evidence" in instructions
+    assert "Inspect failed rows alongside scores and feedback" in instructions
+    assert "tool-call inputs/outputs/errors" in instructions
+    assert "predict-call\n  inputs/outputs/errors" in instructions
+    assert "LM finish reasons to understand why one parent\n  won" in instructions
+    assert "`steps[*].output` can be shortened for display" in instructions
+    assert "prefer `steps[*].untruncated_output` if present" in instructions
+    assert 'failure_metadata.failure_class == "model_output_truncated"' in instructions
+    assert "generated LM answer was cut off or incomplete" in instructions
+    assert "shortened sandbox display output" in instructions
+    assert "Use repeated\n  behavioral failure modes" in instructions
+    assert "do not overfit to one unusual disagreement row" in instructions
+    assert "Use available tools and `predict()` for focused evidence extraction" in instructions
+    assert "Helper `predict()` calls may extract evidence" in instructions
+    assert "you choose the final" in instructions
+    assert "Before editing, identify one patch-source-win cluster" in instructions
+    assert "state the exact" in instructions
+    assert "task-intent or observable trigger" in instructions
+    assert "state the" in instructions
+    assert "non-application boundary" in instructions
+    assert "grounded in base-win or both-success evidence" in instructions
+    assert "cannot state the trigger and boundary concretely" in instructions
+    assert "ProposerRunTrace" not in instructions
+    assert "archival" not in instructions
+    assert "token cost/cache accounting" not in instructions
+    assert "durations" not in instructions
+    assert "candidate_hash" not in instructions
+    assert "outer proposer" not in instructions
+    assert "helper output" not in instructions
+    assert "support-filter" not in instructions
+    assert "verification" not in instructions
+
+
+def test_generic_proposer_prompt_contains_surgical_compression_invariants():
+    instructions = build_proposer_signature(_spec()).instructions
+
+    assert "spreadsheet formula" not in instructions.lower()
+    assert ImproveInstructionsGeneric.input_fields["traces_file"].json_schema_extra["desc"] == (
+        "JSON file containing structured execution evidence for proposer review"
+    )
+    assert "ProposerRunTrace" not in instructions
+    assert "archival" not in instructions
+    assert "token cost/cache accounting" not in instructions
+    assert "durations" not in instructions
+    assert "candidate_hash" not in instructions
+    assert "outer proposer" not in instructions
+    assert "helper output" not in instructions
+    assert "support-filter" not in instructions
+    assert "one coherent missing capability family" not in instructions
+    assert "patch-source" not in instructions
+
+
+def test_rlm_instruction_proposer_serializes_proposer_trace_records(
+    tmp_path: Path, monkeypatch
+):
+    import rlm_gepa.proposer.rlm as proposer_module
+
+    captured: dict[str, object] = {}
+
+    class FakePredictRLM:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        async def acall(self, **kwargs):
+            traces_file = kwargs["traces_file"]
+            captured["records"] = json.loads(Path(traces_file.path).read_text())
+            return SimpleNamespace(
+                new_instructions="updated rules",
+                generalization_check=[],
+                trajectory=[],
+                trace=None,
+            )
+
+    monkeypatch.setattr(proposer_module, "PredictRLM", FakePredictRLM)
+    monkeypatch.setattr(proposer_module, "progress_write", lambda _message: None)
+    monkeypatch.setattr(proposer_module, "install_rlm_log_stream", lambda _label: None)
+    monkeypatch.setattr(proposer_module, "restore_rlm_log_stream", lambda _stream: None)
+    proposer = RLMInstructionProposer(
+        spec=_spec(),
+        lm=_DummyLM(),
+        sub_lm=_DummyLM(),
+        output_dir=tmp_path,
+        max_iterations=1,
+        timeout=1,
+        heartbeat_interval_seconds=60,
+        run_id="run_test",
+    )
+    records = [
+        {
+            "Inputs": "input",
+            "Score": 0.0,
+            "Traces": [
+                RunTrace(
+                    status="completed",
+                    model="dummy/main",
+                    sub_model="dummy/sub",
+                    iterations=1,
+                    max_iterations=1,
+                    duration_ms=10,
+                    usage=LMUsage(
+                        main=TokenUsage(input_tokens=100, output_tokens=50, cost=0.01),
+                        sub=TokenUsage(input_tokens=20, output_tokens=10, cost=0.002),
+                    ),
+                    steps=[
+                        IterationStep(
+                            iteration=1,
+                            reasoning="inspect image",
+                            code="x = 1",
+                            output="ok",
+                            untruncated_output="ok",
+                            duration_ms=10,
+                            tool_calls=[ToolCall(name="tool", error="boom", duration_ms=1)],
+                            predict_calls=[
+                                PredictCallGroup(
+                                    signature="image -> answer",
+                                    model="dummy/sub",
+                                    calls=[
+                                        PredictCallDetail(
+                                            duration_ms=1,
+                                            input={
+                                                "image": "data:image/png;base64,QUJDREVGRw=="
+                                            },
+                                            output={},
+                                            error="predict boom",
+                                        )
+                                    ],
+                                )
+                            ],
+                        )
+                    ],
+                )
+            ],
+            "Failure Metadata": {
+                "failure_class": "host_tool_timeout_or_leak",
+                "failure_reason": "tool timed out",
+                "candidate_hash": "cand_sha256_deadbeef",
+                "telemetry_ref": {
+                    "trace_id": "run_test:cand_sha256_deadbeef:minibatch:0:0",
+                    "candidate_hash": "cand_sha256_deadbeef",
+                    "events_path": "telemetry/events.jsonl",
+                },
+            },
+            "Trace Preview": "rendered preview",
+            "Generated Outputs": "rendered preview",
+            "Feedback": "failed",
+            "Error": "tool timed out",
+        }
+    ]
+
+    new_text = proposer.propose_one_component("skill_instructions", "seed", records)
+
+    assert new_text == "updated rules"
+    serialized = captured["records"]
+    assert isinstance(serialized, list)
+    assert serialized[0]["Traces"][0]["steps"][0]["tool_calls"][0]["error"] == "boom"
+    assert serialized[0]["Traces"][0]["steps"][0]["predict_calls"][0]["calls"][0][
+        "error"
+    ] == "predict boom"
+    serialized_text = json.dumps(serialized)
+    assert "QUJDREVGRw==" not in serialized_text
+    assert "data:image/png;base64,<IMAGE_BASE_64_ENCODED(12)>" in serialized_text
+    assert "usage" not in serialized[0]["Traces"][0]
+    assert "duration_ms" not in serialized[0]["Traces"][0]
+    assert "usage" not in serialized_text
+    assert "duration_ms" not in serialized_text
+    assert "cost" not in serialized_text
+    assert "cache_hits" not in serialized_text
+    assert serialized[0]["Failure Metadata"]["failure_class"] == "host_tool_timeout_or_leak"
+    assert "candidate_hash" not in serialized_text
+    assert "telemetry_ref" not in serialized_text
+    assert "events_path" not in serialized_text
+    assert "trace_id" not in serialized_text
+    assert "Trace Preview" not in serialized[0]
+    assert "Generated Outputs" not in serialized[0]
+
+
+def test_generic_proposer_output_fields_describe_compact_edits_and_preservation():
+    output_fields = ImproveInstructionsGeneric.output_fields
+
+    new_desc = output_fields["new_instructions"].json_schema_extra["desc"]
+    check_desc = output_fields["generalization_check"].json_schema_extra["desc"]
+
+    assert "compact replacement or compression over appending" in new_desc
+    assert "Do not include audit labels or task IDs" in new_desc
+    assert "preserved solved behavior" in check_desc
 
 
 def _assert_valid_patch_output(
@@ -2729,14 +3218,24 @@ def _assert_valid_patch_output(
     selected_capability = patch_output["selected_capability"]
     assert isinstance(selected_capability, dict)
     assert set(selected_capability) >= {
-        "name",
+        "decision",
+        "summary",
         "evidence_task_ids",
         "trigger",
-        "action",
         "non_application_boundary",
-        "preservation_note",
     }
     assert set(selected_capability["evidence_task_ids"]) <= set(trace_task_ids)
+    assert isinstance(selected_capability["trigger"], str)
+    assert selected_capability["trigger"].strip()
+    assert isinstance(selected_capability["non_application_boundary"], str)
+    assert selected_capability["non_application_boundary"].strip()
+    patch_audit = patch_output["patch_audit"]
+    assert isinstance(patch_audit, dict)
+    assert set(patch_audit) >= {
+        "supported_source_win_ids",
+        "guardrail_hazards",
+        "notes",
+    }
     assert patch_output["base_instruction_chars"] == len(base_instructions)
     assert patch_output["new_instruction_chars"] == len(new_instructions)
     assert patch_output["instruction_char_delta"] == len(new_instructions) - len(

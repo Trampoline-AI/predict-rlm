@@ -69,15 +69,16 @@ COST_GROUPS = [
         [
             ("trace main", {"merge_trace_executor", "merge_trace_main"}),
             ("trace sub", {"merge_trace_sub_lm", "merge_trace_sub"}),
-            ("proposer main", {"merge_proposer"}),
-            ("proposer sub", {"merge_proposer_sub_lm", "merge_proposer_sub"}),
-        ],
-    ),
-    (
-        "patch-merge",
-        [
-            ("main", {"patch_merge_proposer"}),
-            ("sub", {"patch_merge_proposer_sub_lm", "patch_merge_proposer_sub"}),
+            ("proposer main", {"merge_proposer", "patch_merge_proposer"}),
+            (
+                "proposer sub",
+                {
+                    "merge_proposer_sub_lm",
+                    "merge_proposer_sub",
+                    "patch_merge_proposer_sub_lm",
+                    "patch_merge_proposer_sub",
+                },
+            ),
         ],
     ),
 ]

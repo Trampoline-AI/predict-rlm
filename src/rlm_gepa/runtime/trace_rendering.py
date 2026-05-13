@@ -6,6 +6,28 @@ from typing import Any
 
 from predict_rlm.trace import RunTrace
 
+PROPOSER_FAILURE_METADATA_KEYS = frozenset(
+    {
+        "failure_class",
+        "failure_reason",
+        "truncated",
+        "truncation_reason",
+        "finish_reason",
+        "max_tokens",
+        "output_tokens",
+    }
+)
+
+
+def proposer_failure_metadata(metadata: Mapping[str, Any] | None) -> dict[str, Any]:
+    if not metadata:
+        return {}
+    return {
+        key: value
+        for key, value in metadata.items()
+        if key in PROPOSER_FAILURE_METADATA_KEYS and value is not None
+    }
+
 
 def render_inputs(inputs: Mapping[str, Any]) -> str:
     if not inputs:
@@ -134,6 +156,19 @@ def trace_to_json(trace: Any) -> Any:
         return None
     if hasattr(trace, "to_exportable_json"):
         return json.loads(trace.to_exportable_json(indent=0))
+    return trace
+
+
+def trace_to_proposer_json(trace: Any) -> Any:
+    if trace is None:
+        return None
+    if hasattr(trace, "to_proposer_json"):
+        return json.loads(trace.to_proposer_json(indent=0))
+    if hasattr(trace, "to_proposer"):
+        proposer_trace = trace.to_proposer()
+        if hasattr(proposer_trace, "model_dump"):
+            return proposer_trace.model_dump()
+        return proposer_trace
     return trace
 
 
