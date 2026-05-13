@@ -11,6 +11,7 @@ Based on the [Recursive Language Models](https://arxiv.org/abs/2512.24601v1) pap
   <a href="https://github.com/Trampoline-AI/predict-rlm/actions/workflows/tests.yml"><img src="https://img.shields.io/github/actions/workflow/status/Trampoline-AI/predict-rlm/tests.yml?label=Tests" alt="Tests"></a>
   <a href="https://codecov.io/gh/Trampoline-AI/predict-rlm"><img src="https://img.shields.io/codecov/c/github/Trampoline-AI/predict-rlm?token=NNS3R7OIT2&color=brightgreen&label=codecov" alt="codecov"></a>
   <a href="https://pypi.org/project/predict-rlm/"><img src="https://img.shields.io/pypi/v/predict-rlm?color=blue" alt="PyPI"></a>
+  <a href="https://pypi.org/project/predict-rlm/"><img src="https://img.shields.io/pypi/dw/predict-rlm" alt="PyPI - Downloads"></a>
   <a href="https://pypi.org/project/predict-rlm/"><img src="https://img.shields.io/pypi/pyversions/predict-rlm" alt="Python"></a>
   <a href="https://discord.gg/BAkd288sGN"><img src="https://img.shields.io/badge/Discord-Join-5865F2?style=flat&logo=discord&logoColor=white" alt="Discord"></a>
   <a href="https://github.com/Trampoline-AI/predict-rlm"><img src="https://img.shields.io/github/stars/trampoline-ai/predict-rlm?cacheSeconds=3600" alt="GitHub stars"></a>
