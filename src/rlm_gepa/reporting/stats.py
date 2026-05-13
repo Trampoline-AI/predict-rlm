@@ -138,14 +138,11 @@ def iteration_rows(run_dir: str | Path) -> list[dict[str, Any]]:
                 continue
             iteration = entry.get("i", len(rows))
             parent_label = entry.get("selected_program_candidate", "")
-            parent_hard = _hard_count(parent_scores)
             rows.append(
                 {
                     "iter": _format_iter_parents(iteration, parent_label),
-                    "soft: par → child": f"{_mean_list(parent_scores):.3f} → -",
-                    "hard: par → child": (
-                        f"{_hard_rate(parent_scores):.3f} → -; {parent_hard} → -"
-                    ),
+                    "soft: par → child": "-",
+                    "hard: par → child": "-",
                     "flips": "-",
                     "p": "-",
                     "outcome": "NO CHILD",
@@ -216,11 +213,19 @@ def candidate_rows(run_dir: str | Path) -> list[dict[str, Any]]:
         muted_prefix = {
             header: prefix
             for header, prefix in {
-                "soft: par → child": _delta_muted_prefix(soft_change),
-                "hard: par → child": _delta_muted_prefix(hard_change),
+                "soft: par → child": _candidate_score_muted_prefix(soft_change),
+                "hard: par → child": _candidate_score_muted_prefix(hard_change),
                 "flips vs par": _delta_muted_prefix(flips_vs_parent),
             }.items()
             if prefix
+        }
+        muted_suffix = {
+            header: suffix
+            for header, suffix in {
+                "soft: par → child": _delta_muted_suffix(soft_change),
+                "hard: par → child": _delta_muted_suffix(hard_change),
+            }.items()
+            if suffix
         }
         rows.append(
             {
@@ -233,6 +238,7 @@ def candidate_rows(run_dir: str | Path) -> list[dict[str, Any]]:
                 "Δ-seed": "-" if index == 0 else f"{candidate_mean - seed_mean:+.3f}",
                 "_highlight": index == best_idx,
                 "_muted_prefix": muted_prefix,
+                "_muted_suffix": muted_suffix,
             }
         )
     return rows
@@ -1461,6 +1467,16 @@ def _mute_terminal_prefix(value: str, raw_value: str, prefix: str, style: str = 
     return f"{value[:start]}{style}{value[start:end]}{ANSI_RESET}{value[end:]}"
 
 
+def _candidate_score_muted_prefix(value: str) -> str:
+    prefixes = []
+    for line in str(value).splitlines():
+        if " → " not in line:
+            continue
+        prefix, _score_and_delta = line.split(" → ", maxsplit=1)
+        prefixes.append(f"{prefix} → ")
+    return "\n".join(prefixes)
+
+
 def _delta_muted_prefix(value: str) -> str:
     prefixes = []
     for line in str(value).splitlines():
@@ -1470,7 +1486,18 @@ def _delta_muted_prefix(value: str) -> str:
     return "\n".join(prefixes)
 
 
+def _delta_muted_suffix(value: str) -> str:
+    suffixes = []
+    for line in str(value).splitlines():
+        match = re.search(r" [+-]\d+(?:\.\d+)?$", line)
+        if match:
+            suffixes.append(match.group(0))
+    return "\n".join(suffixes)
+
+
 def _mute_terminal_suffix(value: str, raw_value: str, suffix: str, style: str = ANSI_MUTED) -> str:
+    if "\n" in suffix:
+        suffix = next((line for line in suffix.splitlines() if raw_value.endswith(line)), "")
     if not suffix or not raw_value.endswith(suffix):
         return value
     start = value.rfind(suffix)
@@ -1682,7 +1709,8 @@ def _format_hard_change(
     if not include_counts:
         return f"{parent_rate:.3f} → {new_rate:.3f} {delta}", f" {delta}"
     total = f" /{n}" if include_total else ""
-    secondary = f"{delta}; {parent_hard} → {new_hard}{total}"
+    count_width = len(str(n))
+    secondary = f"{delta}; {parent_hard:>{count_width}} → {new_hard:>{count_width}}{total}"
     return f"{parent_rate:.3f} → {new_rate:.3f} {secondary}", f" {secondary}"
 
 
