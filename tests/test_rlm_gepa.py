@@ -262,6 +262,8 @@ def test_patch_merge_signature_exposes_selected_capability_contract():
         "decision",
         "summary",
         "evidence_task_ids",
+        "trigger",
+        "non_application_boundary",
     }
 
 
@@ -2877,6 +2879,10 @@ def test_patch_merge_adapter_uses_patch_signature_and_persists_metadata(
                     "decision": "grafted",
                     "summary": "validate inputs before invoking tools",
                     "evidence_task_ids": ["train-a"],
+                    "trigger": "task requires validating user-provided tool inputs before invocation",
+                    "non_application_boundary": (
+                        "do not apply on base-win rows where direct tool invocation already succeeds"
+                    ),
                 },
                 patch_audit={
                     "supported_source_win_ids": ["train-a"],
@@ -2922,6 +2928,14 @@ def test_patch_merge_adapter_uses_patch_signature_and_persists_metadata(
     assert new_text == "base plus patch"
     assert metadata["patch_summary"] == "imported one clause"
     assert metadata["selected_capability"]["decision"] == "grafted"
+    assert (
+        metadata["selected_capability"]["trigger"]
+        == "task requires validating user-provided tool inputs before invocation"
+    )
+    assert (
+        metadata["selected_capability"]["non_application_boundary"]
+        == "do not apply on base-win rows where direct tool invocation already succeeds"
+    )
     assert metadata["base_instruction_chars"] == len("base")
     assert metadata["new_instruction_chars"] == len("base plus patch")
     assert metadata["instruction_char_delta"] == len("base plus patch") - len("base")
@@ -2980,6 +2994,10 @@ def test_rlm_patch_merge_no_op_patch_persists_compact_audit(
                     "decision": "no-op",
                     "summary": "source behavior duplicates the base",
                     "evidence_task_ids": [],
+                    "trigger": "no concrete source-win-only trigger identified",
+                    "non_application_boundary": (
+                        "base-win rows already cover the proposed behavior, so leave base unchanged"
+                    ),
                 },
                 patch_audit={
                     "supported_source_win_ids": [],
@@ -3075,6 +3093,13 @@ def test_patch_merge_prompt_contains_compact_grounding_invariants():
     assert "Use available tools and `predict()` for focused evidence extraction" in instructions
     assert "Helper `predict()` calls may extract evidence" in instructions
     assert "you choose the final" in instructions
+    assert "Before editing, identify one patch-source-win cluster" in instructions
+    assert "state the exact" in instructions
+    assert "task-intent or observable trigger" in instructions
+    assert "state the" in instructions
+    assert "non-application boundary" in instructions
+    assert "grounded in base-win or both-success evidence" in instructions
+    assert "cannot state the trigger and boundary concretely" in instructions
     assert "ProposerRunTrace" not in instructions
     assert "archival" not in instructions
     assert "token cost/cache accounting" not in instructions
@@ -3083,8 +3108,6 @@ def test_patch_merge_prompt_contains_compact_grounding_invariants():
     assert "outer proposer" not in instructions
     assert "helper output" not in instructions
     assert "support-filter" not in instructions
-    assert "trigger" not in instructions
-    assert "non-application" not in instructions
     assert "verification" not in instructions
 
 
@@ -3255,8 +3278,14 @@ def _assert_valid_patch_output(
         "decision",
         "summary",
         "evidence_task_ids",
+        "trigger",
+        "non_application_boundary",
     }
     assert set(selected_capability["evidence_task_ids"]) <= set(trace_task_ids)
+    assert isinstance(selected_capability["trigger"], str)
+    assert selected_capability["trigger"].strip()
+    assert isinstance(selected_capability["non_application_boundary"], str)
+    assert selected_capability["non_application_boundary"].strip()
     patch_audit = patch_output["patch_audit"]
     assert isinstance(patch_audit, dict)
     assert set(patch_audit) >= {

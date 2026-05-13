@@ -208,11 +208,16 @@ The patched skill must work across these use cases:
 3. Use available tools and `predict()` for focused evidence extraction when
    helpful. Helper `predict()` calls may extract evidence; you choose the final
    graft or no-op, wording, and full instructions.
-4. Choose one coherent missing capability family, or return a no-op. The graft
-   may include multiple local clauses only when they are necessary facets of the
-   same behavior; do not import unrelated source-parent behaviors in one patch.
-   The chosen family must be supported by patch-source wins, absent from the
-   base, and safe relative to base-win and both-success evidence.
+4. Before editing, identify one patch-source-win cluster, state the exact
+   task-intent or observable trigger where the graft applies, and state the
+   non-application boundary grounded in base-win or both-success evidence. If
+   you cannot state the trigger and boundary concretely from source-win evidence
+   and preservation rows, return `new_instructions` unchanged from the base and
+   mark the decision no-op. The graft may include multiple local clauses only
+   when they are necessary facets of the same behavior; do not import unrelated
+   source-parent behaviors in one patch. The chosen family must be supported by
+   patch-source wins, absent from the base, and safe relative to base-win and
+   both-success evidence.
 5. Apply the smallest local edit to the base. Prefer modifying or extending the
    nearest existing text over appending a new block. Do not copy patch-source
    wording, concatenate parents, globally rewrite, or broaden beyond evidence.
@@ -243,6 +248,15 @@ class SelectedCapability(BaseModel):
     summary: str = Field(description="Brief description of the graft or no-op reason")
     evidence_task_ids: list[str] = Field(
         description="Train task IDs supporting the decision"
+    )
+    trigger: str = Field(
+        description="Exact task intent or observable condition where the graft applies"
+    )
+    non_application_boundary: str = Field(
+        description=(
+            "Where the graft must not apply, grounded in base-win or "
+            "both-success evidence"
+        )
     )
 
 

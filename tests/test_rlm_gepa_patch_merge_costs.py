@@ -98,6 +98,10 @@ def test_patch_merge_proposer_logs_merge_proposer_cost_roles(tmp_path: Path, mon
                     "decision": "grafted",
                     "summary": "capability",
                     "evidence_task_ids": ["train-a"],
+                    "trigger": "task requires the source parent's missing capability",
+                    "non_application_boundary": (
+                        "do not apply on base-win or both-success rows that already solve it"
+                    ),
                 },
                 patch_audit={
                     "supported_source_win_ids": ["train-a"],
