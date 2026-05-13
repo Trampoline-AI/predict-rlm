@@ -210,17 +210,29 @@ def candidate_rows(run_dir: str | Path) -> list[dict[str, Any]]:
         if index < len(parents) and parents[index]:
             candidate_parents = parents[index]
         candidate_mean = _mean_list(values)
-        hard = _hard_count(values)
-        total = len(values)
+        soft_change, _soft_secondary = _format_candidate_soft_change(subscores, values, candidate_parents)
+        hard_change, _hard_secondary = _format_candidate_hard_change(subscores, values, candidate_parents)
+        flips_vs_parent = _format_candidate_flips_vs_parent(subscores, index, candidate_parents)
+        muted_prefix = {
+            header: prefix
+            for header, prefix in {
+                "soft: par → child": _delta_muted_prefix(soft_change),
+                "hard: par → child": _delta_muted_prefix(hard_change),
+                "flips vs par": _delta_muted_prefix(flips_vs_parent),
+            }.items()
+            if prefix
+        }
         rows.append(
             {
                 "cand [par]": _format_id_parents(index, candidate_parents),
-                "mean": f"{candidate_mean:.3f}",
-                "hard": f"{(hard / total if total else 0.0):.3f} ({hard}/{total})",
+                "soft: par → child": soft_change,
+                "hard: par → child": hard_change,
                 "pareto": f"{pareto_count}/{len(task_ids)}",
                 "exclusive": _format_exclusive(exclusive_scores),
+                "flips vs par": flips_vs_parent,
                 "Δ-seed": "-" if index == 0 else f"{candidate_mean - seed_mean:+.3f}",
                 "_highlight": index == best_idx,
+                "_muted_prefix": muted_prefix,
             }
         )
     return rows
@@ -563,47 +575,15 @@ def _coerce_sequence(value: Any) -> list[Any] | None:
     return None
 
 
-def _format_merge_detail(state: dict[str, Any], entry: dict[str, Any], status: str) -> str:
+def _format_merge_detail(_state: dict[str, Any], entry: dict[str, Any], status: str) -> str:
     child_idx = _merge_child_idx(entry)
     if status == "accepted" and child_idx is not None:
-        details = [f"→ cand {child_idx}"]
-        val_detail = _format_merge_val_detail(state, entry)
-        if val_detail != "-":
-            details.append(val_detail)
-        return "; ".join(details)
+        return f"→ cand {child_idx}"
     if entry.get("rlm_merge_reject_reason"):
         return str(entry["rlm_merge_reject_reason"])
     if entry.get("rlm_merge_error_type"):
         return str(entry["rlm_merge_error_type"])
     return "-"
-
-
-def _format_merge_val_detail(state: dict[str, Any], entry: dict[str, Any]) -> str:
-    child_idx = _merge_child_idx(entry)
-    parent_ids = _merge_parent_ids(entry)
-    subscores = state.get("prog_candidate_val_subscores") or []
-    if child_idx is None or not parent_ids or not _has_candidate_scores(subscores, child_idx):
-        return "-"
-    child_scores = subscores[int(child_idx)]
-    parts: list[str] = []
-    for parent_id in parent_ids:
-        if not _has_candidate_scores(subscores, parent_id):
-            continue
-        parent_values, child_values = _aligned_score_values(subscores[parent_id], child_scores)
-        if not parent_values or not child_values:
-            continue
-        gains, losses = _hard_flips(parent_values, child_values)
-        parent_mean = _mean_list(parent_values)
-        child_mean = _mean_list(child_values)
-        parts.append(
-            f"vs {parent_id}: "
-            f"{parent_mean:.3f}→{child_mean:.3f} {_format_delta(child_mean - parent_mean)}, "
-            f"hard {_hard_count(parent_values)}→{_hard_count(child_values)}/{len(child_values)}, "
-            f"flips +{gains}/-{losses}"
-        )
-    if not parts:
-        return "-"
-    return "full val " + "; ".join(parts)
 
 
 def _merge_child_idx(entry: dict[str, Any]) -> Any:
@@ -614,16 +594,90 @@ def _merge_child_idx(entry: dict[str, Any]) -> Any:
     return None
 
 
-def _merge_parent_ids(entry: dict[str, Any]) -> list[int]:
-    raw_ids: list[Any] = []
-    if entry.get("rlm_merge_base_parent") is not None:
-        raw_ids.append(entry.get("rlm_merge_base_parent"))
-    if entry.get("rlm_merge_patch_source_parent") is not None:
-        raw_ids.append(entry.get("rlm_merge_patch_source_parent"))
-    if not raw_ids:
-        pair = _coerce_sequence(entry.get("rlm_merge_candidate_pair") or entry.get("merged_entities"))
-        if pair is not None:
-            raw_ids.extend(pair[:2])
+def _format_candidate_soft_change(
+    subscores: list[Any], child_scores: Any, parents: Any
+) -> tuple[str, str]:
+    child_values = _score_values(child_scores)
+    parent_ids = _candidate_parent_ids(parents)
+    if not parent_ids:
+        return f"- → {_mean_list(child_values):.3f}", ""
+
+    lines: list[str] = []
+    secondary = ""
+    for parent_id in parent_ids:
+        if not _has_candidate_scores(subscores, parent_id):
+            continue
+        parent_values, aligned_child_values = _aligned_score_values(subscores[parent_id], child_scores)
+        if not parent_values or not aligned_child_values:
+            continue
+        formatted, formatted_secondary = _format_soft_change(parent_values, aligned_child_values)
+        if len(parent_ids) == 1:
+            lines.append(formatted)
+            secondary = formatted_secondary
+        else:
+            lines.append(formatted)
+    if not lines:
+        return f"- → {_mean_list(child_values):.3f}", ""
+    return "\n".join(lines), secondary
+
+
+def _format_candidate_hard_change(
+    subscores: list[Any], child_scores: Any, parents: Any
+) -> tuple[str, str]:
+    child_values = _score_values(child_scores)
+    child_rate = _hard_rate(child_values)
+    parent_ids = _candidate_parent_ids(parents)
+    if not parent_ids:
+        return f"- → {child_rate:.3f}", ""
+
+    lines: list[str] = []
+    secondary = ""
+    for parent_id in parent_ids:
+        if not _has_candidate_scores(subscores, parent_id):
+            continue
+        parent_values, aligned_child_values = _aligned_score_values(subscores[parent_id], child_scores)
+        if not parent_values or not aligned_child_values:
+            continue
+        formatted, formatted_secondary = _format_hard_change(
+            parent_values,
+            aligned_child_values,
+            include_counts=False,
+        )
+        if len(parent_ids) == 1:
+            lines.append(formatted)
+            secondary = formatted_secondary
+        else:
+            lines.append(formatted)
+    if not lines:
+        return f"- → {child_rate:.3f}", ""
+    return "\n".join(lines), secondary
+
+
+def _format_candidate_flips_vs_parent(subscores: list[Any], index: int, parents: Any) -> str:
+    parent_ids = _candidate_parent_ids(parents)
+    if not parent_ids or not _has_candidate_scores(subscores, index):
+        return "-"
+    child_scores = subscores[index]
+    lines: list[str] = []
+    for parent_id in parent_ids:
+        if not _has_candidate_scores(subscores, parent_id):
+            continue
+        parent_values, child_values = _aligned_score_values(subscores[parent_id], child_scores)
+        if not parent_values or not child_values:
+            continue
+        gains, losses = _hard_flips(parent_values, child_values)
+        formatted, _secondary = _format_flips(gains, losses)
+        if len(parent_ids) == 1:
+            lines.append(formatted)
+        else:
+            lines.append(formatted)
+    if not lines:
+        return "-"
+    return "\n".join(lines)
+
+
+def _candidate_parent_ids(parents: Any) -> list[int]:
+    raw_ids = parents if isinstance(parents, list | tuple) else [parents]
     parent_ids: list[int] = []
     for raw_id in raw_ids:
         try:
@@ -820,12 +874,17 @@ def _cost_spacer_row() -> dict[str, Any]:
     }
 
 
-def render_table(rows: list[dict[str, Any]], output_format: str = "terminal") -> str:
+def render_table(
+    rows: list[dict[str, Any]],
+    output_format: str = "terminal",
+    *,
+    width: int | None = None,
+) -> str:
     if not rows:
         return "(no rows)"
     rows = _compact_fractional_columns(rows)
     if output_format == "terminal":
-        return _render_terminal_table(rows)
+        return _render_terminal_table(rows, terminal_width=width)
     if output_format == "markdown":
         return _render_markdown_table(rows)
     raise ValueError(f"unknown table output format: {output_format!r}")
@@ -892,12 +951,16 @@ def _render_markdown_table(rows: list[dict[str, Any]]) -> str:
     return "\n".join([header_line, rule, *body])
 
 
-def _render_terminal_table(rows: list[dict[str, Any]]) -> str:
+def _render_terminal_table(
+    rows: list[dict[str, Any]],
+    *,
+    terminal_width: int | None = None,
+) -> str:
     headers = [header for header in rows[0] if not str(header).startswith("_")]
     rendered_rows = [_render_terminal_row(row, headers) for row in rows]
     header_labels = _terminal_header_labels(rows, headers)
     header_suffixes = _terminal_header_suffixes(rows, headers)
-    terminal_width = shutil.get_terminal_size(fallback=(120, 24)).columns
+    terminal_width = terminal_width or shutil.get_terminal_size(fallback=(120, 24)).columns
     widths = _terminal_widths(headers, rendered_rows, header_labels)
     if _terminal_table_width(headers, widths) > terminal_width:
         rendered_rows = _compact_terminal_count_columns(headers, rendered_rows)
@@ -1274,7 +1337,7 @@ def _render_markdown_row(row: dict[str, Any], headers: list[str]) -> dict[str, s
 
 
 def _terminal_cell(value: Any) -> str:
-    return str(value).replace("\n", " ")
+    return str(value)
 
 
 def _render_terminal_row(row: dict[str, Any], headers: list[str]) -> dict[str, str]:
@@ -1387,6 +1450,8 @@ def _restore_terminal_style(value: str, style: str) -> str:
 
 
 def _mute_terminal_prefix(value: str, raw_value: str, prefix: str, style: str = ANSI_MUTED) -> str:
+    if "\n" in prefix:
+        prefix = next((line for line in prefix.splitlines() if raw_value.startswith(line)), "")
     if not prefix or not raw_value.startswith(prefix):
         return value
     start = value.find(prefix)
@@ -1394,6 +1459,15 @@ def _mute_terminal_prefix(value: str, raw_value: str, prefix: str, style: str = 
         return value
     end = start + len(prefix)
     return f"{value[:start]}{style}{value[start:end]}{ANSI_RESET}{value[end:]}"
+
+
+def _delta_muted_prefix(value: str) -> str:
+    prefixes = []
+    for line in str(value).splitlines():
+        prefix = re.sub(r" [+-]\d+(?:\.\d+)?$", "", line)
+        if prefix != line:
+            prefixes.append(prefix)
+    return "\n".join(prefixes)
 
 
 def _mute_terminal_suffix(value: str, raw_value: str, suffix: str, style: str = ANSI_MUTED) -> str:
@@ -1406,23 +1480,29 @@ def _mute_terminal_suffix(value: str, raw_value: str, suffix: str, style: str = 
     return f"{value[:start]}{style}{value[start:end]}{ANSI_RESET}{value[end:]}"
 
 
-def render_stats(run_dir: str | Path, table: str = "all", output_format: str = "terminal") -> str:
+def render_stats(
+    run_dir: str | Path,
+    table: str = "all",
+    output_format: str = "terminal",
+    *,
+    width: int | None = None,
+) -> str:
     if _is_eval_run(run_dir):
-        return render_eval_stats(run_dir, table=table, output_format=output_format)
+        return render_eval_stats(run_dir, table=table, output_format=output_format, width=width)
 
     sections: list[str] = [header_summary(run_dir)]
     if table in {"all", "iterations"}:
-        sections.extend(["", "iterations:", render_table(iteration_rows(run_dir), output_format)])
+        sections.extend(["", "iterations:", render_table(iteration_rows(run_dir), output_format, width=width)])
     if table == "merges":
-        _append_merge_section(sections, run_dir, output_format)
+        _append_merge_section(sections, run_dir, output_format, width=width)
     elif table == "all":
         merges = merge_rows(run_dir)
         if merges:
-            _append_merge_section(sections, run_dir, output_format, rows=merges)
+            _append_merge_section(sections, run_dir, output_format, rows=merges, width=width)
     if table in {"all", "candidates"}:
-        sections.extend(["", "candidates:", render_table(candidate_rows(run_dir), output_format)])
+        sections.extend(["", "candidates:", render_table(candidate_rows(run_dir), output_format, width=width)])
     if table in {"all", "costs"}:
-        sections.extend(["", "costs:", render_table(cost_rows(run_dir), output_format)])
+        sections.extend(["", "costs:", render_table(cost_rows(run_dir), output_format, width=width)])
     return "\n".join(sections)
 
 
@@ -1432,20 +1512,27 @@ def _append_merge_section(
     output_format: str,
     *,
     rows: list[dict[str, Any]] | None = None,
+    width: int | None = None,
 ) -> None:
     rows = merge_rows(run_dir) if rows is None else rows
-    sections.extend(["", "merges:", render_table(rows, output_format)])
-    details = merge_detail_lines(run_dir)
+    sections.extend(["", "merges:", render_table(rows, output_format, width=width)])
+    details = merge_detail_lines(run_dir, width=width or 80)
     if details:
         sections.extend(["", "merge details:", *details])
 
 
-def render_eval_stats(run_dir: str | Path, table: str = "all", output_format: str = "terminal") -> str:
+def render_eval_stats(
+    run_dir: str | Path,
+    table: str = "all",
+    output_format: str = "terminal",
+    *,
+    width: int | None = None,
+) -> str:
     sections: list[str] = [eval_header_summary(run_dir)]
     if table in {"all", "tasks"}:
-        sections.extend(["", "tasks:", render_table(eval_task_rows(run_dir), output_format)])
+        sections.extend(["", "tasks:", render_table(eval_task_rows(run_dir), output_format, width=width)])
     if table in {"all", "costs"}:
-        sections.extend(["", "costs:", render_table(eval_cost_rows(run_dir), output_format)])
+        sections.extend(["", "costs:", render_table(eval_cost_rows(run_dir), output_format, width=width)])
     if table in {"iterations", "candidates", "merges"}:
         sections.extend(["", f"{table}: not available for eval runs"])
     return "\n".join(sections)
@@ -1485,6 +1572,7 @@ def _candidate_rows_from_artifact(run_dir: str | Path) -> list[dict[str, Any]]:
             "hard": "",
             "pareto": "",
             "exclusive": "",
+            "flips vs par": "",
             "Δ-seed": "",
             "_highlight": candidate.get("idx", index) == best_idx,
         }
@@ -1583,6 +1671,7 @@ def _format_hard_change(
     new_scores: list[float],
     *,
     include_total: bool = True,
+    include_counts: bool = True,
 ) -> tuple[str, str]:
     n = min(len(parent_scores), len(new_scores))
     parent_hard = _hard_count(parent_scores)
@@ -1590,6 +1679,8 @@ def _format_hard_change(
     parent_rate = parent_hard / n if n else 0.0
     new_rate = new_hard / n if n else 0.0
     delta = _format_delta(new_rate - parent_rate)
+    if not include_counts:
+        return f"{parent_rate:.3f} → {new_rate:.3f} {delta}", f" {delta}"
     total = f" /{n}" if include_total else ""
     secondary = f"{delta}; {parent_hard} → {new_hard}{total}"
     return f"{parent_rate:.3f} → {new_rate:.3f} {secondary}", f" {secondary}"

@@ -30,7 +30,7 @@ def run_project_cli(
     args = parser.parse_args(argv)
 
     if args.command in {"stats", "stat"}:
-        print(render_stats(args.run_dir, table=args.table, output_format=args.format))
+        print(render_stats(args.run_dir, table=args.table, output_format=args.format, width=args.width))
         return 0
     if args.command == "plot":
         from .reporting.plots import write_plots
@@ -114,6 +114,7 @@ def build_parser(
         default="all",
     )
     stats.add_argument("--format", choices=["terminal", "markdown"], default="terminal")
+    stats.add_argument("--width", type=int, help="terminal render width in columns")
 
     plot = subparsers.add_parser("plot")
     plot.add_argument("run_dir", type=Path)

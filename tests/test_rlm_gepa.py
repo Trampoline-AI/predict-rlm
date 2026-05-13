@@ -1617,7 +1617,7 @@ def test_stats_hard_flip_p_values_use_two_sided_exact_for_ties(tmp_path: Path):
     assert merge_stats[0]["p"] == "1.00"
 
 
-def test_merge_rows_report_accepted_child_full_val_against_both_parents(tmp_path: Path):
+def test_merge_rows_report_accepted_child_without_full_val_detail(tmp_path: Path):
     state = {
         "prog_candidate_val_subscores": [
             {"a": 0.0, "b": 1.0, "c": 0.0},
@@ -1669,11 +1669,42 @@ def test_merge_rows_report_accepted_child_full_val_against_both_parents(tmp_path
         "hard: best(par) -> merge": "0.500 → 1.000",
         "flips": "+1/-0",
     }
-    assert rows[0]["_detail"] == (
-        "→ cand 3; full val "
-        "vs 1: 0.667→1.000 +0.333, hard 2→3/3, flips +1/-0; "
-        "vs 2: 0.667→1.000 +0.333, hard 2→3/3, flips +1/-0"
-    )
+    assert rows[0]["_detail"] == "→ cand 3"
+
+
+def test_merge_rows_use_subsample_scores_for_table_metrics_not_full_val_details(tmp_path: Path):
+    state = {
+        "prog_candidate_val_subscores": [
+            {"a": 1.0, "b": 1.0, "c": 1.0},
+            {"a": 1.0, "b": 0.0, "c": 1.0},
+            {"a": 1.0, "b": 0.0, "c": 0.0},
+        ],
+        "full_program_trace": [
+            {
+                "i": 12,
+                "rlm_merge_candidate_pair": (0, 1),
+                "rlm_merge_ancestor": 0,
+                "rlm_merge_status": "accepted",
+                "rlm_merge_base_parent": 0,
+                "rlm_merge_patch_source_parent": 1,
+                "rlm_merge_new_program_idx": 2,
+                "id1_subsample_scores": [0.0, 0.0],
+                "id2_subsample_scores": [1.0, 0.0],
+                "new_program_subsample_scores": [1.0, 1.0],
+            }
+        ],
+    }
+    with (tmp_path / "gepa_state.bin").open("wb") as f:
+        pickle.dump(state, f)
+
+    rows = merge_rows(tmp_path)
+
+    assert rows[0]["soft: best(par) -> merge"] == "0.500 → 1.000 +0.500"
+    assert rows[0]["hard: best(par) -> merge"] == "0.500 → 1.000 +0.500; 1 → 2"
+    assert rows[0]["flips"] == "+1/-0 +1"
+    assert rows[0]["p"] == "1.00"
+    assert rows[0]["_merge_hard_denominator"] == 2
+    assert rows[0]["_detail"] == "→ cand 2"
 
 
 def test_merge_rows_do_not_use_normal_mutation_child_for_rejected_merge_val(tmp_path: Path):
@@ -1720,7 +1751,7 @@ def test_merge_rows_do_not_use_normal_mutation_child_for_rejected_merge_val(tmp_
     assert rows[0]["_detail"] == "not better than best parent"
 
 
-def test_merge_rows_use_explicit_merge_child_for_accepted_full_val(tmp_path: Path):
+def test_merge_rows_use_explicit_merge_child_for_accepted_detail(tmp_path: Path):
     state = {
         "prog_candidate_val_subscores": [
             {"a": 0.0, "b": 1.0, "c": 0.0},
@@ -1761,7 +1792,7 @@ def test_merge_rows_use_explicit_merge_child_for_accepted_full_val(tmp_path: Pat
         "hard: best(par) -> merge": "0.500 → 1.000",
         "flips": "+1/-0",
     }
-    assert rows[0]["_detail"].startswith("→ cand 4; full val vs 1:")
+    assert rows[0]["_detail"] == "→ cand 4"
 
 
 def test_iteration_rows_include_attempts_without_child_scores(tmp_path: Path):
@@ -1955,11 +1986,24 @@ def test_reporting_tables_from_artifacts(tmp_path: Path):
     assert merges[0]["_terminal_header_suffixes"]["hard: best(par) -> merge"] == "/2"
     candidates = candidate_rows(tmp_path)
     assert candidates[0]["cand [par]"] == "0 [seed]"
-    assert candidates[0]["hard"] == "0.500 (1/2)"
+    assert candidates[0]["soft: par → child"] == "- → 0.500"
+    assert "soft" not in candidates[0]
+    assert "mean" not in candidates[0]
+    assert candidates[0]["hard: par → child"] == "- → 0.500"
+    assert candidates[0]["flips vs par"] == "-"
     assert candidates[0]["Δ-seed"] == "-"
     assert candidates[1]["cand [par]"] == "1 [0]"
-    assert candidates[1]["hard"] == "1.000 (2/2)"
+    assert candidates[1]["soft: par → child"] == "0.500 → 1.000 +0.500"
+    assert "soft" not in candidates[1]
+    assert "mean" not in candidates[1]
+    assert candidates[1]["hard: par → child"] == "0.500 → 1.000 +0.500"
+    assert candidates[1]["flips vs par"] == "+1/-0 +1"
     assert candidates[1]["Δ-seed"] == "+0.500"
+    assert candidates[1]["_muted_prefix"] == {
+        "soft: par → child": "0.500 → 1.000",
+        "hard: par → child": "0.500 → 1.000",
+        "flips vs par": "+1/-0",
+    }
     assert candidates[1]["_highlight"] is True
     costs = cost_rows(tmp_path)
     assert costs[0]["scope"] == "executor"
@@ -1994,6 +2038,13 @@ def test_reporting_tables_from_artifacts(tmp_path: Path):
     assert "merge details:" in rendered
     assert "iter 1 0+1@0: not better than best parent" in rendered
     assert "| cand [par]" in rendered
+    candidate_section = rendered.split("candidates:", maxsplit=1)[1].split("costs:", maxsplit=1)[0]
+    assert "soft: par → child" in candidate_section
+    assert "hard: par → child" in candidate_section
+    assert "flips vs par" in candidate_section
+    assert "| soft |" not in candidate_section
+    assert "| hard |" not in candidate_section
+    assert "| flips |" not in candidate_section
     assert "| Δ-seed" in rendered
     assert "| ----" in rendered
     assert "**1 [0]**" in rendered
@@ -2015,6 +2066,36 @@ def test_reporting_tables_from_artifacts(tmp_path: Path):
     assert "eff" in terminal
     assert "costs (raw spend: all logged LM calls):" not in terminal
     assert "costs (deduped spend: stable operation ids only; legacy rows counted raw):" not in terminal
+
+
+def test_candidate_rows_show_flips_against_each_parent(tmp_path: Path):
+    state = {
+        "parent_program_for_candidate": [[None], [0], [0, 1]],
+        "prog_candidate_val_subscores": [
+            {"a": 1.0, "b": 0.0, "c": 0.0},
+            {"a": 0.0, "b": 1.0, "c": 0.0},
+            {"a": 1.0, "b": 1.0, "c": 0.0},
+        ],
+    }
+    with (tmp_path / "gepa_state.bin").open("wb") as f:
+        pickle.dump(state, f)
+
+    rows = candidate_rows(tmp_path)
+
+    assert rows[2]["soft: par → child"] == "0.333 → 0.667 +0.333\n0.333 → 0.667 +0.333"
+    assert rows[2]["hard: par → child"] == "0.333 → 0.667 +0.333\n0.333 → 0.667 +0.333"
+    assert rows[2]["flips vs par"] == "+1/-0 +1\n+1/-0 +1"
+    assert rows[2]["_muted_prefix"] == {
+        "soft: par → child": "0.333 → 0.667\n0.333 → 0.667",
+        "hard: par → child": "0.333 → 0.667\n0.333 → 0.667",
+        "flips vs par": "+1/-0\n+1/-0",
+    }
+
+    rendered = render_table(rows)
+
+    assert " -> " not in rendered
+    assert "\033[38;5;178m.333 → .667\033[0m\033[1;38;5;220m +.333" in rendered
+    assert "\033[38;5;178m+1/-0\033[0m\033[1;38;5;220m +1" in rendered
 
 
 def test_live_state_best_candidate_overrides_stale_summary(tmp_path: Path):
@@ -2447,15 +2528,31 @@ def test_project_cli_check_with_dummy_lms(capsys):
 
 
 def test_project_cli_accepts_stat_alias(monkeypatch, capsys, tmp_path: Path):
-    def render_stats(run_dir, table="all", output_format="terminal"):
-        return f"stats {Path(run_dir).name} {table} {output_format}"
+    def render_stats(run_dir, table="all", output_format="terminal", width=None):
+        return f"stats {Path(run_dir).name} {table} {output_format} {width}"
 
     monkeypatch.setattr(cli_module, "render_stats", render_stats)
 
     status = run_project_cli(lambda: _Project(), OptimizeConfig(), argv=["stat", str(tmp_path)])
 
     assert status == 0
-    assert f"stats {tmp_path.name} all terminal" in capsys.readouterr().out
+    assert f"stats {tmp_path.name} all terminal None" in capsys.readouterr().out
+
+
+def test_project_cli_passes_stats_width(monkeypatch, capsys, tmp_path: Path):
+    def render_stats(run_dir, table="all", output_format="terminal", width=None):
+        return f"stats {Path(run_dir).name} {table} {output_format} {width}"
+
+    monkeypatch.setattr(cli_module, "render_stats", render_stats)
+
+    status = run_project_cli(
+        lambda: _Project(),
+        OptimizeConfig(),
+        argv=["stats", str(tmp_path), "--width", "107"],
+    )
+
+    assert status == 0
+    assert f"stats {tmp_path.name} all terminal 107" in capsys.readouterr().out
 
 
 def test_public_api_exports_expected_helpers():
