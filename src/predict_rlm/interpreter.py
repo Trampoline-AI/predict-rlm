@@ -595,8 +595,16 @@ class JspiInterpreter(PythonInterpreter):
             if not response_line:
                 exit_code = self.deno_process.poll()
                 if exit_code is not None:
+                    stderr = getattr(self.deno_process, "stderr", None)
+                    stderr_text = ""
+                    if stderr is not None:
+                        try:
+                            stderr_text = stderr.read() or ""
+                        except Exception:
+                            stderr_text = ""
+                    detail = f" {stderr_text}" if stderr_text else ""
                     raise CodeInterpreterError(
-                        f"Deno exited (code {exit_code}) {context}"
+                        f"Deno exited (code {exit_code}) {context}{detail}"
                     )
                 if method == "health_check":
                     self._write_telemetry_span(
@@ -1352,7 +1360,8 @@ class JspiInterpreter(PythonInterpreter):
             # recoverable error. Sandbox stays alive, RLM sees the
             # error and can rewrite its code to avoid the slow path.
             if asyncio.iscoroutinefunction(tool_fn):
-                token = set_current_telemetry_context(self._telemetry_context)
+                telemetry_context = getattr(self, "_telemetry_context", None)
+                token = set_current_telemetry_context(telemetry_context)
                 try:
                     result = await asyncio.wait_for(
                         tool_fn(*args, **kwargs),
@@ -1367,7 +1376,8 @@ class JspiInterpreter(PythonInterpreter):
                     reset_current_telemetry_context(token)
             else:
                 loop = asyncio.get_running_loop()
-                token = set_current_telemetry_context(self._telemetry_context)
+                telemetry_context = getattr(self, "_telemetry_context", None)
+                token = set_current_telemetry_context(telemetry_context)
                 ctx = contextvars.copy_context()
                 reset_current_telemetry_context(token)
                 future = loop.run_in_executor(

@@ -1314,8 +1314,9 @@ class PredictRLM(dspy.RLM):
         attrs: dict[str, Any] = {}
         if iteration is not None:
             attrs["iteration"] = iteration
-        if self._current_predictor_id is not None:
-            attrs["predict_rlm.predictor_id"] = self._current_predictor_id
+        current_predictor_id = getattr(self, "_current_predictor_id", None)
+        if current_predictor_id is not None:
+            attrs["predict_rlm.predictor_id"] = current_predictor_id
         if extra:
             attrs.update(extra)
         return attrs
@@ -1330,7 +1331,7 @@ class PredictRLM(dspy.RLM):
         start_time_unix_nano: int | None = None,
         end_time_unix_nano: int | None = None,
     ) -> None:
-        telemetry_context = self._current_telemetry_context
+        telemetry_context = getattr(self, "_current_telemetry_context", None)
         if telemetry_context is None:
             return
         try:
@@ -1363,7 +1364,7 @@ class PredictRLM(dspy.RLM):
         )
 
     def _write_generated_code_event(self, *, iteration: int, pred: Any, code: str) -> None:
-        telemetry_context = self._current_telemetry_context
+        telemetry_context = getattr(self, "_current_telemetry_context", None)
         if telemetry_context is None:
             return
         try:
@@ -1438,12 +1439,13 @@ class PredictRLM(dspy.RLM):
         }
 
     def _telemetry_ref(self) -> dict[str, Any] | None:
-        telemetry_context = self._current_telemetry_context
+        telemetry_context = getattr(self, "_current_telemetry_context", None)
         if telemetry_context is None:
             return None
         ref: dict[str, Any] = {"trace_id": telemetry_context.trace_id}
-        if self._current_predictor_id is not None:
-            ref["predictor_id"] = self._current_predictor_id
+        current_predictor_id = getattr(self, "_current_predictor_id", None)
+        if current_predictor_id is not None:
+            ref["predictor_id"] = current_predictor_id
         sink_path = getattr(telemetry_context.sink, "path", None)
         if sink_path is not None:
             parts = Path(sink_path).parts
