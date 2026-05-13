@@ -133,6 +133,27 @@ def iteration_rows(run_dir: str | Path) -> list[dict[str, Any]]:
     for entry in state.get("full_program_trace") or []:
         row_scores = _iteration_scores(entry)
         if row_scores is None:
+            parent_scores = _iteration_parent_only_scores(entry)
+            if parent_scores is None:
+                continue
+            iteration = entry.get("i", len(rows))
+            parent_label = entry.get("selected_program_candidate", "")
+            parent_hard = _hard_count(parent_scores)
+            rows.append(
+                {
+                    "iter": _format_iter_parents(iteration, parent_label),
+                    "soft: par → child": f"{_mean_list(parent_scores):.3f} → -",
+                    "hard: par → child": (
+                        f"{_hard_rate(parent_scores):.3f} → -; {parent_hard} → -"
+                    ),
+                    "flips": "-",
+                    "p": "-",
+                    "outcome": "NO CHILD",
+                    "_highlight": False,
+                    "_muted_prefix": {},
+                    "_iteration_hard_denominator": len(parent_scores) or None,
+                }
+            )
             continue
         parent_scores, new_scores, parent_label = row_scores
         gains, losses = _hard_flips(parent_scores, new_scores)
@@ -1472,12 +1493,12 @@ def _candidate_rows_from_artifact(run_dir: str | Path) -> list[dict[str, Any]]:
 
 
 def _best_candidate_idx(run_dir: str | Path, subscores: list[Any]) -> int | None:
+    if subscores:
+        return max(range(len(subscores)), key=lambda index: _mean_scores(subscores[index]))
     summary = load_summary(run_dir)
     if isinstance(summary.get("best_idx"), int):
         return summary["best_idx"]
-    if not subscores:
-        return None
-    return max(range(len(subscores)), key=lambda index: _mean_scores(subscores[index]))
+    return None
 
 
 def _best_candidate_idx_from_artifacts(
@@ -1516,6 +1537,13 @@ def _iteration_scores(entry: dict[str, Any]) -> tuple[list[float], list[float], 
         pair = entry.get("rlm_merge_candidate_pair") or entry.get("merged_entities") or "merge"
         return parent_scores, new_scores, pair
     return None
+
+
+def _iteration_parent_only_scores(entry: dict[str, Any]) -> list[float] | None:
+    iteration = entry.get("i")
+    if iteration in {None, 0} or "subsample_scores" not in entry:
+        return None
+    return _score_values(entry.get("subsample_scores") or [])
 
 
 def _merge_score_vectors(entry: dict[str, Any]) -> tuple[list[float], list[float]] | None:

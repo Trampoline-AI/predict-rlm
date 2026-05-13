@@ -51,7 +51,7 @@ from rlm_gepa.proposer.selection import (
 )
 from rlm_gepa.reporting import stats as stats_report
 from rlm_gepa.reporting.cost import CostRow, aggregate_costs_from_log, append_cost_rows
-from rlm_gepa.reporting.plots import resolve_plot_output_paths
+from rlm_gepa.reporting.plots import load_plot_data, make_lineage, resolve_plot_output_paths
 from rlm_gepa.reporting.stats import (
     candidate_rows,
     cost_rows,
@@ -1241,6 +1241,223 @@ def test_plot_output_paths_accept_directory_or_prefix(tmp_path: Path):
     assert lineage_path == tmp_path / "summary_candidate_lineage.png"
 
 
+class _FakePlotlyFigure:
+    def __init__(self):
+        self.traces = []
+        self.annotations = []
+        self.layout = {}
+
+    def add_trace(self, trace):
+        self.traces.append(trace)
+
+    def add_annotation(self, **kwargs):
+        self.annotations.append(kwargs)
+
+    def update_layout(self, **kwargs):
+        self.layout.update(kwargs)
+
+
+def _fake_plotly_scatter(**kwargs):
+    return SimpleNamespace(**kwargs)
+
+
+_fake_plotly_go = SimpleNamespace(Figure=_FakePlotlyFigure, Scatter=_fake_plotly_scatter)
+
+
+def test_lineage_draws_all_valid_merge_parent_edges():
+    data = {
+        "n": 4,
+        "scores": [0.1, 0.2, 0.3, 0.4],
+        "parents": [[None], [0], [0], [1, 2]],
+        "best_idx": 3,
+        "pareto_map": {},
+    }
+
+    fig = make_lineage(data, _fake_plotly_go)
+    edge_trace = fig.traces[0]
+    node_trace = fig.traces[1]
+    coord_to_candidate = {
+        (x, y): int(str(text).split("<br>", maxsplit=1)[0])
+        for x, y, text in zip(node_trace.x, node_trace.y, node_trace.text, strict=True)
+    }
+    edges = {
+        (
+            coord_to_candidate[(edge_trace.x[i], edge_trace.y[i])],
+            coord_to_candidate[(edge_trace.x[i + 1], edge_trace.y[i + 1])],
+        )
+        for i in range(0, len(edge_trace.x), 3)
+    }
+
+    assert edge_trace.x.count(None) == 4
+    assert edges == {(0, 1), (0, 2), (1, 3), (2, 3)}
+    assert "Parents: 1, 2" in node_trace.hovertext[3]
+
+
+def test_lineage_reflows_merge_candidates_to_reduce_crossings():
+    data = {
+        "n": 8,
+        "scores": [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8],
+        "parents": [[None], [0], [0], [1, 2], [0], [4], [4], [1, 4]],
+        "best_idx": 7,
+        "pareto_map": {},
+    }
+
+    fig = make_lineage(data, _fake_plotly_go)
+    positions = _lineage_node_positions(fig)
+    edges = _lineage_edges(fig)
+    baseline_positions = _primary_tree_lineage_positions(data["parents"])
+    baseline_crossings = _edge_crossing_count(edges, baseline_positions)
+
+    assert baseline_crossings > 0
+    assert _edge_crossing_count(edges, positions) < baseline_crossings
+    assert _distance_from_parent_center(3, (1, 2), positions) < _distance_from_parent_center(
+        3, (1, 2), baseline_positions
+    )
+
+
+def test_best_lineage_annotation_reserves_horizontal_space_from_same_layer_nodes():
+    data = {
+        "n": 8,
+        "scores": [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8],
+        "parents": [[None], [0], [0], [1, 2], [0], [4], [4], [1, 4]],
+        "best_idx": 7,
+        "pareto_map": {},
+    }
+
+    fig = make_lineage(data, _fake_plotly_go)
+    positions = _lineage_node_positions(fig)
+    best_annotation = next(annotation for annotation in fig.annotations if "Candidate 7 (best)" in annotation["text"])
+    xmin, xmax = _annotation_horizontal_footprint(best_annotation)
+    same_layer_nodes = {
+        candidate: x
+        for candidate, (x, y) in positions.items()
+        if candidate != 7 and y == positions[7][1]
+    }
+
+    assert {
+        candidate: x
+        for candidate, x in same_layer_nodes.items()
+        if xmin < x < xmax
+    } == {}
+
+
+def _annotation_horizontal_footprint(annotation: dict[str, object]) -> tuple[float, float]:
+    x = float(annotation["x"])
+    width = 1.5
+    if annotation["xanchor"] == "right":
+        return x - width, x
+    return x, x + width
+
+
+def _lineage_node_positions(fig) -> dict[int, tuple[float, float]]:
+    node_trace = fig.traces[1]
+    return {
+        int(str(text).split("<br>", maxsplit=1)[0]): (float(x), float(y))
+        for x, y, text in zip(node_trace.x, node_trace.y, node_trace.text, strict=True)
+    }
+
+
+def _lineage_edges(fig) -> list[tuple[int, int]]:
+    edge_trace = fig.traces[0]
+    positions = _lineage_node_positions(fig)
+    candidate_by_position = {position: candidate for candidate, position in positions.items()}
+    return [
+        (
+            candidate_by_position[(float(edge_trace.x[index]), float(edge_trace.y[index]))],
+            candidate_by_position[(float(edge_trace.x[index + 1]), float(edge_trace.y[index + 1]))],
+        )
+        for index in range(0, len(edge_trace.x), 3)
+    ]
+
+
+def _primary_tree_lineage_positions(raw_parents: list[object]) -> dict[int, tuple[float, float]]:
+    primary_parents = [_first_valid_parent(raw_parent, child) for child, raw_parent in enumerate(raw_parents)]
+    children: dict[int, list[int]] = {index: [] for index in range(len(raw_parents))}
+    for child, parent in enumerate(primary_parents):
+        if parent is not None:
+            children[parent].append(child)
+
+    depth = [0] * len(raw_parents)
+
+    def compute_depth(node: int, current_depth: int) -> None:
+        depth[node] = current_depth
+        for child in children[node]:
+            compute_depth(child, current_depth + 1)
+
+    for root, parent in enumerate(primary_parents):
+        if parent is None:
+            compute_depth(root, 0)
+
+    x_pos: dict[int, float] = {}
+    next_x = 0
+
+    def layout(node: int) -> None:
+        nonlocal next_x
+        if not children[node]:
+            x_pos[node] = float(next_x)
+            next_x += 1
+            return
+        for child in children[node]:
+            layout(child)
+        x_pos[node] = sum(x_pos[child] for child in children[node]) / len(children[node])
+
+    for root, parent in enumerate(primary_parents):
+        if parent is None:
+            layout(root)
+
+    return {index: (x_pos[index], float(-depth[index])) for index in range(len(raw_parents))}
+
+
+def _first_valid_parent(raw_parent: object, child: int) -> int | None:
+    raw_values = raw_parent if isinstance(raw_parent, list | tuple) else [raw_parent]
+    for value in raw_values:
+        if isinstance(value, bool) or value is None:
+            continue
+        parent = int(value)
+        if 0 <= parent < child:
+            return parent
+    return None
+
+
+def _edge_crossing_count(
+    edges: list[tuple[int, int]], positions: dict[int, tuple[float, float]]
+) -> int:
+    return sum(
+        _segments_cross(edge, other_edge, positions)
+        for index, edge in enumerate(edges)
+        for other_edge in edges[index + 1 :]
+    )
+
+
+def _segments_cross(
+    edge: tuple[int, int],
+    other_edge: tuple[int, int],
+    positions: dict[int, tuple[float, float]],
+) -> bool:
+    if set(edge) & set(other_edge):
+        return False
+    a, b = positions[edge[0]], positions[edge[1]]
+    c, d = positions[other_edge[0]], positions[other_edge[1]]
+    ab_c = _orientation(a, b, c)
+    ab_d = _orientation(a, b, d)
+    cd_a = _orientation(c, d, a)
+    cd_b = _orientation(c, d, b)
+    return ab_c * ab_d < 0 and cd_a * cd_b < 0
+
+
+def _orientation(
+    a: tuple[float, float], b: tuple[float, float], c: tuple[float, float]
+) -> float:
+    return (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0])
+
+
+def _distance_from_parent_center(
+    candidate: int, parents: tuple[int, ...], positions: dict[int, tuple[float, float]]
+) -> float:
+    parent_center = sum(positions[parent][0] for parent in parents) / len(parents)
+    return abs(positions[candidate][0] - parent_center)
+
+
 def test_cost_aggregation_raw_and_logical(tmp_path: Path):
     path = tmp_path / "cost_log.jsonl"
     row = CostRow(
@@ -1547,6 +1764,40 @@ def test_merge_rows_use_explicit_merge_child_for_accepted_full_val(tmp_path: Pat
     assert rows[0]["_detail"].startswith("→ cand 4; full val vs 1:")
 
 
+def test_iteration_rows_include_attempts_without_child_scores(tmp_path: Path):
+    state = {
+        "full_program_trace": [
+            {"i": 0, "selected_program_candidate": 0, "subsample_scores": [1.0, 0.0]},
+            {"i": 1, "selected_program_candidate": 0, "subsample_scores": [1.0, 0.0]},
+            {
+                "i": 2,
+                "selected_program_candidate": 0,
+                "subsample_scores": [1.0, 0.0],
+                "new_subsample_scores": [0.0, 0.0],
+            },
+        ]
+    }
+    with (tmp_path / "gepa_state.bin").open("wb") as f:
+        pickle.dump(state, f)
+
+    rows = iteration_rows(tmp_path)
+
+    assert [row["iter"] for row in rows] == ["1 [0]", "2 [0]"]
+    assert rows[0] == {
+        "iter": "1 [0]",
+        "soft: par → child": "0.500 → -",
+        "hard: par → child": "0.500 → -; 1 → -",
+        "flips": "-",
+        "p": "-",
+        "outcome": "NO CHILD",
+        "_highlight": False,
+        "_muted_prefix": {},
+        "_iteration_hard_denominator": 2,
+        "_terminal_header_suffixes": {"hard: par → child": "/2"},
+    }
+    assert rows[1]["outcome"] == "REJECTED"
+
+
 def test_merge_rows_compact_outcomes_for_terminal_width(tmp_path: Path):
     state = {
         "full_program_trace": [
@@ -1764,6 +2015,85 @@ def test_reporting_tables_from_artifacts(tmp_path: Path):
     assert "eff" in terminal
     assert "costs (raw spend: all logged LM calls):" not in terminal
     assert "costs (deduped spend: stable operation ids only; legacy rows counted raw):" not in terminal
+
+
+def test_live_state_best_candidate_overrides_stale_summary(tmp_path: Path):
+    state = {
+        "full_program_trace": [
+            {
+                "i": 0,
+                "selected_program_candidate": 0,
+                "subsample_scores": [0.0, 0.0],
+                "new_subsample_scores": [1.0, 1.0],
+                "new_program_idx": 2,
+            }
+        ],
+        "program_candidates": [{}, {}, {}],
+        "parent_program_for_candidate": [[None], [0], [1]],
+        "prog_candidate_val_subscores": [
+            {"a": 0.0, "b": 0.0},
+            {"a": 0.6, "b": 0.6},
+            {"a": 1.0, "b": 1.0},
+        ],
+        "program_full_scores_val_set": [0.0, 0.6, 1.0],
+        "num_metric_calls_by_discovery": [0, 10, 20],
+    }
+    with (tmp_path / "gepa_state.bin").open("wb") as f:
+        pickle.dump(state, f)
+    (tmp_path / "optimization_summary.json").write_text(
+        json.dumps(
+            {
+                "best_idx": 1,
+                "val_aggregate_scores": [0.0, 0.6, 0.5],
+            }
+        )
+    )
+
+    candidates = candidate_rows(tmp_path)
+    iterations = iteration_rows(tmp_path)
+    plot_data = load_plot_data(tmp_path)
+
+    assert [row["_highlight"] for row in candidates] == [False, False, True]
+    assert iterations[0]["_highlight"] is True
+    assert plot_data["best_idx"] == 2
+    assert plot_data["scores"] == [0.0, 0.6, 1.0]
+
+
+def test_plot_data_repairs_truncated_live_full_scores_from_subscores(tmp_path: Path):
+    state = {
+        "program_candidates": [{} for _ in range(8)],
+        "parent_program_for_candidate": [[None], [0], [1], [2], [3], [4], [5], [6]],
+        "prog_candidate_val_subscores": [
+            {"a": 0.0, "b": 0.2},
+            {"a": 0.1, "b": 0.3},
+            {"a": 0.2, "b": 0.4},
+            {"a": 0.3, "b": 0.5},
+            {"a": 0.4, "b": 0.6},
+            {"a": 0.5, "b": 0.7},
+            {"a": 0.8, "b": 0.9},
+            {"a": 0.95, "b": 1.0},
+        ],
+        "program_full_scores_val_set": [0.1, 0.2, 0.3, 0.4, 0.5, 0.6],
+        "num_metric_calls_by_discovery": [0, 10, 20, 30, 40, 50],
+    }
+    with (tmp_path / "gepa_state.bin").open("wb") as f:
+        pickle.dump(state, f)
+    (tmp_path / "optimization_summary.json").write_text(
+        json.dumps(
+            {
+                "best_idx": 5,
+                "val_aggregate_scores": [0.1, 0.2, 0.3, 0.4, 0.5, 0.6],
+            }
+        )
+    )
+
+    plot_data = load_plot_data(tmp_path)
+
+    assert plot_data["n"] == 8
+    assert plot_data["scores"][6] == pytest.approx(0.85)
+    assert plot_data["scores"][7] == pytest.approx(0.975)
+    assert plot_data["best_idx"] == 7
+    assert plot_data["eval_counts"] == [0, 10, 20, 30, 40, 50, 51, 52]
 
 
 def test_cost_rows_group_patch_merge_roles(tmp_path: Path):
@@ -2743,6 +3073,29 @@ def test_adapter_enforces_per_example_timeout(tmp_path: Path):
 
     assert batch.scores == [0.0]
     assert batch.trajectories[0]["record"]["Feedback"] == "evaluation timeout at 0.01s"
+
+
+def test_adapter_prints_big_warning_for_evaluation_errors(tmp_path: Path, monkeypatch):
+    import rlm_gepa.runtime.adapter as adapter_module
+
+    messages: list[str] = []
+    monkeypatch.setattr(adapter_module, "progress_write", messages.append)
+    adapter = RLMGepaAdapter(
+        project=_ErrorProject(),
+        lm=_DummyLM(),
+        sub_lm=_DummyLM(),
+        max_iterations=1,
+        concurrency=1,
+        task_timeout=1,
+        output_dir=tmp_path,
+        run_id="run_test",
+    )
+
+    adapter.evaluate(["example"], {"skill_instructions": "seed"})
+
+    assert messages == [
+        "⚠️  EVALUATION ERROR valset example: expected failure",
+    ]
 
 
 class _ErrorProject(_Project):

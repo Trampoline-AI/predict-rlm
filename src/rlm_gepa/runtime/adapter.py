@@ -231,6 +231,11 @@ class RLMGepaAdapter:
             for done in asyncio.as_completed(tasks):
                 index, result = await done
                 results_by_index[index] = result
+                if result.error:
+                    example_id = result.example_id or _example_id(batch[index]) or str(index)
+                    progress_write(
+                        f"⚠️  EVALUATION ERROR {eval_kind} {example_id}: {_short_error(result.error)}"
+                    )
                 if progress_bar is not None:
                     progress_bar.set_postfix_str(_progress_postfix(result, batch[index], index))
                     progress_bar.update(1)
@@ -870,6 +875,13 @@ def _progress_label(eval_kind: str, eval_idx: int) -> str:
     }
     label = labels.get(eval_kind, eval_kind.replace("_", " ").upper())
     return f"{label} {eval_idx:04d}"
+
+
+def _short_error(error: str, limit: int = 240) -> str:
+    text = " ".join(str(error).split())
+    if len(text) <= limit:
+        return text
+    return text[: limit - 1] + "…"
 
 
 def _progress_postfix(result: RLMGepaExampleResult, example: Any, index: int) -> str:

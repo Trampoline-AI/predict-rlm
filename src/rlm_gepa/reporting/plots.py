@@ -15,6 +15,8 @@ C_TEXT = "#ddd"
 C_PLOT_BG = "#2a2a2a"
 C_PAPER_BG = "#1e1e1e"
 FONT_FAMILY = "Inter, Helvetica, Arial, sans-serif"
+LINEAGE_X_GAP = 0.75
+LINEAGE_ANNOTATION_X_FOOTPRINT = 1.5
 
 
 def write_plots(run_dir: str | Path, output: str | Path | None = None) -> list[Path]:
@@ -60,17 +62,83 @@ def load_plot_data(run_dir: Path) -> dict[str, Any]:
     summary = json.loads(summary_path.read_text()) if summary_path.exists() else {}
     if not isinstance(state, dict):
         state = dict(getattr(state, "__dict__", {}))
-    scores = list(summary.get("val_aggregate_scores") or state.get("program_full_scores_val_set") or [])
+
+    live_full_scores = list(state.get("program_full_scores_val_set") or [])
+    live_subscores = list(state.get("prog_candidate_val_subscores") or [])
     parents = list(state.get("parent_program_for_candidate") or [])
-    eval_counts = list(state.get("num_metric_calls_by_discovery") or range(len(scores)))
+    live_n = max(
+        len(list(state.get("program_candidates") or [])),
+        len(live_subscores),
+        len(live_full_scores),
+        len(parents),
+    )
+    if _has_live_score_data(live_full_scores, live_subscores):
+        scores = [_candidate_score(index, live_full_scores, live_subscores) for index in range(live_n)]
+        best_idx = max(range(len(scores)), key=scores.__getitem__) if scores else 0
+    else:
+        scores = [float(score) for score in summary.get("val_aggregate_scores") or []]
+        best_idx = summary.get("best_idx", max(range(len(scores)), key=scores.__getitem__) if scores else 0)
+
+    parents = list(state.get("parent_program_for_candidate") or [])
+    eval_counts = _eval_counts(state.get("num_metric_calls_by_discovery"), len(scores))
     return {
         "n": len(scores),
         "scores": scores,
         "parents": parents,
         "eval_counts": eval_counts,
-        "best_idx": summary.get("best_idx", max(range(len(scores)), key=scores.__getitem__) if scores else 0),
+        "best_idx": best_idx,
         "pareto_map": state.get("program_at_pareto_front_valset") or {},
     }
+
+
+def _has_live_score_data(full_scores: list[Any], subscores: list[Any]) -> bool:
+    return any(_is_number(score) for score in full_scores) or any(_score_values(score) for score in subscores)
+
+
+def _candidate_score(index: int, full_scores: list[Any], subscores: list[Any]) -> float:
+    if index < len(full_scores) and _is_number(full_scores[index]):
+        return float(full_scores[index])
+    if index < len(subscores):
+        values = _score_values(subscores[index])
+        if values:
+            return sum(values) / len(values)
+    return 0.0
+
+
+def _score_values(scores: Any) -> list[float]:
+    if isinstance(scores, dict):
+        raw_values = scores.values()
+    elif isinstance(scores, list | tuple):
+        raw_values = scores
+    else:
+        raw_values = [scores]
+    return [float(value) for value in raw_values if _is_number(value)]
+
+
+def _is_number(value: Any) -> bool:
+    if isinstance(value, bool):
+        return False
+    try:
+        float(value)
+    except (TypeError, ValueError):
+        return False
+    return True
+
+
+def _eval_counts(raw_counts: Any, n: int) -> list[Any]:
+    counts = list(raw_counts or [])
+    if len(counts) >= n:
+        return counts[:n]
+    if not counts:
+        return list(range(n))
+    last_count = counts[-1]
+    original_len = len(counts)
+    for index in range(original_len, n):
+        try:
+            counts.append(last_count + (index - original_len + 1))
+        except TypeError:
+            counts.append(index)
+    return counts
 
 
 def make_score_vs_rollouts(data: dict[str, Any], go: Any) -> Any:
@@ -208,7 +276,10 @@ def make_score_vs_rollouts(data: dict[str, Any], go: Any) -> Any:
 def make_lineage(data: dict[str, Any], go: Any) -> Any:
     n = data["n"]
     scores = data["scores"]
-    parents = [_primary_parent(_parent_ids(data["parents"][i]), i) if i < len(data["parents"]) else None for i in range(n)]
+    all_parents = [
+        _valid_parent_ids(data["parents"][i] if i < len(data["parents"]) else None, child=i) for i in range(n)
+    ]
+    parents = [_primary_parent(parent_ids, i) for i, parent_ids in enumerate(all_parents)]
     best_idx = data["best_idx"]
     pareto_set = _pareto_set(data["pareto_map"])
 
@@ -245,11 +316,16 @@ def make_lineage(data: dict[str, Any], go: Any) -> Any:
     for root in roots:
         layout(root)
 
+    x_pos = _reflow_lineage_x_positions(x_pos, depth, all_parents)
+    best_annotation_place_right: bool | None = None
+    if 0 <= best_idx < n:
+        x_pos, best_annotation_place_right = _reserve_lineage_annotation_space(x_pos, depth, best_idx)
+
     y_pos = {index: -depth[index] for index in range(n)}
     edge_x: list[float | None] = []
     edge_y: list[float | None] = []
-    for index, parent in enumerate(parents):
-        if parent is not None:
+    for index, parent_ids in enumerate(all_parents):
+        for parent in parent_ids:
             edge_x.extend([x_pos[parent], x_pos[index], None])
             edge_y.extend([y_pos[parent], y_pos[index], None])
 
@@ -283,7 +359,7 @@ def make_lineage(data: dict[str, Any], go: Any) -> Any:
             textfont={"size": 9, "color": "#fff"},
             hovertext=[
                 f"Candidate {index}<br>Val avg: {scores[index]:.4f}<br>"
-                f"Parent: {'seed' if parents[index] is None else parents[index]}"
+                f"{_parent_hover_label(all_parents[index])}"
                 + ("<br><b>BEST</b>" if index == best_idx else "<br>Pareto front" if index in pareto_set else "")
                 for index in range(n)
             ],
@@ -302,7 +378,11 @@ def make_lineage(data: dict[str, Any], go: Any) -> Any:
             lines.append(f"Val avg: {scores[candidate_idx]:.4f} <b>({pct:+.1f}%)</b>")
         else:
             lines.append(f"Val avg: {scores[candidate_idx]:.4f}")
-        place_right = x_pos[candidate_idx] <= x_mid
+        place_right = (
+            best_annotation_place_right
+            if candidate_idx == best_idx and best_annotation_place_right is not None
+            else x_pos[candidate_idx] <= x_mid
+        )
         fig.add_annotation(
             x=x_pos[candidate_idx],
             y=y_pos[candidate_idx],
@@ -345,6 +425,186 @@ def _primary_parent(parent_ids: list[int], child: int) -> int | None:
     return None
 
 
+def _valid_parent_ids(raw: Any, *, child: int) -> list[int]:
+    parents: list[int] = []
+    seen: set[int] = set()
+    for parent in _parent_ids(raw):
+        if parent in seen or not 0 <= parent < child:
+            continue
+        seen.add(parent)
+        parents.append(parent)
+    return parents
+
+
+def _parent_hover_label(parent_ids: list[int]) -> str:
+    if not parent_ids:
+        return "Parent: seed"
+    if len(parent_ids) == 1:
+        return f"Parent: {parent_ids[0]}"
+    return f"Parents: {', '.join(str(parent) for parent in parent_ids)}"
+
+
+def _reflow_lineage_x_positions(
+    initial_x: dict[int, float],
+    depth: list[int],
+    all_parents: list[list[int]],
+) -> dict[int, float]:
+    layers: dict[int, list[int]] = {}
+    for candidate, candidate_depth in enumerate(depth):
+        layers.setdefault(candidate_depth, []).append(candidate)
+    if not layers:
+        return initial_x
+
+    orders = {
+        candidate_depth: sorted(candidates, key=lambda candidate: (initial_x[candidate], candidate))
+        for candidate_depth, candidates in layers.items()
+    }
+    all_children: dict[int, list[int]] = {candidate: [] for candidate in range(len(depth))}
+    for child, parent_ids in enumerate(all_parents):
+        for parent in parent_ids:
+            all_children[parent].append(child)
+
+    for candidate_depth in sorted(orders, reverse=True):
+        positions = _rank_positions(orders)
+        orders[candidate_depth] = _sort_layer_by_neighbors(
+            orders[candidate_depth],
+            all_children,
+            positions,
+        )
+
+    for candidate_depth in sorted(orders):
+        positions = _rank_positions(orders)
+        parent_neighbors = {candidate: all_parents[candidate] for candidate in orders[candidate_depth]}
+        orders[candidate_depth] = _sort_layer_by_neighbors(
+            orders[candidate_depth],
+            parent_neighbors,
+            positions,
+        )
+
+    return _layered_barycenter_x_positions(orders, all_parents, initial_x)
+
+
+def _sort_layer_by_neighbors(
+    candidates: list[int],
+    neighbors_by_candidate: dict[int, list[int]],
+    positions: dict[int, float],
+) -> list[int]:
+    current_rank = {candidate: rank for rank, candidate in enumerate(candidates)}
+
+    def sort_key(candidate: int) -> tuple[float, int, int]:
+        neighbor_positions = [positions[neighbor] for neighbor in neighbors_by_candidate[candidate] if neighbor in positions]
+        if not neighbor_positions:
+            return float(current_rank[candidate]), current_rank[candidate], candidate
+        return sum(neighbor_positions) / len(neighbor_positions), current_rank[candidate], candidate
+
+    return sorted(candidates, key=sort_key)
+
+
+def _rank_positions(orders: dict[int, list[int]]) -> dict[int, float]:
+    return {
+        candidate: float(rank)
+        for candidates in orders.values()
+        for rank, candidate in enumerate(candidates)
+    }
+
+
+def _layered_barycenter_x_positions(
+    orders: dict[int, list[int]],
+    all_parents: list[list[int]],
+    initial_x: dict[int, float],
+) -> dict[int, float]:
+    x_pos: dict[int, float] = {}
+    for candidate_depth in sorted(orders):
+        candidates = orders[candidate_depth]
+        targets = [
+            _candidate_x_target(candidate, all_parents[candidate], x_pos, initial_x)
+            for candidate in candidates
+        ]
+        for candidate, x in zip(candidates, _spread_targets(targets), strict=True):
+            x_pos[candidate] = x
+    return x_pos
+
+
+def _candidate_x_target(
+    candidate: int,
+    parent_ids: list[int],
+    x_pos: dict[int, float],
+    initial_x: dict[int, float],
+) -> float:
+    parent_positions = [x_pos[parent] for parent in parent_ids if parent in x_pos]
+    if parent_positions:
+        return sum(parent_positions) / len(parent_positions)
+    return initial_x[candidate]
+
+
+def _spread_targets(targets: list[float]) -> list[float]:
+    if not targets:
+        return []
+    x_values = list(targets)
+    for index in range(1, len(x_values)):
+        x_values[index] = max(x_values[index], x_values[index - 1] + LINEAGE_X_GAP)
+    target_center = sum(targets) / len(targets)
+    x_center = sum(x_values) / len(x_values)
+    shift = target_center - x_center
+    return [x + shift for x in x_values]
+
+
+def _reserve_lineage_annotation_space(
+    x_pos: dict[int, float],
+    depth: list[int],
+    candidate_idx: int,
+) -> tuple[dict[int, float], bool]:
+    if candidate_idx not in x_pos:
+        return x_pos, True
+    same_layer_nodes = [
+        index
+        for index, candidate_depth in enumerate(depth)
+        if index != candidate_idx and candidate_depth == depth[candidate_idx] and index in x_pos
+    ]
+    if not same_layer_nodes:
+        x_mid = (min(x_pos.values()) + max(x_pos.values())) / 2 if x_pos else 0.0
+        return x_pos, x_pos[candidate_idx] <= x_mid
+
+    x_mid = (min(x_pos.values()) + max(x_pos.values())) / 2
+    prefer_right = x_pos[candidate_idx] <= x_mid
+    right_cost = _annotation_space_reservation_cost(x_pos, same_layer_nodes, candidate_idx, place_right=True)
+    left_cost = _annotation_space_reservation_cost(x_pos, same_layer_nodes, candidate_idx, place_right=False)
+    place_right = prefer_right if right_cost == left_cost else right_cost < left_cost
+    return _shift_same_layer_nodes_out_of_annotation(x_pos, same_layer_nodes, candidate_idx, place_right), place_right
+
+
+def _annotation_space_reservation_cost(
+    x_pos: dict[int, float],
+    same_layer_nodes: list[int],
+    candidate_idx: int,
+    *,
+    place_right: bool,
+) -> float:
+    shifted = _shift_same_layer_nodes_out_of_annotation(x_pos, same_layer_nodes, candidate_idx, place_right)
+    return sum(abs(shifted[index] - x_pos[index]) for index in same_layer_nodes)
+
+
+def _shift_same_layer_nodes_out_of_annotation(
+    x_pos: dict[int, float],
+    same_layer_nodes: list[int],
+    candidate_idx: int,
+    place_right: bool,
+) -> dict[int, float]:
+    shifted = dict(x_pos)
+    anchor = x_pos[candidate_idx]
+    if place_right:
+        next_allowed = anchor + LINEAGE_ANNOTATION_X_FOOTPRINT
+        for index in sorted((node for node in same_layer_nodes if x_pos[node] > anchor), key=x_pos.__getitem__):
+            shifted[index] = max(shifted[index], next_allowed)
+            next_allowed = shifted[index] + LINEAGE_X_GAP
+    else:
+        next_allowed = anchor - LINEAGE_ANNOTATION_X_FOOTPRINT
+        for index in sorted((node for node in same_layer_nodes if x_pos[node] < anchor), key=x_pos.__getitem__, reverse=True):
+            shifted[index] = min(shifted[index], next_allowed)
+            next_allowed = shifted[index] - LINEAGE_X_GAP
+    return shifted
+
+
 def _add_score_callout(
     fig: Any,
     *,
@@ -379,11 +639,19 @@ def _add_score_callout(
 def _parent_ids(raw: Any) -> list[int]:
     if raw is None:
         return []
+    if isinstance(raw, bool):
+        return []
     if isinstance(raw, int):
         return [raw]
     if isinstance(raw, list | tuple):
-        return [int(value) for value in raw if value is not None]
-    return [int(raw)]
+        parent_ids: list[int] = []
+        for value in raw:
+            parent_ids.extend(_parent_ids(value))
+        return parent_ids
+    try:
+        return [int(raw)]
+    except (TypeError, ValueError):
+        return []
 
 
 def _pareto_set(pareto_map: dict[Any, Any]) -> set[int]:
