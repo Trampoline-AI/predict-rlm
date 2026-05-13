@@ -1,7 +1,9 @@
 """Tests for PredictRLM with predict tool for DSPy signatures."""
 
 import asyncio
+import hashlib
 import logging
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import dspy
@@ -12,6 +14,7 @@ from pydantic import BaseModel
 from predict_rlm import PredictRLM
 from predict_rlm.predict_rlm import _models_from_schema
 from predict_rlm.rlm_skills import Skill
+from predict_rlm.telemetry import TelemetryContext, classify_failure
 from predict_rlm.trace import drain_predict_calls, init_predict_call_collector
 
 
@@ -49,6 +52,14 @@ class MockLM:
         return ["Default LM response"]
 
 
+class ListTelemetrySink:
+    def __init__(self):
+        self.records: list[dict[str, Any]] = []
+
+    def write(self, record: dict[str, Any]) -> None:
+        self.records.append(record)
+
+
 class TestPredictTool:
     """Tests that PredictRLM predict tool correctly runs DSPy signatures."""
 
@@ -78,7 +89,9 @@ class TestPredictTool:
             mock_predict_class.assert_called_once()
             sig = mock_predict_class.call_args[0][0]
             assert hasattr(sig, "input_fields") and "question" in sig.input_fields
-            mock_predictor.acall.assert_called_once_with(question="What is the capital of France?")
+            mock_predictor.acall.assert_called_once_with(
+                question="What is the capital of France?"
+            )
 
     @pytest.mark.asyncio
     async def test_predict_with_multiple_outputs(self):
@@ -705,11 +718,12 @@ class TestTracedErrorHandling:
         context.__enter__.return_value = repl
         context.__exit__.return_value = False
 
-        with patch.object(PredictRLM, "_interpreter_context", return_value=context), \
-            patch.object(PredictRLM, "_prepare_execution_tools", return_value={}), \
-            patch.object(PredictRLM, "_build_variables", return_value={}), \
-            patch.object(rlm, "_execute_iteration", side_effect=RuntimeError("boom")):
-
+        with (
+            patch.object(PredictRLM, "_interpreter_context", return_value=context),
+            patch.object(PredictRLM, "_prepare_execution_tools", return_value={}),
+            patch.object(PredictRLM, "_build_variables", return_value={}),
+            patch.object(rlm, "_execute_iteration", side_effect=RuntimeError("boom")),
+        ):
             with pytest.raises(RuntimeError, match="boom") as exc_info:
                 rlm._forward_traced(None, images=["img"], query="q")
 
@@ -736,11 +750,12 @@ class TestTracedErrorHandling:
                 )
             raise RuntimeError("boom")
 
-        with patch.object(PredictRLM, "_interpreter_context", return_value=context), \
-            patch.object(PredictRLM, "_prepare_execution_tools", return_value={}), \
-            patch.object(PredictRLM, "_build_variables", return_value={}), \
-            patch.object(rlm, "_execute_iteration", side_effect=side_effect):
-
+        with (
+            patch.object(PredictRLM, "_interpreter_context", return_value=context),
+            patch.object(PredictRLM, "_prepare_execution_tools", return_value={}),
+            patch.object(PredictRLM, "_build_variables", return_value={}),
+            patch.object(rlm, "_execute_iteration", side_effect=side_effect),
+        ):
             with pytest.raises(RuntimeError, match="boom") as exc_info:
                 rlm._forward_traced(None, images=["img"], query="q")
 
@@ -761,11 +776,14 @@ class TestTracedErrorHandling:
         context.__enter__.return_value = repl
         context.__exit__.return_value = False
 
-        with patch.object(PredictRLM, "_interpreter_context", return_value=context), \
-            patch.object(PredictRLM, "_prepare_execution_tools", return_value={}), \
-            patch.object(PredictRLM, "_build_variables", return_value={}), \
-            patch.object(rlm, "_aexecute_iteration", new=AsyncMock(side_effect=RuntimeError("boom"))):
-
+        with (
+            patch.object(PredictRLM, "_interpreter_context", return_value=context),
+            patch.object(PredictRLM, "_prepare_execution_tools", return_value={}),
+            patch.object(PredictRLM, "_build_variables", return_value={}),
+            patch.object(
+                rlm, "_aexecute_iteration", new=AsyncMock(side_effect=RuntimeError("boom"))
+            ),
+        ):
             with pytest.raises(RuntimeError, match="boom") as exc_info:
                 await rlm._aforward_traced(None, images=["img"], query="q")
 
@@ -1296,9 +1314,7 @@ class TestUnresolvedTypesFallback:
                     raise ValueError("Unknown name 'UnknownModel'")
                 return original_sig(*args, **kwargs)
 
-            with patch(
-                "predict_rlm.predict_rlm.dspy.Signature", side_effect=sig_side_effect
-            ):
+            with patch("predict_rlm.predict_rlm.dspy.Signature", side_effect=sig_side_effect):
                 with caplog.at_level(logging.WARNING, logger="predict_rlm.predict_rlm"):
                     result = await rlm.tools["predict"].func(
                         "text: str -> items: list[UnknownModel]",
@@ -1395,6 +1411,198 @@ class TestExecuteIteration:
             )
 
 
+class TestPredictRLMTelemetry:
+    """Focused generated-code telemetry tests without real LM calls."""
+
+    def test_interpreter_construction_receives_current_telemetry_context(self):
+        sink = ListTelemetrySink()
+        telemetry_context = TelemetryContext(sink=sink, trace_id="trace_case_interpreter")
+        rlm = PredictRLM(
+            ImageAnalysisSignature,
+            sub_lm=MagicMock(),
+            telemetry_context=telemetry_context,
+        )
+        created_kwargs = {}
+
+        class FakeJspiInterpreter:
+            def __init__(self, **kwargs):
+                created_kwargs.update(kwargs)
+
+            def shutdown(self):
+                created_kwargs["shutdown_called"] = True
+
+        with patch("predict_rlm.predict_rlm.JspiInterpreter", FakeJspiInterpreter):
+            rlm._begin_telemetry_execution()
+            try:
+                with rlm._interpreter_context(execution_tools={}) as repl:
+                    assert isinstance(repl, FakeJspiInterpreter)
+            finally:
+                rlm._clear_telemetry_execution()
+
+        assert created_kwargs["telemetry_context"] is telemetry_context
+        assert created_kwargs["shutdown_called"] is True
+
+    def test_generated_code_event_uses_safe_payload(self):
+        sink = ListTelemetrySink()
+        telemetry_context = TelemetryContext(sink=sink, trace_id="trace_case_1")
+        rlm = PredictRLM(
+            ImageAnalysisSignature,
+            sub_lm=MagicMock(),
+            max_iterations=5,
+            telemetry_context=telemetry_context,
+        )
+
+        mock_repl = MagicMock()
+        mock_repl.execute = MagicMock(return_value="output")
+        mock_pred = MagicMock()
+        mock_pred.reasoning = "I will inspect the data."
+        mock_pred.code = "```python\nsecret_code = 41 + 1\nprint(secret_code)\n```"
+        rlm.generate_action = MagicMock(return_value=mock_pred)
+
+        with patch.object(rlm, "_process_execution_result", return_value=MagicMock()):
+            rlm._begin_telemetry_execution()
+            try:
+                rlm._execute_iteration(
+                    repl=mock_repl,
+                    variables=[],
+                    history=[],
+                    iteration=0,
+                    input_args={},
+                    output_field_names=["answer"],
+                )
+            finally:
+                rlm._clear_telemetry_execution()
+
+        names = [record["name"] for record in sink.records]
+        assert names == [
+            "rlm.action_generation.start",
+            "rlm.action_generation.ok",
+            "rlm.iteration.generated_code",
+        ]
+        event = next(
+            record
+            for record in sink.records
+            if record["name"] == "rlm.iteration.generated_code"
+        )
+        attrs = event["attributes"]
+        code = "secret_code = 41 + 1\nprint(secret_code)"
+        assert attrs["iteration"] == 1
+        assert attrs["has_code"] is True
+        assert attrs["code_chars"] == len(code)
+        assert (
+            attrs["code_sha256"] == "sha256_" + hashlib.sha256(code.encode("utf-8")).hexdigest()
+        )
+        assert attrs["reasoning_chars"] == len(mock_pred.reasoning)
+        assert "predict_rlm.predictor_id" in attrs
+        assert "reasoning" not in attrs
+        assert code not in str(attrs)
+        assert "secret_code" not in str(attrs)
+
+    def test_invalid_action_output_emits_parse_error_classifiable_as_no_code(self):
+        sink = ListTelemetrySink()
+        telemetry_context = TelemetryContext(sink=sink, trace_id="trace_case_2")
+        rlm = PredictRLM(
+            ImageAnalysisSignature,
+            sub_lm=MagicMock(),
+            max_iterations=5,
+            telemetry_context=telemetry_context,
+        )
+
+        mock_pred = MagicMock()
+        mock_pred.reasoning = "thinking"
+        mock_pred.code = ""
+        rlm.generate_action = MagicMock(return_value=mock_pred)
+
+        rlm._begin_telemetry_execution()
+        try:
+            with pytest.raises(RuntimeError, match="invalid code"):
+                rlm._execute_iteration(
+                    repl=MagicMock(),
+                    variables=[],
+                    history=[],
+                    iteration=0,
+                    input_args={},
+                    output_field_names=["answer"],
+                )
+        finally:
+            rlm._clear_telemetry_execution()
+
+        event = next(
+            record
+            for record in sink.records
+            if record["name"] == "rlm.action_generation.parse_error"
+        )
+        attrs = event["attributes"]
+        assert attrs["iteration"] == 1
+        assert attrs["has_code"] is False
+        assert attrs["code_chars"] == 0
+        assert attrs["failure.class"] == "model_no_code_generated"
+        assert classify_failure(None, [event]) == "model_no_code_generated"
+
+    def test_action_generation_exception_emits_unknown_parse_error_evidence(self):
+        sink = ListTelemetrySink()
+        telemetry_context = TelemetryContext(sink=sink, trace_id="trace_case_3")
+        rlm = PredictRLM(
+            ImageAnalysisSignature,
+            sub_lm=MagicMock(),
+            max_iterations=5,
+            telemetry_context=telemetry_context,
+        )
+        rlm.generate_action = MagicMock(side_effect=ConnectionError("lm unavailable"))
+
+        rlm._begin_telemetry_execution()
+        try:
+            with pytest.raises(ConnectionError, match="lm unavailable"):
+                rlm._execute_iteration(
+                    repl=MagicMock(),
+                    variables=[],
+                    history=[],
+                    iteration=0,
+                    input_args={},
+                    output_field_names=["answer"],
+                )
+        finally:
+            rlm._clear_telemetry_execution()
+
+        event = next(
+            record
+            for record in sink.records
+            if record["name"] == "rlm.action_generation.parse_error"
+        )
+        attrs = event["attributes"]
+        assert attrs["failure.class"] == "unknown"
+        assert attrs["error.type"] == "ConnectionError"
+        assert attrs["has_code"] is False
+
+    def test_error_trace_gets_compact_telemetry_ref(self):
+        sink = ListTelemetrySink()
+        telemetry_context = TelemetryContext(sink=sink, trace_id="trace_case_4")
+        rlm = PredictRLM(
+            ImageAnalysisSignature,
+            sub_lm=MagicMock(),
+            max_iterations=2,
+            telemetry_context=telemetry_context,
+        )
+
+        repl = MagicMock()
+        context = MagicMock()
+        context.__enter__.return_value = repl
+        context.__exit__.return_value = False
+
+        with (
+            patch.object(PredictRLM, "_interpreter_context", return_value=context),
+            patch.object(PredictRLM, "_prepare_execution_tools", return_value={}),
+            patch.object(PredictRLM, "_build_variables", return_value={}),
+            patch.object(rlm, "_execute_iteration", side_effect=RuntimeError("boom")),
+        ):
+            with pytest.raises(RuntimeError, match="boom") as exc_info:
+                rlm._forward_traced(None, images=["img"], query="q")
+
+        ref = exc_info.value.trace.telemetry_ref
+        assert ref["trace_id"] == "trace_case_4"
+        assert ref["predictor_id"].startswith("prlm_")
+
+
 class TestAexecuteIteration:
     """Tests for _aexecute_iteration: async vs sync interpreter dispatch."""
 
@@ -1415,8 +1623,12 @@ class TestAexecuteIteration:
         rlm.generate_action.acall = AsyncMock(return_value=mock_pred)
 
         mock_result = MagicMock()
-        with patch.object(rlm, "_process_execution_result", return_value=mock_result) as mock_process:
-            with patch("predict_rlm.predict_rlm._strip_code_fences", return_value="print('hello')"):
+        with patch.object(
+            rlm, "_process_execution_result", return_value=mock_result
+        ) as mock_process:
+            with patch(
+                "predict_rlm.predict_rlm._strip_code_fences", return_value="print('hello')"
+            ):
                 result = await rlm._aexecute_iteration(
                     repl=mock_repl,
                     variables=[],
@@ -1429,6 +1641,7 @@ class TestAexecuteIteration:
         mock_repl.aexecute.assert_called_once_with("print('hello')", variables={})
         assert result is mock_result
         from predict_rlm.predict_rlm import _PARENT_TAKES_CODE
+
         if _PARENT_TAKES_CODE:
             mock_process.assert_called_once_with(
                 mock_pred, "print('hello')", "output from aexecute", [], ["answer"]
@@ -1456,7 +1669,9 @@ class TestAexecuteIteration:
 
         mock_result = MagicMock()
         with patch.object(rlm, "_process_execution_result", return_value=mock_result):
-            with patch("predict_rlm.predict_rlm._strip_code_fences", return_value="print('hi')"):
+            with patch(
+                "predict_rlm.predict_rlm._strip_code_fences", return_value="print('hi')"
+            ):
                 result = await rlm._aexecute_iteration(
                     repl=mock_repl,
                     variables=[],
@@ -1486,7 +1701,9 @@ class TestAexecuteIteration:
         rlm.generate_action.acall = AsyncMock(return_value=mock_pred)
 
         mock_result = MagicMock()
-        with patch.object(rlm, "_process_execution_result", return_value=mock_result) as mock_process:
+        with patch.object(
+            rlm, "_process_execution_result", return_value=mock_result
+        ) as mock_process:
             with patch("predict_rlm.predict_rlm._strip_code_fences", return_value="bad_code()"):
                 await rlm._aexecute_iteration(
                     repl=mock_repl,
@@ -1498,6 +1715,7 @@ class TestAexecuteIteration:
                 )
 
         from predict_rlm.predict_rlm import _PARENT_TAKES_CODE
+
         error_arg = mock_process.call_args[0][2 if _PARENT_TAKES_CODE else 1]
         assert "[Error]" in error_arg
         assert "sandbox crashed" in error_arg
@@ -1596,6 +1814,7 @@ class TestSkillsMergeIntoInit:
 
     def test_skills_merge_tools(self):
         """Skills tools are accessible on the RLM alongside predict."""
+
         def my_tool(x: str) -> str:
             """A custom tool."""
             return x
@@ -1610,6 +1829,7 @@ class TestSkillsMergeIntoInit:
 
     def test_skill_tool_conflicts_with_user_tool_raises(self):
         """Tool name conflict between a skill and the tools parameter raises ValueError."""
+
         def my_tool(x: str) -> str:
             """A tool."""
             return x
@@ -1629,6 +1849,7 @@ class TestSkillsMergeIntoInit:
 
     def test_multiple_skills_merge(self):
         """Multiple skills have their instructions, packages, and tools merged."""
+
         def tool_a() -> str:
             """Tool A."""
             return "a"

@@ -98,6 +98,7 @@ def build_parser(
     optimize.add_argument("--resume", action="store_true")
     optimize.add_argument("--cache", action="store_true")
     optimize.add_argument("--verbose-rlm", action="store_true")
+    optimize.add_argument("--telemetry-level", choices=["off", "minimal", "debug"])
     optimize.add_argument("--merge-proposer", action="store_true")
     optimize.add_argument("--max-merge-attempts", type=int)
     optimize.add_argument("--candidate-selection-strategy", choices=["pareto", "current_best", "epsilon_greedy"])
@@ -154,6 +155,10 @@ def apply_optimize_args(config: OptimizeConfig, args: argparse.Namespace) -> Opt
         config.cache = True
     if args.verbose_rlm:
         config.verbose_rlm = True
+    telemetry_level = getattr(args, "telemetry_level", None)
+    if telemetry_level is not None:
+        config.telemetry_level = telemetry_level
+        config.telemetry_enabled = telemetry_level != "off"
     if args.merge_proposer:
         config.merge_proposer = True
     return config

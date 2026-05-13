@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
+import contextvars
 import functools
 import inspect
 import json
@@ -31,6 +32,13 @@ from typing import TYPE_CHECKING, Any
 from dspy.primitives.code_interpreter import CodeInterpreterError, FinalOutput
 from dspy.primitives.python_interpreter import PythonInterpreter
 from pydantic import BaseModel
+
+from .telemetry import (
+    TelemetryContext,
+    make_span_id,
+    reset_current_telemetry_context,
+    set_current_telemetry_context,
+)
 
 if TYPE_CHECKING:
     from os import PathLike
@@ -217,6 +225,7 @@ class JspiInterpreter(PythonInterpreter):
         enable_env_vars: list[str] | None = None,
         sync_files: bool = True,
         exec_timeout: float = 300.0,
+        telemetry_context: TelemetryContext | None = None,
     ) -> None:
         """Initialize interpreter with JSPI and concurrent tool support.
 
@@ -257,7 +266,12 @@ class JspiInterpreter(PythonInterpreter):
                          catch genuinely pathological code (regex
                          catastrophic backtracking, infinite loops, or a
                          host tool that never returns).
+            telemetry_context: Optional best-effort OTel-shaped telemetry
+                         context. Telemetry failures are always ignored.
         """
+        self._telemetry_context = telemetry_context
+        self._interpreter_id = make_span_id("jspi")
+        self._last_semaphore_attrs: dict[str, Any] = {}
         # Merge default domains with user-provided domains
         network_access = list(DEFAULT_ALLOWED_DOMAINS) if preinstall_packages else []
         if allowed_domains:
@@ -327,8 +341,57 @@ class JspiInterpreter(PythonInterpreter):
         # Pending file-sync operations requested by tools during execution.
         # Maps request ID → asyncio.Future resolved by the execute loop.
         self._pending_file_ops: dict[int, asyncio.Future] = {}
+        self._active_tool_count = 0
         # Per-execute wall-clock timeout (see __init__ docstring).
         self._exec_timeout = exec_timeout
+
+    def _telemetry_process_pid(self) -> int | None:
+        process = getattr(self, "deno_process", None)
+        pid = getattr(process, "pid", None)
+        return pid if isinstance(pid, int) else None
+
+    def _telemetry_pending_file_ops_count(self) -> int:
+        pending_file_ops = getattr(self, "_pending_file_ops", {})
+        return len(pending_file_ops) if pending_file_ops is not None else 0
+
+    def _telemetry_pending_tool_count(self) -> int:
+        active_tool_count = getattr(self, "_active_tool_count", 0)
+        return active_tool_count if isinstance(active_tool_count, int) else 0
+
+    def _telemetry_attrs(self, extra: dict[str, Any] | None = None) -> dict[str, Any]:
+        attrs: dict[str, Any] = {
+            "predict_rlm.interpreter_id": getattr(self, "_interpreter_id", None),
+        }
+        pid = self._telemetry_process_pid()
+        if pid is not None:
+            attrs["process.pid"] = pid
+        if extra:
+            attrs.update(extra)
+        return {key: value for key, value in attrs.items() if value is not None}
+
+    def _write_telemetry_span(
+        self,
+        name: str,
+        *,
+        status: str | dict[str, Any] = "OK",
+        attributes: dict[str, Any] | None = None,
+        start_time_unix_nano: int | None = None,
+        end_time_unix_nano: int | None = None,
+    ) -> None:
+        telemetry_context = getattr(self, "_telemetry_context", None)
+        if telemetry_context is None:
+            return
+        try:
+            telemetry_context.write_span(
+                name,
+                event_domain="sandbox",
+                status=status,
+                start_time_unix_nano=start_time_unix_nano,
+                end_time_unix_nano=end_time_unix_nano,
+                attributes=self._telemetry_attrs(attributes),
+            )
+        except Exception:
+            return
 
     def _ensure_deno_process(self) -> None:
         """Override to capture raw fds for non-blocking I/O."""
@@ -356,6 +419,7 @@ class JspiInterpreter(PythonInterpreter):
             # Reset executor — old threads may be stuck on a dead process
             self._executor.shutdown(wait=False)
             self._executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+            self._write_telemetry_span("sandbox.deno.start")
 
     def shutdown(self) -> None:
         """Shut down the Deno subprocess with timeout guards.
@@ -365,7 +429,10 @@ class JspiInterpreter(PythonInterpreter):
         """
         import subprocess
 
-        if self.deno_process and self.deno_process.poll() is None:
+        process = self.deno_process
+        if process and process.poll() is None:
+            self._write_telemetry_span("sandbox.shutdown.start")
+            killed = False
             try:
                 self._write_stdin(
                     json.dumps({"jsonrpc": "2.0", "method": "shutdown"}) + "\n"
@@ -376,8 +443,24 @@ class JspiInterpreter(PythonInterpreter):
             try:
                 self.deno_process.wait(timeout=5)
             except subprocess.TimeoutExpired:
-                self.deno_process.kill()
+                try:
+                    self.deno_process.kill()
+                    killed = True
+                    self._write_telemetry_span(
+                        "sandbox.shutdown.kill",
+                        attributes={"process.kill_result": "sent"},
+                    )
+                except Exception as exc:
+                    self._write_telemetry_span(
+                        "sandbox.shutdown.kill",
+                        status={"code": "ERROR", "message": str(exc)},
+                        attributes={"process.kill_result": "error"},
+                    )
                 self.deno_process.wait()
+            self._write_telemetry_span(
+                "sandbox.shutdown.complete",
+                attributes={"process.kill_result": "killed" if killed else "not_needed"},
+            )
         self.deno_process = None
         self._owner_thread = None
         if hasattr(self, "_executor"):
@@ -476,6 +559,15 @@ class JspiInterpreter(PythonInterpreter):
         """
         self._request_id += 1
         request_id = self._request_id
+        start_time = time.time_ns()
+        if method == "health_check":
+            self._write_telemetry_span(
+                "sandbox.health_check.start",
+                attributes={
+                    "rpc.request_id": request_id,
+                    "timeout.seconds": DENO_REQUEST_TIMEOUT_SEC,
+                },
+            )
         msg = json.dumps(
             {
                 "jsonrpc": "2.0",
@@ -503,9 +595,22 @@ class JspiInterpreter(PythonInterpreter):
             if not response_line:
                 exit_code = self.deno_process.poll()
                 if exit_code is not None:
-                    stderr = self.deno_process.stderr.read() if self.deno_process.stderr else ""
                     raise CodeInterpreterError(
-                        f"Deno exited (code {exit_code}) {context}: {stderr}"
+                        f"Deno exited (code {exit_code}) {context}"
+                    )
+                if method == "health_check":
+                    self._write_telemetry_span(
+                        "sandbox.health_check.no_response",
+                        status={
+                            "code": "ERROR",
+                            "message": f"No response {context}",
+                        },
+                        attributes={
+                            "rpc.request_id": request_id,
+                            "timeout.seconds": DENO_REQUEST_TIMEOUT_SEC,
+                            "failure.class": "sandbox_lifecycle_failure",
+                        },
+                        start_time_unix_nano=start_time,
                     )
                 raise CodeInterpreterError(f"No response {context}")
 
@@ -534,6 +639,15 @@ class JspiInterpreter(PythonInterpreter):
         if "error" in response:
             raise CodeInterpreterError(
                 f"Error {context}: {response['error'].get('message', 'Unknown error')}"
+            )
+        if method == "health_check":
+            self._write_telemetry_span(
+                "sandbox.health_check.ok",
+                attributes={
+                    "rpc.request_id": request_id,
+                    "timeout.seconds": DENO_REQUEST_TIMEOUT_SEC,
+                },
+                start_time_unix_nano=start_time,
             )
         return response
 
@@ -651,11 +765,24 @@ class JspiInterpreter(PythonInterpreter):
         # Limit concurrent Deno sandboxes to prevent OOM.
         # Acquired per-execute, released when done — allows other
         # interpreters to run between iterations.
-        await self._get_semaphore().acquire()
+        sem = self._get_semaphore()
+        wait_start = time.perf_counter()
+        await sem.acquire()
+        wait_ms = round((time.perf_counter() - wait_start) * 1000)
+        sem_value = getattr(sem, "_value", None)
+        self._last_semaphore_attrs = {
+            "sandbox.semaphore_wait_ms": wait_ms,
+            "sandbox.active_count": (
+                self.MAX_CONCURRENT_SANDBOXES - sem_value
+                if isinstance(sem_value, int)
+                else None
+            ),
+        }
         try:
             return await self._aexecute_inner(code, variables)
         finally:
-            self._get_semaphore().release()
+            self._last_semaphore_attrs = {}
+            sem.release()
 
     async def _aexecute_inner(self, code: str, variables: dict[str, Any] | None) -> Any:
         """Inner async execute — runs within the sandbox semaphore."""
@@ -665,6 +792,17 @@ class JspiInterpreter(PythonInterpreter):
 
         self._request_id += 1
         execute_request_id = self._request_id
+        execute_start_time = time.time_ns()
+        self._write_telemetry_span(
+            "sandbox.execute.start",
+            attributes={
+                "rpc.request_id": execute_request_id,
+                "timeout.seconds": self._exec_timeout,
+                "sandbox.pending_tool_count": self._telemetry_pending_tool_count(),
+                "sandbox.pending_file_op_count": self._telemetry_pending_file_ops_count(),
+                **getattr(self, "_last_semaphore_attrs", {}),
+            },
+        )
         input_data = json.dumps({
             "jsonrpc": "2.0",
             "method": "execute",
@@ -681,9 +819,13 @@ class JspiInterpreter(PythonInterpreter):
                 "restored on a fresh process, so this run is unrecoverable."
             ) from e
 
-        return await self._execute_with_timeout(execute_request_id)
+        return await self._execute_with_timeout(execute_request_id, execute_start_time)
 
-    async def _execute_with_timeout(self, execute_request_id: int) -> Any:
+    async def _execute_with_timeout(
+        self,
+        execute_request_id: int,
+        execute_start_time: int | None = None,
+    ) -> Any:
         """Run the execute loop under a wall-clock deadline.
 
         On timeout the Deno subprocess is almost certainly CPU-bound in
@@ -694,11 +836,37 @@ class JspiInterpreter(PythonInterpreter):
         dirs, skill imports) was only invoked on the original subprocess.
         """
         try:
-            return await asyncio.wait_for(
+            result = await asyncio.wait_for(
                 self._execute_async(execute_request_id),
                 timeout=self._exec_timeout,
             )
+            self._write_telemetry_span(
+                "sandbox.execute.ok",
+                attributes={
+                    "rpc.request_id": execute_request_id,
+                    "timeout.seconds": self._exec_timeout,
+                    "sandbox.pending_tool_count": self._telemetry_pending_tool_count(),
+                    "sandbox.pending_file_op_count": self._telemetry_pending_file_ops_count(),
+                },
+                start_time_unix_nano=execute_start_time,
+            )
+            return result
         except asyncio.TimeoutError:
+            self._write_telemetry_span(
+                "sandbox.execute.timeout",
+                status={
+                    "code": "ERROR",
+                    "message": f"Sandbox exec timed out after {self._exec_timeout}s",
+                },
+                attributes={
+                    "rpc.request_id": execute_request_id,
+                    "timeout.seconds": self._exec_timeout,
+                    "sandbox.pending_tool_count": self._telemetry_pending_tool_count(),
+                    "sandbox.pending_file_op_count": self._telemetry_pending_file_ops_count(),
+                    "failure.class": "sandbox_exec_timeout",
+                },
+                start_time_unix_nano=execute_start_time,
+            )
             self._kill_sandbox()
             raise SandboxFatalError(
                 f"Sandbox exec timed out after {self._exec_timeout}s "
@@ -719,14 +887,26 @@ class JspiInterpreter(PythonInterpreter):
         RLM run.
         """
         if self.deno_process is not None:
+            self._write_telemetry_span("sandbox.shutdown.start")
+            kill_result = "sent"
             try:
                 self.deno_process.kill()
             except Exception:
-                pass
+                kill_result = "error"
             try:
                 self.deno_process.wait(timeout=2)
             except Exception:
                 pass
+            self._write_telemetry_span(
+                "sandbox.shutdown.kill",
+                attributes={"process.kill_result": kill_result},
+                status="OK" if kill_result == "sent" else "ERROR",
+            )
+            self._write_telemetry_span(
+                "sandbox.shutdown.complete",
+                attributes={"process.kill_result": kill_result},
+                status="OK" if kill_result == "sent" else "ERROR",
+            )
         self.deno_process = None
         # Cancel any pending file-sync futures; they can't complete now.
         for fut in list(self._pending_file_ops.values()):
@@ -757,6 +937,16 @@ class JspiInterpreter(PythonInterpreter):
         # Send the code as JSON-RPC 2.0 request
         self._request_id += 1
         execute_request_id = self._request_id
+        execute_start_time = time.time_ns()
+        self._write_telemetry_span(
+            "sandbox.execute.start",
+            attributes={
+                "rpc.request_id": execute_request_id,
+                "timeout.seconds": self._exec_timeout,
+                "sandbox.pending_tool_count": self._telemetry_pending_tool_count(),
+                "sandbox.pending_file_op_count": self._telemetry_pending_file_ops_count(),
+            },
+        )
         input_data = json.dumps(
             {
                 "jsonrpc": "2.0",
@@ -781,15 +971,19 @@ class JspiInterpreter(PythonInterpreter):
 
         nest_asyncio.apply()
         loop = asyncio.get_event_loop()
-        return loop.run_until_complete(self._execute_with_timeout(execute_request_id))
+        return loop.run_until_complete(
+            self._execute_with_timeout(execute_request_id, execute_start_time)
+        )
 
     async def _execute_async(self, execute_request_id: int) -> Any:
         """Read messages and handle tool calls concurrently using asyncio."""
         pending_tasks: dict[str, asyncio.Task] = {}  # request_id -> Task
 
         while True:
+            self._active_tool_count = len(pending_tasks)
             # Check for completed tool calls and send responses
             await self._send_completed_responses(pending_tasks)
+            self._active_tool_count = len(pending_tasks)
 
             # Read next message — non-blocking via event loop fd watching
             if pending_tasks:
@@ -804,9 +998,8 @@ class JspiInterpreter(PythonInterpreter):
                     continue
 
             if not output_line:
-                err_output = self.deno_process.stderr.read()
                 raise CodeInterpreterError(
-                    f"No output from Deno subprocess. Stderr: {err_output}"
+                    "No output from Deno subprocess."
                 )
 
             # Skip non-JSON lines (e.g., Pyodide package loading messages)
@@ -833,12 +1026,16 @@ class JspiInterpreter(PythonInterpreter):
                 if result["method"] == "tool_call":
                     request_id = result["id"]
                     params = result.get("params", {})
-                    task = asyncio.create_task(self._execute_tool_async(params["name"], params))
+                    task = asyncio.create_task(
+                        self._execute_tool_async(params["name"], params, request_id)
+                    )
                     pending_tasks[request_id] = task
+                    self._active_tool_count = len(pending_tasks)
                     continue
 
             # Before returning, ensure all pending tool calls complete
             await self._wait_and_send_all_responses(pending_tasks)
+            self._active_tool_count = len(pending_tasks)
 
             # JSON-RPC success response
             if "result" in result:
@@ -1053,7 +1250,12 @@ class JspiInterpreter(PythonInterpreter):
                 f"mount_file failed: {result['error'].get('message', result['error'])}"
             )
 
-    async def _execute_tool_async(self, tool_name: str, call_args: dict) -> dict:
+    async def _execute_tool_async(
+        self,
+        tool_name: str,
+        call_args: dict,
+        tool_request_id: int | str | None = None,
+    ) -> dict:
         """Execute a tool asynchronously and return the response dict."""
         from .trace import ToolCall, ms_since, record_tool_call
 
@@ -1066,6 +1268,18 @@ class JspiInterpreter(PythonInterpreter):
             )
 
         call_start = time.perf_counter()
+        telemetry_start = time.time_ns()
+        self._write_telemetry_span(
+            "sandbox.tool_call.start",
+            attributes={
+                "tool.name": tool_name,
+                "tool.id": tool_request_id,
+                "rpc.request_id": tool_request_id,
+                "timeout.seconds": TOOL_CALL_TIMEOUT_SEC,
+                "sandbox.pending_tool_count": self._telemetry_pending_tool_count(),
+                "sandbox.pending_file_op_count": self._telemetry_pending_file_ops_count(),
+            },
+        )
         # Copy to mutable containers so the SyncedFile handler below can
         # rewrite sandbox paths to host paths before invoking the tool.
         args = list(call_args.get("args", []))
@@ -1138,6 +1352,7 @@ class JspiInterpreter(PythonInterpreter):
             # recoverable error. Sandbox stays alive, RLM sees the
             # error and can rewrite its code to avoid the slow path.
             if asyncio.iscoroutinefunction(tool_fn):
+                token = set_current_telemetry_context(self._telemetry_context)
                 try:
                     result = await asyncio.wait_for(
                         tool_fn(*args, **kwargs),
@@ -1148,10 +1363,16 @@ class JspiInterpreter(PythonInterpreter):
                         f"tool {tool_name!r} timed out after "
                         f"{TOOL_CALL_TIMEOUT_SEC}s (per-call budget)"
                     ) from e
+                finally:
+                    reset_current_telemetry_context(token)
             else:
                 loop = asyncio.get_running_loop()
+                token = set_current_telemetry_context(self._telemetry_context)
+                ctx = contextvars.copy_context()
+                reset_current_telemetry_context(token)
                 future = loop.run_in_executor(
                     self._executor,
+                    ctx.run,
                     functools.partial(tool_fn, *args, **kwargs),
                 )
                 try:
@@ -1192,6 +1413,18 @@ class JspiInterpreter(PythonInterpreter):
                     duration_ms=ms_since(call_start),
                 ))
 
+            self._write_telemetry_span(
+                "sandbox.tool_call.ok",
+                attributes={
+                    "tool.name": tool_name,
+                    "tool.id": tool_request_id,
+                    "rpc.request_id": tool_request_id,
+                    "timeout.seconds": TOOL_CALL_TIMEOUT_SEC,
+                    "sandbox.pending_tool_count": self._telemetry_pending_tool_count(),
+                    "sandbox.pending_file_op_count": self._telemetry_pending_file_ops_count(),
+                },
+                start_time_unix_nano=telemetry_start,
+            )
             return response
         except Exception as e:
             # Clean up any SyncedFile temp dir before returning
@@ -1206,6 +1439,21 @@ class JspiInterpreter(PythonInterpreter):
                     error=str(e),
                     duration_ms=ms_since(call_start),
                 ))
+            if isinstance(e, TimeoutError):
+                self._write_telemetry_span(
+                    "sandbox.tool_call.timeout",
+                    status={"code": "ERROR", "message": str(e)},
+                    attributes={
+                        "tool.name": tool_name,
+                        "tool.id": tool_request_id,
+                        "rpc.request_id": tool_request_id,
+                        "timeout.seconds": TOOL_CALL_TIMEOUT_SEC,
+                        "sandbox.pending_tool_count": self._telemetry_pending_tool_count(),
+                        "sandbox.pending_file_op_count": self._telemetry_pending_file_ops_count(),
+                        "failure.class": "host_tool_timeout_or_leak",
+                    },
+                    start_time_unix_nano=telemetry_start,
+                )
             return {"error": str(e)}
 
     def _write_stdin(self, data: str) -> None:

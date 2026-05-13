@@ -4,12 +4,21 @@ import asyncio
 import json
 from collections.abc import Mapping, Sequence
 from contextlib import contextmanager
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
 from gepa import EvaluationBatch
 
 from predict_rlm import PredictRLM
+from predict_rlm.telemetry import (
+    TelemetryContext,
+    classify_failure,
+    make_trace_id,
+)
+from predict_rlm.telemetry import (
+    candidate_hash as compute_candidate_hash,
+)
 from predict_rlm.trace import extract_trace_from_exc
 
 from ..proposer.rlm import (
@@ -55,6 +64,7 @@ class RLMGepaAdapter:
         verbose_rlm: bool = False,
         display_progress_bar: bool = False,
         valset_size: int | None = None,
+        telemetry_context: TelemetryContext | None = None,
     ):
         self.project = project
         self.lm = lm
@@ -77,6 +87,7 @@ class RLMGepaAdapter:
         self.heartbeat_interval_seconds = heartbeat_interval_seconds
         self.display_progress_bar = display_progress_bar
         self.valset_size = valset_size
+        self.telemetry_context = telemetry_context
         self._last_minibatch_signature: tuple[str, ...] | None = None
         self._progress_label_override: str | None = None
         self._reflective_progress: dict[str, int] | None = None
@@ -147,6 +158,14 @@ class RLMGepaAdapter:
         self._eval_counts[eval_kind] = eval_idx + 1
         event_id = f"{self.run_id}_eval_{eval_kind}_attempt_{eval_idx:04d}"
         operation_id = f"eval_{eval_kind}_{eval_idx:04d}"
+        attempt_id = f"attempt_{eval_idx:04d}"
+        cand_hash = compute_candidate_hash(candidate)
+        eval_telemetry_context = self._eval_telemetry_context(
+            candidate_hash=cand_hash,
+            eval_kind=eval_kind,
+            eval_idx=eval_idx,
+            attempt_id=attempt_id,
+        )
 
         context = EvaluationContext(
             lm=self.lm,
@@ -156,18 +175,29 @@ class RLMGepaAdapter:
             output_dir=self.output_dir,
             kind=eval_kind,
             verbose_rlm=self.verbose_rlm,
+            concurrency=self.concurrency,
+            telemetry_context=eval_telemetry_context,
         )
 
         semaphore = asyncio.Semaphore(self.concurrency)
 
         async def run_one(index: int, example: Any) -> tuple[int, RLMGepaExampleResult]:
+            example_context = replace(
+                context,
+                telemetry_context=self._example_telemetry_context(
+                    eval_telemetry_context,
+                    example=example,
+                    index=index,
+                ),
+            )
             async with semaphore:
                 try:
                     result = await asyncio.wait_for(
-                        self.project.evaluate_example(candidate, example, context),
+                        self.project.evaluate_example(candidate, example, example_context),
                         timeout=self.task_timeout,
                     )
                 except asyncio.TimeoutError:
+                    self._write_outer_timeout_event(example_context, example, index)
                     return index, RLMGepaExampleResult(
                         score=0.0,
                         feedback=f"evaluation timeout at {self.task_timeout}s",
@@ -225,6 +255,12 @@ class RLMGepaAdapter:
         with trace_path.open("x", encoding="utf-8") as f:
             for index, result in enumerate(results):
                 example_id = result.example_id or str(index)
+                row_telemetry_context = self._example_telemetry_context(
+                    eval_telemetry_context,
+                    example=batch[index],
+                    index=index,
+                )
+                trace_events = _events_for_trace(row_telemetry_context)
                 outputs.append({"example_id": example_id, "score": result.score})
                 scores.append(float(result.score))
                 if result.objective_scores is not None:
@@ -235,12 +271,13 @@ class RLMGepaAdapter:
                 record = reflective_record(result)
                 if trajectories is not None:
                     trajectories.append({"example_id": example_id, "task_id": example_id, "record": record})
-                row = {
+                row: dict[str, Any] = {
                     "schema_version": 1,
                     "event_id": event_id,
                     "operation_id": operation_id,
                     "example_id": example_id,
                     "candidate_id": None,
+                    "candidate_hash": cand_hash,
                     "kind": eval_kind,
                     "status": "error" if result.error else "completed",
                     "score": result.score,
@@ -250,6 +287,13 @@ class RLMGepaAdapter:
                     "traces": [trace_to_json(trace) for trace in result.traces],
                     "error": result.error,
                 }
+                row.update(
+                    _row_failure_metadata(
+                        row,
+                        trace_events,
+                        telemetry_context=row_telemetry_context,
+                    )
+                )
                 f.write(json.dumps(row, default=str) + "\n")
 
         self._write_eval_cost(
@@ -304,6 +348,81 @@ class RLMGepaAdapter:
             leave=False,
             unit="task",
         )
+
+    def _eval_telemetry_context(
+        self,
+        *,
+        candidate_hash: str,
+        eval_kind: str,
+        eval_idx: int,
+        attempt_id: str,
+    ) -> TelemetryContext | None:
+        if self.telemetry_context is None:
+            return None
+        return replace(
+            self.telemetry_context,
+            trace_id=make_trace_id(self.run_id, candidate_hash, eval_kind, eval_idx),
+            run_id=self.run_id,
+            eval_kind=eval_kind,
+            eval_idx=eval_idx,
+            attempt_id=attempt_id,
+            candidate_hash=candidate_hash,
+        )
+
+    def _example_telemetry_context(
+        self,
+        telemetry_context: TelemetryContext | None,
+        *,
+        example: Any,
+        index: int,
+    ) -> TelemetryContext | None:
+        if telemetry_context is None:
+            return None
+        example_id = _example_id(example) or str(index)
+        return replace(
+            telemetry_context,
+            trace_id=make_trace_id(
+                self.run_id,
+                telemetry_context.candidate_hash,
+                telemetry_context.eval_kind,
+                telemetry_context.eval_idx,
+                example_id,
+            ),
+            parent_span_id=f"eval_{telemetry_context.eval_kind}_{telemetry_context.eval_idx}",
+            example_id=example_id,
+        )
+
+    def _write_outer_timeout_event(
+        self,
+        context: EvaluationContext,
+        example: Any,
+        index: int,
+    ) -> None:
+        telemetry_context = context.telemetry_context
+        if telemetry_context is None or self.project.project_name != "spreadsheet-rlm":
+            return
+        try:
+            telemetry_context.write_span(
+                "spreadbench.case.timeout",
+                event_domain="spreadbench",
+                status={
+                    "code": "ERROR",
+                    "message": f"outer task timeout at {self.task_timeout}s",
+                },
+                attributes={
+                    "rlm.phase": context.kind,
+                    "rlm.configured_timeout_sec": self.task_timeout,
+                    "rlm.concurrency": self.concurrency,
+                    "spreadbench.case_idx": index,
+                    "spreadbench.example_id": telemetry_context.example_id
+                    or _example_id(example)
+                    or str(index),
+                    "failure.class": "outer_task_timeout",
+                    "failure.evidence": "provisional",
+                },
+            )
+        except Exception:
+            return
 
     def make_reflective_dataset(
         self,
@@ -534,6 +653,187 @@ def reflective_record(result: RLMGepaExampleResult) -> dict[str, str]:
 def _example_id(example: Any) -> str | None:
     value = getattr(example, "task_id", None) or getattr(example, "example_id", None)
     return str(value) if value is not None else None
+
+
+def _events_for_trace(
+    telemetry_context: TelemetryContext | None,
+) -> list[dict[str, Any]]:
+    if telemetry_context is None:
+        return []
+    sink_path = getattr(telemetry_context.sink, "path", None)
+    if sink_path is None:
+        return []
+    path = Path(sink_path)
+    if not path.is_file():
+        return []
+    events: list[dict[str, Any]] = []
+    try:
+        for line in path.read_text(encoding="utf-8").splitlines():
+            if not line.strip():
+                continue
+            event = json.loads(line)
+            if event.get("trace_id") == telemetry_context.trace_id:
+                events.append(event)
+    except Exception:
+        return []
+    return events
+
+
+def _row_failure_metadata(
+    row: dict[str, Any],
+    events: list[dict[str, Any]],
+    *,
+    telemetry_context: TelemetryContext | None,
+) -> dict[str, Any]:
+    metadata: dict[str, Any] = {}
+    truncation = _lm_truncation_metadata(row, events)
+    row_for_classification = {**row, **truncation}
+    if float(row.get("score") or 0.0) == 0.0:
+        metadata["failure_class"] = classify_failure(row_for_classification, events)
+        metadata["failure_reason"] = _failure_reason(row, events)
+    metadata.update(truncation)
+    ref = _telemetry_ref(telemetry_context)
+    if ref is not None:
+        metadata["telemetry_ref"] = ref
+    if row.get("candidate_id") is None and telemetry_context is not None:
+        metadata["candidate_hash"] = telemetry_context.candidate_hash
+    return metadata
+
+
+def _lm_truncation_metadata(
+    row: dict[str, Any],
+    events: list[dict[str, Any]],
+) -> dict[str, Any]:
+    metadata: dict[str, Any] = {}
+    sources: list[dict[str, Any]] = [row]
+    sources.extend(_trace_truncation_sources(row.get("trace")))
+    for trace in row.get("traces") or []:
+        sources.extend(_trace_truncation_sources(trace))
+    for event in events:
+        attrs = event.get("attributes") if isinstance(event.get("attributes"), dict) else {}
+        sources.append(attrs)
+    for source in sources:
+        truncated = source.get("lm.truncated") or source.get("truncated")
+        if truncated is True or str(truncated).lower() == "true":
+            metadata["truncated"] = True
+        for src_key, dst_key in (
+            ("lm.truncation_reason", "truncation_reason"),
+            ("lm.finish_reason", "finish_reason"),
+            ("lm.max_tokens", "max_tokens"),
+            ("lm.output_tokens", "output_tokens"),
+        ):
+            if dst_key not in metadata and source.get(src_key) is not None:
+                metadata[dst_key] = source[src_key]
+            if dst_key not in metadata and source.get(dst_key) is not None:
+                metadata[dst_key] = source[dst_key]
+    finish_reason = str(metadata.get("finish_reason") or "").lower().replace("-", "_")
+    if finish_reason in {
+        "length",
+        "max_tokens",
+        "max_output_tokens",
+        "content_length",
+        "token_limit",
+    }:
+        metadata["truncated"] = True
+        metadata.setdefault("truncation_reason", "max_tokens")
+    max_tokens = _coerce_positive_int(metadata.get("max_tokens"))
+    output_tokens = _coerce_positive_int(metadata.get("output_tokens"))
+    if max_tokens is not None:
+        metadata["max_tokens"] = max_tokens
+    if output_tokens is not None:
+        metadata["output_tokens"] = output_tokens
+    if (
+        max_tokens is not None
+        and output_tokens is not None
+        and output_tokens >= int(max_tokens * 0.98)
+    ):
+        metadata["truncated"] = True
+        metadata.setdefault("truncation_reason", "max_tokens")
+    return metadata
+
+
+def _trace_truncation_sources(trace: Any) -> list[dict[str, Any]]:
+    if not isinstance(trace, Mapping):
+        return []
+    sources: list[dict[str, Any]] = []
+    usage = trace.get("usage") if isinstance(trace.get("usage"), Mapping) else {}
+    for usage_key in ("main", "sub"):
+        usage_part = usage.get(usage_key) if isinstance(usage.get(usage_key), Mapping) else {}
+        if usage_part:
+            sources.append(dict(usage_part))
+        truncation = usage_part.get("truncation")
+        if isinstance(truncation, Mapping):
+            sources.append(dict(truncation))
+    for step in trace.get("steps") or []:
+        if not isinstance(step, Mapping):
+            continue
+        lm = step.get("lm")
+        if isinstance(lm, Mapping):
+            sources.append(dict(lm))
+        for group in step.get("predict_calls") or []:
+            if not isinstance(group, Mapping):
+                continue
+            total_usage = group.get("total_usage")
+            if isinstance(total_usage, Mapping) and isinstance(total_usage.get("truncation"), Mapping):
+                sources.append(dict(total_usage["truncation"]))
+            for call in group.get("calls") or []:
+                if not isinstance(call, Mapping):
+                    continue
+                call_lm = call.get("lm")
+                if isinstance(call_lm, Mapping):
+                    sources.append(dict(call_lm))
+                call_usage = call.get("usage")
+                if isinstance(call_usage, Mapping):
+                    sources.append(dict(call_usage))
+                if isinstance(call_usage, Mapping) and isinstance(call_usage.get("truncation"), Mapping):
+                    sources.append(dict(call_usage["truncation"]))
+    return sources
+
+
+def _coerce_positive_int(value: Any) -> int | None:
+    try:
+        coerced = int(value)
+    except (TypeError, ValueError):
+        return None
+    return coerced if coerced > 0 else None
+
+
+def _telemetry_ref(telemetry_context: TelemetryContext | None) -> dict[str, Any] | None:
+    if telemetry_context is None:
+        return None
+    ref: dict[str, Any] = {"trace_id": telemetry_context.trace_id}
+    if telemetry_context.candidate_hash is not None:
+        ref["candidate_hash"] = telemetry_context.candidate_hash
+    sink_path = getattr(telemetry_context.sink, "path", None)
+    if sink_path is not None:
+        parts = Path(sink_path).parts
+        if "telemetry" in parts:
+            idx = parts.index("telemetry")
+            ref["events_path"] = str(Path(*parts[idx:]))
+    return ref
+
+
+def _failure_reason(row: dict[str, Any], events: list[dict[str, Any]]) -> str | None:
+    for event in events:
+        attrs = event.get("attributes") if isinstance(event.get("attributes"), dict) else {}
+        for key in ("failure.reason", "failure.evidence"):
+            value = attrs.get(key)
+            if value:
+                return _compact_reason(value)
+        status = event.get("status") if isinstance(event.get("status"), dict) else {}
+        if status.get("message"):
+            return _compact_reason(status["message"])
+    for key in ("error", "feedback"):
+        if row.get(key):
+            return _compact_reason(row[key])
+    return None
+
+
+def _compact_reason(value: Any, *, limit: int = 240) -> str:
+    text = " ".join(str(value).split())
+    if len(text) <= limit:
+        return text
+    return text[: limit - 3] + "..."
 
 
 def _batch_signature(batch: Sequence[Any]) -> tuple[str, ...]:

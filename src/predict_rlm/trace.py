@@ -28,7 +28,9 @@ class TokenUsage(BaseModel):
 
     input_tokens: int = Field(default=0, description="Total input/prompt tokens")
     output_tokens: int = Field(default=0, description="Total output/completion tokens")
-    cost: float = Field(default=0.0, description="Total billed cost in USD (excludes cache hits)")
+    cost: float = Field(
+        default=0.0, description="Total billed cost in USD (excludes cache hits)"
+    )
     cache_hits: int = Field(
         default=0, description="Number of LM calls served from DSPy's cache"
     )
@@ -39,6 +41,31 @@ class TokenUsage(BaseModel):
         self.cost += other.cost
         self.cache_hits += other.cache_hits
         return self
+
+
+class LMFinishMetadata(BaseModel):
+    """Compact LM completion metadata stored in RunTrace."""
+
+    finish_reason: str | None = Field(
+        default=None,
+        description="Provider/DSPy finish reason, for example 'stop' or 'length'",
+    )
+
+
+class _LMCompletionMetadata(BaseModel):
+    """Internal richer LM completion metadata for telemetry and diagnosis."""
+
+    truncated: bool = False
+    truncation_reason: str | None = None
+    finish_reason: str | None = None
+    max_tokens: int | None = Field(
+        default=None,
+        description="Configured/requested output token cap if discoverable",
+    )
+    output_tokens: int | None = Field(
+        default=None,
+        description="Output/completion tokens reported for the LM call(s)",
+    )
 
 
 class PredictCallDetail(BaseModel):
@@ -56,6 +83,10 @@ class PredictCallDetail(BaseModel):
     )
     error: str | None = Field(
         default=None, description="Error message if the predict() call failed"
+    )
+    lm: LMFinishMetadata | None = Field(
+        default=None,
+        description="Why the LM stopped for this predict() call",
     )
 
 
@@ -108,6 +139,10 @@ class IterationStep(BaseModel):
         default_factory=list,
         description="predict() subcalls made during this iteration, grouped by signature",
     )
+    lm: LMFinishMetadata | None = Field(
+        default=None,
+        description="Why the main LM stopped while generating this iteration's code",
+    )
 
 
 class LMUsage(BaseModel):
@@ -141,6 +176,10 @@ class RunTrace(BaseModel):
     duration_ms: int = Field(description="Total wall-clock duration in milliseconds")
     usage: LMUsage = Field(
         default_factory=LMUsage, description="Token usage split by main and sub LM"
+    )
+    telemetry_ref: dict[str, Any] | None = Field(
+        default=None,
+        description="Compact telemetry reference for joining partial traces to events",
     )
     steps: list[IterationStep] = Field(
         default_factory=list, description="Per-iteration execution steps"
@@ -221,6 +260,7 @@ class _RawPredictCall:
         "input",
         "output",
         "error",
+        "lm",
     )
 
     def __init__(
@@ -233,6 +273,7 @@ class _RawPredictCall:
         input: dict[str, Any],
         output: dict[str, Any],
         error: str | None = None,
+        lm: LMFinishMetadata | None = None,
     ):
         self.signature = signature
         self.instructions = instructions
@@ -242,6 +283,7 @@ class _RawPredictCall:
         self.input = input
         self.output = output
         self.error = error
+        self.lm = lm
 
 
 # ContextVar holding raw predict() calls for the current iteration.
@@ -292,6 +334,7 @@ def drain_predict_calls() -> list[PredictCallGroup]:
                         input=c.input,
                         output=c.output,
                         error=c.error,
+                        lm=c.lm,
                     )
                     for c in group_calls
                 ],
@@ -383,6 +426,184 @@ def usage_since(lm: Any, since: int) -> TokenUsage:
         cost=cost,
         cache_hits=cache_hits,
     )
+
+
+def lm_finish_since(lm: Any, since: int) -> LMFinishMetadata | None:
+    """Extract compact finish metadata from LM history entries."""
+
+    metadata = lm_completion_metadata_since(lm, since)
+    if metadata is None or metadata.finish_reason is None:
+        return None
+    return LMFinishMetadata(finish_reason=metadata.finish_reason)
+
+
+def lm_completion_metadata_since(
+    lm: Any,
+    since: int,
+    *,
+    output_tokens: int | None = None,
+) -> _LMCompletionMetadata | None:
+    """Extract rich completion metadata from LM history entries."""
+
+    history = getattr(lm, "history", None)
+    if not history or len(history) <= since:
+        return None
+
+    aggregate: _LMCompletionMetadata | None = None
+    for entry in history[since:]:
+        if not isinstance(entry, dict):
+            continue
+        usage = entry.get("usage", {}) or {}
+        entry_cost = entry.get("cost", 0) or 0
+        if _is_cache_hit(entry, usage, entry_cost):
+            continue
+        metadata = lm_truncation_from_history_entry(entry, lm=lm)
+        aggregate = merge_lm_truncation(aggregate, metadata)
+
+    if aggregate is not None and output_tokens is not None:
+        aggregate.output_tokens = output_tokens
+    return aggregate
+
+
+def merge_lm_truncation(
+    left: _LMCompletionMetadata | None,
+    right: _LMCompletionMetadata | None,
+) -> _LMCompletionMetadata | None:
+    """Merge rich LM completion metadata across multiple calls."""
+
+    if left is None:
+        return right.model_copy() if right is not None else None
+    if right is None:
+        return left
+
+    if right.truncated:
+        left.truncated = True
+        left.truncation_reason = right.truncation_reason or left.truncation_reason
+    left.finish_reason = right.finish_reason or left.finish_reason
+    left.max_tokens = right.max_tokens or left.max_tokens
+    if left.output_tokens is None:
+        left.output_tokens = right.output_tokens
+    elif right.output_tokens is not None:
+        left.output_tokens += right.output_tokens
+    return left
+
+
+def lm_truncation_from_history_entry(
+    entry: dict[str, Any],
+    *,
+    lm: Any = None,
+) -> _LMCompletionMetadata | None:
+    """Extract finish/max-token metadata from one DSPy LM history entry."""
+
+    finish_reason = _extract_finish_reason(entry.get("response"))
+    max_tokens = _extract_max_tokens(entry, lm=lm)
+    output_tokens = _extract_output_tokens(entry)
+    truncated, reason = _classify_truncation(
+        finish_reason=finish_reason,
+        max_tokens=max_tokens,
+        output_tokens=output_tokens,
+    )
+    if finish_reason is None and max_tokens is None and output_tokens is None:
+        return None
+    return _LMCompletionMetadata(
+        truncated=truncated,
+        truncation_reason=reason,
+        finish_reason=finish_reason,
+        max_tokens=max_tokens,
+        output_tokens=output_tokens,
+    )
+
+
+def _classify_truncation(
+    *,
+    finish_reason: str | None,
+    max_tokens: int | None,
+    output_tokens: int | None,
+) -> tuple[bool, str | None]:
+    normalized = (finish_reason or "").lower().replace("-", "_")
+    if normalized in {
+        "length",
+        "max_tokens",
+        "max_output_tokens",
+        "content_length",
+        "token_limit",
+    }:
+        return True, "max_tokens"
+    if max_tokens is not None and output_tokens is not None and max_tokens > 0:
+        if output_tokens >= max_tokens or output_tokens >= int(max_tokens * 0.98):
+            return True, "max_tokens"
+    return False, None
+
+
+def _extract_finish_reason(response: Any) -> str | None:
+    choices = _get_value(response, "choices")
+    if not choices:
+        return None
+    for choice in choices:
+        finish_reason = _get_value(choice, "finish_reason")
+        if finish_reason is not None:
+            return str(finish_reason)
+    return None
+
+
+def _extract_output_tokens(entry: dict[str, Any]) -> int | None:
+    usage = entry.get("usage", {}) or {}
+    for key in ("completion_tokens", "output_tokens"):
+        value = _coerce_int(usage.get(key))
+        if value is not None:
+            return value
+    response_usage = _get_value(entry.get("response"), "usage")
+    for key in ("completion_tokens", "output_tokens"):
+        value = _coerce_int(_get_value(response_usage, key))
+        if value is not None:
+            return value
+    return None
+
+
+def _extract_max_tokens(entry: dict[str, Any], *, lm: Any = None) -> int | None:
+    candidates: list[Any] = [
+        entry.get("max_tokens"),
+        entry.get("max_output_tokens"),
+    ]
+    for container_key in ("kwargs", "config", "params", "request"):
+        container = entry.get(container_key)
+        candidates.extend(
+            [
+                _get_value(container, "max_tokens"),
+                _get_value(container, "max_output_tokens"),
+            ]
+        )
+    if lm is not None:
+        candidates.extend(
+            [
+                _get_value(lm, "max_tokens"),
+                _get_value(lm, "max_output_tokens"),
+                _get_value(_get_value(lm, "kwargs"), "max_tokens"),
+                _get_value(_get_value(lm, "kwargs"), "max_output_tokens"),
+            ]
+        )
+    for candidate in candidates:
+        value = _coerce_int(candidate)
+        if value is not None:
+            return value
+    return None
+
+
+def _get_value(value: Any, key: str) -> Any:
+    if value is None:
+        return None
+    if isinstance(value, dict):
+        return value.get(key)
+    return getattr(value, key, None)
+
+
+def _coerce_int(value: Any) -> int | None:
+    if isinstance(value, bool) or value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def _is_cache_hit(entry: dict, usage: dict, cost: float) -> bool:

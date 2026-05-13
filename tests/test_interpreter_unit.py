@@ -1,9 +1,13 @@
 """Unit tests for interpreter helpers (no Deno required)."""
 
+import asyncio
 import subprocess
 import tempfile
+import types
+from typing import Any
 from unittest.mock import patch
 
+import pytest
 from dspy.primitives.code_interpreter import CodeInterpreterError
 
 from predict_rlm.interpreter import (
@@ -12,6 +16,15 @@ from predict_rlm.interpreter import (
     SandboxFatalError,
     _needs_jspi_flag,
 )
+from predict_rlm.telemetry import TelemetryContext
+
+
+class ListTelemetrySink:
+    def __init__(self):
+        self.records: list[dict[str, Any]] = []
+
+    def write(self, record: dict[str, Any]) -> None:
+        self.records.append(record)
 
 
 class TestNeedsJspiFlag:
@@ -49,6 +62,13 @@ class TestNeedsJspiFlag:
 def _make_interpreter():
     """Create a JspiInterpreter without running __init__ (no Deno subprocess)."""
     return JspiInterpreter.__new__(JspiInterpreter)
+
+
+def _attach_telemetry(interp: JspiInterpreter) -> ListTelemetrySink:
+    sink = ListTelemetrySink()
+    interp._telemetry_context = TelemetryContext(sink=sink, trace_id="trace-1")
+    interp._interpreter_id = "jspi-test"
+    return sink
 
 
 class TestBuildDenoCommand:
@@ -181,3 +201,90 @@ class TestSandboxFatalError:
 
     def test_is_not_code_interpreter_error(self):
         assert not issubclass(SandboxFatalError, CodeInterpreterError)
+
+
+class TestJspiTelemetry:
+    def test_health_check_no_response_emits_lifecycle_failure(self):
+        interp = _make_interpreter()
+        sink = _attach_telemetry(interp)
+        interp._request_id = 0
+        interp._stdin_fd = -1
+        interp._stdout_fd = -1
+        interp._read_buf = ""
+        interp.deno_process = types.SimpleNamespace(
+            stdin=types.SimpleNamespace(write=lambda _data: None, flush=lambda: None),
+            stdout=None,
+            poll=lambda: None,
+            pid=1234,
+        )
+
+        with patch.object(interp, "_read_with_timeout", return_value=None):
+            with pytest.raises(CodeInterpreterError, match="No response"):
+                interp._send_request("health_check", {}, "during health check")
+
+        names = [record["name"] for record in sink.records]
+        assert names == [
+            "sandbox.health_check.start",
+            "sandbox.health_check.no_response",
+        ]
+        no_response = sink.records[-1]
+        assert no_response["status"]["code"] == "ERROR"
+        assert no_response["attributes"]["failure.class"] == "sandbox_lifecycle_failure"
+        assert no_response["attributes"]["process.pid"] == 1234
+        assert no_response["attributes"]["rpc.request_id"] == 1
+
+    def test_execute_timeout_emits_timeout_and_kill_events(self):
+        interp = _make_interpreter()
+        sink = _attach_telemetry(interp)
+        interp._exec_timeout = 0.01
+        interp._pending_file_ops = {}
+        interp.deno_process = types.SimpleNamespace(
+            kill=lambda: None,
+            wait=lambda timeout=None: None,
+            pid=4321,
+        )
+
+        async def _never_returns(_request_id):
+            await asyncio.sleep(60)
+
+        interp._execute_async = _never_returns
+
+        with pytest.raises(SandboxFatalError):
+            asyncio.run(interp._execute_with_timeout(7, 1_000_000_000))
+
+        names = [record["name"] for record in sink.records]
+        assert "sandbox.execute.timeout" in names
+        assert "sandbox.shutdown.kill" in names
+        timeout = next(
+            record for record in sink.records if record["name"] == "sandbox.execute.timeout"
+        )
+        assert timeout["status"]["code"] == "ERROR"
+        assert timeout["attributes"]["failure.class"] == "sandbox_exec_timeout"
+        assert timeout["attributes"]["rpc.request_id"] == 7
+        assert timeout["attributes"]["process.pid"] == 4321
+
+    def test_tool_timeout_emits_host_tool_failure(self, monkeypatch):
+        import predict_rlm.interpreter as rlm_interpreter
+
+        monkeypatch.setattr(rlm_interpreter, "TOOL_CALL_TIMEOUT_SEC", 0.01)
+
+        async def slow_tool():
+            await asyncio.sleep(60)
+
+        interp = _make_interpreter()
+        sink = _attach_telemetry(interp)
+        interp.tools = {"slow_tool": slow_tool}
+        interp._debug = False
+        interp._pending_file_ops = {}
+
+        response = asyncio.run(
+            interp._execute_tool_async("slow_tool", {"args": [], "kwargs": {}}, "tool-1")
+        )
+
+        assert "error" in response
+        names = [record["name"] for record in sink.records]
+        assert names == ["sandbox.tool_call.start", "sandbox.tool_call.timeout"]
+        timeout = sink.records[-1]
+        assert timeout["attributes"]["failure.class"] == "host_tool_timeout_or_leak"
+        assert timeout["attributes"]["tool.name"] == "slow_tool"
+        assert timeout["attributes"]["tool.id"] == "tool-1"

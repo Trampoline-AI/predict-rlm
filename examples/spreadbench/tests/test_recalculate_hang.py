@@ -3,8 +3,8 @@
 Context:
     The SpreadsheetBench task ``34365`` asks the model to sum annual
     values from column B based on dates in column A and a TRUE flag in
-    column C, output per-row in column G. When the mercury-2 model was
-    run on it, the RLM produced an output xlsx with ~18k formulas of
+    column C, output per-row in column G. During an RLM run, the model
+    produced an output xlsx with ~18k formulas of
     the form::
 
         G{n}: =SUMIFS(B:B, A:A, ">="&DATE(YEAR(A{n}),1,1),
@@ -45,10 +45,15 @@ import time
 from pathlib import Path
 
 import pytest
+from openpyxl import Workbook
+
+from predict_rlm.telemetry import JsonlTelemetrySink, TelemetryContext
 
 _TESTS_DIR = Path(__file__).resolve().parent
 _EXAMPLE_DIR = _TESTS_DIR.parent
 _REPO_ROOT = _EXAMPLE_DIR.parent.parent
+if str(_EXAMPLE_DIR) not in sys.path:
+    sys.path.insert(0, str(_EXAMPLE_DIR))
 
 FIXTURE = _TESTS_DIR / "fixtures" / "hang_huge_range_34365.xlsx"
 
@@ -71,8 +76,11 @@ def test_recalculate_does_not_hang_on_full_column_refs(tmp_path: Path):
         "import sys; "
         f"sys.path.insert(0, {child_src!r}); "
         "import json; "
-        "from spreadsheet_rlm.tools.recalculate import recalculate; "
-        f"r = recalculate({str(src)!r}); "
+        "from spreadsheet_rlm.tools import recalculate as mod; "
+        "mod._FORMULAS_TIMEOUT_SECONDS = 1.0; "
+        "mod._FORMULAS_TERMINATE_GRACE_SECONDS = 0.5; "
+        "mod._find_libreoffice = lambda: None; "
+        f"r = mod.recalculate({str(src)!r}); "
         "print(json.dumps({'source': r.source, 'resolved': r.resolved, "
         "'total': r.total_formulas, 'errors': r.errors}))"
     )
@@ -113,3 +121,31 @@ def test_recalculate_does_not_hang_on_full_column_refs(tmp_path: Path):
         f"land on baseline or libreoffice, got source={source!r}"
     )
     assert any("timed out after" in err for err in payload["errors"]), payload
+
+
+def test_recalculate_writes_host_tool_telemetry_for_no_formula_workbook(tmp_path: Path):
+    src = tmp_path / "plain.xlsx"
+    wb = Workbook()
+    wb.active["A1"] = "plain"
+    wb.save(src)
+    wb.close()
+    telemetry_context = TelemetryContext(
+        sink=JsonlTelemetrySink(tmp_path / "telemetry" / "events.jsonl"),
+        trace_id="trace-recalc",
+        run_id="run-test",
+    )
+
+    from spreadsheet_rlm.tools.recalculate import recalculate
+
+    result = recalculate(src, telemetry_context=telemetry_context)
+
+    assert result.source == "baseline"
+    events = [
+        json.loads(line)
+        for line in (tmp_path / "telemetry" / "events.jsonl").read_text().splitlines()
+    ]
+    assert events[0]["name"] == "host_tool.recalculate"
+    assert events[0]["event_domain"] == "host_tool"
+    attrs = events[0]["attributes"]
+    assert attrs["spreadbench.recalculate.branch"] == "no_formulas"
+    assert attrs["spreadbench.recalculate.total_formulas"] == 0

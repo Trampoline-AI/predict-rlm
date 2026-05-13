@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import inspect
 import os
 import re
@@ -37,6 +38,7 @@ from ._shared import build_rlm_signatures, format_tool_docs_full
 from .files import File, build_file_plan, scan_file_fields
 from .interpreter import JspiInterpreter, SandboxFatalError
 from .rlm_skills import Skill, merge_skills
+from .telemetry import TelemetryContext, make_span_id
 from .trace import (
     IterationStep,
     LMUsage,
@@ -46,6 +48,8 @@ from .trace import (
     drain_tool_calls,
     init_predict_call_collector,
     init_tool_call_collector,
+    lm_completion_metadata_since,
+    lm_finish_since,
     ms_since,
     record_predict_call,
     reset_predict_call_collector,
@@ -58,9 +62,7 @@ from .trace import (
 # work even when tests patch predict_rlm.dspy.Image to a mock.
 _ImageType = dspy.Image
 
-_PARENT_TAKES_CODE = "code" in inspect.signature(
-    dspy.RLM._process_execution_result
-).parameters
+_PARENT_TAKES_CODE = "code" in inspect.signature(dspy.RLM._process_execution_result).parameters
 
 
 def _strip_code_fences(code: str) -> str:
@@ -76,8 +78,7 @@ def _strip_code_fences(code: str) -> str:
 def _format_execution_error(code: str, exc: Exception) -> str:
     err = str(exc)
     if code.count('"""') >= 3 and (
-        "unterminated" in err.lower()
-        or "invalid syntax" in err.lower()
+        "unterminated" in err.lower() or "invalid syntax" in err.lower()
     ):
         return (
             f"[Error] {err}\n\n"
@@ -89,6 +90,10 @@ def _format_execution_error(code: str, exc: Exception) -> str:
             "delimiter to '''...'''."
         )
     return f"[Error] {exc}"
+
+
+def _sha256_text(value: str) -> str:
+    return "sha256_" + hashlib.sha256(value.encode("utf-8")).hexdigest()
 
 
 if TYPE_CHECKING:
@@ -231,9 +236,7 @@ class _ValidatingJSONAdapter(_ValidatingOutputAdapterMixin, JSONAdapter):
         if not isinstance(fields, dict):
             return
 
-        parsed_result = {
-            k: v for k, v in fields.items() if k in signature.output_fields
-        }
+        parsed_result = {k: v for k, v in fields.items() if k in signature.output_fields}
         for name, value in parsed_result.items():
             field = signature.output_fields[name]
             if value is None and not _annotation_allows_none(field.annotation):
@@ -260,10 +263,7 @@ class _ValidatingChatAdapter(_ValidatingOutputAdapterMixin, ChatAdapter):
         try:
             return Adapter.__call__(self, lm, lm_kwargs, signature, demos, inputs)
         except Exception as e:
-            if (
-                isinstance(e, ContextWindowExceededError)
-                or not self.use_json_adapter_fallback
-            ):
+            if isinstance(e, ContextWindowExceededError) or not self.use_json_adapter_fallback:
                 raise e
             return _ValidatingJSONAdapter()(
                 lm,
@@ -284,10 +284,7 @@ class _ValidatingChatAdapter(_ValidatingOutputAdapterMixin, ChatAdapter):
         try:
             return await Adapter.acall(self, lm, lm_kwargs, signature, demos, inputs)
         except Exception as e:
-            if (
-                isinstance(e, ContextWindowExceededError)
-                or not self.use_json_adapter_fallback
-            ):
+            if isinstance(e, ContextWindowExceededError) or not self.use_json_adapter_fallback:
                 raise e
             return await _ValidatingJSONAdapter().acall(
                 lm,
@@ -410,6 +407,7 @@ def _models_from_schema(schema: dict) -> dict[str, type]:
     _build_model(root_name, schema)
 
     return built_models
+
 
 PREDICT_RLM_INSTRUCTIONS = """You are tasked with producing the following outputs given the inputs {inputs}:
 {output_fields}
@@ -711,6 +709,7 @@ class PredictRLM(dspy.RLM):
         skills: list[Skill] | None = None,
         debug: bool = False,
         output_dir: str | Path | None = None,
+        telemetry_context: TelemetryContext | None = None,
     ):
         """
         Args:
@@ -744,6 +743,9 @@ class PredictRLM(dspy.RLM):
             output_dir: Default host directory for output files. When set,
                        File output fields without an explicit path
                        are written here. If None, a temp directory is used.
+            telemetry_context: Optional run/case telemetry context for
+                       OTel-shaped local JSONL events. Disabled/failed
+                       telemetry writes are always ignored.
         """
         # Store main LM. ``dspy.LM.copy()`` gives a fresh history so
         # concurrent PredictRLM instances don't share mutable state —
@@ -783,6 +785,9 @@ class PredictRLM(dspy.RLM):
         self._allowed_domains = allowed_domains
         self._debug = debug
         self._output_dir = str(output_dir) if output_dir else None
+        self._telemetry_context = telemetry_context
+        self._current_telemetry_context: TelemetryContext | None = None
+        self._current_predictor_id: str | None = None
 
         # Merge skills into instructions, packages, modules, and tools
         self._skill_instructions = ""
@@ -874,9 +879,7 @@ class PredictRLM(dspy.RLM):
             """True if the annotation allows None (Optional[T], T | None, etc.)."""
             return _unwrap_optional(anno) is not anno
 
-        def _wrap_images_from_sig(
-            sig_obj: Any, kwargs: dict[str, Any]
-        ) -> dict[str, Any]:
+        def _wrap_images_from_sig(sig_obj: Any, kwargs: dict[str, Any]) -> dict[str, Any]:
             """Wrap URL/base64 strings as dspy.Image for Image-typed input fields."""
             wrapped: dict[str, Any] = {}
             for key, value in kwargs.items():
@@ -1053,8 +1056,7 @@ class PredictRLM(dspy.RLM):
             else:
                 wrapped_kwargs = _wrap_images_from_sig(sig, kwargs)
                 output_field_annotations = {
-                    name: field.annotation
-                    for name, field in sig.output_fields.items()
+                    name: field.annotation for name, field in sig.output_fields.items()
                 }
 
             # Create predictor and run with the specified LM (async, no threads)
@@ -1084,8 +1086,7 @@ class PredictRLM(dspy.RLM):
                         import dataclasses
 
                         return {
-                            k: _to_serializable(v)
-                            for k, v in dataclasses.asdict(value).items()
+                            k: _to_serializable(v) for k, v in dataclasses.asdict(value).items()
                         }
 
                     if isinstance(value, list):
@@ -1152,6 +1153,7 @@ class PredictRLM(dspy.RLM):
                         input=kwargs,
                         output=result,
                         error=str(exc),
+                        lm=lm_finish_since(lm, _hist_len_before),
                     )
                 )
                 raise
@@ -1165,6 +1167,7 @@ class PredictRLM(dspy.RLM):
                         usage=usage_since(lm, _hist_len_before),
                         input=kwargs,
                         output=result,
+                        lm=lm_finish_since(lm, _hist_len_before),
                     )
                 )
                 return result
@@ -1223,9 +1226,7 @@ class PredictRLM(dspy.RLM):
                 val = raw[name]
                 if _is_list_annotation(field.annotation):
                     if isinstance(val, list):
-                        raw[name] = [
-                            {"path": v} if isinstance(v, str) else v for v in val
-                        ]
+                        raw[name] = [{"path": v} if isinstance(v, str) else v for v in val]
                 elif isinstance(val, str):
                     raw[name] = {"path": val}
 
@@ -1243,7 +1244,9 @@ class PredictRLM(dspy.RLM):
             yield self._interpreter
         else:
             extra_read = list(file_plan["read_paths"]) if file_plan else []
-            extra_write = [file_plan["write_dir"]] if file_plan and file_plan["write_dir"] else None
+            extra_write = (
+                [file_plan["write_dir"]] if file_plan and file_plan["write_dir"] else None
+            )
 
             # Add module host paths to read permissions
             for mod_path in self._skill_modules.values():
@@ -1257,6 +1260,7 @@ class PredictRLM(dspy.RLM):
                 debug=self._debug,
                 extra_read_paths=extra_read or None,
                 extra_write_paths=extra_write,
+                telemetry_context=self._current_telemetry_context,
             )
             try:
                 yield repl
@@ -1285,6 +1289,170 @@ class PredictRLM(dspy.RLM):
                 yield
             finally:
                 self._context_lm = None
+
+    def _begin_telemetry_execution(self) -> TelemetryContext | None:
+        """Prepare per-execution telemetry identity."""
+        telemetry_context = self._telemetry_context
+        predictor_id = make_span_id("prlm")
+        self._current_predictor_id = predictor_id
+        if telemetry_context is None:
+            self._current_telemetry_context = None
+            return None
+        self._current_telemetry_context = telemetry_context
+        return self._current_telemetry_context
+
+    def _clear_telemetry_execution(self) -> None:
+        self._current_telemetry_context = None
+        self._current_predictor_id = None
+
+    def _telemetry_attrs(
+        self,
+        *,
+        iteration: int | None = None,
+        extra: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        attrs: dict[str, Any] = {}
+        if iteration is not None:
+            attrs["iteration"] = iteration
+        if self._current_predictor_id is not None:
+            attrs["predict_rlm.predictor_id"] = self._current_predictor_id
+        if extra:
+            attrs.update(extra)
+        return attrs
+
+    def _write_telemetry_span(
+        self,
+        name: str,
+        *,
+        iteration: int | None = None,
+        status: str | dict[str, Any] = "OK",
+        attributes: dict[str, Any] | None = None,
+        start_time_unix_nano: int | None = None,
+        end_time_unix_nano: int | None = None,
+    ) -> None:
+        telemetry_context = self._current_telemetry_context
+        if telemetry_context is None:
+            return
+        try:
+            telemetry_context.write_span(
+                name,
+                event_domain="rlm",
+                status=status,
+                start_time_unix_nano=start_time_unix_nano,
+                end_time_unix_nano=end_time_unix_nano,
+                attributes=self._telemetry_attrs(
+                    iteration=iteration,
+                    extra=attributes,
+                ),
+            )
+        except Exception:
+            return
+
+    def _generated_code_attributes(
+        self, *, iteration: int, pred: Any, code: str
+    ) -> dict[str, Any]:
+        reasoning = getattr(pred, "reasoning", "") or ""
+        return self._telemetry_attrs(
+            iteration=iteration + 1,
+            extra={
+                "has_code": bool(code),
+                "code_chars": len(code),
+                "code_sha256": _sha256_text(code),
+                "reasoning_chars": len(reasoning),
+            },
+        )
+
+    def _write_generated_code_event(self, *, iteration: int, pred: Any, code: str) -> None:
+        telemetry_context = self._current_telemetry_context
+        if telemetry_context is None:
+            return
+        try:
+            telemetry_context.write_span(
+                "rlm.iteration.generated_code",
+                event_domain="rlm",
+                attributes=self._generated_code_attributes(
+                    iteration=iteration,
+                    pred=pred,
+                    code=code,
+                ),
+            )
+        except Exception:
+            return
+
+    def _action_generation_error_attrs(
+        self,
+        exc: BaseException,
+        *,
+        lm_metadata: Any | None = None,
+    ) -> dict[str, Any]:
+        exception_message = str(exc)
+        invalid_action_output = (
+            isinstance(exc, RuntimeError)
+            and exception_message.startswith("PredictRLM action adapter returned invalid")
+        )
+        normalized_exception_message = exception_message.lower()
+        truncated = bool(lm_metadata and lm_metadata.truncated) or (
+            "lm response was truncated" in normalized_exception_message
+            or (
+                "truncated" in normalized_exception_message
+                and any(
+                    marker in normalized_exception_message
+                    for marker in ("max_tokens", "max output")
+                )
+            )
+        )
+        failure_class = "unknown"
+        if truncated:
+            failure_class = "model_output_truncated"
+        elif isinstance(exc, (AdapterParseError, ValidationError)) or invalid_action_output:
+            failure_class = "model_no_code_generated"
+        attrs: dict[str, Any] = {
+            "has_code": False,
+            "code_chars": 0,
+            "code_sha256": _sha256_text(""),
+            "reasoning_chars": 0,
+            "error.type": type(exc).__name__,
+            "error.message_chars": len(exception_message),
+            "error.message_sha256": _sha256_text(exception_message),
+            "failure.class": failure_class,
+        }
+        if lm_metadata is not None:
+            attrs["lm.truncated"] = lm_metadata.truncated
+            if lm_metadata.truncation_reason is not None:
+                attrs["lm.truncation_reason"] = lm_metadata.truncation_reason
+            if lm_metadata.finish_reason is not None:
+                attrs["lm.finish_reason"] = lm_metadata.finish_reason
+            if lm_metadata.max_tokens is not None:
+                attrs["lm.max_tokens"] = lm_metadata.max_tokens
+            if lm_metadata.output_tokens is not None:
+                attrs["lm.output_tokens"] = lm_metadata.output_tokens
+        elif truncated:
+            attrs["lm.truncated"] = True
+            attrs["lm.truncation_reason"] = "max_tokens"
+        return attrs
+
+    def _action_generation_error_status(self, exc: BaseException) -> dict[str, Any]:
+        return {
+            "code": "ERROR",
+            "message": f"{type(exc).__name__}: action generation did not produce parsed code",
+        }
+
+    def _telemetry_ref(self) -> dict[str, Any] | None:
+        telemetry_context = self._current_telemetry_context
+        if telemetry_context is None:
+            return None
+        ref: dict[str, Any] = {"trace_id": telemetry_context.trace_id}
+        if self._current_predictor_id is not None:
+            ref["predictor_id"] = self._current_predictor_id
+        sink_path = getattr(telemetry_context.sink, "path", None)
+        if sink_path is not None:
+            parts = Path(sink_path).parts
+            if "telemetry" in parts:
+                idx = parts.index("telemetry")
+                ref["events_path"] = str(Path(*parts[idx:]))
+            else:
+                ref["events_path"] = str(sink_path)
+        return ref
 
     def forward(self, **kwargs: Any) -> dspy.Prediction:
         """Execute the RLM with captured context LM for thread-safe predict calls.
@@ -1346,6 +1514,7 @@ class PredictRLM(dspy.RLM):
             max_iterations=self.max_iterations,
             duration_ms=ms_since(run_start),
             usage=LMUsage(main=main_usage, **({"sub": sub_usage} if sub_usage else {})),
+            telemetry_ref=self._telemetry_ref() if status == "error" else None,
             steps=trace_steps,
         )
 
@@ -1375,21 +1544,56 @@ class PredictRLM(dspy.RLM):
     ):
         """Execute one synchronous RLM iteration with PredictRLM validation."""
         variables_info = [variable.format() for variable in variables]
-        pred = self.generate_action(
-            variables_info=variables_info,
-            repl_history=history,
-            iteration=f"{iteration + 1}/{self.max_iterations}",
+        action_start_ns = time.time_ns()
+        self._write_telemetry_span(
+            "rlm.action_generation.start",
+            iteration=iteration + 1,
+            start_time_unix_nano=action_start_ns,
+            end_time_unix_nano=action_start_ns,
         )
-        if not isinstance(getattr(pred, "reasoning", None), str):
-            raise RuntimeError(
-                "PredictRLM action adapter returned invalid reasoning; "
-                "expected a validated non-null string."
+        try:
+            lm_hist_before_action = snapshot_lm_history_len(dspy.settings.lm)
+            pred = self.generate_action(
+                variables_info=variables_info,
+                repl_history=history,
+                iteration=f"{iteration + 1}/{self.max_iterations}",
             )
-        if not isinstance(getattr(pred, "code", None), str) or len(pred.code) < 1:
-            raise RuntimeError(
-                "PredictRLM action adapter returned invalid code; "
-                "expected a validated non-empty string."
+            if not isinstance(getattr(pred, "reasoning", None), str):
+                raise RuntimeError(
+                    "PredictRLM action adapter returned invalid reasoning; "
+                    "expected a validated non-null string."
+                )
+            if not isinstance(getattr(pred, "code", None), str) or len(pred.code) < 1:
+                raise RuntimeError(
+                    "PredictRLM action adapter returned invalid code; "
+                    "expected a validated non-empty string."
+                )
+        except BaseException as exc:
+            lm_metadata = lm_completion_metadata_since(
+                dspy.settings.lm, lm_hist_before_action
             )
+            self._write_telemetry_span(
+                "rlm.action_generation.parse_error",
+                iteration=iteration + 1,
+                status=self._action_generation_error_status(exc),
+                attributes=self._action_generation_error_attrs(
+                    exc,
+                    lm_metadata=lm_metadata,
+                ),
+                start_time_unix_nano=action_start_ns,
+            )
+            raise
+        lm_metadata = lm_finish_since(dspy.settings.lm, lm_hist_before_action)
+        self._write_telemetry_span(
+            "rlm.action_generation.ok",
+            iteration=iteration + 1,
+            start_time_unix_nano=action_start_ns,
+            attributes={
+                "has_code": True,
+                "code_chars": len(getattr(pred, "code", "") or ""),
+                "reasoning_chars": len(getattr(pred, "reasoning", "") or ""),
+            },
+        )
         if self.verbose:
             import logging as _logging
 
@@ -1400,6 +1604,7 @@ class PredictRLM(dspy.RLM):
 
         code = pred.code or ""
         code = _strip_code_fences(code)
+        self._write_generated_code_event(iteration=iteration, pred=pred, code=code)
 
         from dspy.primitives.repl_types import REPLEntry
 
@@ -1418,13 +1623,18 @@ class PredictRLM(dspy.RLM):
             result = _format_execution_error(code, e)
 
         if _PARENT_TAKES_CODE:
-            step_result = self._process_execution_result(pred, code, result, history, output_field_names)
+            step_result = self._process_execution_result(
+                pred, code, result, history, output_field_names
+            )
         else:
-            step_result = self._process_execution_result(pred, result, history, output_field_names)
+            step_result = self._process_execution_result(
+                pred, result, history, output_field_names
+            )
         if not isinstance(step_result, dspy.Prediction):
             self._partial_history = step_result
         self._partial_pending_entry = None
         self._partial_pending_start = None
+        self._last_action_lm_metadata = lm_metadata
         return step_result
 
     async def _aexecute_iteration(
@@ -1444,21 +1654,56 @@ class PredictRLM(dspy.RLM):
         stays free for other coroutines.
         """
         variables_info = [variable.format() for variable in variables]
-        pred = await self.generate_action.acall(
-            variables_info=variables_info,
-            repl_history=history,
-            iteration=f"{iteration + 1}/{self.max_iterations}",
+        action_start_ns = time.time_ns()
+        self._write_telemetry_span(
+            "rlm.action_generation.start",
+            iteration=iteration + 1,
+            start_time_unix_nano=action_start_ns,
+            end_time_unix_nano=action_start_ns,
         )
-        if not isinstance(getattr(pred, "reasoning", None), str):
-            raise RuntimeError(
-                "PredictRLM action adapter returned invalid reasoning; "
-                "expected a validated non-null string."
+        try:
+            lm_hist_before_action = snapshot_lm_history_len(dspy.settings.lm)
+            pred = await self.generate_action.acall(
+                variables_info=variables_info,
+                repl_history=history,
+                iteration=f"{iteration + 1}/{self.max_iterations}",
             )
-        if not isinstance(getattr(pred, "code", None), str) or len(pred.code) < 1:
-            raise RuntimeError(
-                "PredictRLM action adapter returned invalid code; "
-                "expected a validated non-empty string."
+            if not isinstance(getattr(pred, "reasoning", None), str):
+                raise RuntimeError(
+                    "PredictRLM action adapter returned invalid reasoning; "
+                    "expected a validated non-null string."
+                )
+            if not isinstance(getattr(pred, "code", None), str) or len(pred.code) < 1:
+                raise RuntimeError(
+                    "PredictRLM action adapter returned invalid code; "
+                    "expected a validated non-empty string."
+                )
+        except BaseException as exc:
+            lm_metadata = lm_completion_metadata_since(
+                dspy.settings.lm, lm_hist_before_action
             )
+            self._write_telemetry_span(
+                "rlm.action_generation.parse_error",
+                iteration=iteration + 1,
+                status=self._action_generation_error_status(exc),
+                attributes=self._action_generation_error_attrs(
+                    exc,
+                    lm_metadata=lm_metadata,
+                ),
+                start_time_unix_nano=action_start_ns,
+            )
+            raise
+        lm_metadata = lm_finish_since(dspy.settings.lm, lm_hist_before_action)
+        self._write_telemetry_span(
+            "rlm.action_generation.ok",
+            iteration=iteration + 1,
+            start_time_unix_nano=action_start_ns,
+            attributes={
+                "has_code": True,
+                "code_chars": len(getattr(pred, "code", "") or ""),
+                "reasoning_chars": len(getattr(pred, "reasoning", "") or ""),
+            },
+        )
         if self.verbose:
             import logging as _logging
 
@@ -1469,6 +1714,7 @@ class PredictRLM(dspy.RLM):
 
         code = pred.code or ""
         code = _strip_code_fences(code)
+        self._write_generated_code_event(iteration=iteration, pred=pred, code=code)
 
         # Capture reasoning+code BEFORE executing so a mid-execution
         # cancellation still leaves this iteration visible in the partial
@@ -1493,9 +1739,13 @@ class PredictRLM(dspy.RLM):
             result = _format_execution_error(code, e)
 
         if _PARENT_TAKES_CODE:
-            step_result = self._process_execution_result(pred, code, result, history, output_field_names)
+            step_result = self._process_execution_result(
+                pred, code, result, history, output_field_names
+            )
         else:
-            step_result = self._process_execution_result(pred, result, history, output_field_names)
+            step_result = self._process_execution_result(
+                pred, result, history, output_field_names
+            )
         # Snapshot the updated REPL history for partial-trajectory recovery.
         # step_result is either a new REPLHistory (iteration continues) or a
         # dspy.Prediction (SUBMIT happened). Only the former gets a history
@@ -1504,6 +1754,7 @@ class PredictRLM(dspy.RLM):
             self._partial_history = step_result
         self._partial_pending_entry = None
         self._partial_pending_start = None
+        self._last_action_lm_metadata = lm_metadata
         return step_result
 
     def _prepare_file_io(
@@ -1561,9 +1812,7 @@ class PredictRLM(dspy.RLM):
 
         return file_plan, transformed
 
-    def _setup_sandbox_files(
-        self, repl: JspiInterpreter, file_plan: dict[str, Any]
-    ) -> None:
+    def _setup_sandbox_files(self, repl: JspiInterpreter, file_plan: dict[str, Any]) -> None:
         """Mount input files, skill modules, and create output dirs in the sandbox."""
         repl._ensure_deno_process()
 
@@ -1607,7 +1856,11 @@ class PredictRLM(dspy.RLM):
 
             if kind == "file":
                 # RLM submitted a specific file path like "/sandbox/output/excel/result.xlsx"
-                if submitted_path and isinstance(submitted_path, str) and submitted_path.startswith("/sandbox/"):
+                if (
+                    submitted_path
+                    and isinstance(submitted_path, str)
+                    and submitted_path.startswith("/sandbox/")
+                ):
                     basename = os.path.basename(submitted_path)
                     host_path = os.path.join(host_dir, basename)
                     os.makedirs(host_dir, exist_ok=True)
@@ -1664,10 +1917,9 @@ class PredictRLM(dspy.RLM):
         # concurrent PredictRLM runs. No track_usage context needed —
         # DSPy's BaseLM stamps cost and tokens into history on every call.
         lm_hist_start = snapshot_lm_history_len(lm)
-        sub_hist_start = (
-            snapshot_lm_history_len(sub_lm) if sub_lm and sub_lm is not lm else 0
-        )
+        sub_hist_start = snapshot_lm_history_len(sub_lm) if sub_lm and sub_lm is not lm else 0
         steps: list[IterationStep] = []
+        self._begin_telemetry_execution()
 
         try:
             self._validate_inputs(input_args)
@@ -1705,12 +1957,16 @@ class PredictRLM(dspy.RLM):
                         result = self._execute_iteration(
                             repl, variables, history, iteration, input_args, output_field_names
                         )
+                        action_lm_metadata = getattr(self, "_last_action_lm_metadata", None)
+                        self._last_action_lm_metadata = None
 
                         # Extract step data from the new history entry
                         new_history = result if isinstance(result, REPLHistory) else None
                         if new_history and len(new_history.entries) > len(history.entries):
                             entry = new_history.entries[-1]
-                        elif isinstance(result, dspy.Prediction) and hasattr(result, "trajectory"):
+                        elif isinstance(result, dspy.Prediction) and hasattr(
+                            result, "trajectory"
+                        ):
                             traj = result.trajectory
                             entry_data = traj[-1] if traj else {}
                             from dspy.primitives.repl_types import REPLEntry
@@ -1742,6 +1998,7 @@ class PredictRLM(dspy.RLM):
                             duration_ms=ms_since(iter_start),
                             tool_calls=drain_tool_calls(),
                             predict_calls=drain_predict_calls(),
+                            lm=action_lm_metadata,
                         )
                         steps.append(step)
 
@@ -1791,6 +2048,7 @@ class PredictRLM(dspy.RLM):
                 pass
             raise
         finally:
+            self._clear_telemetry_execution()
             if file_plan:
                 self.generate_action, self.extract = orig_action, orig_extract
 
@@ -1816,10 +2074,9 @@ class PredictRLM(dspy.RLM):
         # ``entry["cost"]`` from ``_hidden_params["response_cost"]``, so
         # ``usage_since`` returns LiteLLM-computed authoritative cost.
         lm_hist_start = snapshot_lm_history_len(lm)
-        sub_hist_start = (
-            snapshot_lm_history_len(sub_lm) if sub_lm and sub_lm is not lm else 0
-        )
+        sub_hist_start = snapshot_lm_history_len(sub_lm) if sub_lm and sub_lm is not lm else 0
         steps: list[IterationStep] = []
+        self._begin_telemetry_execution()
 
         try:
             self._validate_inputs(input_args)
@@ -1857,11 +2114,15 @@ class PredictRLM(dspy.RLM):
                         result = await self._aexecute_iteration(
                             repl, variables, history, iteration, input_args, output_field_names
                         )
+                        action_lm_metadata = getattr(self, "_last_action_lm_metadata", None)
+                        self._last_action_lm_metadata = None
 
                         new_history = result if isinstance(result, REPLHistory) else None
                         if new_history and len(new_history.entries) > len(history.entries):
                             entry = new_history.entries[-1]
-                        elif isinstance(result, dspy.Prediction) and hasattr(result, "trajectory"):
+                        elif isinstance(result, dspy.Prediction) and hasattr(
+                            result, "trajectory"
+                        ):
                             traj = result.trajectory
                             entry_data = traj[-1] if traj else {}
                             from dspy.primitives.repl_types import REPLEntry
@@ -1893,6 +2154,7 @@ class PredictRLM(dspy.RLM):
                             duration_ms=ms_since(iter_start),
                             tool_calls=drain_tool_calls(),
                             predict_calls=drain_predict_calls(),
+                            lm=action_lm_metadata,
                         )
                         steps.append(step)
 
@@ -1942,6 +2204,7 @@ class PredictRLM(dspy.RLM):
                 pass
             raise
         finally:
+            self._clear_telemetry_execution()
             if file_plan:
                 self.generate_action, self.extract = orig_action, orig_extract
 

@@ -13,8 +13,20 @@ import dspy
 import pytest
 
 import rlm_gepa.cli as cli_module
+from predict_rlm.telemetry import JsonlTelemetrySink, TelemetryContext, classify_failure
+from predict_rlm.trace import (
+    IterationStep,
+    LMFinishMetadata,
+    LMUsage,
+    PredictCallDetail,
+    PredictCallGroup,
+    RunTrace,
+    TokenUsage,
+    ToolCall,
+)
 from rlm_gepa import (
     AgentSpec,
+    EvaluationContext,
     OptimizeConfig,
     RLMGepaProject,
     agent_spec_from_rlm,
@@ -46,7 +58,7 @@ from rlm_gepa.reporting.stats import (
     render_table,
 )
 from rlm_gepa.runtime.acceptance import should_accept_reflective_candidate
-from rlm_gepa.runtime.adapter import RLMGepaAdapter
+from rlm_gepa.runtime.adapter import RLMGepaAdapter, _row_failure_metadata
 from rlm_gepa.schema import RLMGepaExampleResult, validate_project
 from rlm_gepa.service import (
     _coerce_reflection_lm_text,
@@ -2349,6 +2361,190 @@ def test_adapter_propagates_verbose_rlm_to_every_example(tmp_path: Path):
     assert project.verbose_values == [True, True]
 
 
+class _TelemetryProject(_Project):
+    def __init__(self):
+        self.contexts: list[EvaluationContext] = []
+
+    async def evaluate_example(self, candidate, example, context):
+        self.contexts.append(context)
+        context.telemetry_context.write_span(
+            "test.case",
+            event_domain="test",
+            attributes={"example": example},
+        )
+        return RLMGepaExampleResult(
+            score=1.0,
+            feedback="",
+            traces=[{"status": "ok"}],
+            example_id=str(example),
+        )
+
+
+def test_adapter_threads_telemetry_context_and_persists_candidate_hash(tmp_path: Path):
+    project = _TelemetryProject()
+    telemetry_context = TelemetryContext(
+        sink=JsonlTelemetrySink(tmp_path / "telemetry" / "events.jsonl"),
+        trace_id="run_test",
+        run_id="run_test",
+    )
+    adapter = RLMGepaAdapter(
+        project=project,
+        lm=_DummyLM(),
+        sub_lm=_DummyLM(),
+        max_iterations=1,
+        concurrency=2,
+        task_timeout=1,
+        output_dir=tmp_path,
+        run_id="run_test",
+        telemetry_context=telemetry_context,
+    )
+
+    adapter.evaluate(
+        [SimpleNamespace(task_id="example")],
+        {"skill_instructions": "seed"},
+        capture_traces=False,
+    )
+
+    context = project.contexts[0].telemetry_context
+    assert context.run_id == "run_test"
+    assert context.eval_kind == "valset"
+    assert context.eval_idx == 0
+    assert context.attempt_id == "attempt_0000"
+    assert context.example_id == "example"
+    assert context.candidate_id is None
+    assert context.candidate_hash.startswith("cand_sha256_")
+    events = [
+        json.loads(line)
+        for line in (tmp_path / "telemetry" / "events.jsonl").read_text().splitlines()
+    ]
+    assert events[0]["attributes"]["rlm.candidate_hash"] == context.candidate_hash
+    trace_rows = [
+        json.loads(line)
+        for line in (
+            tmp_path / "task_traces" / "run_test_eval_valset_attempt_0000_valset.jsonl"
+        )
+        .read_text()
+        .splitlines()
+    ]
+    assert trace_rows[0]["candidate_id"] is None
+    assert trace_rows[0]["candidate_hash"] == context.candidate_hash
+    assert trace_rows[0]["telemetry_ref"]["trace_id"] == context.trace_id
+
+
+class _FailingTelemetryProject(_Project):
+    async def evaluate_example(self, candidate, example, context):
+        context.telemetry_context.write_span(
+            "host_tool.recalculate.timeout",
+            event_domain="host_tool",
+            status={"code": "ERROR", "message": "tool timed out"},
+            attributes={"failure.class": "host_tool_timeout_or_leak"},
+        )
+        return RLMGepaExampleResult(
+            score=0.0,
+            feedback="tool failed",
+            traces=[],
+            example_id=str(example),
+            error="tool timed out",
+        )
+
+
+def test_adapter_trace_rows_include_compact_failure_metadata(tmp_path: Path):
+    telemetry_context = TelemetryContext(
+        sink=JsonlTelemetrySink(tmp_path / "telemetry" / "events.jsonl"),
+        trace_id="run_test",
+        run_id="run_test",
+    )
+    adapter = RLMGepaAdapter(
+        project=_FailingTelemetryProject(),
+        lm=_DummyLM(),
+        sub_lm=_DummyLM(),
+        max_iterations=1,
+        concurrency=1,
+        task_timeout=1,
+        output_dir=tmp_path,
+        run_id="run_test",
+        telemetry_context=telemetry_context,
+    )
+
+    adapter.evaluate(["example"], {"skill_instructions": "seed"}, capture_traces=False)
+
+    trace_rows = [
+        json.loads(line)
+        for line in (
+            tmp_path / "task_traces" / "run_test_eval_valset_attempt_0000_valset.jsonl"
+        )
+        .read_text()
+        .splitlines()
+    ]
+    row = trace_rows[0]
+    assert row["candidate_id"] is None
+    assert row["candidate_hash"].startswith("cand_sha256_")
+    assert row["failure_class"] == "host_tool_timeout_or_leak"
+    assert row["failure_reason"] == "tool timed out"
+    assert row["telemetry_ref"]["events_path"] == "telemetry/events.jsonl"
+    assert row["telemetry_ref"]["trace_id"].endswith(":0")
+
+
+def test_gepa_failure_metadata_includes_lm_truncation_fields():
+    events = [
+        {
+            "name": "rlm.action_generation.parse_error",
+            "status": {"code": "ERROR", "message": "parse failed"},
+            "attributes": {
+                "failure.class": "model_output_truncated",
+                "lm.truncated": True,
+                "lm.truncation_reason": "max_tokens",
+                "lm.finish_reason": "length",
+                "lm.max_tokens": 50000,
+                "lm.output_tokens": 50000,
+            },
+        }
+    ]
+
+    metadata = _row_failure_metadata(
+        {"score": 0.0},
+        events,
+        telemetry_context=None,
+    )
+
+    assert metadata["failure_class"] == "model_output_truncated"
+    assert metadata["truncated"] is True
+    assert metadata["truncation_reason"] == "max_tokens"
+    assert metadata["finish_reason"] == "length"
+    assert metadata["max_tokens"] == 50000
+    assert metadata["output_tokens"] == 50000
+
+
+def test_gepa_failure_metadata_infers_truncation_from_structured_trace_finish_reason():
+    metadata = _row_failure_metadata(
+        {
+            "score": 0.0,
+            "trace": {
+                "usage": {
+                    "main": {
+                        "output_tokens": 50000,
+                        "max_tokens": 50000,
+                    }
+                },
+                "steps": [{"lm": {"finish_reason": "length"}}],
+            },
+        },
+        [],
+        telemetry_context=None,
+    )
+
+    assert metadata["failure_class"] == "model_output_truncated"
+    assert metadata["truncated"] is True
+    assert metadata["truncation_reason"] == "max_tokens"
+    assert metadata["finish_reason"] == "length"
+    assert metadata["max_tokens"] == 50000
+    assert metadata["output_tokens"] == 50000
+
+
+def test_telemetry_classifier_uses_truncation_without_error_text():
+    assert classify_failure({"score": 0.0, "truncated": True}, []) == "model_output_truncated"
+
+
 def test_adapter_enforces_per_example_timeout(tmp_path: Path):
     adapter = RLMGepaAdapter(
         project=_TimeoutProject(),
@@ -2382,6 +2578,7 @@ def test_resume_uses_unique_event_namespace_for_write_once_artifacts(tmp_path: P
     run_dir = tmp_path / "run"
     config = OptimizeConfig(run_dir=run_dir)
     _run_dir, first_run_id = prepare_run_dir(_Project(), config, command="first")
+    assert (run_dir / "telemetry").is_dir()
     (run_dir / "gepa_state.bin").write_bytes(b"checkpoint")
     old_trace = run_dir / "task_traces" / f"{first_run_id}_eval_valset_attempt_0000_valset.jsonl"
     old_trace.write_text("existing\n")

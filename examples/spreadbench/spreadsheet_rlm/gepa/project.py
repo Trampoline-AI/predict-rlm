@@ -5,10 +5,13 @@ import os
 import random
 import shutil
 import tempfile
+import time
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
 from predict_rlm import File, PredictRLM
+from predict_rlm.telemetry import TelemetryContext, make_trace_id
 from predict_rlm.trace import RunTrace, extract_trace_from_exc
 from rlm_gepa import EvaluationContext, RLMGepaExampleResult, RLMGepaProject
 
@@ -99,6 +102,17 @@ class SpreadsheetGepaProject(RLMGepaProject):
     ) -> tuple[float, str, RunTrace | None]:
         output_path = tmp_dir / f"{case_idx}_{task.task_id}_output.xlsx"
         trace: RunTrace | None = None
+        telemetry_context = _case_telemetry_context(context.telemetry_context, task, case_idx)
+        case_start_ns = time.time_ns()
+        _write_case_event(
+            telemetry_context,
+            "spreadbench.case.start",
+            context=context,
+            task=task,
+            case_idx=case_idx,
+            start_time_unix_nano=case_start_ns,
+            end_time_unix_nano=case_start_ns,
+        )
         try:
             answer_sheet, answer_range = await asyncio.to_thread(
                 parse_answer_position,
@@ -119,6 +133,7 @@ class SpreadsheetGepaProject(RLMGepaProject):
                 max_iterations=context.max_iterations,
                 verbose=context.verbose_rlm,
                 debug=False,
+                telemetry_context=telemetry_context,
             )
             result = await asyncio.wait_for(
                 predictor.acall(
@@ -134,24 +149,71 @@ class SpreadsheetGepaProject(RLMGepaProject):
                 and result.output_spreadsheet.path
                 and os.path.exists(result.output_spreadsheet.path)
             ):
-                return 0.0, f"case {case_idx}: RLM returned no output workbook", trace
+                score = 0.0
+                _write_case_end(
+                    telemetry_context,
+                    context=context,
+                    task=task,
+                    case_idx=case_idx,
+                    start_time_unix_nano=case_start_ns,
+                    score=score,
+                )
+                return score, f"case {case_idx}: RLM returned no output workbook", trace
             shutil.copy2(result.output_spreadsheet.path, output_path)
         except asyncio.TimeoutError as exc:
+            _write_case_event(
+                telemetry_context,
+                "spreadbench.case.timeout",
+                context=context,
+                task=task,
+                case_idx=case_idx,
+                start_time_unix_nano=case_start_ns,
+                status={
+                    "code": "ERROR",
+                    "message": f"RLM timeout at {context.task_timeout}s",
+                },
+                attributes={
+                    "failure.class": "outer_task_timeout",
+                    "failure.evidence": "provisional",
+                },
+            )
             return (
                 0.0,
                 f"case {case_idx}: RLM timeout at {context.task_timeout}s",
                 extract_trace_from_exc(exc),
             )
         except Exception as exc:
+            _write_case_event(
+                telemetry_context,
+                "spreadbench.case.exception",
+                context=context,
+                task=task,
+                case_idx=case_idx,
+                start_time_unix_nano=case_start_ns,
+                status={
+                    "code": "ERROR",
+                    "message": f"RLM {type(exc).__name__}: {exc}",
+                },
+                attributes={"exception.type": type(exc).__name__},
+            )
             return (
                 0.0,
                 f"case {case_idx}: RLM {type(exc).__name__}: {exc}",
                 extract_trace_from_exc(exc),
             )
 
-        await asyncio.to_thread(_best_effort_recalculate, output_path)
+        await asyncio.to_thread(_best_effort_recalculate, output_path, telemetry_context)
         if answer_path is None:
-            return 0.0, f"case {case_idx}: answer file not found", trace
+            score = 0.0
+            _write_case_end(
+                telemetry_context,
+                context=context,
+                task=task,
+                case_idx=case_idx,
+                start_time_unix_nano=case_start_ns,
+                score=score,
+            )
+            return score, f"case {case_idx}: answer file not found", trace
         try:
             score, message = await asyncio.to_thread(
                 score_workbooks,
@@ -161,8 +223,26 @@ class SpreadsheetGepaProject(RLMGepaProject):
                 task.answer_position,
             )
             status = "PASS" if score == 1.0 else "FAIL"
+            _write_case_end(
+                telemetry_context,
+                context=context,
+                task=task,
+                case_idx=case_idx,
+                start_time_unix_nano=case_start_ns,
+                score=score,
+            )
             return score, f"case {case_idx}: score={score:.3f} {status}\n{message}", trace
         except Exception as exc:
+            _write_case_event(
+                telemetry_context,
+                "spreadbench.case.exception",
+                context=context,
+                task=task,
+                case_idx=case_idx,
+                start_time_unix_nano=case_start_ns,
+                status={"code": "ERROR", "message": f"comparison error: {exc}"},
+                attributes={"exception.type": type(exc).__name__},
+            )
             return 0.0, f"case {case_idx}: comparison error: {exc}", trace
 
     def _load_split(self) -> tuple[list[SpreadsheetTask], list[SpreadsheetTask]]:
@@ -203,8 +283,106 @@ def split_train_val(
     return train, val
 
 
-def _best_effort_recalculate(path: Path) -> None:
+def _best_effort_recalculate(
+    path: Path,
+    telemetry_context: TelemetryContext | None = None,
+) -> None:
     try:
-        recalculate(str(path))
+        recalculate(str(path), telemetry_context=telemetry_context)
+    except Exception as exc:
+        if telemetry_context is not None:
+            try:
+                telemetry_context.write_span(
+                    "host_tool.recalculate",
+                    event_domain="host_tool",
+                    status={
+                        "code": "ERROR",
+                        "message": f"evaluator recalc {type(exc).__name__}: {exc}",
+                    },
+                    attributes={
+                        "failure.class": "evaluator_exception",
+                        "failure.reason": "evaluator-side recalc exception",
+                    },
+                )
+            except Exception:
+                pass
+        return
+
+
+def _case_telemetry_context(
+    telemetry_context: TelemetryContext | None,
+    task: SpreadsheetTask,
+    case_idx: int,
+) -> TelemetryContext | None:
+    if telemetry_context is None:
+        return None
+    return replace(
+        telemetry_context,
+        trace_id=make_trace_id(
+            telemetry_context.run_id,
+            telemetry_context.candidate_hash,
+            telemetry_context.eval_kind,
+            telemetry_context.eval_idx,
+            task.task_id,
+            case_idx,
+        ),
+        parent_span_id=f"case_{task.task_id}_{case_idx}",
+        example_id=task.task_id,
+        case_idx=case_idx,
+    )
+
+
+def _write_case_end(
+    telemetry_context: TelemetryContext | None,
+    *,
+    context: EvaluationContext,
+    task: SpreadsheetTask,
+    case_idx: int,
+    start_time_unix_nano: int,
+    score: float,
+) -> None:
+    _write_case_event(
+        telemetry_context,
+        "spreadbench.case.end",
+        context=context,
+        task=task,
+        case_idx=case_idx,
+        start_time_unix_nano=start_time_unix_nano,
+        attributes={"spreadbench.score": float(score)},
+    )
+
+
+def _write_case_event(
+    telemetry_context: TelemetryContext | None,
+    name: str,
+    *,
+    context: EvaluationContext,
+    task: SpreadsheetTask,
+    case_idx: int,
+    start_time_unix_nano: int,
+    end_time_unix_nano: int | None = None,
+    status: str | dict[str, Any] = "OK",
+    attributes: dict[str, Any] | None = None,
+) -> None:
+    if telemetry_context is None:
+        return
+    event_attributes = {
+        "rlm.phase": context.kind,
+        "rlm.configured_timeout_sec": context.task_timeout,
+        "rlm.concurrency": context.concurrency,
+        "spreadbench.example_id": task.task_id,
+        "spreadbench.case_idx": case_idx,
+    }
+    if attributes:
+        event_attributes.update(attributes)
+    try:
+        telemetry_context.write_span(
+            name,
+            event_domain="spreadbench",
+            start_time_unix_nano=start_time_unix_nano,
+            end_time_unix_nano=end_time_unix_nano,
+            status=status,
+            attributes=event_attributes,
+        )
     except Exception:
         return
