@@ -1795,6 +1795,30 @@ def test_merge_rows_use_explicit_merge_child_for_accepted_detail(tmp_path: Path)
     assert rows[0]["_detail"] == "→ cand 4"
 
 
+def test_iteration_hard_count_transition_aligns_count_width(tmp_path: Path):
+    parent_scores = [1.0] * 13 + [0.0] * 37
+    child_scores = [1.0] * 9 + [0.0] * 41
+    state = {
+        "full_program_trace": [
+            {
+                "i": 8,
+                "selected_program_candidate": 2,
+                "subsample_scores": parent_scores,
+                "new_subsample_scores": child_scores,
+            }
+        ]
+    }
+    with (tmp_path / "gepa_state.bin").open("wb") as f:
+        pickle.dump(state, f)
+
+    rows = iteration_rows(tmp_path)
+
+    assert rows[0]["hard: par → child"] == "0.260 → 0.180 -0.080; 13 →  9"
+    rendered = render_table(rows)
+    plain_rendered = stats_report.re.sub(r"\033\[[0-9;]*m", "", rendered)
+    assert ".260 → .180 -.080; 13 →  9" in plain_rendered
+
+
 def test_iteration_rows_include_attempts_without_child_scores(tmp_path: Path):
     state = {
         "full_program_trace": [
@@ -1816,8 +1840,8 @@ def test_iteration_rows_include_attempts_without_child_scores(tmp_path: Path):
     assert [row["iter"] for row in rows] == ["1 [0]", "2 [0]"]
     assert rows[0] == {
         "iter": "1 [0]",
-        "soft: par → child": "0.500 → -",
-        "hard: par → child": "0.500 → -; 1 → -",
+        "soft: par → child": "-",
+        "hard: par → child": "-",
         "flips": "-",
         "p": "-",
         "outcome": "NO CHILD",
@@ -2000,11 +2024,17 @@ def test_reporting_tables_from_artifacts(tmp_path: Path):
     assert candidates[1]["flips vs par"] == "+1/-0 +1"
     assert candidates[1]["Δ-seed"] == "+0.500"
     assert candidates[1]["_muted_prefix"] == {
-        "soft: par → child": "0.500 → 1.000",
-        "hard: par → child": "0.500 → 1.000",
+        "soft: par → child": "0.500 → ",
+        "hard: par → child": "0.500 → ",
         "flips vs par": "+1/-0",
     }
+    assert candidates[1]["_muted_suffix"] == {
+        "soft: par → child": " +0.500",
+        "hard: par → child": " +0.500",
+    }
     assert candidates[1]["_highlight"] is True
+    candidate_terminal = render_table(candidates)
+    assert "\033[38;5;178m0.500 → \033[0m\033[1;38;5;220m1.000\033[38;5;178m +0.500" in candidate_terminal
     costs = cost_rows(tmp_path)
     assert costs[0]["scope"] == "executor"
     assert costs[0]["model"] == ""
@@ -2086,15 +2116,19 @@ def test_candidate_rows_show_flips_against_each_parent(tmp_path: Path):
     assert rows[2]["hard: par → child"] == "0.333 → 0.667 +0.333\n0.333 → 0.667 +0.333"
     assert rows[2]["flips vs par"] == "+1/-0 +1\n+1/-0 +1"
     assert rows[2]["_muted_prefix"] == {
-        "soft: par → child": "0.333 → 0.667\n0.333 → 0.667",
-        "hard: par → child": "0.333 → 0.667\n0.333 → 0.667",
+        "soft: par → child": "0.333 → \n0.333 → ",
+        "hard: par → child": "0.333 → \n0.333 → ",
         "flips vs par": "+1/-0\n+1/-0",
+    }
+    assert rows[2]["_muted_suffix"] == {
+        "soft: par → child": " +0.333\n +0.333",
+        "hard: par → child": " +0.333\n +0.333",
     }
 
     rendered = render_table(rows)
 
     assert " -> " not in rendered
-    assert "\033[38;5;178m.333 → .667\033[0m\033[1;38;5;220m +.333" in rendered
+    assert "\033[38;5;178m.333 → \033[0m\033[1;38;5;220m.667\033[38;5;178m +.333" in rendered
     assert "\033[38;5;178m+1/-0\033[0m\033[1;38;5;220m +1" in rendered
 
 
