@@ -51,7 +51,7 @@ from rlm_gepa.proposer.selection import (
 )
 from rlm_gepa.reporting import stats as stats_report
 from rlm_gepa.reporting.cost import CostRow, aggregate_costs_from_log, append_cost_rows
-from rlm_gepa.reporting.plots import load_plot_data, resolve_plot_output_paths
+from rlm_gepa.reporting.plots import load_plot_data, make_lineage, resolve_plot_output_paths
 from rlm_gepa.reporting.stats import (
     candidate_rows,
     cost_rows,
@@ -1239,6 +1239,223 @@ def test_plot_output_paths_accept_directory_or_prefix(tmp_path: Path):
 
     assert score_path == tmp_path / "summary_score_vs_rollouts.png"
     assert lineage_path == tmp_path / "summary_candidate_lineage.png"
+
+
+class _FakePlotlyFigure:
+    def __init__(self):
+        self.traces = []
+        self.annotations = []
+        self.layout = {}
+
+    def add_trace(self, trace):
+        self.traces.append(trace)
+
+    def add_annotation(self, **kwargs):
+        self.annotations.append(kwargs)
+
+    def update_layout(self, **kwargs):
+        self.layout.update(kwargs)
+
+
+def _fake_plotly_scatter(**kwargs):
+    return SimpleNamespace(**kwargs)
+
+
+_fake_plotly_go = SimpleNamespace(Figure=_FakePlotlyFigure, Scatter=_fake_plotly_scatter)
+
+
+def test_lineage_draws_all_valid_merge_parent_edges():
+    data = {
+        "n": 4,
+        "scores": [0.1, 0.2, 0.3, 0.4],
+        "parents": [[None], [0], [0], [1, 2]],
+        "best_idx": 3,
+        "pareto_map": {},
+    }
+
+    fig = make_lineage(data, _fake_plotly_go)
+    edge_trace = fig.traces[0]
+    node_trace = fig.traces[1]
+    coord_to_candidate = {
+        (x, y): int(str(text).split("<br>", maxsplit=1)[0])
+        for x, y, text in zip(node_trace.x, node_trace.y, node_trace.text, strict=True)
+    }
+    edges = {
+        (
+            coord_to_candidate[(edge_trace.x[i], edge_trace.y[i])],
+            coord_to_candidate[(edge_trace.x[i + 1], edge_trace.y[i + 1])],
+        )
+        for i in range(0, len(edge_trace.x), 3)
+    }
+
+    assert edge_trace.x.count(None) == 4
+    assert edges == {(0, 1), (0, 2), (1, 3), (2, 3)}
+    assert "Parents: 1, 2" in node_trace.hovertext[3]
+
+
+def test_lineage_reflows_merge_candidates_to_reduce_crossings():
+    data = {
+        "n": 8,
+        "scores": [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8],
+        "parents": [[None], [0], [0], [1, 2], [0], [4], [4], [1, 4]],
+        "best_idx": 7,
+        "pareto_map": {},
+    }
+
+    fig = make_lineage(data, _fake_plotly_go)
+    positions = _lineage_node_positions(fig)
+    edges = _lineage_edges(fig)
+    baseline_positions = _primary_tree_lineage_positions(data["parents"])
+    baseline_crossings = _edge_crossing_count(edges, baseline_positions)
+
+    assert baseline_crossings > 0
+    assert _edge_crossing_count(edges, positions) < baseline_crossings
+    assert _distance_from_parent_center(3, (1, 2), positions) < _distance_from_parent_center(
+        3, (1, 2), baseline_positions
+    )
+
+
+def test_best_lineage_annotation_reserves_horizontal_space_from_same_layer_nodes():
+    data = {
+        "n": 8,
+        "scores": [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8],
+        "parents": [[None], [0], [0], [1, 2], [0], [4], [4], [1, 4]],
+        "best_idx": 7,
+        "pareto_map": {},
+    }
+
+    fig = make_lineage(data, _fake_plotly_go)
+    positions = _lineage_node_positions(fig)
+    best_annotation = next(annotation for annotation in fig.annotations if "Candidate 7 (best)" in annotation["text"])
+    xmin, xmax = _annotation_horizontal_footprint(best_annotation)
+    same_layer_nodes = {
+        candidate: x
+        for candidate, (x, y) in positions.items()
+        if candidate != 7 and y == positions[7][1]
+    }
+
+    assert {
+        candidate: x
+        for candidate, x in same_layer_nodes.items()
+        if xmin < x < xmax
+    } == {}
+
+
+def _annotation_horizontal_footprint(annotation: dict[str, object]) -> tuple[float, float]:
+    x = float(annotation["x"])
+    width = 1.5
+    if annotation["xanchor"] == "right":
+        return x - width, x
+    return x, x + width
+
+
+def _lineage_node_positions(fig) -> dict[int, tuple[float, float]]:
+    node_trace = fig.traces[1]
+    return {
+        int(str(text).split("<br>", maxsplit=1)[0]): (float(x), float(y))
+        for x, y, text in zip(node_trace.x, node_trace.y, node_trace.text, strict=True)
+    }
+
+
+def _lineage_edges(fig) -> list[tuple[int, int]]:
+    edge_trace = fig.traces[0]
+    positions = _lineage_node_positions(fig)
+    candidate_by_position = {position: candidate for candidate, position in positions.items()}
+    return [
+        (
+            candidate_by_position[(float(edge_trace.x[index]), float(edge_trace.y[index]))],
+            candidate_by_position[(float(edge_trace.x[index + 1]), float(edge_trace.y[index + 1]))],
+        )
+        for index in range(0, len(edge_trace.x), 3)
+    ]
+
+
+def _primary_tree_lineage_positions(raw_parents: list[object]) -> dict[int, tuple[float, float]]:
+    primary_parents = [_first_valid_parent(raw_parent, child) for child, raw_parent in enumerate(raw_parents)]
+    children: dict[int, list[int]] = {index: [] for index in range(len(raw_parents))}
+    for child, parent in enumerate(primary_parents):
+        if parent is not None:
+            children[parent].append(child)
+
+    depth = [0] * len(raw_parents)
+
+    def compute_depth(node: int, current_depth: int) -> None:
+        depth[node] = current_depth
+        for child in children[node]:
+            compute_depth(child, current_depth + 1)
+
+    for root, parent in enumerate(primary_parents):
+        if parent is None:
+            compute_depth(root, 0)
+
+    x_pos: dict[int, float] = {}
+    next_x = 0
+
+    def layout(node: int) -> None:
+        nonlocal next_x
+        if not children[node]:
+            x_pos[node] = float(next_x)
+            next_x += 1
+            return
+        for child in children[node]:
+            layout(child)
+        x_pos[node] = sum(x_pos[child] for child in children[node]) / len(children[node])
+
+    for root, parent in enumerate(primary_parents):
+        if parent is None:
+            layout(root)
+
+    return {index: (x_pos[index], float(-depth[index])) for index in range(len(raw_parents))}
+
+
+def _first_valid_parent(raw_parent: object, child: int) -> int | None:
+    raw_values = raw_parent if isinstance(raw_parent, list | tuple) else [raw_parent]
+    for value in raw_values:
+        if isinstance(value, bool) or value is None:
+            continue
+        parent = int(value)
+        if 0 <= parent < child:
+            return parent
+    return None
+
+
+def _edge_crossing_count(
+    edges: list[tuple[int, int]], positions: dict[int, tuple[float, float]]
+) -> int:
+    return sum(
+        _segments_cross(edge, other_edge, positions)
+        for index, edge in enumerate(edges)
+        for other_edge in edges[index + 1 :]
+    )
+
+
+def _segments_cross(
+    edge: tuple[int, int],
+    other_edge: tuple[int, int],
+    positions: dict[int, tuple[float, float]],
+) -> bool:
+    if set(edge) & set(other_edge):
+        return False
+    a, b = positions[edge[0]], positions[edge[1]]
+    c, d = positions[other_edge[0]], positions[other_edge[1]]
+    ab_c = _orientation(a, b, c)
+    ab_d = _orientation(a, b, d)
+    cd_a = _orientation(c, d, a)
+    cd_b = _orientation(c, d, b)
+    return ab_c * ab_d < 0 and cd_a * cd_b < 0
+
+
+def _orientation(
+    a: tuple[float, float], b: tuple[float, float], c: tuple[float, float]
+) -> float:
+    return (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0])
+
+
+def _distance_from_parent_center(
+    candidate: int, parents: tuple[int, ...], positions: dict[int, tuple[float, float]]
+) -> float:
+    parent_center = sum(positions[parent][0] for parent in parents) / len(parents)
+    return abs(positions[candidate][0] - parent_center)
 
 
 def test_cost_aggregation_raw_and_logical(tmp_path: Path):
