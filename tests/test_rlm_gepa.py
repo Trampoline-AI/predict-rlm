@@ -51,7 +51,7 @@ from rlm_gepa.proposer.selection import (
 )
 from rlm_gepa.reporting import stats as stats_report
 from rlm_gepa.reporting.cost import CostRow, aggregate_costs_from_log, append_cost_rows
-from rlm_gepa.reporting.plots import resolve_plot_output_paths
+from rlm_gepa.reporting.plots import load_plot_data, resolve_plot_output_paths
 from rlm_gepa.reporting.stats import (
     candidate_rows,
     cost_rows,
@@ -1798,6 +1798,85 @@ def test_reporting_tables_from_artifacts(tmp_path: Path):
     assert "eff" in terminal
     assert "costs (raw spend: all logged LM calls):" not in terminal
     assert "costs (deduped spend: stable operation ids only; legacy rows counted raw):" not in terminal
+
+
+def test_live_state_best_candidate_overrides_stale_summary(tmp_path: Path):
+    state = {
+        "full_program_trace": [
+            {
+                "i": 0,
+                "selected_program_candidate": 0,
+                "subsample_scores": [0.0, 0.0],
+                "new_subsample_scores": [1.0, 1.0],
+                "new_program_idx": 2,
+            }
+        ],
+        "program_candidates": [{}, {}, {}],
+        "parent_program_for_candidate": [[None], [0], [1]],
+        "prog_candidate_val_subscores": [
+            {"a": 0.0, "b": 0.0},
+            {"a": 0.6, "b": 0.6},
+            {"a": 1.0, "b": 1.0},
+        ],
+        "program_full_scores_val_set": [0.0, 0.6, 1.0],
+        "num_metric_calls_by_discovery": [0, 10, 20],
+    }
+    with (tmp_path / "gepa_state.bin").open("wb") as f:
+        pickle.dump(state, f)
+    (tmp_path / "optimization_summary.json").write_text(
+        json.dumps(
+            {
+                "best_idx": 1,
+                "val_aggregate_scores": [0.0, 0.6, 0.5],
+            }
+        )
+    )
+
+    candidates = candidate_rows(tmp_path)
+    iterations = iteration_rows(tmp_path)
+    plot_data = load_plot_data(tmp_path)
+
+    assert [row["_highlight"] for row in candidates] == [False, False, True]
+    assert iterations[0]["_highlight"] is True
+    assert plot_data["best_idx"] == 2
+    assert plot_data["scores"] == [0.0, 0.6, 1.0]
+
+
+def test_plot_data_repairs_truncated_live_full_scores_from_subscores(tmp_path: Path):
+    state = {
+        "program_candidates": [{} for _ in range(8)],
+        "parent_program_for_candidate": [[None], [0], [1], [2], [3], [4], [5], [6]],
+        "prog_candidate_val_subscores": [
+            {"a": 0.0, "b": 0.2},
+            {"a": 0.1, "b": 0.3},
+            {"a": 0.2, "b": 0.4},
+            {"a": 0.3, "b": 0.5},
+            {"a": 0.4, "b": 0.6},
+            {"a": 0.5, "b": 0.7},
+            {"a": 0.8, "b": 0.9},
+            {"a": 0.95, "b": 1.0},
+        ],
+        "program_full_scores_val_set": [0.1, 0.2, 0.3, 0.4, 0.5, 0.6],
+        "num_metric_calls_by_discovery": [0, 10, 20, 30, 40, 50],
+    }
+    with (tmp_path / "gepa_state.bin").open("wb") as f:
+        pickle.dump(state, f)
+    (tmp_path / "optimization_summary.json").write_text(
+        json.dumps(
+            {
+                "best_idx": 5,
+                "val_aggregate_scores": [0.1, 0.2, 0.3, 0.4, 0.5, 0.6],
+            }
+        )
+    )
+
+    plot_data = load_plot_data(tmp_path)
+
+    assert plot_data["n"] == 8
+    assert plot_data["scores"][6] == pytest.approx(0.85)
+    assert plot_data["scores"][7] == pytest.approx(0.975)
+    assert plot_data["best_idx"] == 7
+    assert plot_data["eval_counts"] == [0, 10, 20, 30, 40, 50, 51, 52]
 
 
 def test_cost_rows_group_patch_merge_roles(tmp_path: Path):

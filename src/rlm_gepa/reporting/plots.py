@@ -60,17 +60,83 @@ def load_plot_data(run_dir: Path) -> dict[str, Any]:
     summary = json.loads(summary_path.read_text()) if summary_path.exists() else {}
     if not isinstance(state, dict):
         state = dict(getattr(state, "__dict__", {}))
-    scores = list(summary.get("val_aggregate_scores") or state.get("program_full_scores_val_set") or [])
+
+    live_full_scores = list(state.get("program_full_scores_val_set") or [])
+    live_subscores = list(state.get("prog_candidate_val_subscores") or [])
     parents = list(state.get("parent_program_for_candidate") or [])
-    eval_counts = list(state.get("num_metric_calls_by_discovery") or range(len(scores)))
+    live_n = max(
+        len(list(state.get("program_candidates") or [])),
+        len(live_subscores),
+        len(live_full_scores),
+        len(parents),
+    )
+    if _has_live_score_data(live_full_scores, live_subscores):
+        scores = [_candidate_score(index, live_full_scores, live_subscores) for index in range(live_n)]
+        best_idx = max(range(len(scores)), key=scores.__getitem__) if scores else 0
+    else:
+        scores = [float(score) for score in summary.get("val_aggregate_scores") or []]
+        best_idx = summary.get("best_idx", max(range(len(scores)), key=scores.__getitem__) if scores else 0)
+
+    parents = list(state.get("parent_program_for_candidate") or [])
+    eval_counts = _eval_counts(state.get("num_metric_calls_by_discovery"), len(scores))
     return {
         "n": len(scores),
         "scores": scores,
         "parents": parents,
         "eval_counts": eval_counts,
-        "best_idx": summary.get("best_idx", max(range(len(scores)), key=scores.__getitem__) if scores else 0),
+        "best_idx": best_idx,
         "pareto_map": state.get("program_at_pareto_front_valset") or {},
     }
+
+
+def _has_live_score_data(full_scores: list[Any], subscores: list[Any]) -> bool:
+    return any(_is_number(score) for score in full_scores) or any(_score_values(score) for score in subscores)
+
+
+def _candidate_score(index: int, full_scores: list[Any], subscores: list[Any]) -> float:
+    if index < len(full_scores) and _is_number(full_scores[index]):
+        return float(full_scores[index])
+    if index < len(subscores):
+        values = _score_values(subscores[index])
+        if values:
+            return sum(values) / len(values)
+    return 0.0
+
+
+def _score_values(scores: Any) -> list[float]:
+    if isinstance(scores, dict):
+        raw_values = scores.values()
+    elif isinstance(scores, list | tuple):
+        raw_values = scores
+    else:
+        raw_values = [scores]
+    return [float(value) for value in raw_values if _is_number(value)]
+
+
+def _is_number(value: Any) -> bool:
+    if isinstance(value, bool):
+        return False
+    try:
+        float(value)
+    except (TypeError, ValueError):
+        return False
+    return True
+
+
+def _eval_counts(raw_counts: Any, n: int) -> list[Any]:
+    counts = list(raw_counts or [])
+    if len(counts) >= n:
+        return counts[:n]
+    if not counts:
+        return list(range(n))
+    last_count = counts[-1]
+    original_len = len(counts)
+    for index in range(original_len, n):
+        try:
+            counts.append(last_count + (index - original_len + 1))
+        except TypeError:
+            counts.append(index)
+    return counts
 
 
 def make_score_vs_rollouts(data: dict[str, Any], go: Any) -> Any:

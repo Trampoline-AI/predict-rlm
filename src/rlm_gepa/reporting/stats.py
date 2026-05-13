@@ -1493,12 +1493,12 @@ def _candidate_rows_from_artifact(run_dir: str | Path) -> list[dict[str, Any]]:
 
 
 def _best_candidate_idx(run_dir: str | Path, subscores: list[Any]) -> int | None:
+    if subscores:
+        return max(range(len(subscores)), key=lambda index: _mean_scores(subscores[index]))
     summary = load_summary(run_dir)
     if isinstance(summary.get("best_idx"), int):
         return summary["best_idx"]
-    if not subscores:
-        return None
-    return max(range(len(subscores)), key=lambda index: _mean_scores(subscores[index]))
+    return None
 
 
 def _best_candidate_idx_from_artifacts(
