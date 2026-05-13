@@ -460,10 +460,12 @@ def _build_instruction(
     instruction_type: str,
 ) -> str:
     if instruction_type == "Sheet-Level Manipulation":
+        # Match the Tetra/SpreadsheetBench strict-prompt convention: prevent
+        # VBA/prose-in-cell contamination and force direct workbook edits.
         pos_note = (
             "This is a workbook editing task, not a question-answering task. "
-            "Do not answer with explanatory prose, VBA text, or source code in cells; "
-            "implement the requested final workbook state with Python/openpyxl. "
+            "Do not answer with explanatory prose, VBA macros, or source code in cells; "
+            "modify the workbook directly with Python/openpyxl to produce the requested final state. "
             f"Answer position: {answer_range} on sheet '{answer_sheet}'. "
             "This is the maximum range whose values or formatting/style changes may be scored. "
             "For formatting/color tasks, preserve existing cell values unless the instruction "
