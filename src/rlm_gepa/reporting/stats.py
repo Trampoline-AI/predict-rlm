@@ -15,6 +15,7 @@ from .cost import LMCost, aggregate_costs_from_log
 HARD_THRESHOLD = 0.999
 ANSI_ITALIC = "\033[3m"
 ANSI_MUTED = "\033[38;5;248m"
+ANSI_MUTED_GOLD = "\033[38;5;178m"
 ANSI_BOLD_GOLD = "\033[1;38;5;220m"
 ANSI_RESET = "\033[0m"
 CELL_MATCH_RE = re.compile(r"(\d+)\s*/\s*(\d+)\s+cells?\s+match")
@@ -29,8 +30,31 @@ TERMINAL_HEADER_ALIASES = {
     "repeat_cost": "repeat",
     "effective_cost": "eff",
     "cost_usd": "cost",
+    "soft: best(par) -> merge": "soft\nbest(par) -> merge",
+    "hard: best(par) -> merge": "hard\nbest(par) -> merge",
 }
-TERMINAL_WRAP_COLUMNS = {"scope", "model"}
+MERGE_TERMINAL_HEADER_ALIASES = {
+    "pair@anc": "pair\n@anc",
+    "soft: best(par) -> merge": "soft\nbest(par) -> merge",
+    "hard: best(par) -> merge": "hard\nbest(par) -> merge",
+}
+MERGE_METRIC_COLUMNS = (
+    "soft: best(par) -> merge",
+    "hard: best(par) -> merge",
+    "flips",
+)
+TERMINAL_WRAP_COLUMNS = {
+    "scope",
+    "model",
+    "iter",
+    "pair@anc",
+    "outcome",
+    "soft: par → child",
+    "hard: par → child",
+    "soft: best(par) -> merge",
+    "hard: best(par) -> merge",
+    "flips",
+}
 COST_GROUPS = [
     ("executor", [("main", {"executor", "main"}), ("sub", {"sub_lm", "sub"})]),
     (
@@ -112,7 +136,8 @@ def iteration_rows(run_dir: str | Path) -> list[dict[str, Any]]:
         parent_scores, new_scores, parent_label = row_scores
         gains, losses = _hard_flips(parent_scores, new_scores)
         soft_change, soft_secondary = _format_soft_change(parent_scores, new_scores)
-        hard_change, hard_secondary = _format_hard_change(parent_scores, new_scores)
+        hard_change, hard_secondary = _format_hard_change(parent_scores, new_scores, include_total=False)
+        hard_denominator = min(len(parent_scores), len(new_scores)) or None
         flips, flips_secondary = _format_flips(gains, losses)
         iteration = entry.get("i", len(rows))
         rows.append(
@@ -129,8 +154,10 @@ def iteration_rows(run_dir: str | Path) -> list[dict[str, Any]]:
                     "hard: par → child": hard_change.removesuffix(hard_secondary),
                     "flips": flips.removesuffix(flips_secondary),
                 },
+                "_iteration_hard_denominator": hard_denominator,
             }
         )
+    _apply_iteration_terminal_header_suffixes(rows)
     return rows
 
 
@@ -184,19 +211,77 @@ def merge_rows(run_dir: str | Path) -> list[dict[str, Any]]:
         if not _is_merge_entry(entry):
             continue
         status = str(entry.get("rlm_merge_status") or ("accepted" if entry.get("merged") else "scored"))
+        score_vectors = _merge_score_vectors(entry)
+        if score_vectors is None:
+            soft_change = hard_change = flips = p_value = "-"
+            muted_prefix = {}
+            hard_denominator = None
+        else:
+            parent_scores, new_scores = score_vectors
+            gains, losses = _hard_flips(parent_scores, new_scores)
+            soft_change, soft_secondary = _format_soft_change(parent_scores, new_scores)
+            hard_change, hard_secondary = _format_hard_change(parent_scores, new_scores, include_total=False)
+            flips, flips_secondary = _format_flips(gains, losses)
+            p_value = f"{_mcnemar_exact_p(gains, losses):.2f}"
+            hard_denominator = min(len(parent_scores), len(new_scores))
+            muted_prefix = {
+                "soft: best(par) -> merge": soft_change.removesuffix(soft_secondary),
+                "hard: best(par) -> merge": hard_change.removesuffix(hard_secondary),
+                "flips": flips.removesuffix(flips_secondary),
+            }
         rows.append(
             {
                 "iter": str(entry.get("i", len(rows))),
                 "pair@anc": _format_merge_pair(entry),
-                "status": status,
-                "pre": _format_merge_preflight(entry),
-                "n": _format_merge_subsample(entry),
-                "score Δ": _format_merge_score(entry),
-                "val Δ": _format_merge_val_score(state, entry),
+                "soft: best(par) -> merge": soft_change,
+                "hard: best(par) -> merge": hard_change,
+                "flips": flips,
+                "p": p_value,
+                "outcome": _format_merge_outcome(status),
                 "_detail": _format_merge_detail(state, entry, status),
+                "_muted_prefix": muted_prefix,
+                "_merge_hard_denominator": hard_denominator,
             }
         )
+    _apply_merge_terminal_header_aliases(rows)
     return rows
+
+
+def _apply_merge_terminal_header_aliases(rows: list[dict[str, Any]]) -> None:
+    aliases = dict(MERGE_TERMINAL_HEADER_ALIASES)
+    denominator = _common_hard_denominator(rows, "_merge_hard_denominator")
+    for row in rows:
+        row["_terminal_header_aliases"] = {
+            **row.get("_terminal_header_aliases", {}),
+            **aliases,
+        }
+        if denominator is not None:
+            row["_terminal_header_suffixes"] = {
+                **row.get("_terminal_header_suffixes", {}),
+                "hard: best(par) -> merge": f"/{denominator}",
+            }
+
+
+def _apply_iteration_terminal_header_suffixes(rows: list[dict[str, Any]]) -> None:
+    denominator = _common_hard_denominator(rows, "_iteration_hard_denominator")
+    if denominator is None:
+        return
+    for row in rows:
+        row["_terminal_header_suffixes"] = {
+            **row.get("_terminal_header_suffixes", {}),
+            "hard: par → child": f"/{denominator}",
+        }
+
+
+def _common_hard_denominator(rows: list[dict[str, Any]], key: str) -> int | None:
+    denominators = [row.get(key) for row in rows if row.get(key) is not None]
+    if not denominators:
+        return None
+    unique_denominators = set(denominators)
+    if len(unique_denominators) != 1:
+        return None
+    denominator = unique_denominators.pop()
+    return int(denominator) if denominator else None
 
 
 def merge_detail_lines(run_dir: str | Path, *, width: int = 80) -> list[str]:
@@ -439,69 +524,27 @@ def _format_merge_pair(entry: dict[str, Any]) -> str:
     return f"{pair[0]}+{pair[1]}@{ancestor_text}"
 
 
+def _format_merge_outcome(status: str) -> str:
+    normalized = status.lower().replace("-", "_").replace(" ", "_")
+    if normalized == "accepted":
+        return "accepted"
+    if normalized in {"pair_skipped", "attempt_cap_exhausted", "no_merge_candidate"}:
+        return "skipped"
+    if normalized in {"preflight_failed", "subsample_rejected"}:
+        return "rejected"
+    return status
+
+
 def _coerce_sequence(value: Any) -> list[Any] | None:
     if isinstance(value, list | tuple):
         return list(value)
     return None
 
 
-def _format_merge_preflight(entry: dict[str, Any]) -> str:
-    a_wins = entry.get("rlm_merge_preflight_a_wins")
-    b_wins = entry.get("rlm_merge_preflight_b_wins")
-    if a_wins is None or b_wins is None:
-        return "-"
-    return f"{a_wins}/{b_wins}"
-
-
-def _format_merge_subsample(entry: dict[str, Any]) -> str:
-    ids = entry.get("rlm_merge_subsample_ids")
-    if isinstance(ids, list | tuple):
-        return str(len(ids))
-    scores = entry.get("new_program_subsample_scores")
-    if isinstance(scores, list | tuple | dict):
-        return str(len(scores))
-    return "-"
-
-
-def _format_merge_score(entry: dict[str, Any]) -> str:
-    new_sum = entry.get("rlm_merge_new_sum")
-    parent_sums = entry.get("rlm_merge_parent_sums")
-    if new_sum is None and "new_program_subsample_scores" in entry:
-        new_sum = sum(_score_values(entry.get("new_program_subsample_scores") or []))
-    if parent_sums is None and "id1_subsample_scores" in entry and "id2_subsample_scores" in entry:
-        parent_sums = [
-            sum(_score_values(entry.get("id1_subsample_scores") or [])),
-            sum(_score_values(entry.get("id2_subsample_scores") or [])),
-        ]
-    if new_sum is None or not isinstance(parent_sums, list | tuple) or not parent_sums:
-        return "-"
-    new_value = float(new_sum)
-    best_parent = max(float(value) for value in parent_sums)
-    delta = new_value - best_parent
-    return f"{new_value:.3f} {_format_delta(delta)}"
-
-
-def _format_merge_val_score(state: dict[str, Any], entry: dict[str, Any]) -> str:
-    child_idx = entry.get("new_program_idx")
-    parent_ids = _merge_parent_ids(entry)
-    subscores = state.get("prog_candidate_val_subscores") or []
-    if child_idx is None or not parent_ids or not _has_candidate_scores(subscores, child_idx):
-        return "-"
-    child_mean = _mean_scores(subscores[int(child_idx)])
-    parent_means = [
-        (parent_id, _mean_scores(subscores[parent_id]))
-        for parent_id in parent_ids
-        if _has_candidate_scores(subscores, parent_id)
-    ]
-    if not parent_means:
-        return "-"
-    best_parent_id, best_parent_mean = max(parent_means, key=lambda item: item[1])
-    return f"{child_mean:.3f} {_format_delta(child_mean - best_parent_mean)} vs {best_parent_id}"
-
-
 def _format_merge_detail(state: dict[str, Any], entry: dict[str, Any], status: str) -> str:
-    if status == "accepted" and "new_program_idx" in entry:
-        details = [f"→ cand {entry['new_program_idx']}"]
+    child_idx = _merge_child_idx(entry)
+    if status == "accepted" and child_idx is not None:
+        details = [f"→ cand {child_idx}"]
         val_detail = _format_merge_val_detail(state, entry)
         if val_detail != "-":
             details.append(val_detail)
@@ -514,7 +557,7 @@ def _format_merge_detail(state: dict[str, Any], entry: dict[str, Any], status: s
 
 
 def _format_merge_val_detail(state: dict[str, Any], entry: dict[str, Any]) -> str:
-    child_idx = entry.get("new_program_idx")
+    child_idx = _merge_child_idx(entry)
     parent_ids = _merge_parent_ids(entry)
     subscores = state.get("prog_candidate_val_subscores") or []
     if child_idx is None or not parent_ids or not _has_candidate_scores(subscores, child_idx):
@@ -539,6 +582,14 @@ def _format_merge_val_detail(state: dict[str, Any], entry: dict[str, Any]) -> st
     if not parts:
         return "-"
     return "full val " + "; ".join(parts)
+
+
+def _merge_child_idx(entry: dict[str, Any]) -> Any:
+    if "rlm_merge_new_program_idx" in entry:
+        return entry.get("rlm_merge_new_program_idx")
+    if entry.get("rlm_merge_status") == "accepted":
+        return entry.get("new_program_idx")
+    return None
 
 
 def _merge_parent_ids(entry: dict[str, Any]) -> list[int]:
@@ -822,18 +873,22 @@ def _render_markdown_table(rows: list[dict[str, Any]]) -> str:
 def _render_terminal_table(rows: list[dict[str, Any]]) -> str:
     headers = [header for header in rows[0] if not str(header).startswith("_")]
     rendered_rows = [_render_terminal_row(row, headers) for row in rows]
-    header_labels = {header: TERMINAL_HEADER_ALIASES.get(header, str(header)) for header in headers}
+    header_labels = _terminal_header_labels(rows, headers)
+    header_suffixes = _terminal_header_suffixes(rows, headers)
     terminal_width = shutil.get_terminal_size(fallback=(120, 24)).columns
     widths = _terminal_widths(headers, rendered_rows, header_labels)
     if _terminal_table_width(headers, widths) > terminal_width:
         rendered_rows = _compact_terminal_count_columns(headers, rendered_rows)
         widths = _terminal_widths(headers, rendered_rows, header_labels)
-    rendered_rows, widths = _wrap_terminal_rows_to_width(
+    header_labels, rendered_rows, widths = _wrap_terminal_rows_to_width(
         headers,
+        header_labels,
         rendered_rows,
         widths,
         terminal_width=terminal_width,
+        source_rows=rows,
     )
+    header_labels, widths = _apply_terminal_header_suffixes(header_labels, header_suffixes, headers, widths)
     body = [
         line
         for source_row, row in zip(rows, rendered_rows, strict=True)
@@ -852,7 +907,7 @@ def _render_terminal_table(rows: list[dict[str, Any]]) -> str:
     return "\n".join(
         [
             _terminal_rule("┌", "┬", "┐", headers, widths),
-            _terminal_row(header_labels, headers, widths, align="left"),
+            *_terminal_row_lines(header_labels, headers, widths, align="left"),
             _terminal_rule("├", "┼", "┤", headers, widths),
             *body,
             _terminal_rule("└", "┴", "┘", headers, widths),
@@ -860,29 +915,127 @@ def _render_terminal_table(rows: list[dict[str, Any]]) -> str:
     )
 
 
+def _terminal_header_labels(rows: list[dict[str, Any]], headers: list[str]) -> dict[str, str]:
+    header_labels = {header: TERMINAL_HEADER_ALIASES.get(header, str(header)) for header in headers}
+    for row in rows:
+        aliases = row.get("_terminal_header_aliases")
+        if isinstance(aliases, dict):
+            header_labels.update({header: str(label) for header, label in aliases.items() if header in headers})
+    return header_labels
+
+
+def _terminal_header_suffixes(rows: list[dict[str, Any]], headers: list[str]) -> dict[str, str]:
+    header_suffixes: dict[str, str] = {}
+    for row in rows:
+        suffixes = row.get("_terminal_header_suffixes")
+        if isinstance(suffixes, dict):
+            header_suffixes.update(
+                {
+                    header: str(suffix).strip()
+                    for header, suffix in suffixes.items()
+                    if header in headers and str(suffix).strip()
+                }
+            )
+    return header_suffixes
+
+
+def _apply_terminal_header_suffixes(
+    header_labels: dict[str, str],
+    header_suffixes: dict[str, str],
+    headers: list[str],
+    widths: dict[str, int],
+) -> tuple[dict[str, str], dict[str, int]]:
+    if not header_suffixes:
+        return header_labels, widths
+
+    labels = dict(header_labels)
+    adjusted_widths = dict(widths)
+    for header in headers:
+        suffix = header_suffixes.get(header)
+        if not suffix:
+            continue
+        label_lines = labels[header].splitlines() or [""]
+        bottom_line = label_lines[-1]
+        min_width = len(suffix) if not bottom_line else len(bottom_line) + len(suffix) + 1
+        width = max(adjusted_widths[header], min_width)
+        if bottom_line:
+            label_lines[-1] = bottom_line + " " * (width - len(bottom_line) - len(suffix)) + suffix
+        else:
+            label_lines[-1] = suffix.rjust(width)
+        labels[header] = "\n".join(label_lines)
+        adjusted_widths[header] = max(width, _max_line_len(labels[header]))
+    return labels, adjusted_widths
+
+
 def _wrap_terminal_rows_to_width(
     headers: list[str],
+    header_labels: dict[str, str],
     rendered_rows: list[dict[str, str]],
     widths: dict[str, int],
     *,
     terminal_width: int,
-) -> tuple[list[dict[str, str]], dict[str, int]]:
+    source_rows: list[dict[str, Any]] | None = None,
+) -> tuple[dict[str, str], list[dict[str, str]], dict[str, int]]:
     if _terminal_table_width(headers, widths) <= terminal_width:
-        return rendered_rows, widths
+        return header_labels, rendered_rows, widths
+
+    if _is_merge_terminal_table(headers):
+        return _wrap_merge_terminal_headers(headers, header_labels, rendered_rows)
+
+    header_labels, rendered_rows, widths = _collapse_pair_ancestor_column(
+        headers,
+        header_labels,
+        rendered_rows,
+        widths,
+    )
+    if _terminal_table_width(headers, widths) <= terminal_width:
+        return header_labels, rendered_rows, widths
+
+    rendered_rows, widths, metrics_collapsed = _collapse_merge_metric_columns(
+        headers,
+        header_labels,
+        rendered_rows,
+        widths,
+        source_rows or [],
+    )
+    if _terminal_table_width(headers, widths) <= terminal_width:
+        return header_labels, rendered_rows, widths
 
     wrap_headers = [header for header in headers if header in TERMINAL_WRAP_COLUMNS]
     if not wrap_headers:
-        return rendered_rows, widths
+        return header_labels, rendered_rows, widths
 
     fixed_width = sum(width for header, width in widths.items() if header not in wrap_headers)
     available = terminal_width - fixed_width - (3 * len(headers) + 1)
-    min_wrap_width = sum(len(header) for header in wrap_headers)
+    min_widths = _terminal_min_wrap_widths(
+        wrap_headers,
+        header_labels,
+        rendered_rows,
+        metrics_collapsed,
+        available,
+    )
+    min_wrap_width = sum(min_widths.values())
     available = max(available, min_wrap_width)
-    per_column = max(1, available // len(wrap_headers))
 
     wrapped_widths = dict(widths)
+    remaining = available - min_wrap_width
     for header in wrap_headers:
-        wrapped_widths[header] = min(widths[header], max(len(header), per_column))
+        wrapped_widths[header] = min(widths[header], min_widths[header])
+    while remaining > 0 and any(wrapped_widths[header] < widths[header] for header in wrap_headers):
+        for header in wrap_headers:
+            if remaining <= 0:
+                break
+            if wrapped_widths[header] < widths[header]:
+                wrapped_widths[header] += 1
+                remaining -= 1
+
+    wrapped_header_labels = dict(header_labels)
+    for header in wrap_headers:
+        wrapped_header_labels[header] = _wrap_terminal_cell(
+            header_labels[header],
+            wrapped_widths[header],
+            header,
+        )
 
     wrapped_rows: list[dict[str, str]] = []
     for row in rendered_rows:
@@ -890,7 +1043,116 @@ def _wrap_terminal_rows_to_width(
         for header in wrap_headers:
             wrapped_row[header] = _wrap_terminal_cell(row[header], wrapped_widths[header], header)
         wrapped_rows.append(wrapped_row)
-    return wrapped_rows, wrapped_widths
+    return wrapped_header_labels, wrapped_rows, wrapped_widths
+
+
+def _is_merge_terminal_table(headers: list[str]) -> bool:
+    return "pair@anc" in headers and all(header in headers for header in MERGE_METRIC_COLUMNS)
+
+
+def _wrap_merge_terminal_headers(
+    headers: list[str],
+    header_labels: dict[str, str],
+    rendered_rows: list[dict[str, str]],
+) -> tuple[dict[str, str], list[dict[str, str]], dict[str, int]]:
+    wrapped_header_labels = dict(header_labels)
+    if "pair@anc" in headers:
+        wrapped_header_labels["pair@anc"] = "pair\n@anc"
+    return wrapped_header_labels, rendered_rows, _terminal_widths(headers, rendered_rows, wrapped_header_labels)
+
+
+def _collapse_pair_ancestor_column(
+    headers: list[str],
+    header_labels: dict[str, str],
+    rendered_rows: list[dict[str, str]],
+    widths: dict[str, int],
+) -> tuple[dict[str, str], list[dict[str, str]], dict[str, int]]:
+    if "pair@anc" not in headers:
+        return header_labels, rendered_rows, widths
+    header_labels = dict(header_labels)
+    header_labels["pair@anc"] = "pair\n@anc"
+    rendered_rows = [
+        {**row, "pair@anc": _collapse_pair_ancestor_cell(row["pair@anc"])} for row in rendered_rows
+    ]
+    return header_labels, rendered_rows, _terminal_widths(headers, rendered_rows, header_labels)
+
+
+def _collapse_pair_ancestor_cell(value: str) -> str:
+    text = str(value)
+    if "@" not in text or text == "@":
+        return text
+    pair, ancestor = text.rsplit("@", 1)
+    if not pair or not ancestor:
+        return text
+    return f"{pair}\n@\n{ancestor}"
+
+
+def _collapse_merge_metric_columns(
+    headers: list[str],
+    header_labels: dict[str, str],
+    rendered_rows: list[dict[str, str]],
+    widths: dict[str, int],
+    source_rows: list[dict[str, Any]],
+) -> tuple[list[dict[str, str]], dict[str, int], bool]:
+    metric_headers = [header for header in MERGE_METRIC_COLUMNS if header in headers]
+    if not metric_headers or not source_rows:
+        return rendered_rows, widths, False
+
+    wrapped_rows: list[dict[str, str]] = []
+    changed = False
+    for row, source_row in zip(rendered_rows, source_rows, strict=False):
+        muted_prefix = source_row.get("_muted_prefix", {})
+        wrapped_row = dict(row)
+        for header in metric_headers:
+            prefix = muted_prefix.get(header) if isinstance(muted_prefix, dict) else None
+            if not prefix:
+                continue
+            collapsed = _collapse_at_muted_prefix_boundary(wrapped_row[header], str(prefix))
+            if collapsed != wrapped_row[header]:
+                changed = True
+                wrapped_row[header] = collapsed
+        wrapped_rows.append(wrapped_row)
+    if not changed:
+        return rendered_rows, widths, False
+    return wrapped_rows, _terminal_widths(headers, wrapped_rows, header_labels), True
+
+
+def _collapse_at_muted_prefix_boundary(value: str, prefix: str) -> str:
+    text = str(value)
+    if not text.startswith(prefix) or len(text) <= len(prefix):
+        return text
+    secondary = text[len(prefix) :].strip()
+    if not secondary:
+        return text
+    return f"{prefix}\n{secondary}"
+
+
+def _terminal_min_wrap_widths(
+    wrap_headers: list[str],
+    header_labels: dict[str, str],
+    rendered_rows: list[dict[str, str]],
+    metrics_collapsed: bool,
+    available: int,
+) -> dict[str, int]:
+    min_widths = {header: _min_terminal_wrap_width(header_labels[header]) for header in wrap_headers}
+    if not metrics_collapsed:
+        return min_widths
+
+    protected_widths = dict(min_widths)
+    for header in MERGE_METRIC_COLUMNS:
+        if header in protected_widths:
+            protected_widths[header] = max(
+                protected_widths[header],
+                _max_line_len(header_labels[header]),
+                *(_max_line_len(row[header]) for row in rendered_rows),
+            )
+    if sum(protected_widths.values()) <= available:
+        return protected_widths
+    return min_widths
+
+
+def _min_terminal_wrap_width(label: str) -> int:
+    return max((min(len(part), 10) for line in str(label).splitlines() for part in line.split()), default=1)
 
 
 def _terminal_widths(
@@ -950,6 +1212,8 @@ def _wrap_terminal_cell(value: str, width: int, header: str) -> str:
     text = str(value)
     if not text.strip() or len(text) <= width:
         return text
+    if "\n" in text:
+        return "\n".join(_wrap_terminal_cell(line, width, header) for line in text.splitlines())
     if header == "scope":
         bullet_match = re.match(r"^(\s*-\s+)(.*)$", text)
         if bullet_match and len(bullet_match.group(1)) < width:
@@ -1085,8 +1349,9 @@ def _terminal_row_line(
         else:
             value = value.rjust(widths[header])
         raw_line = cell_lines[header][line_index] if line_index < len(cell_lines[header]) else ""
-        value = _mute_terminal_prefix(value, raw_line, (muted_prefix or {}).get(header, ""))
-        value = _mute_terminal_suffix(value, raw_line, (muted_suffix or {}).get(header, ""))
+        muted_style = ANSI_MUTED_GOLD if highlight else ANSI_MUTED
+        value = _mute_terminal_prefix(value, raw_line, (muted_prefix or {}).get(header, ""), muted_style)
+        value = _mute_terminal_suffix(value, raw_line, (muted_suffix or {}).get(header, ""), muted_style)
         if highlight and value.strip():
             value = f"{ANSI_BOLD_GOLD}{_restore_terminal_style(value, ANSI_BOLD_GOLD)}{ANSI_RESET}"
         elif category and header == headers[0] and value.strip():
@@ -1099,24 +1364,24 @@ def _restore_terminal_style(value: str, style: str) -> str:
     return value.replace(ANSI_RESET, f"{ANSI_RESET}{style}")
 
 
-def _mute_terminal_prefix(value: str, raw_value: str, prefix: str) -> str:
+def _mute_terminal_prefix(value: str, raw_value: str, prefix: str, style: str = ANSI_MUTED) -> str:
     if not prefix or not raw_value.startswith(prefix):
         return value
     start = value.find(prefix)
     if start < 0:
         return value
     end = start + len(prefix)
-    return f"{value[:start]}{ANSI_MUTED}{value[start:end]}{ANSI_RESET}{value[end:]}"
+    return f"{value[:start]}{style}{value[start:end]}{ANSI_RESET}{value[end:]}"
 
 
-def _mute_terminal_suffix(value: str, raw_value: str, suffix: str) -> str:
+def _mute_terminal_suffix(value: str, raw_value: str, suffix: str, style: str = ANSI_MUTED) -> str:
     if not suffix or not raw_value.endswith(suffix):
         return value
     start = value.rfind(suffix)
     if start < 0:
         return value
     end = start + len(suffix)
-    return f"{value[:start]}{ANSI_MUTED}{value[start:end]}{ANSI_RESET}{value[end:]}"
+    return f"{value[:start]}{style}{value[start:end]}{ANSI_RESET}{value[end:]}"
 
 
 def render_stats(run_dir: str | Path, table: str = "all", output_format: str = "terminal") -> str:
@@ -1244,13 +1509,26 @@ def _iteration_scores(entry: dict[str, Any]) -> tuple[list[float], list[float], 
             _score_values(entry.get("new_subsample_scores") or []),
             entry.get("selected_program_candidate", ""),
         )
-    if "id1_subsample_scores" in entry and "new_program_subsample_scores" in entry:
-        id1_scores = _score_values(entry.get("id1_subsample_scores") or [])
-        id2_scores = _score_values(entry.get("id2_subsample_scores") or [])
-        parent_scores = id1_scores if sum(id1_scores) >= sum(id2_scores) else id2_scores
+    merge_vectors = _merge_score_vectors(entry)
+    if merge_vectors is not None:
+        parent_scores, new_scores = merge_vectors
         pair = entry.get("rlm_merge_candidate_pair") or entry.get("merged_entities") or "merge"
-        return parent_scores, _score_values(entry.get("new_program_subsample_scores") or []), pair
+        return parent_scores, new_scores, pair
     return None
+
+
+def _merge_score_vectors(entry: dict[str, Any]) -> tuple[list[float], list[float]] | None:
+    if "id1_subsample_scores" not in entry or "new_program_subsample_scores" not in entry:
+        return None
+    id1_scores = _score_values(entry.get("id1_subsample_scores") or [])
+    id2_scores = _score_values(entry.get("id2_subsample_scores") or [])
+    new_scores = _score_values(entry.get("new_program_subsample_scores") or [])
+    if not id1_scores or not new_scores:
+        return None
+    parent_scores = id1_scores if sum(id1_scores) >= sum(id2_scores) else id2_scores
+    if not parent_scores:
+        return None
+    return parent_scores, new_scores
 
 
 def _mean_scores(scores: Any) -> float:
@@ -1271,14 +1549,20 @@ def _hard_count(values: list[float]) -> int:
     return sum(1 for value in values if value >= HARD_THRESHOLD)
 
 
-def _format_hard_change(parent_scores: list[float], new_scores: list[float]) -> tuple[str, str]:
+def _format_hard_change(
+    parent_scores: list[float],
+    new_scores: list[float],
+    *,
+    include_total: bool = True,
+) -> tuple[str, str]:
     n = min(len(parent_scores), len(new_scores))
     parent_hard = _hard_count(parent_scores)
     new_hard = _hard_count(new_scores)
     parent_rate = parent_hard / n if n else 0.0
     new_rate = new_hard / n if n else 0.0
     delta = _format_delta(new_rate - parent_rate)
-    secondary = f"{delta}; {parent_hard} → {new_hard} /{n}"
+    total = f" /{n}" if include_total else ""
+    secondary = f"{delta}; {parent_hard} → {new_hard}{total}"
     return f"{parent_rate:.3f} → {new_rate:.3f} {secondary}", f" {secondary}"
 
 
@@ -1321,7 +1605,7 @@ def _mcnemar_exact_p(gains: int, losses: int) -> float:
     if total == 0:
         return 1.0
     smaller = min(gains, losses)
-    cdf = sum(math.comb(total, i) for i in range(smaller + 1)) * (0.5 ** total)
+    cdf = sum(math.comb(total, i) for i in range(smaller + 1)) * (0.5**total)
     return min(1.0, 2 * cdf)
 
 

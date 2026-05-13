@@ -27,6 +27,7 @@ from rlm_gepa import (
 )
 from rlm_gepa.cli import apply_optimize_args, run_project_cli
 from rlm_gepa.proposer.merge import VALID_STATUSES, RlmMergeProposer
+from rlm_gepa.proposer.rlm import SelectedCapability
 from rlm_gepa.proposer.selection import (
     PatchMergePair,
     pick_patch_merge_pair,
@@ -44,9 +45,14 @@ from rlm_gepa.reporting.stats import (
     render_stats,
     render_table,
 )
+from rlm_gepa.runtime.acceptance import should_accept_reflective_candidate
 from rlm_gepa.runtime.adapter import RLMGepaAdapter
 from rlm_gepa.schema import RLMGepaExampleResult, validate_project
-from rlm_gepa.service import _coerce_reflection_lm_text, prepare_run_dir
+from rlm_gepa.service import (
+    _coerce_reflection_lm_text,
+    _ProgressCandidateSelector,
+    prepare_run_dir,
+)
 
 
 class _DummyLM:
@@ -105,6 +111,58 @@ class _Project(RLMGepaProject):
         raise NotImplementedError
 
 
+def test_reflective_candidate_accepts_bounded_dense_loss_with_hard_flip_signal():
+    decision = should_accept_reflective_candidate(
+        before_scores=[0.99, 0.99, 0.99, 0.50],
+        after_scores=[1.00, 1.00, 1.00, 0.45],
+    )
+
+    assert decision.accepted
+    assert decision.reason == "hard_flip_signal"
+    assert decision.dense_delta < 0.0
+    assert decision.hard_wins == 3
+    assert decision.hard_losses == 0
+    assert decision.hard_flip_p_value <= 0.40
+
+
+def test_reflective_candidate_rejects_bounded_dense_loss_without_significant_hard_flips():
+    decision = should_accept_reflective_candidate(
+        before_scores=[0.99, 0.80],
+        after_scores=[1.00, 0.77],
+    )
+
+    assert not decision.accepted
+    assert decision.reason == "not_improved"
+    assert decision.hard_wins == 1
+    assert decision.hard_losses == 0
+    assert decision.hard_flip_p_value > 0.40
+
+
+def test_reflective_candidate_reports_two_sided_hard_flip_p_value_for_ties():
+    decision = should_accept_reflective_candidate(
+        before_scores=[0.99, 0.99, 0.99, 0.99, 1.00, 1.00, 1.00, 1.00],
+        after_scores=[1.00, 1.00, 1.00, 1.00, 0.99, 0.99, 0.99, 0.99],
+    )
+
+    assert decision.hard_wins == 4
+    assert decision.hard_losses == 4
+    assert decision.hard_flip_p_value == pytest.approx(1.0)
+
+
+def test_reflective_candidate_accepts_two_sided_hard_flip_signal_under_default_threshold():
+    decision = should_accept_reflective_candidate(
+        before_scores=[0.99, 0.99, 0.99, 0.99, 1.00],
+        after_scores=[1.00, 1.00, 1.00, 1.00, 0.94],
+    )
+
+    assert decision.accepted
+    assert decision.reason == "hard_flip_signal"
+    assert decision.dense_delta >= -0.01
+    assert decision.hard_wins == 4
+    assert decision.hard_losses == 1
+    assert decision.hard_flip_p_value == pytest.approx(0.375)
+
+
 def test_build_signatures_render_agent_spec():
     spec = _spec()
     proposer = build_proposer_signature(spec)
@@ -154,6 +212,16 @@ def test_agent_spec_from_rlm_can_omit_agent_type():
     assert "lookup" in spec.tool_signatures
 
 
+def test_proposer_signature_allows_multiple_async_predict_passes_for_concrete_edits():
+    proposer = build_proposer_signature(_spec())
+    instructions = " ".join(proposer.instructions.split())
+
+    assert "one or more `predict()` calls" in instructions
+    assert "asyncio.gather" in instructions
+    assert "structured brief containing root causes and edit decisions" in instructions
+    assert "must not draft the substantive wording from scratch" in instructions
+
+
 def test_patch_merge_signature_uses_base_and_patch_source_without_ancestor():
     patch = build_patch_merge_signature(_spec())
 
@@ -166,19 +234,21 @@ def test_patch_merge_signature_uses_base_and_patch_source_without_ancestor():
     assert "common ancestor" not in patch.instructions.lower()
 
 
-def test_patch_merge_prompt_contract_is_surgical_patch_not_synthesis():
-    prompt = build_patch_merge_signature(_spec()).instructions.lower()
+def test_patch_merge_signature_exposes_selected_capability_contract():
+    patch = build_patch_merge_signature(_spec())
 
-    assert "start from `base_parent_instructions`" in prompt
-    assert "preserve base behavior by default" in prompt
-    assert "import at most 1-3 clauses" in prompt
-    assert "structured metadata" in prompt
-    assert "task ids" in prompt
-    assert "do not summarize" in prompt
-    assert "compress" in prompt
-    assert "concatenate" in prompt
-    assert "globally rewrite" in prompt
-    assert "return base unchanged" in prompt
+    assert "selected_capability" in patch.output_fields
+    assert "imported_from_other" in patch.output_fields
+    assert "rejected_from_other" in patch.output_fields
+    assert "new_instructions" in patch.output_fields
+    assert set(SelectedCapability.model_fields) == {
+        "name",
+        "evidence_task_ids",
+        "trigger",
+        "action",
+        "non_application_boundary",
+        "preservation_note",
+    }
 
 
 def test_merge_signature_is_evidence_backed_patch_contract():
@@ -521,8 +591,11 @@ class _PatchEvidenceAdapter:
         self.base_scores = base_scores
         self.source_scores = source_scores
         self.evaluate_calls = 0
+        self.progress_labels: list[str] = []
 
-    def progress_label(self, _label):
+    def progress_label(self, label):
+        self.progress_labels.append(label)
+
         class NoopContext:
             def __enter__(self):
                 return None
@@ -621,6 +694,28 @@ def test_patch_evidence_oversamples_two_minibatches_before_selecting_records(tmp
 
     assert len(evidence.sampled_train_ids) == 8
     assert len(evidence.records) == 4
+
+
+def test_patch_evidence_progress_labels_use_zero_indexed_iteration(tmp_path: Path):
+    proposer = _make_patch_evidence_proposer(
+        tmp_path,
+        base_scores=[1.0, 0.0],
+        source_scores=[0.0, 1.0],
+        merge_minibatch_size=2,
+    )
+
+    proposer._build_patch_disagreement_evidence(
+        state=_patch_evidence_state(),
+        iteration=4,
+        attempt_idx=0,
+        base_parent_id=1,
+        patch_source_parent_id=2,
+    )
+
+    assert proposer.adapter.progress_labels == [
+        "Iteration 4 Patch Base Parent #1 Trace",
+        "Iteration 4 Patch Source Parent #2 Trace",
+    ]
 
 
 def test_patch_evidence_prefers_larger_disagreements_and_caps_records(tmp_path: Path):
@@ -1018,6 +1113,25 @@ def test_reflection_lm_text_normalization_accepts_common_payloads():
         _coerce_reflection_lm_text({"usage": {"input_tokens": 10}})
 
 
+def test_progress_candidate_selector_uses_zero_indexed_iteration():
+    class Selector:
+        def select_candidate_idx(self, _state):
+            return 4
+
+    class Adapter:
+        def __init__(self):
+            self.context = None
+
+        def set_reflective_progress_context(self, **kwargs):
+            self.context = kwargs
+
+    adapter = Adapter()
+    selector = _ProgressCandidateSelector(Selector(), adapter)
+
+    assert selector.select_candidate_idx(SimpleNamespace(i=5, program_candidates=[{}, {}, {}])) == 4
+    assert adapter.context == {"iteration": 5, "parent_idx": 4, "child_idx": 3}
+
+
 def _make_merge_proposer(tmp_path: Path, state_payload: dict | None = None) -> RlmMergeProposer:
     from gepa.core.data_loader import ensure_loader
 
@@ -1208,9 +1322,49 @@ def test_merge_iteration_rows_use_best_actual_parent_instead_of_oracle(tmp_path:
 
     assert rows[0]["iter"] == "12 [2, 5]"
     assert rows[0]["soft: par → child"] == "0.450 → 0.200 -0.250"
-    assert rows[0]["hard: par → child"] == "0.250 → 0.000 -0.250; 1 → 0 /4"
+    assert rows[0]["hard: par → child"] == "0.250 → 0.000 -0.250; 1 → 0"
     assert rows[0]["flips"] == "+0/-1 -1"
     assert rows[0]["p"] == "1.00"
+
+    merge_stats = merge_rows(tmp_path)
+    assert merge_stats[0]["soft: best(par) -> merge"] == "0.450 → 0.200 -0.250"
+    assert merge_stats[0]["hard: best(par) -> merge"] == "0.250 → 0.000 -0.250; 1 → 0"
+    assert merge_stats[0]["flips"] == "+0/-1 -1"
+    assert merge_stats[0]["p"] == "1.00"
+    assert "score Δ" not in merge_stats[0]
+
+
+def test_stats_hard_flip_p_values_use_two_sided_exact_for_ties(tmp_path: Path):
+    parent_scores = [0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0]
+    child_scores = [1.0, 1.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0]
+    state = {
+        "full_program_trace": [
+            {
+                "i": 0,
+                "selected_program_candidate": 0,
+                "new_program_idx": 1,
+                "subsample_scores": parent_scores,
+                "new_subsample_scores": child_scores,
+            },
+            {
+                "i": 1,
+                "rlm_merge_candidate_pair": (0, 1),
+                "id1_subsample_scores": parent_scores,
+                "id2_subsample_scores": [0.0] * len(parent_scores),
+                "new_program_subsample_scores": child_scores,
+            },
+        ],
+    }
+    with (tmp_path / "gepa_state.bin").open("wb") as f:
+        pickle.dump(state, f)
+
+    rows = iteration_rows(tmp_path)
+    merge_stats = merge_rows(tmp_path)
+
+    assert rows[0]["flips"] == "+4/-4 +0"
+    assert rows[0]["p"] == "1.00"
+    assert merge_stats[0]["flips"] == "+4/-4 +0"
+    assert merge_stats[0]["p"] == "1.00"
 
 
 def test_merge_rows_report_accepted_child_full_val_against_both_parents(tmp_path: Path):
@@ -1241,12 +1395,161 @@ def test_merge_rows_report_accepted_child_full_val_against_both_parents(tmp_path
 
     rows = merge_rows(tmp_path)
 
-    assert rows[0]["val Δ"] == "1.000 +0.333 vs 1"
+    assert [key for key in rows[0] if not key.startswith("_")] == [
+        "iter",
+        "pair@anc",
+        "soft: best(par) -> merge",
+        "hard: best(par) -> merge",
+        "flips",
+        "p",
+        "outcome",
+    ]
+    assert "pre" not in rows[0]
+    assert "n" not in rows[0]
+    assert "val Δ" not in rows[0]
+    assert "score Δ" not in rows[0]
+    assert "status" not in rows[0]
+    assert rows[0]["soft: best(par) -> merge"] == "0.500 → 1.000 +0.500"
+    assert rows[0]["hard: best(par) -> merge"] == "0.500 → 1.000 +0.500; 1 → 2"
+    assert rows[0]["flips"] == "+1/-0 +1"
+    assert rows[0]["p"] == "1.00"
+    assert rows[0]["outcome"] == "accepted"
+    assert rows[0]["_muted_prefix"] == {
+        "soft: best(par) -> merge": "0.500 → 1.000",
+        "hard: best(par) -> merge": "0.500 → 1.000",
+        "flips": "+1/-0",
+    }
     assert rows[0]["_detail"] == (
         "→ cand 3; full val "
         "vs 1: 0.667→1.000 +0.333, hard 2→3/3, flips +1/-0; "
         "vs 2: 0.667→1.000 +0.333, hard 2→3/3, flips +1/-0"
     )
+
+
+def test_merge_rows_do_not_use_normal_mutation_child_for_rejected_merge_val(tmp_path: Path):
+    state = {
+        "prog_candidate_val_subscores": [
+            {"a": 1.0, "b": 0.0, "c": 0.0},
+            {"a": 1.0, "b": 1.0, "c": 0.0},
+            {"a": 0.0, "b": 1.0, "c": 0.0},
+            {"a": 1.0, "b": 1.0, "c": 1.0},
+        ],
+        "full_program_trace": [
+            {
+                "i": 9,
+                "rlm_merge_candidate_pair": (1, 2),
+                "rlm_merge_ancestor": 0,
+                "rlm_merge_status": "subsample_rejected",
+                "rlm_merge_new_program_idx": None,
+                "new_program_idx": 3,
+                "rlm_merge_reject_reason": "not better than best parent",
+                "id1_subsample_scores": [1.0, 0.0],
+                "id2_subsample_scores": [0.0, 1.0],
+                "new_program_subsample_scores": [0.0, 1.0],
+            }
+        ],
+    }
+    with (tmp_path / "gepa_state.bin").open("wb") as f:
+        pickle.dump(state, f)
+
+    rows = merge_rows(tmp_path)
+
+    assert "val Δ" not in rows[0]
+    assert "score Δ" not in rows[0]
+    assert "status" not in rows[0]
+    assert rows[0]["soft: best(par) -> merge"] == "0.500 → 0.500 +0.000"
+    assert rows[0]["hard: best(par) -> merge"] == "0.500 → 0.500 +0.000; 1 → 1"
+    assert rows[0]["flips"] == "+1/-1 +0"
+    assert rows[0]["p"] == "1.00"
+    assert rows[0]["outcome"] == "rejected"
+    assert rows[0]["_muted_prefix"] == {
+        "soft: best(par) -> merge": "0.500 → 0.500",
+        "hard: best(par) -> merge": "0.500 → 0.500",
+        "flips": "+1/-1",
+    }
+    assert rows[0]["_detail"] == "not better than best parent"
+
+
+def test_merge_rows_use_explicit_merge_child_for_accepted_full_val(tmp_path: Path):
+    state = {
+        "prog_candidate_val_subscores": [
+            {"a": 0.0, "b": 1.0, "c": 0.0},
+            {"a": 1.0, "b": 1.0, "c": 0.0},
+            {"a": 0.0, "b": 1.0, "c": 1.0},
+            {"a": 0.0, "b": 0.0, "c": 0.0},
+            {"a": 1.0, "b": 1.0, "c": 1.0},
+        ],
+        "full_program_trace": [
+            {
+                "i": 10,
+                "rlm_merge_candidate_pair": (1, 2),
+                "rlm_merge_ancestor": 0,
+                "rlm_merge_status": "accepted",
+                "rlm_merge_new_program_idx": 4,
+                "new_program_idx": 3,
+                "id1_subsample_scores": [1.0, 0.0],
+                "id2_subsample_scores": [0.0, 1.0],
+                "new_program_subsample_scores": [1.0, 1.0],
+            }
+        ],
+    }
+    with (tmp_path / "gepa_state.bin").open("wb") as f:
+        pickle.dump(state, f)
+
+    rows = merge_rows(tmp_path)
+
+    assert "val Δ" not in rows[0]
+    assert "score Δ" not in rows[0]
+    assert "status" not in rows[0]
+    assert rows[0]["soft: best(par) -> merge"] == "0.500 → 1.000 +0.500"
+    assert rows[0]["hard: best(par) -> merge"] == "0.500 → 1.000 +0.500; 1 → 2"
+    assert rows[0]["flips"] == "+1/-0 +1"
+    assert rows[0]["p"] == "1.00"
+    assert rows[0]["outcome"] == "accepted"
+    assert rows[0]["_muted_prefix"] == {
+        "soft: best(par) -> merge": "0.500 → 1.000",
+        "hard: best(par) -> merge": "0.500 → 1.000",
+        "flips": "+1/-0",
+    }
+    assert rows[0]["_detail"].startswith("→ cand 4; full val vs 1:")
+
+
+def test_merge_rows_compact_outcomes_for_terminal_width(tmp_path: Path):
+    state = {
+        "full_program_trace": [
+            {"i": 1, "rlm_merge_status": "pair_skipped", "rlm_merge_candidate_pair": (0, 1)},
+            {
+                "i": 2,
+                "rlm_merge_status": "no_merge_candidate",
+                "rlm_merge_candidate_pair": (0, 1),
+            },
+            {
+                "i": 3,
+                "rlm_merge_status": "subsample_rejected",
+                "rlm_merge_candidate_pair": (0, 1),
+            },
+            {
+                "i": 4,
+                "rlm_merge_status": "preflight_failed",
+                "rlm_merge_candidate_pair": (0, 1),
+            },
+            {"i": 5, "rlm_merge_status": "accepted", "rlm_merge_candidate_pair": (0, 1)},
+            {"i": 6, "rlm_merge_status": "custom_status", "rlm_merge_candidate_pair": (0, 1)},
+        ]
+    }
+    with (tmp_path / "gepa_state.bin").open("wb") as f:
+        pickle.dump(state, f)
+
+    rows = merge_rows(tmp_path)
+
+    assert [row["outcome"] for row in rows] == [
+        "skipped",
+        "skipped",
+        "rejected",
+        "rejected",
+        "accepted",
+        "custom_status",
+    ]
 
 
 def test_reporting_tables_from_artifacts(tmp_path: Path):
@@ -1330,23 +1633,42 @@ def test_reporting_tables_from_artifacts(tmp_path: Path):
     rows = iteration_rows(tmp_path)
     assert rows[0]["outcome"] == "→ cand 1"
     assert rows[0]["soft: par → child"] == "0.500 → 1.000 +0.500"
-    assert rows[0]["hard: par → child"] == "0.500 → 1.000 +0.500; 1 → 2 /2"
+    assert rows[0]["hard: par → child"] == "0.500 → 1.000 +0.500; 1 → 2"
     assert rows[0]["flips"] == "+1/-0 +1"
     assert rows[0]["p"] == "1.00"
     assert rows[0]["iter"] == "0 [0]"
     assert rows[0]["_highlight"] is True
+    iteration_terminal = render_table(rows)
+    iteration_plain_lines = [
+        stats_report.re.sub(r"\033\[[0-9;]*m", "", line) for line in iteration_terminal.splitlines()
+    ]
+    iteration_header_line = next(line for line in iteration_plain_lines if "hard: par" in line)
+    iteration_hard_header = iteration_header_line.strip("│").split("│")[2]
+    assert iteration_hard_header.rstrip().endswith("/2")
+    assert "1 → 2 /2" not in iteration_terminal
     assert rows[1]["iter"] == "1 [0, 1]"
     merges = merge_rows(tmp_path)
-    assert merges[0] == {
+    assert {
+        key: value
+        for key, value in merges[0].items()
+        if key not in {"_merge_hard_denominator", "_terminal_header_aliases", "_terminal_header_suffixes"}
+    } == {
         "iter": "1",
         "pair@anc": "0+1@0",
-        "status": "subsample_rejected",
-        "pre": "3/2",
-        "n": "2",
-        "score Δ": "1.000 +0.000",
-        "val Δ": "-",
+        "soft: best(par) -> merge": "0.500 → 0.500 +0.000",
+        "hard: best(par) -> merge": "0.500 → 0.500 +0.000; 1 → 1",
+        "flips": "+1/-1 +0",
+        "p": "1.00",
+        "outcome": "rejected",
         "_detail": "not better than best parent",
+        "_muted_prefix": {
+            "soft: best(par) -> merge": "0.500 → 0.500",
+            "hard: best(par) -> merge": "0.500 → 0.500",
+            "flips": "+1/-1",
+        },
     }
+    assert rows[0]["_terminal_header_suffixes"]["hard: par → child"] == "/2"
+    assert merges[0]["_terminal_header_suffixes"]["hard: best(par) -> merge"] == "/2"
     candidates = candidate_rows(tmp_path)
     assert candidates[0]["cand [par]"] == "0 [seed]"
     assert candidates[0]["hard"] == "0.500 (1/2)"
@@ -1381,8 +1703,10 @@ def test_reporting_tables_from_artifacts(tmp_path: Path):
     assert "| iter" in rendered
     assert "| soft: par → child" in rendered
     assert "| hard: par → child" in rendered
+    assert "| soft: best(par) -> merge" in rendered
+    assert "| hard: best(par) -> merge" in rendered
     assert "| pair@anc" in rendered
-    assert "subsample_rejected" in rendered
+    assert "rejected" in rendered
     assert "merge details:" in rendered
     assert "iter 1 0+1@0: not better than best parent" in rendered
     assert "| cand [par]" in rendered
@@ -1393,9 +1717,12 @@ def test_reporting_tables_from_artifacts(tmp_path: Path):
     assert "┌" in terminal
     assert "\033[3m" in terminal
     assert "\033[38;5;248m" in terminal
-    assert "\033[38;5;248m0.500 → 1.000\033[0m\033[1;38;5;220m +0.500" in terminal
-    assert "\033[38;5;248m0.500 → 1.000\033[0m\033[1;38;5;220m +0.500; 1 → 2 /2" in terminal
-    assert "\033[38;5;248m+1/-0\033[0m\033[1;38;5;220m +1" in terminal
+    assert "\033[38;5;178m0.500 → 1.000\033[0m\033[1;38;5;220m +0.500" in terminal
+    assert "\033[38;5;178m0.500 → 1.000\033[0m\033[1;38;5;220m +0.500; 1 → 2" in terminal
+    assert "\033[38;5;178m+1/-0\033[0m\033[1;38;5;220m +1" in terminal
+    assert "\033[38;5;248m+1/-1\033[0m +0" in terminal
+    assert "\033[38;5;248m0.500 → 0.500\033[0m +0.000" in terminal
+    assert "\033[38;5;248m0.500 → 0.500\033[0m +0.000; 1 → 1" in terminal
     assert "\033[1;38;5;220m" in terminal
     assert "**1**" not in terminal
     assert "costs:" in terminal
@@ -1461,6 +1788,21 @@ def test_cost_rows_group_patch_merge_roles(tmp_path: Path):
     assert not any(row.get("scope") == "other" for row in rows)
 
 
+def test_highlighted_terminal_rows_use_dim_gold_for_muted_prefixes():
+    rendered = render_table(
+        [
+            {
+                "metric": "0.100 → 0.200 +0.100",
+                "_highlight": True,
+                "_muted_prefix": {"metric": "0.100 → 0.200"},
+            }
+        ]
+    )
+
+    assert "\033[38;5;178m.100 → .200" in rendered
+    assert "\033[38;5;248m.100 → .200" not in rendered
+
+
 def test_terminal_cost_table_wraps_scope_and_model_to_terminal_width(monkeypatch):
     monkeypatch.setattr(
         stats_report.shutil,
@@ -1490,6 +1832,139 @@ def test_terminal_cost_table_wraps_scope_and_model_to_terminal_width(monkeypatch
     assert "  - patch" in rendered
     assert "│     _merg" in rendered
     assert "poser" in rendered
+
+
+def test_terminal_merge_table_wraps_headers_and_status_to_terminal_width(monkeypatch):
+    def plain_lines(rendered: str) -> list[str]:
+        return [stats_report.re.sub(r"\033\[[0-9;]*m", "", line) for line in rendered.splitlines()]
+
+    def cell_lines(rendered: str, column_index: int) -> list[str]:
+        lines = []
+        for line in plain_lines(rendered):
+            if line.startswith("│"):
+                cells = line.strip("│").split("│")
+                lines.append(cells[column_index].strip())
+        return lines
+
+    def raw_cell_lines(rendered: str, column_index: int) -> list[str]:
+        lines = []
+        for line in plain_lines(rendered):
+            if line.startswith("│"):
+                cells = line.strip("│").split("│")
+                lines.append(cells[column_index])
+        return lines
+
+    def body_cell_rows(rendered: str) -> list[list[str]]:
+        lines = plain_lines(rendered)
+        body_start = next(index for index, line in enumerate(lines) if line.startswith("├")) + 1
+        return [line.strip("│").split("│") for line in lines[body_start:] if line.startswith("│")]
+
+    monkeypatch.setattr(
+        stats_report.shutil,
+        "get_terminal_size",
+        lambda fallback=(120, 24): os.terminal_size((90, 24)),
+    )
+    rows = [
+        {
+            "iter": "12345 [123, 456]",
+            "pair@anc": "123+456@789",
+            "soft: best(par) -> merge": "0.123 → 0.987 +0.864",
+            "hard: best(par) -> merge": "0.111 → 0.999 +0.888; 1 → 9",
+            "flips": "+8/-0 +8",
+            "p": "0.01",
+            "outcome": "rejected",
+            "_terminal_header_aliases": {
+                "soft: best(par) -> merge": "soft\nbest(par) -> merge",
+                "hard: best(par) -> merge": "hard\nbest(par) -> merge",
+            },
+            "_terminal_header_suffixes": {
+                "hard: best(par) -> merge": "/10",
+            },
+            "_muted_prefix": {
+                "soft: best(par) -> merge": "0.123 → 0.987",
+                "hard: best(par) -> merge": "0.111 → 0.999",
+                "flips": "+8/-0",
+            },
+        }
+    ]
+
+    rendered = render_table(rows)
+
+    assert "soft: best(par) -> merge" not in rendered
+    assert "hard: best(par) -> merge" not in rendered
+    assert "soft" in rendered
+    assert "best(par) -> merge" in rendered
+    assert stats_report.re.search(r"best\(par\) -> merge\s+/10", "\n".join(plain_lines(rendered)))
+    assert "par→merge" not in rendered
+    assert "1 → 9 /10" not in rendered
+    assert "rejected" in rendered
+
+    monkeypatch.setattr(
+        stats_report.shutil,
+        "get_terminal_size",
+        lambda fallback=(120, 24): os.terminal_size((92, 24)),
+    )
+    moderate = render_table(
+        [
+            {
+                "iter": "12",
+                "pair@anc": "3+4@2",
+                "soft: best(par) -> merge": "0.123 → 0.987 +0.864",
+                "hard: best(par) -> merge": "0.111 → 0.999 +0.888; 1 → 9",
+                "flips": "+8/-0 +8",
+                "p": "0.01",
+                "outcome": "accepted",
+                "_terminal_header_aliases": {
+                    "soft: best(par) -> merge": "soft\nbest(par) -> merge",
+                    "hard: best(par) -> merge": "hard\nbest(par) -> merge",
+                },
+                "_terminal_header_suffixes": {
+                    "hard: best(par) -> merge": "/10",
+                },
+                "_muted_prefix": {
+                    "soft: best(par) -> merge": "0.123 → 0.987",
+                    "hard: best(par) -> merge": "0.111 → 0.999",
+                    "flips": "+8/-0",
+                },
+            }
+        ]
+    )
+    moderate_lines = plain_lines(moderate)
+    pair_lines = cell_lines(moderate, 1)
+    hard_lines = raw_cell_lines(moderate, 3)
+    moderate_body_cells = body_cell_rows(moderate)
+
+    assert moderate_lines
+    assert pair_lines[:2] == ["pair", "@anc"]
+    assert "@" not in pair_lines[:2]
+    assert "anc" not in pair_lines[:2]
+    assert pair_lines[2:3] == ["3+4@2"]
+    assert hard_lines[1].rstrip().endswith("/10")
+    assert len(moderate_body_cells) == 1
+    assert [moderate_body_cells[0][index].strip() for index in (1, 2, 3, 4)] == [
+        "3+4@2",
+        ".123 → .987 +.864",
+        ".111 → .999 +.888; 1 → 9",
+        "+8/-0 +8",
+    ]
+
+    monkeypatch.setattr(
+        stats_report.shutil,
+        "get_terminal_size",
+        lambda fallback=(120, 24): os.terminal_size((90, 24)),
+    )
+    tight = render_table(rows)
+    tight_lines = plain_lines(tight)
+    body_cells = body_cell_rows(tight)
+
+    assert tight_lines
+    assert len(body_cells) == 1
+    assert [body_cells[0][index].strip() for index in (1, 2, 3, 4)] == [
+        "123+456@789",
+        ".123 → .987 +.864",
+        ".111 → .999 +.888; 1 → 9",
+        "+8/-0 +8",
+    ]
 
 
 def test_eval_stats_from_eval_artifact(tmp_path: Path):
@@ -1964,6 +2439,14 @@ def test_patch_merge_adapter_uses_patch_signature_and_persists_metadata(
             return SimpleNamespace(
                 base_parent_id=10,
                 patch_summary="imported one clause",
+                selected_capability={
+                    "name": "validated tool usage",
+                    "evidence_task_ids": ["train-a"],
+                    "trigger": "inputs require tool use",
+                    "action": "validate inputs before invoking the tool",
+                    "non_application_boundary": "do not apply to unrelated formatting tasks",
+                    "preservation_note": "preserves base wins by only applying to tool-use rows",
+                },
                 imported_from_other=[
                     {
                         "clause": "Use the tool only after validating inputs.",
@@ -2010,6 +2493,10 @@ def test_patch_merge_adapter_uses_patch_signature_and_persists_metadata(
 
     assert new_text == "base plus patch"
     assert metadata["patch_summary"] == "imported one clause"
+    assert metadata["selected_capability"]["name"] == "validated tool usage"
+    assert metadata["base_instruction_chars"] == len("base")
+    assert metadata["new_instruction_chars"] == len("base plus patch")
+    assert metadata["instruction_char_delta"] == len("base plus patch") - len("base")
     assert captured["signature"].input_fields.keys() >= {
         "base_parent_id",
         "base_parent_instructions",
@@ -2017,6 +2504,7 @@ def test_patch_merge_adapter_uses_patch_signature_and_persists_metadata(
         "patch_source_parent_instructions",
         "paired_disagreement_traces_file",
     }
+    assert "selected_capability" in captured["signature"].output_fields
     assert "common_ancestor_instructions" not in captured["inputs"]
     assert captured["inputs"]["base_parent_id"] == 10
     assert captured["inputs"]["patch_source_parent_id"] == 11
@@ -2024,4 +2512,41 @@ def test_patch_merge_adapter_uses_patch_signature_and_persists_metadata(
     assert len(artifacts) == 1
     payload = json.loads(artifacts[0].read_text())
     assert payload["kind"] == "patch_merge_proposer"
-    assert payload["patch_output"]["imported_from_other"][0]["evidence_task_ids"] == ["train-a"]
+    patch_output = payload["patch_output"]
+    _assert_valid_patch_output(
+        patch_output,
+        trace_task_ids=["train-a"],
+        base_instructions="base",
+        new_instructions="base plus patch",
+    )
+    assert patch_output["imported_from_other"][0]["evidence_task_ids"] == ["train-a"]
+
+
+def _assert_valid_patch_output(
+    patch_output: dict[str, object],
+    *,
+    trace_task_ids: list[str],
+    base_instructions: str,
+    new_instructions: str,
+) -> None:
+    selected_capability = patch_output["selected_capability"]
+    assert isinstance(selected_capability, dict)
+    assert set(selected_capability) >= {
+        "name",
+        "evidence_task_ids",
+        "trigger",
+        "action",
+        "non_application_boundary",
+        "preservation_note",
+    }
+    assert set(selected_capability["evidence_task_ids"]) <= set(trace_task_ids)
+    assert patch_output["base_instruction_chars"] == len(base_instructions)
+    assert patch_output["new_instruction_chars"] == len(new_instructions)
+    assert patch_output["instruction_char_delta"] == len(new_instructions) - len(
+        base_instructions
+    )
+    for task_id in trace_task_ids:
+        if len(task_id) >= 4:
+            assert task_id not in new_instructions
+    for audit_label in ("base_win", "patch_source_win", "both_success_guardrail"):
+        assert audit_label not in new_instructions

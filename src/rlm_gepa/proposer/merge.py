@@ -104,7 +104,7 @@ class RlmMergeProposer(MergeProposer):
         self,
         state: GEPAState[RolloutOutput, DataId],
     ) -> CandidateProposal[DataId] | None:
-        i = state.i + 1
+        i = state.i
         state.full_program_trace[-1]["invoked_merge"] = True
 
         if not (
