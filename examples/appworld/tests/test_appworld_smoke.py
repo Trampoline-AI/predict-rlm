@@ -288,6 +288,15 @@ def test_default_appworld_python_prefers_local_runtime(tmp_path, monkeypatch):
     assert _default_appworld_python() == str(appworld_python)
 
 
+def test_default_appworld_python_finds_example_runtime_from_repo_root(tmp_path, monkeypatch):
+    appworld_python = tmp_path / "examples" / "appworld" / ".appworld-venv" / "bin" / "python"
+    appworld_python.parent.mkdir(parents=True)
+    appworld_python.write_text("")
+    monkeypatch.chdir(tmp_path)
+
+    assert _default_appworld_python() == str(appworld_python)
+
+
 def test_session_client_call_api_rejects_non_object_kwargs():
     client = AppWorldSessionClient()
 
@@ -1179,6 +1188,29 @@ def test_install_codex_lm_auto_enables_and_sets_default_key(monkeypatch):
 
     assert calls == [("anthropic/",)]
     assert bench_cli.os.environ["OPENAI_API_KEY"] == "codex-lm"
+
+
+def test_build_lm_uses_codex_lm_monkeypatch_after_import(monkeypatch):
+    from rlm_gepa.runtime import lm_config
+
+    original_lm = lm_config.dspy.LM
+
+    class FakeCodexLM:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+    class InterceptedLM(original_lm):
+        def __new__(cls, *args, **kwargs):
+            return FakeCodexLM(**kwargs)
+
+    monkeypatch.setattr(lm_config.dspy, "LM", InterceptedLM)
+    monkeypatch.setattr(lm_config, "validate_lm_env", lambda lm: None)
+
+    lm = lm_config.build_lm("openai/gpt-5.4-mini", reasoning_effort="low")
+
+    assert isinstance(lm, FakeCodexLM)
+    assert lm.kwargs["model"] == "openai/gpt-5.4-mini"
+    assert lm.kwargs["reasoning_effort"] == "low"
 
 
 def test_install_codex_lm_no_flag_disables_auto_enable(monkeypatch):

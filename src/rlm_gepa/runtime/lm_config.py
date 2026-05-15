@@ -66,24 +66,42 @@ def get_sub_lm_config(lm: str, reasoning_effort: str | None = "none") -> dict[st
     return get_lm_config(lm, reasoning_effort=reasoning_effort)
 
 
+def _forward_with_rate_limit_retry(self: dspy.LM, *args: Any, **kwargs: Any) -> Any:
+    retryer = Retrying(
+        retry=retry_if_exception_type(litellm.RateLimitError),
+        wait=_RATE_LIMIT_RETRY_WAIT,
+        stop=stop_after_attempt(_RATE_LIMIT_RETRY_ATTEMPTS),
+        reraise=True,
+    )
+    for attempt in retryer:
+        with attempt:
+            return super(type(self), self).forward(*args, **kwargs)
+    raise RuntimeError("unreachable")
+
+
 class RateLimitRetryLM(dspy.LM):
     def forward(self, *args: Any, **kwargs: Any) -> Any:
-        retryer = Retrying(
-            retry=retry_if_exception_type(litellm.RateLimitError),
-            wait=_RATE_LIMIT_RETRY_WAIT,
-            stop=stop_after_attempt(_RATE_LIMIT_RETRY_ATTEMPTS),
-            reraise=True,
-        )
-        for attempt in retryer:
-            with attempt:
-                return super().forward(*args, **kwargs)
-        raise RuntimeError("unreachable")
+        return _forward_with_rate_limit_retry(self, *args, **kwargs)
+
+
+def _rate_limit_retry_lm_class() -> type[dspy.LM]:
+    if RateLimitRetryLM.__mro__[1] is dspy.LM:
+        return RateLimitRetryLM
+    return type(
+        "RateLimitRetryLM",
+        (dspy.LM,),
+        {
+            "__module__": __name__,
+            "forward": _forward_with_rate_limit_retry,
+        },
+    )
 
 
 def build_lm(model_or_lm: Any, *, reasoning_effort: str | None = None, cache: bool = False) -> Any:
     if not isinstance(model_or_lm, str):
         return model_or_lm
-    return RateLimitRetryLM(**get_lm_config(model_or_lm, reasoning_effort), cache=cache)
+    lm_class = _rate_limit_retry_lm_class()
+    return lm_class(**get_lm_config(model_or_lm, reasoning_effort), cache=cache)
 
 
 configure_litellm_logging()
