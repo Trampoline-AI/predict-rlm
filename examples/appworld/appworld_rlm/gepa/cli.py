@@ -33,6 +33,7 @@ def main(argv: list[str] | None = None) -> int:
 
 def _add_project_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--train-dataset")
+    parser.add_argument("--val-dataset")
     parser.add_argument("--data-root", type=Path)
     parser.add_argument("--val-ratio", type=float)
     parser.add_argument("--val-limit", type=int)
@@ -45,6 +46,8 @@ def _apply_project_args(config: OptimizeConfig, args: Any) -> AppWorldGepaConfig
         config = AppWorldGepaConfig(**config.to_dict())
     if args.train_dataset is not None:
         config.train_dataset = args.train_dataset
+    if args.val_dataset is not None:
+        config.val_dataset = args.val_dataset
     if args.data_root is not None:
         config.data_root = args.data_root
     if args.val_ratio is not None:

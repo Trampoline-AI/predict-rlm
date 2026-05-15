@@ -110,15 +110,22 @@ class AppWorldGepaProject(RLMGepaProject):
             return "Improve AppWorld execution strategy, API probing, retry discipline, supervisor completion, and final-state verification without evaluator access during solving."
         return ""
 
+    def minibatch_group_id(self, example: AppWorldExample) -> str | None:
+        return example.group_id
+
     def _load_split(self) -> tuple[list[AppWorldExample], list[AppWorldExample]]:
         if self._split is not None:
             return self._split
         train_pool = load_dataset(self.config.train_dataset, self.config.data_root)
-        train, validation = split_train_validation(
-            train_pool,
-            val_ratio=self.config.val_ratio,
-            seed=self.config.seed,
-        )
+        if self.config.val_dataset is None:
+            train, validation = split_train_validation(
+                train_pool,
+                val_ratio=self.config.val_ratio,
+                seed=self.config.seed,
+            )
+        else:
+            train = train_pool
+            validation = load_dataset(self.config.val_dataset, self.config.data_root)
         if self.config.val_limit is not None:
             validation = validation[: self.config.val_limit]
         self._split = (train, validation)

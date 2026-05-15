@@ -15,6 +15,7 @@ from ..bench.config import DEFAULT_CONCURRENCY
 @dataclass
 class AppWorldGepaConfig(OptimizeConfig):
     train_dataset: str = "train"
+    val_dataset: str | None = None
     data_root: Path = Path("data")
     val_ratio: float = 0.20
     val_limit: int | None = None
@@ -24,6 +25,7 @@ class AppWorldGepaConfig(OptimizeConfig):
         payload.update(
             {
                 "train_dataset": self.train_dataset,
+                "val_dataset": self.val_dataset,
                 "data_root": str(self.data_root),
                 "val_ratio": self.val_ratio,
                 "val_limit": self.val_limit,

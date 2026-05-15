@@ -66,6 +66,8 @@ from rlm_gepa.runtime.acceptance import should_accept_reflective_candidate
 from rlm_gepa.runtime.adapter import RLMGepaAdapter, _row_failure_metadata
 from rlm_gepa.schema import RLMGepaExampleResult, validate_project
 from rlm_gepa.service import (
+    GroupAwareBatchSampler,
+    _build_minibatch_sampler,
     _coerce_reflection_lm_text,
     _ProgressCandidateSelector,
     prepare_run_dir,
@@ -282,6 +284,48 @@ def test_validate_project_accepts_minimal_project():
     assert result.seed_candidate == {"skill_instructions": "seed rules"}
     assert list(result.trainset) == ["train"]
     assert list(result.valset) == ["val"]
+
+
+def test_minibatch_sampler_uses_flat_epoch_shuffle_when_project_has_no_group_ids():
+    from gepa.core.data_loader import ensure_loader
+    from gepa.strategies.batch_sampler import EpochShuffledBatchSampler
+
+    loader = ensure_loader(["a", "b", "c", "d"])
+    sampler = _build_minibatch_sampler(_Project(), loader, minibatch_size=2, rng=random.Random(7))
+
+    assert isinstance(sampler, EpochShuffledBatchSampler)
+
+
+def test_group_aware_batch_sampler_keeps_groups_intact():
+    from gepa.core.data_loader import ensure_loader
+
+    class GroupedProject(_Project):
+        def minibatch_group_id(self, example) -> str | None:
+            return example["group"]
+
+    examples = [
+        {"task_id": f"group_{group}_{index}", "group": f"group_{group}"}
+        for group in range(11)
+        for index in range(3)
+    ]
+    loader = ensure_loader(examples)
+    sampler = _build_minibatch_sampler(
+        GroupedProject(),
+        loader,
+        minibatch_size=30,
+        rng=random.Random(7),
+    )
+
+    assert isinstance(sampler, GroupAwareBatchSampler)
+    batch_ids = sampler.next_minibatch_ids(loader, SimpleNamespace(i=0))
+    batch_examples = loader.fetch(batch_ids)
+    group_counts: dict[str, int] = {}
+    for example in batch_examples:
+        group_counts[example["group"]] = group_counts.get(example["group"], 0) + 1
+
+    assert len(batch_examples) == 30
+    assert len(group_counts) == 10
+    assert set(group_counts.values()) == {3}
 
 
 def test_validate_project_rejects_seed_key_mismatch():

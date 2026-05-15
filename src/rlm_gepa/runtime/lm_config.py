@@ -5,8 +5,16 @@ from typing import Any
 
 import dspy
 import litellm
+from tenacity import (
+    Retrying,
+    retry_if_exception_type,
+    stop_after_attempt,
+    wait_exponential_jitter,
+)
 
 _LITELLM_LOGGER_NAMES = ("LiteLLM", "LiteLLM Router", "LiteLLM Proxy")
+_RATE_LIMIT_RETRY_ATTEMPTS = 10
+_RATE_LIMIT_RETRY_WAIT = wait_exponential_jitter(initial=1, max=60, jitter=1)
 
 
 def configure_litellm_logging() -> None:
@@ -36,7 +44,12 @@ def get_lm_config(
     validate_lm_env(lm)
 
     config: dict[str, Any] = {"model": lm, "num_retries": 5}
-    if reasoning_effort and reasoning_effort != "none":
+    if _is_moonshot_kimi_model(lm):
+        if reasoning_effort == "none":
+            config["extra_body"] = {"thinking": {"type": "disabled"}}
+        elif reasoning_effort:
+            config["extra_body"] = {"thinking": {"type": "enabled"}}
+    elif reasoning_effort and reasoning_effort != "none":
         config["reasoning_effort"] = reasoning_effort
 
     if thinking_budget is not None:
@@ -44,14 +57,33 @@ def get_lm_config(
     return config
 
 
+def _is_moonshot_kimi_model(lm: str) -> bool:
+    model = lm.lower()
+    return "moonshot/" in model and "kimi" in model
+
+
 def get_sub_lm_config(lm: str, reasoning_effort: str | None = "none") -> dict[str, Any]:
     return get_lm_config(lm, reasoning_effort=reasoning_effort)
+
+
+class RateLimitRetryLM(dspy.LM):
+    def forward(self, *args: Any, **kwargs: Any) -> Any:
+        retryer = Retrying(
+            retry=retry_if_exception_type(litellm.RateLimitError),
+            wait=_RATE_LIMIT_RETRY_WAIT,
+            stop=stop_after_attempt(_RATE_LIMIT_RETRY_ATTEMPTS),
+            reraise=True,
+        )
+        for attempt in retryer:
+            with attempt:
+                return super().forward(*args, **kwargs)
+        raise RuntimeError("unreachable")
 
 
 def build_lm(model_or_lm: Any, *, reasoning_effort: str | None = None, cache: bool = False) -> Any:
     if not isinstance(model_or_lm, str):
         return model_or_lm
-    return dspy.LM(**get_lm_config(model_or_lm, reasoning_effort), cache=cache)
+    return RateLimitRetryLM(**get_lm_config(model_or_lm, reasoning_effort), cache=cache)
 
 
 configure_litellm_logging()

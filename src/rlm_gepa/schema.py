@@ -268,6 +268,9 @@ class RLMGepaProject(ABC):
     def component_focus(self, component_name: str) -> str:
         return ""
 
+    def minibatch_group_id(self, example: Any) -> str | None:
+        return None
+
 
 @dataclass(frozen=True)
 class ProjectValidation:

@@ -246,6 +246,15 @@ def test_train_validation_split_is_group_disjoint_and_deterministic():
     assert {item.group_id for item in train_a}.isdisjoint({item.group_id for item in val_a})
 
 
+def test_appworld_gepa_project_uses_example_group_id():
+    config = default_config()
+    config.data_root = FIXTURE_ROOT
+    project = AppWorldGepaProject(config)
+    example = load_dataset("train", FIXTURE_ROOT)[0]
+
+    assert project.minibatch_group_id(example) == example.group_id
+
+
 def test_score_runner_result_feedback():
     score, feedback = score_runner_result({"score": 0.25, "feedback": "missing email"})
     assert score == 0.25
@@ -833,6 +842,30 @@ def test_gepa_project_validates_with_fixture_data(monkeypatch, tmp_path):
     assert len(validation.trainset) > len(validation.valset) > 0
     assert project.components == (COMPONENT_SKILL,)
     assert set(project.seed_candidate()) == {COMPONENT_SKILL}
+
+
+def test_gepa_project_can_use_explicit_dev_valset(monkeypatch, tmp_path):
+    monkeypatch.setenv("APPWORLD_DATA_ROOT", str(_write_synthetic_demo_data_root(tmp_path / "appworld_data")))
+    config = AppWorldGepaConfig(data_root=FIXTURE_ROOT, train_dataset="train", val_dataset="dev")
+    project = AppWorldGepaProject(config)
+    validation = validate_project(project)
+
+    assert [example.task_id for example in validation.trainset] == [
+        "aaa111_1",
+        "aaa111_2",
+        "aaa111_3",
+        "bbb222_1",
+        "bbb222_2",
+        "bbb222_3",
+        "ccc333_1",
+        "ccc333_2",
+        "ccc333_3",
+        "ddd444_1",
+        "ddd444_2",
+        "ddd444_3",
+    ]
+    assert [example.task_id for example in validation.valset] == ["eee555_1"]
+    assert validation.valset[0].dataset == "dev"
 
 
 def test_gepa_agent_spec_is_derived_from_clean_rlm_tools():

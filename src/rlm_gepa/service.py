@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import json
+import random
 import time
 import uuid
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -108,6 +109,7 @@ def run_optimization(
     t0 = time.time()
     state = _run_gepa_engine(
         config=config,
+        project=project,
         seed_candidate=validation.seed_candidate,
         trainset=list(validation.trainset),
         valset=list(validation.valset),
@@ -209,6 +211,7 @@ def write_summary_artifacts(
 def _run_gepa_engine(
     *,
     config: OptimizeConfig,
+    project: RLMGepaProject,
     seed_candidate: dict[str, str],
     trainset: list[Any],
     valset: list[Any],
@@ -217,13 +220,10 @@ def _run_gepa_engine(
     seed: int,
     reflection_lm: Any,
 ) -> Any:
-    import random
-
     from gepa.core.data_loader import ensure_loader
     from gepa.logging.experiment_tracker import create_experiment_tracker
     from gepa.logging.logger import StdOutLogger
     from gepa.proposer.reflective_mutation.reflective_mutation import ReflectiveMutationProposer
-    from gepa.strategies.batch_sampler import EpochShuffledBatchSampler
     from gepa.strategies.candidate_selector import (
         CurrentBestCandidateSelector,
         EpsilonGreedyCandidateSelector,
@@ -253,7 +253,12 @@ def _run_gepa_engine(
         "round_robin": RoundRobinReflectionComponentSelector,
         "all": AllReflectionComponentSelector,
     }[config.component_selection_strategy]()
-    batch_sampler = EpochShuffledBatchSampler(minibatch_size=config.minibatch_size, rng=rng)
+    batch_sampler = _build_minibatch_sampler(
+        project,
+        train_loader,
+        minibatch_size=config.minibatch_size,
+        rng=rng,
+    )
     experiment_tracker = create_experiment_tracker(
         use_wandb=False,
         wandb_api_key=None,
@@ -328,6 +333,109 @@ def _run_gepa_engine(
     )
     with experiment_tracker:
         return engine.run()
+
+
+class GroupAwareBatchSampler:
+    def __init__(
+        self,
+        minibatch_size: int,
+        group_id_fn: Callable[[Any], str | None],
+        rng: random.Random | None = None,
+    ):
+        self.minibatch_size = minibatch_size
+        self.group_id_fn = group_id_fn
+        self.rng = rng or random.Random(0)
+        self.batches: list[list[Any]] = []
+        self.epoch = -1
+        self.last_trainset_size = 0
+
+    def next_minibatch_ids(self, loader: Any, state: Any) -> list[Any]:
+        trainset_size = len(loader)
+        if trainset_size == 0:
+            raise ValueError("Cannot sample a minibatch from an empty loader.")
+
+        if not self.batches or trainset_size != self.last_trainset_size:
+            self._refresh(loader, state.i)
+        else:
+            curr_epoch = state.i // len(self.batches)
+            if curr_epoch > self.epoch:
+                self._refresh(loader, state.i)
+
+        return self.batches[state.i % len(self.batches)]
+
+    def _refresh(self, loader: Any, iteration: int) -> None:
+        grouped_ids = self._group_ids(loader)
+        self.rng.shuffle(grouped_ids)
+        self.batches = self._pack_batches(grouped_ids)
+        self.last_trainset_size = len(loader)
+        self.epoch = iteration // len(self.batches)
+
+    def _group_ids(self, loader: Any) -> list[list[Any]]:
+        all_ids = list(loader.all_ids())
+        examples = loader.fetch(all_ids)
+        groups: dict[tuple[str, str | int], list[Any]] = {}
+        for index, (data_id, example) in enumerate(zip(all_ids, examples, strict=True)):
+            group_id = self.group_id_fn(example)
+            group_key = ("group", group_id) if group_id is not None else ("ungrouped", index)
+            groups.setdefault(group_key, []).append(data_id)
+        return list(groups.values())
+
+    def _pack_batches(self, grouped_ids: list[list[Any]]) -> list[list[Any]]:
+        batches: list[list[Any]] = []
+        current: list[Any] = []
+        for group_ids in grouped_ids:
+            if len(group_ids) > self.minibatch_size:
+                if current:
+                    batches.append(current)
+                    current = []
+                for start in range(0, len(group_ids), self.minibatch_size):
+                    batches.append(group_ids[start : start + self.minibatch_size])
+                continue
+
+            current.extend(group_ids)
+            if len(current) >= self.minibatch_size:
+                batches.append(current)
+                current = []
+
+        if current:
+            batches.append(current)
+        return self._pad_batches(batches, grouped_ids)
+
+    def _pad_batches(self, batches: list[list[Any]], grouped_ids: list[list[Any]]) -> list[list[Any]]:
+        pad_groups = [group_ids for group_ids in grouped_ids if group_ids]
+        if not pad_groups:
+            return batches
+        for batch in batches:
+            pad_index = 0
+            while len(batch) < self.minibatch_size:
+                batch.extend(pad_groups[pad_index % len(pad_groups)])
+                pad_index += 1
+        return batches
+
+
+def _build_minibatch_sampler(
+    project: RLMGepaProject,
+    train_loader: Any,
+    *,
+    minibatch_size: int,
+    rng: random.Random,
+) -> Any:
+    from gepa.strategies.batch_sampler import EpochShuffledBatchSampler
+
+    if _loader_has_minibatch_groups(project, train_loader):
+        return GroupAwareBatchSampler(
+            minibatch_size=minibatch_size,
+            group_id_fn=project.minibatch_group_id,
+            rng=rng,
+        )
+    return EpochShuffledBatchSampler(minibatch_size=minibatch_size, rng=rng)
+
+
+def _loader_has_minibatch_groups(project: RLMGepaProject, loader: Any) -> bool:
+    all_ids = list(loader.all_ids())
+    if not all_ids:
+        return False
+    return any(project.minibatch_group_id(example) is not None for example in loader.fetch(all_ids))
 
 
 def _reflection_lm_callable(lm: Any) -> Any:
