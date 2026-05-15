@@ -25,6 +25,28 @@ Based on the [Recursive Language Models](https://arxiv.org/abs/2512.24601v1) pap
 uv add predict-rlm
 ```
 
+Optional extras are available for adjacent tooling:
+
+```bash
+# GEPA optimization support
+uv add "predict-rlm[gepa]"
+
+# Codex-backed DSPy LM and the `codex-lm` CLI
+uv add "predict-rlm[codex-lm]"
+```
+
+With the Codex LM extra installed, import `CodexLM` or use the script. The
+vendored backend supports current Codex model slugs including `gpt-5.5`.
+
+```python
+from dspy_codex_lm import CodexLM
+```
+
+```bash
+codex-lm auth list
+codex-lm usage
+```
+
 ## Why RLMs?
 
 <p align="center">
