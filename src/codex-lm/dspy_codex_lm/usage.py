@@ -4,7 +4,7 @@ import json
 import re
 import urllib.request
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Mapping
 
@@ -355,7 +355,7 @@ def _format_reset_at(value: Any) -> str:
     timestamp = _as_number(value)
     if timestamp is None:
         return _redact_text(str(value))
-    dt = datetime.fromtimestamp(timestamp)
+    dt = datetime.fromtimestamp(timestamp, timezone.utc)
     return f"{dt:%H:%M} on {dt.day} {dt:%b}"
 
 

@@ -169,18 +169,18 @@ def test_summarize_usage_parses_live_wham_shape():
     assert rows[1].percent_remaining == 100.0
     assert rows[1].reset == "in 7d"
     assert rows[2].percent_remaining == 92.0
-    assert rows[2].reset == "00:30 on 10 May"
+    assert rows[2].reset == "04:30 on 10 May"
     assert rows[3].percent_remaining == 65.0
-    assert rows[3].reset == "18:40 on 11 May"
+    assert rows[3].reset == "22:40 on 11 May"
 
     text = format_usage_summary(payload)
     assert "Plan: pro" in text
     assert "Credits: balance 0; has_credits=false" in text
     assert (
-        "5h limit:                    [██████████████████░░] 92% left (resets 00:30 on 10 May)"
+        "5h limit:                    [██████████████████░░] 92% left (resets 04:30 on 10 May)"
     ) in text
     assert (
-        "Weekly limit:                [█████████████░░░░░░░] 65% left (resets 18:40 on 11 May)"
+        "Weekly limit:                [█████████████░░░░░░░] 65% left (resets 22:40 on 11 May)"
     ) in text
     assert "GPT-5.3-Codex-Spark limit:" in text
     assert (
