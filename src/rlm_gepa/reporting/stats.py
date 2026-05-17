@@ -86,6 +86,8 @@ COST_GROUPS = [
 
 def load_run_state(run_dir: str | Path) -> dict[str, Any]:
     path = Path(run_dir) / "gepa_state.bin"
+    if not path.exists():
+        return {}
     with path.open("rb") as f:
         state = pickle.load(f)
     if isinstance(state, dict):

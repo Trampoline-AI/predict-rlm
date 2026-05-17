@@ -2206,6 +2206,15 @@ def test_reporting_tables_from_artifacts(tmp_path: Path):
     assert "costs (deduped spend: stable operation ids only; legacy rows counted raw):" not in terminal
 
 
+def test_render_stats_before_state_checkpoint_does_not_crash(tmp_path: Path) -> None:
+    (tmp_path / "run_metadata.json").write_text(json.dumps({"project_name": "demo"}))
+
+    rendered = render_stats(tmp_path, table="all", output_format="markdown")
+
+    assert "iter=0" in rendered
+    assert "candidates=0" in rendered
+
+
 def test_candidate_rows_show_flips_against_each_parent(tmp_path: Path):
     state = {
         "parent_program_for_candidate": [[None], [0], [0, 1]],
