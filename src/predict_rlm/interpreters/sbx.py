@@ -273,7 +273,7 @@ class SbxInterpreter(PersistentJsonRpcRunnerClient, PredictRLMInterpreter):
         if self._supervisor_command is None and self._sandbox_name and self.config.remove_on_shutdown:
             if not self.config.persist:
                 subprocess.run(
-                    ["sbx", "rm", self._sandbox_name],
+                    ["sbx", "rm", "--force", self._sandbox_name],
                     check=False,
                     capture_output=True,
                     text=True,
