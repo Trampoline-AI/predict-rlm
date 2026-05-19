@@ -7,6 +7,7 @@ Core classes:
 File I/O:
     File — Unified file type for inputs (mount into sandbox) and outputs
            (sync from sandbox). Use ``list[File]`` for multiple files.
+    Workspace — Mutable input directory mounted into the sandbox and synced back.
 
 Lifecycle callbacks:
     IterationStep — payload passed to ``on_rlm_iteration_end`` callbacks.
@@ -15,7 +16,7 @@ Lifecycle callbacks:
                     to broadcast progress (e.g. to a websocket).
 """
 
-from .files import File, LocalDir, LocalFile, OutputDir, OutputFile, SyncedFile
+from .files import File, LocalDir, LocalFile, OutputDir, OutputFile, SyncedFile, Workspace
 from .interpreters import (
     DEFAULT_SBX_TEMPLATE,
     SandboxBackend,
@@ -43,4 +44,5 @@ __all__ = [
     "SbxInterpreter",
     "SbxPool",
     "SyncedFile",
+    "Workspace",
 ]

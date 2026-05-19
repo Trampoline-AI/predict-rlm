@@ -55,6 +55,18 @@ const filterBinary = (s) => {
   );
 };
 
+const sha256Hex = async (data) => {
+  const digest = await crypto.subtle.digest("SHA-256", data);
+  return Array.from(new Uint8Array(digest))
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("");
+};
+
+const relativePath = (root, fullPath) => {
+  const prefix = root.endsWith("/") ? root : root + "/";
+  return fullPath.startsWith(prefix) ? fullPath.slice(prefix.length) : fullPath;
+};
+
 // =============================================================================
 // Python Code Templates
 // =============================================================================
@@ -913,17 +925,28 @@ while (true) {
     const params = input.params || {};
     const requestId = input.id; // undefined for notifications
 
-    // sync_file — notification (no response)
+    // sync_file — notification or request
     if (method === "sync_file") {
       try {
         await Deno.writeFile(
           params.host_path || params.virtual_path,
           pyodide.FS.readFile(params.virtual_path),
         );
+        if (requestId !== undefined) {
+          console.log(jsonrpcResult({ ok: true }, requestId));
+        }
       } catch (e) {
-        console.error(
-          `sync_file failed for ${params.virtual_path}: ${e.message || e}`,
-        );
+        if (requestId !== undefined) {
+          console.log(jsonrpcError(
+            JSONRPC_APP_ERRORS.RuntimeError,
+            `sync_file failed for ${params.virtual_path}: ${e.message || e}`,
+            requestId,
+          ));
+        } else {
+          console.error(
+            `sync_file failed for ${params.virtual_path}: ${e.message || e}`,
+          );
+        }
       }
       continue;
     }
@@ -1025,6 +1048,50 @@ while (true) {
           JSONRPC_APP_ERRORS.RuntimeError,
           "Failed to list directory: " + e.message,
           requestId,
+        ));
+      }
+      continue;
+    }
+
+    // workspace_manifest — recursively list files with sha256 and size metadata
+    if (method === "workspace_manifest") {
+      const rootPath = params.path;
+      try {
+        let rootStat;
+        try {
+          rootStat = pyodide.FS.stat(rootPath);
+        } catch (e) {
+          throw new Error("Workspace mount does not exist: " + rootPath);
+        }
+        if (!pyodide.FS.isDir(rootStat.mode)) {
+          throw new Error("Workspace mount is not a directory: " + rootPath);
+        }
+        const files = {};
+        async function walk(dir) {
+          const entries = pyodide.FS.readdir(dir);
+          for (const entry of entries) {
+            if (entry === "." || entry === "..") continue;
+            const fullPath = dir + "/" + entry;
+            const stat = pyodide.FS.stat(fullPath);
+            if (pyodide.FS.isFile(stat.mode)) {
+              const data = pyodide.FS.readFile(fullPath);
+              files[relativePath(rootPath, fullPath)] = {
+                type: "file",
+                sha256: await sha256Hex(data),
+                size: data.length,
+              };
+            } else if (pyodide.FS.isDir(stat.mode)) {
+              await walk(fullPath);
+            }
+          }
+        }
+        await walk(rootPath);
+        console.log(jsonrpcResult({ files }, requestId));
+      } catch (e) {
+        console.log(jsonrpcError(
+          JSONRPC_APP_ERRORS.RuntimeError,
+          "Failed to build workspace manifest: " + e.message,
+          requestId
         ));
       }
       continue;

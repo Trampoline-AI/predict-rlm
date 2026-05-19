@@ -277,6 +277,79 @@ class MySignature(dspy.Signature):
 
 ---
 
+## `Workspace`
+
+Mutable host directory mounted into the sandbox and synced back after execution steps. Use `Workspace` for coding-agent workflows where the RLM should edit an existing directory instead of returning one explicit `File` output.
+
+```python
+from predict_rlm import PredictRLM, Workspace
+
+class UpdateProject(dspy.Signature):
+    workspace: Workspace = dspy.InputField()
+    request: str = dspy.InputField()
+    summary: str = dspy.OutputField()
+
+rlm = PredictRLM(UpdateProject, lm="openai/gpt-5.4")
+result = rlm(
+    workspace=Workspace(path="/path/to/project"),
+    request="Add validation for empty CSV rows.",
+)
+```
+
+`Workspace` fields are input-only. Inside the sandbox, the field value is replaced with the workspace mount path string, so the RLM reads and writes files with standard Python APIs:
+
+```python
+from pathlib import Path
+
+root = Path(workspace)  # /sandbox/workspace by default
+config = root / "pyproject.toml"
+config.write_text(config.read_text().replace("old", "new"))
+```
+
+### Fields
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `path` | `str` | — | Host directory to mirror into the sandbox. Must exist and must not be a symlink. |
+| `mount_path` | `str` | `"/sandbox/workspace"` | Sandbox directory where the workspace is mounted. Use distinct mount paths when passing `list[Workspace]`. |
+| `sync_back` | `bool` | `True` | Whether sandbox changes are synced back to the host after each code block. |
+| `exclude` | `list[str]` | common caches/build dirs | Directory or file names excluded from mirroring and sync-back. Defaults include `.git`, `.venv`, `node_modules`, `__pycache__`, `.pytest_cache`, `.mypy_cache`, `.ruff_cache`, `dist`, `build`, and `.DS_Store`. |
+| `max_file_bytes` | `int \| None` | `5_000_000` | Maximum file size to mirror and sync. Larger host files are skipped. Oversized sandbox changes raise a sync conflict. Set to `None` to disable the size limit. |
+
+### Sync behavior
+
+At setup time, predict-rlm scans the host workspace, skips excluded names, symlinks, non-regular files, and files larger than `max_file_bytes`, then mounts the remaining files into `mount_path`.
+
+After each sandbox code block, including failed code blocks while the sandbox process remains alive, predict-rlm compares the current sandbox manifest with the last synced manifest:
+
+- New and modified sandbox files are copied back to the corresponding host paths.
+- Sandbox deletions remove the corresponding host files.
+- Host changes made concurrently to a path that also changed in the sandbox raise `WorkspaceSyncConflictError`.
+- Sandbox files above `max_file_bytes` raise `WorkspaceSyncConflictError` instead of being synced or interpreted as deletions.
+- Excluded sandbox paths are ignored.
+- Host symlinks, symlink parent paths, non-directory parent paths, and root escapes raise sync conflicts.
+
+The host workspace path is added to the sandbox's Deno read and write permissions so the runner can mount initial files and sync changes back.
+
+### Multiple workspaces
+
+Use `list[Workspace]` for multiple mutable directories:
+
+```python
+class UpdateRepos(dspy.Signature):
+    workspaces: list[Workspace] = dspy.InputField()
+    summary: str = dspy.OutputField()
+
+result = rlm(workspaces=[
+    Workspace(path="/path/to/api", mount_path="/sandbox/api"),
+    Workspace(path="/path/to/web", mount_path="/sandbox/web"),
+])
+```
+
+Each workspace must have a unique `mount_path`.
+
+---
+
 ## `Skill`
 
 Reusable bundle of instructions, packages, modules, and tools. See the

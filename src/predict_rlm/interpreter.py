@@ -60,6 +60,7 @@ from .telemetry import (
     reset_current_telemetry_context,
     set_current_telemetry_context,
 )
+from .workspace import WorkspaceFileInfo
 
 if TYPE_CHECKING:
     from os import PathLike
@@ -373,6 +374,7 @@ class JspiInterpreter(PythonInterpreter):
         # Per-execute wall-clock timeout (see __init__ docstring).
         self._exec_timeout = exec_timeout
         self._execution_gate = InterpreterExecutionGate("JSPI interpreter")
+        self._post_execute_hooks: list[Callable[[Any], Any]] = []
 
     def configure_debug(self, enabled: bool) -> None:
         self._debug = enabled
@@ -793,21 +795,40 @@ class JspiInterpreter(PythonInterpreter):
         )
         return response.get("result", {}).get("files", [])
 
+    def workspace_manifest(self, virtual_path: str) -> dict[str, WorkspaceFileInfo]:
+        """Return a recursive file manifest under a sandbox workspace path."""
+        self._ensure_deno_process()
+        response = self._send_request(
+            "workspace_manifest",
+            {"path": virtual_path},
+            f"building workspace manifest for {virtual_path}",
+        )
+        files = response.get("result", {}).get("files", {})
+        return {
+            rel_path: WorkspaceFileInfo(
+                type=info["type"],
+                sha256=info["sha256"],
+                size=info["size"],
+            )
+            for rel_path, info in files.items()
+        }
+
+    def add_post_execute_hook(self, hook: Callable[[Any], Any]) -> None:
+        """Register a hook called after each completed sandbox execution."""
+        self._post_execute_hooks.append(hook)
+
+    def _run_post_execute_hooks(self) -> None:
+        for hook in getattr(self, "_post_execute_hooks", ()):
+            hook(self)
+
     def sync_file_to(self, virtual_path: str, host_path: str) -> None:
         """Sync a single file from the sandbox MEMFS back to the host."""
         self._ensure_deno_process()
-        # sync_file is a notification (no response expected), but we use
-        # _send_request for the JSON-RPC request pattern with a response.
-        # Use direct stdin write like the parent's _sync_files does.
-        sync_msg = json.dumps(
-            {
-                "jsonrpc": "2.0",
-                "method": "sync_file",
-                "params": {"virtual_path": virtual_path, "host_path": host_path},
-            }
+        self._send_request(
+            "sync_file",
+            {"virtual_path": virtual_path, "host_path": host_path},
+            f"syncing {virtual_path} to {host_path}",
         )
-        self.deno_process.stdin.write(sync_msg + "\n")
-        self.deno_process.stdin.flush()
 
     def _strip_code_fences(self, code: str) -> str:
         return strip_code_fences(code)
@@ -1365,6 +1386,7 @@ class JspiInterpreter(PythonInterpreter):
             if "result" in result:
                 res = result["result"]
                 self._sync_files()
+                self._run_post_execute_hooks()
                 if isinstance(res, dict) and "timeout" in res:
                     return self._format_recoverable_timeout_result(res)
                 if interpreter_result_logging_enabled(getattr(self, "_verbose", False)):
@@ -1406,8 +1428,10 @@ class JspiInterpreter(PythonInterpreter):
                         if text:
                             parts.append(repr(text))
                         detail = ", ".join(parts)
+                    self._run_post_execute_hooks()
                     raise SyntaxError(detail or "Invalid Python syntax")
                 else:
+                    self._run_post_execute_hooks()
                     raise SandboxExecutionError(
                         f"{error_type}: {error_args or error_msg}",
                         partial_output=partial_output,

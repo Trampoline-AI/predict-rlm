@@ -87,3 +87,43 @@ results = await asyncio.gather(*[
     for img in images
 ])
 ```
+
+## Mutable workspaces
+
+Use `Workspace` when the RLM should edit a host directory directly, such as fixing code, updating a project, or producing several related files whose names are not known up front. A workspace is an input-only field: predict-rlm mirrors eligible host files into the sandbox, gives the RLM the sandbox path, and syncs sandbox changes back to the host after each code block.
+
+```python
+from predict_rlm import PredictRLM, Workspace
+
+class FixBug(dspy.Signature):
+    """Fix the bug in the project and summarize the change."""
+    workspace: Workspace = dspy.InputField()
+    bug_report: str = dspy.InputField()
+    summary: str = dspy.OutputField()
+
+rlm = PredictRLM(FixBug, lm="openai/gpt-5.4")
+result = rlm(
+    workspace=Workspace(path="/path/to/project"),
+    bug_report="The CSV importer drops rows with empty optional columns.",
+)
+```
+
+Inside the sandbox, the `workspace` input is a string path such as `/sandbox/workspace`, so the RLM can use ordinary Python file APIs:
+
+```python
+from pathlib import Path
+
+root = Path(workspace)
+source = root / "src" / "importer.py"
+text = source.read_text()
+source.write_text(text.replace("if not value: continue", "if value is None: continue"))
+```
+
+Workspace sync is conservative:
+
+- Excluded names such as `.git`, `.venv`, `node_modules`, caches, `dist`, and `build` are not mirrored or synced back.
+- Files larger than `max_file_bytes` are skipped on the way in. If a sandbox edit grows a file beyond that limit, sync raises a conflict instead of deleting or overwriting the host file.
+- Symlinks are not followed. Host symlink paths and path escapes are treated as sync conflicts.
+- If the host and sandbox both change the same path since the last sync, sync raises `WorkspaceSyncConflictError` rather than clobbering the host change.
+
+Use `File` outputs when the RLM should return specific generated artifacts. Use `Workspace` when the output is a set of edits to an existing directory.
