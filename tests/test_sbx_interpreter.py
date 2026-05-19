@@ -1232,6 +1232,26 @@ class TestSbxCommandConstruction:
         assert command[:4] == ["sbx", "exec", "-i", "-w"]
         assert not any(cmd[:2] == ["sbx", "rm"] for cmd in commands)
 
+    def test_create_failure_includes_sbx_output(self, monkeypatch, tmp_path: Path):
+        def fake_run(command, **kwargs):
+            raise subprocess.CalledProcessError(
+                1,
+                command,
+                output="creating sandbox",
+                stderr="sandbox name already exists",
+            )
+
+        monkeypatch.setattr(shutil, "which", lambda name: "/usr/local/bin/sbx")
+        monkeypatch.setattr(subprocess, "run", fake_run)
+        interpreter = SbxInterpreter(
+            config=SbxConfig(name="created-name"),
+            preinstall_packages=False,
+            _staging_root=tmp_path / "staging",
+        )
+
+        with pytest.raises(SandboxFatalError, match="sandbox name already exists"):
+            interpreter._start_sbx_and_build_runner_command()
+
     def test_workspace_flags_include_read_only_primary_and_extra_workspaces(
         self, monkeypatch, tmp_path: Path
     ):

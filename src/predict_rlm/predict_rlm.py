@@ -37,7 +37,7 @@ from pydantic import ConfigDict, ValidationError, create_model
 from ._shared import build_rlm_signatures, format_tool_docs_full
 from .debug import debug_event, safe_model_name
 from .execution_timeout import validate_execution_timeout
-from .files import File, build_file_plan, scan_file_fields
+from .files import File, build_file_plan, scan_file_fields, scan_workspace_fields
 from .interpreter import JspiInterpreter, SandboxFatalError
 from .interpreters import (
     PredictRLMInterpreter,
@@ -1392,9 +1392,9 @@ class PredictRLM(dspy.RLM):
                 raise
         else:
             extra_read = list(file_plan["read_paths"]) if file_plan else []
-            extra_write = (
-                [file_plan["write_dir"]] if file_plan and file_plan["write_dir"] else None
-            )
+            extra_write = list(file_plan.get("write_paths", [])) if file_plan else []
+            if file_plan and file_plan["write_dir"]:
+                extra_write.append(file_plan["write_dir"])
 
             # Add module host paths to read permissions
             for mod_path in self._skill_modules.values():
@@ -1407,7 +1407,7 @@ class PredictRLM(dspy.RLM):
                 "skill_packages": self._skill_packages or None,
                 "debug": self._debug,
                 "extra_read_paths": extra_read or None,
-                "extra_write_paths": extra_write,
+                "extra_write_paths": extra_write or None,
             }
             if self._sbx_pool is not None:
                 lease_start = time.perf_counter()
@@ -2217,11 +2217,16 @@ class PredictRLM(dspy.RLM):
         no file fields are present.
         """
         input_file_fields, output_file_fields = scan_file_fields(self.signature)
-        if not input_file_fields and not output_file_fields:
+        input_workspace_fields = scan_workspace_fields(self.signature)
+        if not input_file_fields and not output_file_fields and not input_workspace_fields:
             return None, input_args
 
         file_plan = build_file_plan(
-            input_args, input_file_fields, output_file_fields, self._output_dir
+            input_args,
+            input_file_fields,
+            output_file_fields,
+            output_dir=self._output_dir,
+            input_workspace_fields=input_workspace_fields,
         )
         if not file_plan:
             return None, input_args
@@ -2257,6 +2262,24 @@ class PredictRLM(dspy.RLM):
                     )
                 transformed[field_name] = f"/sandbox/input/{field_name}"
 
+        for field_name, kind in input_workspace_fields.items():
+            value = transformed.get(field_name)
+            if value is None:
+                continue
+            if kind == "list_workspace":
+                for workspace in value:
+                    if not os.path.isdir(workspace.path):
+                        raise FileNotFoundError(
+                            f"Workspace for field '{field_name}' not found: {workspace.path}"
+                        )
+                transformed[field_name] = [workspace.mount_path for workspace in value]
+            elif kind == "workspace":
+                if not os.path.isdir(value.path):
+                    raise FileNotFoundError(
+                        f"Workspace for field '{field_name}' not found: {value.path}"
+                    )
+                transformed[field_name] = value.mount_path
+
         # Remove output file fields from input_args (they aren't RLM inputs)
         for field_name in output_file_fields:
             transformed.pop(field_name, None)
@@ -2281,6 +2304,12 @@ class PredictRLM(dspy.RLM):
 
             for host_path, virtual_path in file_plan["mounts"]:
                 repl.mount_file_at(host_path, virtual_path)
+
+            for state in file_plan.get("workspace_states", []):
+                repl.mkdir_p(state.workspace.mount_path)
+                for host_path, virtual_path in state.iter_mounts():
+                    repl.mount_file_at(host_path, virtual_path)
+                repl.add_post_execute_hook(state.sync_from_sandbox)
 
             for virtual_dir in file_plan["output_dirs"]:
                 repl.mkdir_p(virtual_dir)
@@ -2374,6 +2403,11 @@ class PredictRLM(dspy.RLM):
                         repl.sync_file_to(vpath, hp)
                         result_files.append(File(path=hp))
                 setattr(prediction, field_name, result_files)
+
+    def _sync_workspace_files(self, repl: JspiInterpreter, file_plan: dict[str, Any]) -> None:
+        """Run a final workspace sync before returning to the caller."""
+        for state in file_plan.get("workspace_states", []):
+            state.sync_from_sandbox(repl)
 
     def _forward_traced(
         self, file_plan: dict[str, Any] | None, **input_args: Any
@@ -2528,6 +2562,9 @@ class PredictRLM(dspy.RLM):
                             self._sync_output_files(
                                 repl, prediction, output_file_fields, file_plan
                             )
+
+                    if file_plan:
+                        self._sync_workspace_files(repl, file_plan)
 
                     prediction.trace = self._build_run_trace(
                         status=status,
@@ -2733,6 +2770,9 @@ class PredictRLM(dspy.RLM):
                                 repl, prediction, output_file_fields, file_plan
                             )
 
+                    if file_plan:
+                        self._sync_workspace_files(repl, file_plan)
+
                     prediction.trace = self._build_run_trace(
                         status=status,
                         steps=steps,
@@ -2794,6 +2834,7 @@ class PredictRLM(dspy.RLM):
             _is_list_annotation,
             is_input_file_type,
             is_output_file_type,
+            is_workspace_type,
         )
 
         # Replace file-typed fields with str/list[str] for the RLM's view
@@ -2808,7 +2849,7 @@ class PredictRLM(dspy.RLM):
                     type_=replacement,
                 )
         for name, field in self.signature.input_fields.items():
-            if is_input_file_type(field.annotation):
+            if is_input_file_type(field.annotation) or is_workspace_type(field.annotation):
                 replacement = list[str] if _is_list_annotation(field.annotation) else str
                 modified_sig = modified_sig.with_updated_fields(
                     name,

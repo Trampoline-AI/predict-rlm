@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
+import hashlib
 import inspect
 import json
 import os
@@ -28,6 +29,7 @@ from predict_rlm.execution_timeout import (
 )
 from predict_rlm.files import get_synced_file_params
 from predict_rlm.interpreter import SandboxFatalError
+from predict_rlm.workspace import WorkspaceFileInfo
 
 from .base import (
     InterpreterExecutionGate,
@@ -92,6 +94,7 @@ class SbxInterpreter(PersistentJsonRpcRunnerClient, PredictRLMInterpreter):
         self._sandbox_name: str | None = None
         self._prepared_runner_path: Path | None = None
         self._shutdown = False
+        self._post_execute_hooks: list[Callable[[Any], Any]] = []
 
     def execute(
         self,
@@ -101,7 +104,10 @@ class SbxInterpreter(PersistentJsonRpcRunnerClient, PredictRLMInterpreter):
         timeout: float | None = None,
     ) -> Any:
         with self._execution_gate.top_level():
-            return self._execute_top_level(code, variables, timeout=timeout)
+            try:
+                return self._execute_top_level(code, variables, timeout=timeout)
+            finally:
+                self._run_post_execute_hooks()
 
     def _execute_top_level(
         self,
@@ -153,11 +159,43 @@ class SbxInterpreter(PersistentJsonRpcRunnerClient, PredictRLMInterpreter):
             if path.is_file()
         ]
 
+    def workspace_manifest(self, virtual_path: str) -> dict[str, WorkspaceFileInfo]:
+        root = self._host_path_for_virtual_path(virtual_path)
+        if not root.exists():
+            raise FileNotFoundError(f"Workspace mount does not exist: {virtual_path}")
+        if not root.is_dir():
+            raise NotADirectoryError(f"Workspace mount is not a directory: {virtual_path}")
+        files: dict[str, WorkspaceFileInfo] = {}
+        for path in sorted(root.rglob("*")):
+            if not path.is_file():
+                continue
+            rel_path = path.relative_to(root).as_posix()
+            files[rel_path] = WorkspaceFileInfo(
+                type="file",
+                sha256=self._sha256_file(path),
+                size=path.stat().st_size,
+            )
+        return files
+
+    def add_post_execute_hook(self, hook: Callable[[Any], Any]) -> None:
+        self._post_execute_hooks.append(hook)
+
+    def _run_post_execute_hooks(self) -> None:
+        for hook in self._post_execute_hooks:
+            hook(self)
+
     def sync_file_to(self, virtual_path: str, host_path: str) -> None:
         source = self._host_path_for_virtual_path(virtual_path)
         target = Path(host_path)
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(source, target)
+
+    def _sha256_file(self, path: Path) -> str:
+        digest = hashlib.sha256()
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                digest.update(chunk)
+        return digest.hexdigest()
 
     def _host_path_for_virtual_path(self, virtual_path: str) -> Path:
         if virtual_path != "/sandbox" and not virtual_path.startswith("/sandbox/"):
@@ -361,8 +399,17 @@ class SbxInterpreter(PersistentJsonRpcRunnerClient, PredictRLMInterpreter):
                     text=True,
                     timeout=self.config.create_timeout,
                 )
-            except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
-                raise SandboxFatalError(f"Failed to create sbx sandbox: {exc}") from exc
+            except subprocess.CalledProcessError as exc:
+                raise SandboxFatalError(
+                    f"Failed to create sbx sandbox: {exc}. "
+                    f"stdout: {exc.stdout or ''} stderr: {exc.stderr or ''}"
+                ) from exc
+            except subprocess.TimeoutExpired as exc:
+                raise SandboxFatalError(
+                    f"Failed to create sbx sandbox: timed out after "
+                    f"{self.config.create_timeout}s. "
+                    f"stdout: {exc.stdout or ''} stderr: {exc.stderr or ''}"
+                ) from exc
 
             self._sandbox_name = self.config.name or self._parse_sandbox_name(created.stdout)
             self._apply_network_policy()

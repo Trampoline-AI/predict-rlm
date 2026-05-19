@@ -94,6 +94,9 @@ class TestIsFileType:
     def test_optional_file(self):
         assert is_file_type(Optional[File]) is True
 
+    def test_pep604_optional_file(self):
+        assert is_file_type(File | None) is True
+
     def test_list_file(self):
         assert is_file_type(list[File]) is True
 
@@ -135,6 +138,14 @@ class TestScanFileFields:
             answer: str = dspy.OutputField()
 
         inputs, outputs = scan_file_fields(Sig)
+        assert inputs == {"documents": "list_file"}
+
+    def test_pep604_optional_list_file_input(self):
+        class Sig(dspy.Signature):
+            documents: list[File] | None = dspy.InputField()
+            answer: str = dspy.OutputField()
+
+        inputs, _ = scan_file_fields(Sig)
         assert inputs == {"documents": "list_file"}
 
     def test_list_file_output(self):
@@ -199,7 +210,6 @@ class TestBuildFileInstructions:
         )
         assert "docs" in result
         assert "file1.pdf" in result
-
 
 # -- build_file_plan tests --
 
@@ -291,7 +301,6 @@ class TestBuildFilePlan:
         finally:
             os.unlink(p1)
             os.unlink(p2)
-
 
 # -- PredictRLM-level unit tests --
 
@@ -399,7 +408,6 @@ class TestPrepareFileIO:
             os.unlink(p1)
             os.unlink(p2)
 
-
 class TestBuildSignaturesWithFiles:
     """Tests for PredictRLM._build_signatures_with_files."""
 
@@ -439,7 +447,6 @@ class TestBuildSignaturesWithFiles:
         rlm = self._make_rlm(Sig)
         action, _ = rlm._build_signatures_with_files("## Files\ntest")
         assert "`source`" in action.signature.instructions
-
 
 class TestSyncOutputFiles:
     """Tests for PredictRLM._sync_output_files."""
@@ -842,8 +849,8 @@ print("done")
             f.write("name,age\nAlice,30\nBob,25\n")
             input_path = f.name
 
-        with tempfile.TemporaryDirectory() as output_dir:
-            try:
+        try:
+            with tempfile.TemporaryDirectory() as output_dir:
                 interpreter = JspiInterpreter(
                     preinstall_packages=False,
                     extra_read_paths=[input_path],
@@ -896,8 +903,9 @@ print(f"Wrote {{len(rows)}} rows")
                     assert data[1]["name"] == "BOB"
                 finally:
                     interpreter.shutdown()
-            finally:
-                os.unlink(input_path)
+        finally:
+            os.unlink(input_path)
+
 
     def test_mkdir_p_creates_nested_dirs(self):
         """mkdir_p creates deeply nested directories in MEMFS."""
