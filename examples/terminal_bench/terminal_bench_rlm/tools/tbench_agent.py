@@ -3,13 +3,21 @@ from __future__ import annotations
 import asyncio
 import importlib
 import inspect
+import json
 import os
+import time
 import uuid
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable
 
 import dspy
+
+from terminal_bench_rlm.skills import (
+    TERMINAL_BENCH_SKILL_NAME,
+    build_terminal_bench_skill,
+)
 
 TERMINAL_WRAPPER_TOOL_NAMES = frozenset(
     {"run_terminal_command", "send_terminal_keys", "read_terminal"}
@@ -66,12 +74,14 @@ def _coerce_float(value: Any) -> float:
     return float(value)
 
 
-def _build_lm(value: Any, reasoning_effort: str | None) -> Any:
+def _build_lm(value: Any, reasoning_effort: str | None, service_tier: str | None = None) -> Any:
     if not isinstance(value, str) or reasoning_effort is None:
         return value
     kwargs: dict[str, Any] = {"cache": False}
     if reasoning_effort != "none":
         kwargs["reasoning_effort"] = reasoning_effort
+    if service_tier:
+        kwargs["service_tier"] = service_tier
     return dspy.LM(value, **kwargs)
 
 
@@ -132,6 +142,37 @@ def _write_trace(trace: Any, logging_dir: Path | None) -> None:
         path.write_text(str(trace), encoding="utf-8")
 
 
+def _write_phase_event(
+    path: Path | None,
+    *,
+    task_id: str | None,
+    event: str,
+    phase: str,
+    status: str,
+    **fields: Any,
+) -> None:
+    if path is None:
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "timestamp": datetime.now().isoformat(),
+        "event": event,
+        "phase": phase,
+        "status": status,
+        "task_id": task_id,
+        **fields,
+    }
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(payload, sort_keys=True) + "\n")
+    duration = payload.get("duration_seconds")
+    duration_text = f" duration_seconds={duration:.3f}" if isinstance(duration, (int, float)) else ""
+    print(
+        f"phase_event task={task_id} phase={phase} event={event} "
+        f"status={status}{duration_text}",
+        flush=True,
+    )
+
+
 def _predict_rlm_class() -> Any:
     global PredictRLM
     if PredictRLM is None:
@@ -141,6 +182,19 @@ def _predict_rlm_class() -> Any:
 
 def _skill_class() -> Any:
     return getattr(importlib.import_module("predict_rlm"), "Skill")
+
+
+def _with_terminal_bench_skill(
+    rlm_kwargs: dict[str, Any],
+    skill_instructions: str | None,
+) -> None:
+    skills = [
+        skill
+        for skill in list(rlm_kwargs.get("skills") or [])
+        if getattr(skill, "name", None) != TERMINAL_BENCH_SKILL_NAME
+    ]
+    skills.append(build_terminal_bench_skill(_skill_class(), skill_instructions))
+    rlm_kwargs["skills"] = skills
 
 
 def _interpreter_class() -> Any:
@@ -248,8 +302,12 @@ class _TerminalBenchRLMBaseAgentMixin:
         codex_lm_exclude: tuple[str, ...] | list[str] | str | None = None,
         lm_reasoning_effort: str | None = None,
         sub_lm_reasoning_effort: str | None = None,
+        lm_service_tier: str | None = None,
+        sub_lm_service_tier: str | None = None,
         exec_timeout: float | str | None = None,
         no_rebuild: bool | None = None,
+        phase_log_path: str | Path | None = None,
+        task_id: str | None = None,
         **predict_rlm_kwargs: Any,
     ) -> None:
         _validate_tools(tools)
@@ -262,6 +320,10 @@ class _TerminalBenchRLMBaseAgentMixin:
         self.codex_lm_exclude = _coerce_codex_lm_exclude(codex_lm_exclude)
         self.lm_reasoning_effort = _coerce_optional_text(lm_reasoning_effort)
         self.sub_lm_reasoning_effort = _coerce_optional_text(sub_lm_reasoning_effort)
+        self.lm_service_tier = _coerce_optional_text(lm_service_tier)
+        self.sub_lm_service_tier = _coerce_optional_text(sub_lm_service_tier)
+        self.phase_log_path = Path(phase_log_path) if phase_log_path is not None else None
+        self.task_id = task_id
         self.predict_rlm_kwargs = predict_rlm_kwargs
 
     def perform_task(
@@ -291,21 +353,17 @@ class _TerminalBenchRLMBaseAgentMixin:
         try:
             rlm_kwargs = dict(self.predict_rlm_kwargs)
             if "lm" in rlm_kwargs:
-                rlm_kwargs["lm"] = _build_lm(rlm_kwargs["lm"], self.lm_reasoning_effort)
+                rlm_kwargs["lm"] = _build_lm(
+                    rlm_kwargs["lm"], self.lm_reasoning_effort, self.lm_service_tier
+                )
             if "sub_lm" in rlm_kwargs:
                 rlm_kwargs["sub_lm"] = _build_lm(
-                    rlm_kwargs["sub_lm"], self.sub_lm_reasoning_effort
+                    rlm_kwargs["sub_lm"],
+                    self.sub_lm_reasoning_effort,
+                    self.sub_lm_service_tier,
                 )
             rlm_kwargs["interpreter"] = interpreter
-            if self.skill_instructions:
-                skills = list(rlm_kwargs.get("skills") or [])
-                skills.append(
-                    _skill_class()(
-                        name="terminal-bench",
-                        instructions=self.skill_instructions,
-                    )
-                )
-                rlm_kwargs["skills"] = skills
+            _with_terminal_bench_skill(rlm_kwargs, self.skill_instructions)
             if "max_iterations" in rlm_kwargs:
                 rlm_kwargs["max_iterations"] = int(rlm_kwargs["max_iterations"])
             if self.tools is not None:
@@ -356,12 +414,58 @@ class HarborPredictRLMAgent(_TerminalBenchRLMBaseAgentMixin):
             return {"name": self.name(), "version": self.version() or "unknown", "model_info": None}
         return agent_info_cls(name=self.name(), version=self.version() or "unknown", model_info=None)
 
+    def populate_context_post_run(self, _context: Any) -> None:
+        return None
+
     async def setup(self, environment: Any) -> None:
+        started = time.monotonic()
+        _write_phase_event(
+            self.phase_log_path,
+            task_id=self.task_id,
+            event="agent_setup_start",
+            phase="agent_setup",
+            status="started",
+        )
+        _write_phase_event(
+            self.phase_log_path,
+            task_id=self.task_id,
+            event="agent_setup_end",
+            phase="agent_setup",
+            status="completed",
+            duration_seconds=time.monotonic() - started,
+        )
         return None
 
     async def run(self, instruction: str, environment: Any, context: Any) -> None:
         loop = asyncio.get_running_loop()
-        result = await asyncio.to_thread(self._run_sync, instruction, environment, loop)
+        started = time.monotonic()
+        _write_phase_event(
+            self.phase_log_path,
+            task_id=self.task_id,
+            event="agent_run_start",
+            phase="agent_eval",
+            status="started",
+        )
+        try:
+            result = await self._run_async(instruction, environment, loop)
+        except BaseException:
+            _write_phase_event(
+                self.phase_log_path,
+                task_id=self.task_id,
+                event="agent_run_end",
+                phase="agent_eval",
+                status="failed",
+                duration_seconds=time.monotonic() - started,
+            )
+            raise
+        _write_phase_event(
+            self.phase_log_path,
+            task_id=self.task_id,
+            event="agent_run_end",
+            phase="agent_eval",
+            status="completed",
+            duration_seconds=time.monotonic() - started,
+        )
         answer = _coerce_answer(result)
         if "metadata" in getattr(type(context), "model_fields", {}):
             metadata = dict(context.metadata or {})
@@ -370,7 +474,7 @@ class HarborPredictRLMAgent(_TerminalBenchRLMBaseAgentMixin):
         else:
             setattr(context, "answer", answer)
 
-    def _run_sync(
+    async def _run_async(
         self,
         instruction: str,
         environment: Any,
@@ -378,38 +482,63 @@ class HarborPredictRLMAgent(_TerminalBenchRLMBaseAgentMixin):
     ) -> Any:
         if self.codex_lm:
             _install_codex_lm_monkeypatch(self.codex_lm_exclude)
-        interpreter = _harbor_interpreter_class()(environment, loop=loop, **self.interpreter_kwargs)
+        setup_started = time.monotonic()
+        _write_phase_event(
+            self.phase_log_path,
+            task_id=self.task_id,
+            event="sandbox_setup_start",
+            phase="sandbox_setup",
+            status="started",
+        )
+        try:
+            interpreter = _harbor_interpreter_class()(environment, loop=loop, **self.interpreter_kwargs)
+        except BaseException:
+            _write_phase_event(
+                self.phase_log_path,
+                task_id=self.task_id,
+                event="sandbox_setup_end",
+                phase="sandbox_setup",
+                status="failed",
+                duration_seconds=time.monotonic() - setup_started,
+            )
+            raise
+        _write_phase_event(
+            self.phase_log_path,
+            task_id=self.task_id,
+            event="sandbox_setup_end",
+            phase="sandbox_setup",
+            status="completed",
+            duration_seconds=time.monotonic() - setup_started,
+        )
         try:
             rlm_kwargs = dict(self.predict_rlm_kwargs)
             if "lm" in rlm_kwargs:
-                rlm_kwargs["lm"] = _build_lm(rlm_kwargs["lm"], self.lm_reasoning_effort)
-            if "sub_lm" in rlm_kwargs:
-                rlm_kwargs["sub_lm"] = _build_lm(rlm_kwargs["sub_lm"], self.sub_lm_reasoning_effort)
-            rlm_kwargs["interpreter"] = interpreter
-            if self.skill_instructions:
-                skills = list(rlm_kwargs.get("skills") or [])
-                skills.append(
-                    _skill_class()(
-                        name="terminal-bench",
-                        instructions=self.skill_instructions,
-                    )
+                rlm_kwargs["lm"] = _build_lm(
+                    rlm_kwargs["lm"], self.lm_reasoning_effort, self.lm_service_tier
                 )
-                rlm_kwargs["skills"] = skills
+            if "sub_lm" in rlm_kwargs:
+                rlm_kwargs["sub_lm"] = _build_lm(
+                    rlm_kwargs["sub_lm"],
+                    self.sub_lm_reasoning_effort,
+                    self.sub_lm_service_tier,
+                )
+            rlm_kwargs["interpreter"] = interpreter
+            _with_terminal_bench_skill(rlm_kwargs, self.skill_instructions)
             if "max_iterations" in rlm_kwargs:
                 rlm_kwargs["max_iterations"] = int(rlm_kwargs["max_iterations"])
             if self.tools is not None:
                 rlm_kwargs["tools"] = self.tools
             rlm = _predict_rlm_class()(self.signature, **rlm_kwargs)
-            result = rlm(instruction=instruction)
+            result = rlm.acall(instruction=instruction)
             if inspect.isawaitable(result):
-                result = asyncio.run(result)
+                result = await result
             _write_trace(getattr(result, "trace", None), self.logs_dir)
             return result
         except BaseException as exc:
             _write_trace(getattr(exc, "trace", None), self.logs_dir)
             raise
         finally:
-            interpreter.shutdown()
+            await asyncio.to_thread(interpreter.shutdown)
 
 
 
