@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import ast
 import asyncio
 import json
 import subprocess
@@ -8,6 +9,8 @@ import sys
 import types
 from pathlib import Path
 from types import SimpleNamespace
+
+import pytest
 
 _EXAMPLE_DIR = Path(__file__).resolve().parent.parent
 if str(_EXAMPLE_DIR) not in sys.path:
@@ -22,7 +25,10 @@ from terminal_bench_rlm.gepa.project import (  # noqa: E402
     TerminalBenchSubprocessHarnessRunner,
     TerminalBenchTaskRunRequest,
     TerminalBenchTaskRunResult,
+    _seed_skill_instructions,
+    phase_duration_summary,
 )
+from terminal_bench_rlm.skills import DEFAULT_TERMINAL_BENCH_SKILL_INSTRUCTIONS  # noqa: E402
 from terminal_bench_rlm.tools import tbench_agent  # noqa: E402
 
 from predict_rlm.trace import RunTrace  # noqa: E402
@@ -50,6 +56,7 @@ def test_project_validation_check_has_non_empty_train_and_val_examples() -> None
     assert len(validation.valset) >= 1
 
 
+
 def test_config_serializes_terminal_bench_fields_for_run_metadata() -> None:
     payload = default_config().to_dict()
 
@@ -59,7 +66,7 @@ def test_config_serializes_terminal_bench_fields_for_run_metadata() -> None:
     assert payload["terminal_bench_output_dir"] == "runs/gepa-terminal-bench"
     assert payload["train_task_ids"] == ["configure-git-webserver", "extract-moves-from-video"]
     assert payload["val_task_ids"] == ["super-benchmark-upet"]
-    assert payload["max_iterations"] == 30
+    assert payload["max_iterations"] == 20
 
 
 def test_cli_accepts_harbor_backend_and_executable_args() -> None:
@@ -130,7 +137,7 @@ def test_harbor_runner_builds_harbor_run_command(monkeypatch, tmp_path: Path) ->
         captured["cmd"] = cmd
         captured["kwargs"] = kwargs
         run_dir = config.terminal_bench_output_dir / "gepa-val-task"
-        run_dir.mkdir(parents=True)
+        run_dir.mkdir(parents=True, exist_ok=True)
         (run_dir / "result.json").write_text(
             json.dumps(
                 {
@@ -183,8 +190,389 @@ def test_harbor_runner_builds_harbor_run_command(monkeypatch, tmp_path: Path) ->
     assert cmd[cmd.index("--n-concurrent") + 1] == "1"
     assert "--agent-kwarg" in cmd
     assert "exec_timeout=900" in cmd
+    assert "task_id=task" in cmd
+    assert f"phase_log_path={config.terminal_bench_output_dir / 'gepa-val-task' / 'task_phase_events.jsonl'}" in cmd
+    kwargs = captured["kwargs"]
+    assert isinstance(kwargs, dict)
+    assert kwargs["timeout"] == 2760
+    assert "stdout" not in kwargs
+    assert "stderr" not in kwargs
     assert result.error is None
     assert result.trial_result["verifier_result"]["rewards"]["reward"] == 1.0
+
+
+def test_phase_duration_summary_aggregates_task_phase_event_logs(tmp_path: Path) -> None:
+    task_a_log = tmp_path / "jobs" / "run-a" / "task_phase_events.jsonl"
+    task_a_log.parent.mkdir(parents=True)
+    task_a_log.write_text(
+        "\n".join(
+            json.dumps(event)
+            for event in [
+                {
+                    "task_id": "terminal-bench/a",
+                    "phase": "agent_setup",
+                    "event": "agent_setup_end",
+                    "status": "completed",
+                    "duration_seconds": 1.25,
+                },
+                {
+                    "task_id": "terminal-bench/a",
+                    "phase": "agent_eval",
+                    "event": "agent_run_end",
+                    "status": "completed",
+                    "duration_seconds": 10.5,
+                },
+                {
+                    "task_id": "terminal-bench/a",
+                    "phase": "sandbox_setup",
+                    "event": "sandbox_setup_end",
+                    "status": "completed",
+                    "duration_seconds": 2.0,
+                },
+            ]
+        )
+        + "\n"
+    )
+    task_b_log = tmp_path / "jobs" / "run-b" / "task_phase_events.jsonl"
+    task_b_log.parent.mkdir(parents=True)
+    task_b_log.write_text(
+        json.dumps(
+            {
+                "task_id": "terminal-bench/b",
+                "phase": "agent_eval",
+                "event": "agent_run_end",
+                "status": "failed",
+                "duration_seconds": 4,
+            }
+        )
+        + "\n"
+    )
+
+    summary = phase_duration_summary(tmp_path)
+
+    assert summary == {
+        "phase_totals": {
+            "agent_eval": {"duration_seconds": 14.5, "events": 2},
+            "agent_setup": {"duration_seconds": 1.25, "events": 1},
+            "sandbox_setup": {"duration_seconds": 2.0, "events": 1},
+        },
+        "tasks": {
+            "terminal-bench/a": {
+                "duration_seconds": 13.75,
+                "phases": {
+                    "agent_eval": {"duration_seconds": 10.5, "events": 1},
+                    "agent_setup": {"duration_seconds": 1.25, "events": 1},
+                    "sandbox_setup": {"duration_seconds": 2.0, "events": 1},
+                },
+            },
+            "terminal-bench/b": {
+                "duration_seconds": 4.0,
+                "phases": {"agent_eval": {"duration_seconds": 4.0, "events": 1}},
+            },
+        },
+        "total_logged_duration_seconds": 17.75,
+    }
+
+
+def test_harbor_subprocess_runner_writes_task_phase_events(monkeypatch, tmp_path: Path) -> None:
+    config = default_config()
+    config.terminal_bench_output_dir = tmp_path / "harbor-runs"
+    config.harbor_task_cache_dir = tmp_path / "harbor-cache"
+    task_dir = config.harbor_task_cache_dir / "terminal-bench" / "task" / "sha"
+    task_dir.mkdir(parents=True)
+    (task_dir / "task.toml").write_text(
+        """
+[agent]
+timeout_sec = 900.0
+
+[verifier]
+timeout_sec = 900.0
+
+[environment]
+build_timeout_sec = 900.0
+""".strip()
+    )
+
+    def fake_run(cmd, **_kwargs):
+        run_dir = config.terminal_bench_output_dir / "gepa-val-task"
+        run_dir.mkdir(parents=True, exist_ok=True)
+        (run_dir / "result.json").write_text(
+            json.dumps(
+                {
+                    "trial_results": [
+                        {
+                            "task_info": {"name": "task"},
+                            "verifier_result": {"rewards": {"reward": 1.0}},
+                        }
+                    ]
+                }
+            )
+        )
+        return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    HarborSubprocessHarnessRunner(cwd=tmp_path)._run_sync(
+        TerminalBenchTaskRunRequest(
+            task_id="terminal-bench/task",
+            instruction="",
+            skill_instructions="skill",
+            lm="main",
+            sub_lm="sub",
+            max_iterations=3,
+            task_timeout=900,
+            verbose_rlm=True,
+            output_dir=tmp_path,
+            run_id="gepa-val-task",
+            config=config,
+        )
+    )
+
+    phase_log = config.terminal_bench_output_dir / "gepa-val-task" / "task_phase_events.jsonl"
+    events = [json.loads(line) for line in phase_log.read_text().splitlines()]
+    assert [event["event"] for event in events] == [
+        "harbor_subprocess_start",
+        "harbor_subprocess_end",
+    ]
+    assert events[0]["phase"] == "environment_setup"
+    assert events[0]["task_id"] == "terminal-bench/task"
+    assert events[0]["dataset"] == "terminal-bench/terminal-bench-2-1"
+    assert events[0]["agent_timeout_seconds"] == 900
+    assert events[0]["outer_timeout_seconds"] == 2760
+    assert events[1]["duration_seconds"] >= 0
+
+
+
+def test_harbor_subprocess_runner_uses_official_task_timeout_components(
+    monkeypatch, tmp_path: Path
+) -> None:
+    config = default_config()
+    config.terminal_bench_output_dir = tmp_path / "harbor-runs"
+    config.harbor_task_cache_dir = tmp_path / "harbor-cache"
+    task_dir = config.harbor_task_cache_dir / "terminal-bench" / "task" / "sha"
+    task_dir.mkdir(parents=True)
+    (task_dir / "task.toml").write_text(
+        """
+[agent]
+timeout_sec = 90.0
+
+[verifier]
+timeout_sec = 45.0
+
+[environment]
+build_timeout_sec = 15.0
+""".strip()
+    )
+    captured: dict[str, object] = {}
+
+    def fake_run(cmd, **kwargs):
+        captured["cmd"] = cmd
+        captured["kwargs"] = kwargs
+        return subprocess.CompletedProcess(args=cmd, returncode=1, stdout="", stderr="boom")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    HarborSubprocessHarnessRunner(cwd=tmp_path)._run_sync(
+        TerminalBenchTaskRunRequest(
+            task_id="terminal-bench/task",
+            instruction="",
+            skill_instructions="skill",
+            lm="main",
+            sub_lm="sub",
+            max_iterations=3,
+            task_timeout=1800,
+            verbose_rlm=False,
+            output_dir=tmp_path,
+            run_id="gepa-val-task",
+            config=config,
+        )
+    )
+
+    cmd = captured["cmd"]
+    assert isinstance(cmd, list)
+    assert "exec_timeout=90" in cmd
+    kwargs = captured["kwargs"]
+    assert isinstance(kwargs, dict)
+    assert kwargs["timeout"] == 210
+
+
+def test_harbor_subprocess_runner_uses_global_task_cache_when_run_cache_is_empty(
+    monkeypatch, tmp_path: Path
+) -> None:
+    config = default_config()
+    config.terminal_bench_output_dir = tmp_path / "harbor-runs"
+    config.harbor_task_cache_dir = tmp_path / "empty-run-cache"
+    global_task_dir = tmp_path / "home" / ".cache" / "harbor" / "tasks" / "packages" / "terminal-bench" / "task" / "sha"
+    global_task_dir.mkdir(parents=True)
+    (global_task_dir / "task.toml").write_text(
+        """
+[agent]
+timeout_sec = 90.0
+
+[verifier]
+timeout_sec = 45.0
+
+[environment]
+build_timeout_sec = 15.0
+""".strip()
+    )
+    captured: dict[str, object] = {}
+
+    def fake_run(cmd, **kwargs):
+        captured["cmd"] = cmd
+        captured["kwargs"] = kwargs
+        return subprocess.CompletedProcess(args=cmd, returncode=1, stdout="", stderr="boom")
+
+    monkeypatch.setattr(Path, "home", lambda: tmp_path / "home")
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    HarborSubprocessHarnessRunner(cwd=tmp_path)._run_sync(
+        TerminalBenchTaskRunRequest(
+            task_id="terminal-bench/task",
+            instruction="",
+            skill_instructions="skill",
+            lm="main",
+            sub_lm="sub",
+            max_iterations=3,
+            task_timeout=1800,
+            verbose_rlm=False,
+            output_dir=tmp_path,
+            run_id="gepa-val-task",
+            config=config,
+        )
+    )
+
+    cmd = captured["cmd"]
+    assert isinstance(cmd, list)
+    assert "exec_timeout=90" in cmd
+    kwargs = captured["kwargs"]
+    assert isinstance(kwargs, dict)
+    assert kwargs["timeout"] == 210
+
+
+def test_harbor_subprocess_runner_fails_fast_without_official_real_task_timeouts(
+    monkeypatch, tmp_path: Path
+) -> None:
+    config = default_config()
+    config.terminal_bench_output_dir = tmp_path / "harbor-runs"
+    config.harbor_task_cache_dir = tmp_path / "empty-run-cache"
+
+    def fake_run(*_args, **_kwargs):
+        raise AssertionError("harbor run should not launch without task.toml timeouts")
+
+    monkeypatch.setattr(Path, "home", lambda: tmp_path / "home")
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    with pytest.raises(RuntimeError, match="official Harbor timeouts"):
+        HarborSubprocessHarnessRunner(cwd=tmp_path)._run_sync(
+            TerminalBenchTaskRunRequest(
+                task_id="terminal-bench/task",
+                instruction="",
+                skill_instructions="skill",
+                lm="main",
+                sub_lm="sub",
+                max_iterations=3,
+                task_timeout=1800,
+                verbose_rlm=False,
+                output_dir=tmp_path,
+                run_id="gepa-val-task",
+                config=config,
+            )
+        )
+
+
+def test_harbor_subprocess_runner_times_out_inside_outer_harbor_budget(monkeypatch, tmp_path: Path) -> None:
+    config = default_config()
+    config.terminal_bench_output_dir = tmp_path / "harbor-runs"
+    captured: dict[str, object] = {}
+    long_stdout = "started\n" + ("o" * 5000)
+    long_stderr = "still running\n" + ("e" * 5000)
+
+    def fake_run(cmd, **kwargs):
+        captured["cmd"] = cmd
+        captured["kwargs"] = kwargs
+        raise subprocess.TimeoutExpired(
+            cmd=cmd,
+            timeout=kwargs["timeout"],
+            output=long_stdout,
+            stderr=long_stderr,
+        )
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    result = HarborSubprocessHarnessRunner(cwd=tmp_path)._run_sync(
+        TerminalBenchTaskRunRequest(
+            task_id="task",
+            instruction="",
+            skill_instructions="skill",
+            lm="main",
+            sub_lm="sub",
+            max_iterations=3,
+            task_timeout=30,
+            verbose_rlm=False,
+            output_dir=tmp_path,
+            run_id="gepa-val-task",
+            config=config,
+        )
+    )
+
+    kwargs = captured["kwargs"]
+    assert isinstance(kwargs, dict)
+    assert kwargs["timeout"] == 150
+    assert result.error is not None
+    assert result.error.startswith("Terminal-Bench CLI timed out after 150s")
+    exception_info = result.trial_result["exception_info"]
+    assert exception_info["exception_type"] == "HarnessTimeoutError"
+    assert exception_info["phase"] == "harness_subprocess"
+    assert exception_info["timed_out"] is True
+    assert exception_info["timeout_seconds"] == 150
+    assert exception_info["stdout_tail"].startswith("o")
+    assert exception_info["stdout_tail"].endswith("o" * 20)
+    assert len(exception_info["stdout_tail"]) <= 2000
+    assert exception_info["stderr_tail"].startswith("e")
+    assert exception_info["stderr_tail"].endswith("e" * 20)
+    assert len(exception_info["stderr_tail"]) <= 2000
+
+
+def test_harbor_subprocess_runner_failure_records_bounded_diagnostics(
+    monkeypatch, tmp_path: Path
+) -> None:
+    config = default_config()
+    config.terminal_bench_output_dir = tmp_path / "harbor-runs"
+    long_stdout = "setup\n" + ("a" * 5000)
+    long_stderr = "boom\n" + ("b" * 5000)
+
+    def fake_run(cmd, **kwargs):
+        return subprocess.CompletedProcess(args=cmd, returncode=137, stdout=long_stdout, stderr=long_stderr)
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    result = HarborSubprocessHarnessRunner(cwd=tmp_path)._run_sync(
+        TerminalBenchTaskRunRequest(
+            task_id="task",
+            instruction="",
+            skill_instructions="skill",
+            lm="main",
+            sub_lm="sub",
+            max_iterations=3,
+            task_timeout=30,
+            verbose_rlm=False,
+            output_dir=tmp_path,
+            run_id="gepa-val-task",
+            config=config,
+        )
+    )
+
+    exception_info = result.trial_result["exception_info"]
+    assert exception_info["exception_type"] == "HarnessSubprocessError"
+    assert exception_info["phase"] == "harness_subprocess"
+    assert exception_info["returncode"] == 137
+    assert exception_info["stdout_tail"].startswith("a")
+    assert exception_info["stdout_tail"].endswith("a" * 20)
+    assert len(exception_info["stdout_tail"]) <= 2000
+    assert exception_info["stderr_tail"].startswith("b")
+    assert exception_info["stderr_tail"].endswith("b" * 20)
+    assert len(exception_info["stderr_tail"]) <= 2000
 
 
 def test_harbor_runner_loads_harbor_result_json_without_subprocess(tmp_path: Path) -> None:
@@ -300,13 +688,87 @@ def test_harbor_runner_loads_nested_trial_result_with_ctrf_details(tmp_path: Pat
     assert details == {"tests": 5, "passed": 4, "failed": 1}
 
 
-def test_seed_candidate_allows_shell_package_and_tool_workflows() -> None:
+def test_seed_candidate_uses_shared_default_terminal_bench_skill_text() -> None:
     skill = TerminalBenchGepaProject(default_config()).seed_candidate()[COMPONENT_SKILL]
 
-    assert "subprocess.run" in skill
-    assert "install missing packages" in skill
+    assert skill == DEFAULT_TERMINAL_BENCH_SKILL_INSTRUCTIONS
+    assert _seed_skill_instructions() == DEFAULT_TERMINAL_BENCH_SKILL_INSTRUCTIONS
+
+
+def test_default_terminal_bench_skill_includes_concurrent_timeout_snippet() -> None:
+    skill = DEFAULT_TERMINAL_BENCH_SKILL_INSTRUCTIONS
+    headings = [
+        "Operating principle",
+        "Inspection and changes",
+        "Timeouts and long-running work",
+        "Problem-solving strategy",
+        "Verification and final submission",
+    ]
+
+    assert [skill.index(heading) for heading in headings] == sorted(
+        skill.index(heading) for heading in headings
+    )
+    assert (
+        "As soon as the task is solved and verified, stop improving and submit, "
+        "premature optimization is the root of all evil."
+    ) in skill
+    assert "inspect the filesystem before making changes" in skill
     assert "package managers" in skill
-    assert "programmatic tools" in skill
+    assert "small inspectable steps" in skill
+    assert "1-5 seconds" in skill
+    assert "10-60 seconds" in skill
+    assert "several minutes" in skill
+    assert "commands, network requests, and computations" in skill
+    assert "Do not submit based on an unobserved verification command" in skill
+    assert "separate later iteration" in skill
+    assert "SUBMIT makes the result final" in skill
+    assert "Verify the observable task contract, then submit" in skill
+
+    snippet = skill.split("```python\n", 1)[1].split("\n```", 1)[0]
+    compile(snippet, "<terminal-bench-skill>", "exec", flags=ast.PyCF_ALLOW_TOP_LEVEL_AWAIT)
+    comment_anchors = [
+        (
+            "# Use run() for bounded foreground commands; inspect output before continuing.",
+            "async def run(cmd, timeout=60):",
+        ),
+        (
+            "# Use start()/wait() for longer jobs; poll briefly, return to loop, inspect tails later.",
+            "async def start(cmd):",
+        ),
+        (
+            "# Use requests timeouts for network calls.",
+            "response = requests.get(url, timeout=10)",
+        ),
+        (
+            "# Use asyncio.wait_for for expensive computations or async work that may hang.",
+            "computation = await asyncio.wait_for",
+        ),
+        (
+            "# Use asyncio.gather for independent non-mutating checks that can run concurrently.",
+            "results = await asyncio.gather",
+        ),
+    ]
+    for comment, code_anchor in comment_anchors:
+        assert comment in snippet
+        assert code_anchor in snippet
+        assert snippet.index(comment) < snippet.index(code_anchor)
+
+    for anchor in [
+        "async def run(cmd, timeout=60):",
+        "subprocess.run",
+        "capture_output=True",
+        "timeout=timeout",
+        "async def start(cmd):",
+        "subprocess.Popen",
+        "async def wait(job, seconds=5):",
+        "requests.get(url, timeout=10)",
+        "asyncio.wait_for",
+        "await asyncio.gather",
+        "stdout_tail",
+        "stderr_tail",
+        "print(progress)",
+    ]:
+        assert anchor in snippet
 
 
 def test_seed_candidate_skill_is_passed_to_terminal_bench_agent(monkeypatch) -> None:
@@ -331,7 +793,10 @@ def test_seed_candidate_skill_is_passed_to_terminal_bench_agent(monkeypatch) -> 
     monkeypatch.setattr(tbench_agent, "TerminalBenchRunnerInterpreter", FakeInterpreter)
 
     agent = tbench_agent.TerminalBenchRLMBaseAgent(
-        skill_instructions="Prefer idempotent shell commands and verify files before finishing.",
+        skill_instructions=(
+            "Make task changes boldly in small inspectable steps and verify files "
+            "before finishing."
+        ),
     )
     agent.perform_task("solve it", SimpleNamespace(container=object()))
 
@@ -496,7 +961,7 @@ def test_in_process_runner_calls_terminal_bench_harness_and_loads_results(
     assert kwargs["agent_kwargs"]["max_iterations"] == "3"
     assert kwargs["agent_kwargs"]["verbose"] == "true"
     assert kwargs["task_ids"] == ["task"]
-    assert kwargs["global_agent_timeout_sec"] == 870
+    assert kwargs["global_agent_timeout_sec"] == 900
 
 
 def test_subprocess_runner_passes_codex_lm_agent_kwargs(
@@ -555,7 +1020,7 @@ def test_subprocess_runner_passes_reasoning_effort_agent_kwargs(
 
     class FakeLM:
         model = "openai/gpt-5.5"
-        kwargs = {"reasoning_effort": "low"}
+        kwargs = {"reasoning_effort": "low", "service_tier": "priority"}
 
     def fake_run(cmd, **_kwargs):
         captured["cmd"] = cmd
@@ -588,6 +1053,8 @@ def test_subprocess_runner_passes_reasoning_effort_agent_kwargs(
     ]
     assert "lm_reasoning_effort=low" in agent_kwargs
     assert "sub_lm_reasoning_effort=low" in agent_kwargs
+    assert "lm_service_tier=priority" in agent_kwargs
+    assert "sub_lm_service_tier=priority" in agent_kwargs
 
 
 def test_agent_builds_low_effort_lms_from_agent_kwargs(monkeypatch) -> None:
@@ -623,6 +1090,8 @@ def test_agent_builds_low_effort_lms_from_agent_kwargs(monkeypatch) -> None:
         sub_lm="openai/gpt-5.5",
         lm_reasoning_effort="low",
         sub_lm_reasoning_effort="low",
+        lm_service_tier="priority",
+        sub_lm_service_tier="priority",
     )
     agent.perform_task("solve it", SimpleNamespace(container=object()))
 
@@ -631,8 +1100,10 @@ def test_agent_builds_low_effort_lms_from_agent_kwargs(monkeypatch) -> None:
     sub_lm = kwargs["sub_lm"]
     assert lm.model == "openai/gpt-5.5"
     assert lm.kwargs["reasoning_effort"] == "low"
+    assert lm.kwargs["service_tier"] == "priority"
     assert sub_lm.model == "openai/gpt-5.5"
     assert sub_lm.kwargs["reasoning_effort"] == "low"
+    assert sub_lm.kwargs["service_tier"] == "priority"
 
 
 def test_subprocess_runner_synthesizes_trace_when_agent_does_not_export_one(

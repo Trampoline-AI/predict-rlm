@@ -4,9 +4,12 @@ import asyncio
 import json
 import shlex
 import subprocess
+import time
+import tomllib
 import uuid
 from collections.abc import Sequence
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Protocol
 from urllib.parse import unquote, urlparse
@@ -14,6 +17,7 @@ from urllib.parse import unquote, urlparse
 from predict_rlm.trace import RunTrace
 from rlm_gepa import EvaluationContext, RLMGepaExampleResult, RLMGepaProject
 from terminal_bench_rlm.scoring import to_gepa_example_result
+from terminal_bench_rlm.skills import DEFAULT_TERMINAL_BENCH_SKILL_INSTRUCTIONS
 
 from .config import (
     COMPONENT_SKILL,
@@ -53,6 +57,18 @@ class TerminalBenchTaskRunResult:
     error: str | None = None
 
 
+@dataclass(frozen=True)
+class HarborTaskTimeouts:
+    environment_setup: int
+    agent: int
+    verifier: int
+    cleanup: int
+
+    @property
+    def outer(self) -> int:
+        return self.environment_setup + self.agent + self.verifier + self.cleanup
+
+
 class TerminalBenchHarnessRunner(Protocol):
     async def run(self, request: TerminalBenchTaskRunRequest) -> TerminalBenchTaskRunResult: ...
 
@@ -70,6 +86,7 @@ class HarborSubprocessHarnessRunner:
         config = request.config
         output_dir = _resolve_output_dir(request)
         output_dir.mkdir(parents=True, exist_ok=True)
+        phase_log_path = _phase_log_path(request, output_dir=output_dir)
         cmd = [
             *shlex.split(config.harbor_executable),
             "run",
@@ -95,12 +112,56 @@ class HarborSubprocessHarnessRunner:
         else:
             cmd.append("--force-build")
         cmd.append("--delete" if config.cleanup else "--no-delete")
-        completed = subprocess.run(cmd, cwd=self.cwd, check=False, text=True)
+        started = time.monotonic()
+        _write_phase_event(
+            phase_log_path,
+            event="harbor_subprocess_start",
+            phase="environment_setup",
+            request=request,
+            status="started",
+            agent_timeout_seconds=_agent_timeout(request),
+            outer_timeout_seconds=_subprocess_timeout(request),
+            harbor_run_dir=str(output_dir / request.run_id),
+        )
+        try:
+            completed = subprocess.run(cmd, **_subprocess_run_kwargs(request, cwd=self.cwd))
+        except subprocess.TimeoutExpired as exc:
+            run_dir = output_dir / request.run_id
+            _write_phase_event(
+                phase_log_path,
+                event="harbor_subprocess_end",
+                phase="harness_subprocess",
+                request=request,
+                status="timeout",
+                duration_seconds=time.monotonic() - started,
+                agent_timeout_seconds=_agent_timeout(request),
+                outer_timeout_seconds=_subprocess_timeout(request),
+                harbor_run_dir=str(run_dir),
+            )
+            return TerminalBenchTaskRunResult(
+                task_id=request.task_id,
+                trial_result=_timeout_trial_result(exc),
+                traces=[],
+                run_dir=run_dir,
+                error=_subprocess_timeout_error(exc),
+            )
         run_dir = output_dir / request.run_id
+        _write_phase_event(
+            phase_log_path,
+            event="harbor_subprocess_end",
+            phase="harness_subprocess",
+            request=request,
+            status="completed" if completed.returncode == 0 else "failed",
+            duration_seconds=time.monotonic() - started,
+            agent_timeout_seconds=_agent_timeout(request),
+            outer_timeout_seconds=_subprocess_timeout(request),
+            returncode=completed.returncode,
+            harbor_run_dir=str(run_dir),
+        )
         if completed.returncode != 0:
             return TerminalBenchTaskRunResult(
                 task_id=request.task_id,
-                trial_result={"is_resolved": False, "parser_results": {}},
+                trial_result=_subprocess_failure_trial_result(completed),
                 traces=[],
                 run_dir=run_dir,
                 error=_subprocess_error(completed),
@@ -164,19 +225,23 @@ class TerminalBenchSubprocessHarnessRunner:
         else:
             cmd.append("--rebuild")
 
-        completed = subprocess.run(
-            cmd,
-            cwd=self.cwd,
-            check=False,
-            text=True,
-        )
+        try:
+            completed = subprocess.run(cmd, **_subprocess_run_kwargs(request, cwd=self.cwd))
+        except subprocess.TimeoutExpired as exc:
+            run_dir = output_dir / request.run_id
+            return TerminalBenchTaskRunResult(
+                task_id=request.task_id,
+                trial_result=_timeout_trial_result(exc),
+                traces=[],
+                run_dir=run_dir,
+                error=_subprocess_timeout_error(exc),
+            )
         run_dir = output_dir / request.run_id
         if completed.returncode != 0:
             error = _subprocess_error(completed)
-            trial_result: dict[str, Any] = {"is_resolved": False, "parser_results": {}}
             return TerminalBenchTaskRunResult(
                 task_id=request.task_id,
-                trial_result=trial_result,
+                trial_result=_subprocess_failure_trial_result(completed),
                 traces=[],
                 run_dir=run_dir,
                 error=error,
@@ -310,14 +375,104 @@ def _resolve_output_dir(request: TerminalBenchTaskRunRequest) -> Path:
     return request.output_dir / output_dir
 
 
+
+
+def phase_duration_summary(run_dir: str | Path) -> dict[str, Any]:
+    phase_totals: dict[str, dict[str, float | int]] = {}
+    tasks: dict[str, dict[str, Any]] = {}
+    for path in sorted(Path(run_dir).rglob("task_phase_events.jsonl")):
+        for line in path.read_text(encoding="utf-8").splitlines():
+            if not line.strip():
+                continue
+            event = json.loads(line)
+            phase = str(event.get("phase") or "unknown")
+            task_id = str(event.get("task_id") or path.parent.name)
+            duration = event.get("duration_seconds")
+            if not isinstance(duration, int | float):
+                continue
+            duration = float(duration)
+            _add_phase_duration(phase_totals, phase, duration)
+            task = tasks.setdefault(task_id, {"duration_seconds": 0.0, "phases": {}})
+            task["duration_seconds"] += duration
+            _add_phase_duration(task["phases"], phase, duration)
+    return {
+        "phase_totals": _sorted_phase_durations(phase_totals),
+        "tasks": {
+            task_id: {
+                "duration_seconds": round(float(task["duration_seconds"]), 6),
+                "phases": _sorted_phase_durations(task["phases"]),
+            }
+            for task_id, task in sorted(tasks.items())
+        },
+        "total_logged_duration_seconds": round(
+            sum(float(phase["duration_seconds"]) for phase in phase_totals.values()), 6
+        ),
+    }
+
+
+def _add_phase_duration(target: dict[str, dict[str, float | int]], phase: str, duration: float) -> None:
+    bucket = target.setdefault(phase, {"duration_seconds": 0.0, "events": 0})
+    bucket["duration_seconds"] = float(bucket["duration_seconds"]) + duration
+    bucket["events"] = int(bucket["events"]) + 1
+
+
+def _sorted_phase_durations(
+    durations: dict[str, dict[str, float | int]],
+) -> dict[str, dict[str, float | int]]:
+    return {
+        phase: {
+            "duration_seconds": round(float(values["duration_seconds"]), 6),
+            "events": int(values["events"]),
+        }
+        for phase, values in sorted(durations.items())
+    }
+
+
+def _phase_log_path(request: TerminalBenchTaskRunRequest, *, output_dir: Path) -> Path:
+    return output_dir / request.run_id / "task_phase_events.jsonl"
+
+
+def _write_phase_event(
+    path: Path,
+    *,
+    event: str,
+    phase: str,
+    request: TerminalBenchTaskRunRequest,
+    status: str,
+    **fields: Any,
+) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "timestamp": datetime.now().isoformat(),
+        "event": event,
+        "phase": phase,
+        "status": status,
+        "task_id": request.task_id,
+        "run_id": request.run_id,
+        "dataset": request.config.harbor_dataset,
+        **fields,
+    }
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(payload, sort_keys=True) + "\n")
+    duration = payload.get("duration_seconds")
+    duration_text = f" duration_seconds={duration:.3f}" if isinstance(duration, (int, float)) else ""
+    print(
+        f"phase_event task={request.task_id} phase={phase} event={event} "
+        f"status={status}{duration_text}",
+        flush=True,
+    )
+
 def _agent_kwargs(request: TerminalBenchTaskRunRequest) -> dict[str, str]:
     config = request.config
+    output_dir = _resolve_output_dir(request)
     kwargs = {
         "lm": _model_name(request.lm),
         "sub_lm": _model_name(request.sub_lm),
         "max_iterations": str(request.max_iterations),
-        "exec_timeout": str(request.task_timeout),
+        "exec_timeout": str(_agent_timeout_with_cleanup_grace(request)),
         "skill_instructions": request.skill_instructions,
+        "task_id": request.task_id,
+        "phase_log_path": str(_phase_log_path(request, output_dir=output_dir)),
     }
     lm_reasoning_effort = _reasoning_effort(request.lm)
     if lm_reasoning_effort is not None:
@@ -325,6 +480,12 @@ def _agent_kwargs(request: TerminalBenchTaskRunRequest) -> dict[str, str]:
     sub_lm_reasoning_effort = _reasoning_effort(request.sub_lm)
     if sub_lm_reasoning_effort is not None:
         kwargs["sub_lm_reasoning_effort"] = sub_lm_reasoning_effort
+    lm_service_tier = _service_tier(request.lm)
+    if lm_service_tier is not None:
+        kwargs["lm_service_tier"] = lm_service_tier
+    sub_lm_service_tier = _service_tier(request.sub_lm)
+    if sub_lm_service_tier is not None:
+        kwargs["sub_lm_service_tier"] = sub_lm_service_tier
     if request.verbose_rlm:
         kwargs["verbose"] = "true"
     if config.codex_lm:
@@ -334,9 +495,133 @@ def _agent_kwargs(request: TerminalBenchTaskRunRequest) -> dict[str, str]:
     return kwargs
 
 
+def _agent_timeout(request: TerminalBenchTaskRunRequest) -> int:
+    if request.config.harness_backend == "harbor":
+        return _harbor_task_timeouts(request).agent
+    return max(1, int(request.task_timeout))
+
+
 def _agent_timeout_with_cleanup_grace(request: TerminalBenchTaskRunRequest) -> int:
-    grace = max(0, int(request.config.timeout_cleanup_grace_sec))
-    return max(1, int(request.task_timeout) - grace)
+    return _agent_timeout(request)
+
+
+def _subprocess_timeout(request: TerminalBenchTaskRunRequest) -> int:
+    if request.config.harness_backend == "harbor":
+        return _harbor_task_timeouts(request).outer
+    return max(1, int(request.task_timeout))
+
+
+def _harbor_task_timeouts(request: TerminalBenchTaskRunRequest) -> HarborTaskTimeouts:
+    cleanup = max(0, int(request.config.timeout_cleanup_grace_sec))
+    fallback = max(1, int(request.task_timeout))
+    payload = _load_harbor_task_toml(request)
+    if payload is None:
+        if request.task_id.startswith("terminal-bench/"):
+            raise RuntimeError(
+                f"Cannot determine official Harbor timeouts for {request.task_id}: "
+                "task.toml is missing from the configured task cache and the global Harbor cache."
+            )
+        return HarborTaskTimeouts(
+            environment_setup=fallback,
+            agent=fallback,
+            verifier=fallback,
+            cleanup=cleanup,
+        )
+    return HarborTaskTimeouts(
+        environment_setup=_timeout_from_section(payload, "environment", "build_timeout_sec", fallback),
+        agent=_timeout_from_section(payload, "agent", "timeout_sec", fallback),
+        verifier=_timeout_from_section(payload, "verifier", "timeout_sec", fallback),
+        cleanup=cleanup,
+    )
+
+
+def _load_harbor_task_toml(request: TerminalBenchTaskRunRequest) -> dict[str, Any] | None:
+    task_toml = _harbor_task_toml_path(request)
+    if task_toml is None:
+        return None
+    try:
+        return tomllib.loads(task_toml.read_text(encoding="utf-8"))
+    except (OSError, tomllib.TOMLDecodeError):
+        return None
+
+
+def _harbor_task_toml_path(request: TerminalBenchTaskRunRequest) -> Path | None:
+    roots = []
+    if request.config.harbor_task_cache_dir is not None:
+        roots.append(request.config.harbor_task_cache_dir)
+    global_cache_root = Path.home() / ".cache" / "harbor" / "tasks" / "packages"
+    if global_cache_root not in roots:
+        roots.append(global_cache_root)
+
+    task_parts = [part for part in request.task_id.split("/") if part]
+    candidates = []
+    for cache_root in roots:
+        task_dir = cache_root.joinpath(*task_parts)
+        candidates.extend(path for path in task_dir.glob("*/task.toml") if path.is_file())
+    if not candidates:
+        return None
+    return max(candidates, key=lambda path: path.stat().st_mtime)
+
+
+def _timeout_from_section(
+    payload: dict[str, Any],
+    section: str,
+    key: str,
+    fallback: int,
+) -> int:
+    section_payload = payload.get(section)
+    if not isinstance(section_payload, dict):
+        return fallback
+    value = section_payload.get(key)
+    if value is None:
+        return fallback
+    return max(1, int(float(value)))
+
+
+def _subprocess_run_kwargs(request: TerminalBenchTaskRunRequest, *, cwd: Path) -> dict[str, Any]:
+    kwargs: dict[str, Any] = {
+        "cwd": cwd,
+        "check": False,
+        "text": True,
+        "timeout": _subprocess_timeout(request),
+    }
+    if not request.verbose_rlm:
+        kwargs["stdout"] = subprocess.PIPE
+        kwargs["stderr"] = subprocess.PIPE
+    return kwargs
+
+
+def _timeout_trial_result(exc: subprocess.TimeoutExpired) -> dict[str, Any]:
+    stdout_tail = _tail_text(exc.output)
+    stderr_tail = _tail_text(exc.stderr)
+    return {
+        "is_resolved": False,
+        "parser_results": {},
+        "exception_info": {
+            "exception_type": "HarnessTimeoutError",
+            "exception_message": _subprocess_timeout_error(exc),
+            "phase": "harness_subprocess",
+            "timed_out": True,
+            "timeout_seconds": exc.timeout,
+            "stdout_tail": stdout_tail,
+            "stderr_tail": stderr_tail,
+        },
+    }
+
+
+def _subprocess_failure_trial_result(completed: subprocess.CompletedProcess[str]) -> dict[str, Any]:
+    return {
+        "is_resolved": False,
+        "parser_results": {},
+        "exception_info": {
+            "exception_type": "HarnessSubprocessError",
+            "exception_message": _subprocess_error(completed),
+            "phase": "harness_subprocess",
+            "returncode": completed.returncode,
+            "stdout_tail": _tail_text(completed.stdout),
+            "stderr_tail": _tail_text(completed.stderr),
+        },
+    }
 
 
 def _load_task_run_result(
@@ -391,22 +676,7 @@ def _examples(task_ids: Sequence[str], *, limit: int | None = None) -> list[Term
 
 
 def _seed_skill_instructions() -> str:
-    return (
-        "You are solving Terminal-Bench tasks inside a Linux task container. "
-        "Read the task instruction carefully, inspect the filesystem before making "
-        "changes, and use Python as an orchestration layer for real machine work: "
-        "call subprocess.run or equivalent shell commands to inspect files, run "
-        "programs, edit code, start services, compile artifacts, and execute tests. "
-        "When a task needs missing dependencies, install missing packages with the "
-        "available package managers (for example apt, pip, npm, cargo, or language-"
-        "specific installers) unless the task instruction forbids it. Prefer "
-        "repeatable, idempotent commands and keep state changes limited to the exact "
-        "files/services requested by the task. Use programmatic tools for binary, "
-        "image, audio, video, archive, or other non-text inputs rather than guessing. "
-        "Use small verification loops: run available tests, inspect logs, and check "
-        "command outputs before finishing. Do not rely on Terminal-Bench wrapper "
-        "tools; operate through the PredictRLM interpreter in the container."
-    )
+    return DEFAULT_TERMINAL_BENCH_SKILL_INSTRUCTIONS
 
 
 def _model_name(model: Any) -> str:
@@ -419,6 +689,14 @@ def _reasoning_effort(model: Any) -> str | None:
         return None
     effort = kwargs.get("reasoning_effort")
     return str(effort) if effort else None
+
+
+def _service_tier(model: Any) -> str | None:
+    kwargs = getattr(model, "kwargs", None)
+    if not isinstance(kwargs, dict):
+        return None
+    service_tier = kwargs.get("service_tier")
+    return str(service_tier) if service_tier else None
 
 
 def _run_id(kind: str, task_id: str) -> str:
@@ -570,3 +848,26 @@ def _subprocess_error(completed: subprocess.CompletedProcess[str]) -> str:
     if len(output) > 4000:
         output = output[-4000:]
     return f"Terminal-Bench CLI exited {completed.returncode}: {output}"
+
+
+def _subprocess_timeout_error(exc: subprocess.TimeoutExpired) -> str:
+    output_parts = []
+    for value in (exc.output, exc.stderr):
+        if isinstance(value, bytes):
+            value = value.decode(errors="replace")
+        if value:
+            output_parts.append(str(value))
+    output = "\n".join(output_parts).strip()
+    if len(output) > 4000:
+        output = output[-4000:]
+    suffix = f": {output}" if output else ""
+    return f"Terminal-Bench CLI timed out after {exc.timeout}s{suffix}"
+
+
+def _tail_text(value: Any, *, limit: int = 2000) -> str:
+    if isinstance(value, bytes):
+        value = value.decode(errors="replace")
+    if value is None:
+        return ""
+    text = str(value)
+    return text[-limit:] if len(text) > limit else text
