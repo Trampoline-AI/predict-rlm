@@ -30,7 +30,6 @@ from typing import TYPE_CHECKING, Any
 
 from dspy.primitives.code_interpreter import CodeInterpreterError, FinalOutput
 from dspy.primitives.python_interpreter import PythonInterpreter
-from pydantic import BaseModel
 
 from predict_rlm.execution_timeout import (
     ITERATION_TIMEOUT_FAILURE_CLASS,
@@ -43,6 +42,7 @@ from predict_rlm.interpreters.base import (
     STALE_RESPONSE_DISCARD_LIMIT,
     InterpreterExecutionGate,
 )
+from predict_rlm.serialization import to_plain_data
 
 from .debug import debug_event
 from .telemetry import (
@@ -790,16 +790,6 @@ class JspiInterpreter(PythonInterpreter):
         # No fences found, return as-is
         return code
 
-    def _to_python(self, value: Any) -> Any:
-        """Recursively convert Pydantic models to plain Python dicts."""
-        if isinstance(value, BaseModel):
-            return value.model_dump()
-        if isinstance(value, list):
-            return [self._to_python(v) for v in value]
-        if isinstance(value, dict):
-            return {k: self._to_python(v) for k, v in value.items()}
-        return value
-
     def _serialize_value(self, value: Any) -> str:
         """Serialize a Python value to a string representation for injection.
 
@@ -807,7 +797,7 @@ class JspiInterpreter(PythonInterpreter):
         and uses repr() instead of json.dumps() for dicts/lists so that
         None/True/False stay as valid Python (json.dumps produces null/true/false).
         """
-        value = self._to_python(value)
+        value = to_plain_data(value)
 
         if isinstance(value, (dict, list)):
             return repr(value)
