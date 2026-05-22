@@ -38,6 +38,7 @@ from predict_rlm.execution_timeout import (
 )
 from predict_rlm.files import get_synced_file_params
 from predict_rlm.interpreter import SandboxFatalError
+from predict_rlm.serialization import to_plain_data
 from predict_rlm.trace import ToolCall, ms_since, record_tool_call
 from predict_rlm.workspace import WorkspaceFileInfo
 
@@ -262,6 +263,7 @@ class SbxInterpreter(PersistentJsonRpcRunnerClient, PredictRLMInterpreter):
         return host_path
 
     def _map_variable_value(self, value: Any) -> Any:
+        value = to_plain_data(value)
         if isinstance(value, str) and (value == "/sandbox" or value.startswith("/sandbox/")):
             return str(self._host_path_for_virtual_path(value))
         if isinstance(value, list):
@@ -757,6 +759,7 @@ class SbxInterpreter(PersistentJsonRpcRunnerClient, PredictRLMInterpreter):
             for sandbox_path, host_path, writeback in synced_entries:
                 if writeback and os.path.isfile(host_path):
                     self.mount_file_at(host_path, sandbox_path)
+            result = to_plain_data(result)
             is_json = result is None or isinstance(result, (dict, list, int, float, bool))
             response = {
                 "jsonrpc": "2.0",
