@@ -37,6 +37,7 @@ from predict_rlm.interpreters.base import (
     InterpreterExecutionGate,
 )
 
+from .debug import debug_event
 from .telemetry import (
     TelemetryContext,
     make_span_id,
@@ -411,7 +412,24 @@ class JspiInterpreter(PythonInterpreter):
             pass  # No running loop or fd already closed
 
         prev = self.deno_process
-        super()._ensure_deno_process()
+        start = time.perf_counter()
+        if prev is None or prev.poll() is not None:
+            debug_event(
+                "predict_rlm.sandbox.process.start",
+                backend="jspi",
+                tool_count=len(getattr(self, "tools", {})),
+            )
+        try:
+            super()._ensure_deno_process()
+        except BaseException as exc:
+            debug_event(
+                "predict_rlm.sandbox.process.end",
+                backend="jspi",
+                status="error",
+                error_type=type(exc).__name__,
+                duration_ms=round((time.perf_counter() - start) * 1000),
+            )
+            raise
         if self.deno_process is not None and self.deno_process is not prev:
             self._stdout_fd = self.deno_process.stdout.fileno()
             self._stdin_fd = self.deno_process.stdin.fileno()
@@ -425,6 +443,13 @@ class JspiInterpreter(PythonInterpreter):
             self._executor.shutdown(wait=False)
             self._executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
             self._write_telemetry_span("sandbox.deno.start")
+            debug_event(
+                "predict_rlm.sandbox.process.end",
+                backend="jspi",
+                status="ok",
+                duration_ms=round((time.perf_counter() - start) * 1000),
+                process_pid=getattr(self.deno_process, "pid", None),
+            )
 
     def shutdown(self) -> None:
         """Shut down the Deno subprocess with timeout guards.
@@ -817,6 +842,15 @@ class JspiInterpreter(PythonInterpreter):
                 **getattr(self, "_last_semaphore_attrs", {}),
             },
         )
+        debug_event(
+            "predict_rlm.sandbox.execute.start",
+            backend="jspi",
+            request_id=execute_request_id,
+            code_chars=len(code),
+            timeout_seconds=self._exec_timeout,
+            pending_tool_count=self._telemetry_pending_tool_count(),
+            pending_file_op_count=self._telemetry_pending_file_ops_count(),
+        )
         input_data = json.dumps({
             "jsonrpc": "2.0",
             "method": "execute",
@@ -826,6 +860,14 @@ class JspiInterpreter(PythonInterpreter):
         try:
             await self._write_stdin_async(input_data + "\n")
         except BrokenPipeError as e:
+            debug_event(
+                "predict_rlm.sandbox.execute.end",
+                backend="jspi",
+                status="error",
+                request_id=execute_request_id,
+                error_type=type(e).__name__,
+                duration_ms=round((time.time_ns() - execute_start_time) / 1_000_000),
+            )
             self._kill_sandbox()
             raise SandboxFatalError(
                 "Sandbox subprocess died before receiving the execute "
@@ -864,6 +906,19 @@ class JspiInterpreter(PythonInterpreter):
                 },
                 start_time_unix_nano=execute_start_time,
             )
+            debug_event(
+                "predict_rlm.sandbox.execute.end",
+                backend="jspi",
+                status="ok",
+                request_id=execute_request_id,
+                duration_ms=(
+                    round((time.time_ns() - execute_start_time) / 1_000_000)
+                    if execute_start_time is not None
+                    else None
+                ),
+                pending_tool_count=self._telemetry_pending_tool_count(),
+                pending_file_op_count=self._telemetry_pending_file_ops_count(),
+            )
             return result
         except asyncio.TimeoutError:
             self._write_telemetry_span(
@@ -880,6 +935,20 @@ class JspiInterpreter(PythonInterpreter):
                     "failure.class": "sandbox_exec_timeout",
                 },
                 start_time_unix_nano=execute_start_time,
+            )
+            debug_event(
+                "predict_rlm.sandbox.execute.end",
+                backend="jspi",
+                status="timeout",
+                request_id=execute_request_id,
+                duration_ms=(
+                    round((time.time_ns() - execute_start_time) / 1_000_000)
+                    if execute_start_time is not None
+                    else None
+                ),
+                timeout_seconds=self._exec_timeout,
+                pending_tool_count=self._telemetry_pending_tool_count(),
+                pending_file_op_count=self._telemetry_pending_file_ops_count(),
             )
             self._kill_sandbox()
             raise SandboxFatalError(
@@ -969,6 +1038,15 @@ class JspiInterpreter(PythonInterpreter):
                 "sandbox.pending_file_op_count": self._telemetry_pending_file_ops_count(),
             },
         )
+        debug_event(
+            "predict_rlm.sandbox.execute.start",
+            backend="jspi",
+            request_id=execute_request_id,
+            code_chars=len(code),
+            timeout_seconds=self._exec_timeout,
+            pending_tool_count=self._telemetry_pending_tool_count(),
+            pending_file_op_count=self._telemetry_pending_file_ops_count(),
+        )
         input_data = json.dumps(
             {
                 "jsonrpc": "2.0",
@@ -980,6 +1058,14 @@ class JspiInterpreter(PythonInterpreter):
         try:
             self._write_stdin(input_data + "\n")
         except BrokenPipeError as e:
+            debug_event(
+                "predict_rlm.sandbox.execute.end",
+                backend="jspi",
+                status="error",
+                request_id=execute_request_id,
+                error_type=type(e).__name__,
+                duration_ms=round((time.time_ns() - execute_start_time) / 1_000_000),
+            )
             self._kill_sandbox()
             raise SandboxFatalError(
                 "Sandbox subprocess died before receiving the execute "
@@ -1335,6 +1421,16 @@ class JspiInterpreter(PythonInterpreter):
         args = list(call_args.get("args", []))
         kwargs = dict(call_args.get("kwargs", {}))
         temp_dir: str | None = None
+        debug_event(
+            "predict_rlm.tool_call.start",
+            backend="jspi",
+            tool_name=tool_name,
+            tool_id=tool_request_id,
+            timeout_seconds=TOOL_CALL_TIMEOUT_SEC,
+            arg_count=len(args),
+            kwarg_count=len(kwargs),
+            pydantic_schema_count=len(call_args.get("pydantic_schemas") or {}),
+        )
 
         try:
             if tool_name not in self.tools:
@@ -1483,6 +1579,15 @@ class JspiInterpreter(PythonInterpreter):
                 },
                 start_time_unix_nano=telemetry_start,
             )
+            debug_event(
+                "predict_rlm.tool_call.end",
+                backend="jspi",
+                status="ok",
+                tool_name=tool_name,
+                tool_id=tool_request_id,
+                duration_ms=ms_since(call_start),
+                result_type=response["type"],
+            )
             return response
         except Exception as e:
             # Clean up any SyncedFile temp dir before returning
@@ -1512,6 +1617,18 @@ class JspiInterpreter(PythonInterpreter):
                     },
                     start_time_unix_nano=telemetry_start,
                 )
+                status = "timeout"
+            else:
+                status = "error"
+            debug_event(
+                "predict_rlm.tool_call.end",
+                backend="jspi",
+                status=status,
+                tool_name=tool_name,
+                tool_id=tool_request_id,
+                duration_ms=ms_since(call_start),
+                error_type=type(e).__name__,
+            )
             return {"error": str(e)}
 
     def _write_stdin(self, data: str) -> None:

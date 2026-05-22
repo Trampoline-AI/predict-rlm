@@ -4,6 +4,7 @@ import asyncio
 import inspect
 import json
 import os
+import re
 import shlex
 import subprocess
 import tempfile
@@ -47,6 +48,34 @@ def _python_bootstrap_command() -> str:
             "command -v python3 >/dev/null 2>&1 || command -v python >/dev/null 2>&1",
         ]
     )
+
+
+def _docker_compose_project_name(name: str) -> str:
+    name = name.lower()
+    if not re.match(r"^[a-z0-9]", name):
+        name = "0" + name
+    return re.sub(r"[^a-z0-9_-]", "-", name)
+
+
+def _run_coroutine_on_loop(coro: Any, loop: asyncio.AbstractEventLoop) -> Any:
+    try:
+        running_loop = asyncio.get_running_loop()
+    except RuntimeError:
+        running_loop = None
+    if running_loop is loop:
+        close = getattr(coro, "close", None)
+        if close is not None:
+            close()
+        raise SandboxFatalError(
+            "HarborEnvironmentInterpreter sync methods must run outside the Harbor event loop"
+        )
+    return asyncio.run_coroutine_threadsafe(coro, loop).result()
+
+
+def _resolve_maybe_awaitable(value: Any, loop: asyncio.AbstractEventLoop) -> Any:
+    if inspect.isawaitable(value):
+        return _run_coroutine_on_loop(value, loop)
+    return value
 
 
 class ContainerProcess(Protocol):
@@ -232,6 +261,147 @@ class HarborContainerAdapter:
         raise TypeError(
             "Terminal-Bench container does not expose an interactive exec method; "
             "provide container_adapter=... with start_exec/copy/exec primitives"
+        )
+
+
+class HarborEnvironmentAdapter(HarborContainerAdapter):
+    """Adapter that bridges Harbor's async environment APIs into the runner protocol."""
+
+    def __init__(
+        self,
+        environment: Any,
+        *,
+        loop: asyncio.AbstractEventLoop,
+        exec_timeout: float,
+    ) -> None:
+        super().__init__(environment)
+        self.environment = environment
+        self.loop = loop
+        self.exec_timeout = exec_timeout
+
+    def _resolve(self, value: Any) -> Any:
+        return _resolve_maybe_awaitable(value, self.loop)
+
+    def copy_to(self, host_path: str, container_path: str) -> None:
+        if not self._is_docker_sdk_runtime and hasattr(self.environment, "upload_file"):
+            self._resolve(self.environment.upload_file(host_path, container_path))
+            return
+        super().copy_to(host_path, container_path)
+
+    def copy_from(self, container_path: str, host_path: str) -> None:
+        if not self._is_docker_sdk_runtime and hasattr(self.environment, "download_file"):
+            self._resolve(self.environment.download_file(container_path, host_path))
+            return
+        super().copy_from(container_path, host_path)
+
+    def exec(self, command: list[str], *, timeout: float | None = None) -> Any:
+        if self._is_docker_sdk_runtime:
+            return super().exec(command, timeout=timeout)
+        method = getattr(self.environment, "exec", None)
+        if method is None:
+            return super().exec(command, timeout=timeout)
+        return self._resolve(
+            method(
+                command=" ".join(shlex.quote(str(part)) for part in command),
+                timeout_sec=int(timeout or self.exec_timeout),
+            )
+        )
+
+    def install_runner_script(
+        self,
+        source: str,
+        runner_path: str,
+        *,
+        timeout: float | None = None,
+    ) -> None:
+        if self._is_docker_sdk_runtime or not hasattr(self.environment, "upload_file"):
+            super().install_runner_script(source, runner_path, timeout=timeout)
+            return
+        with tempfile.NamedTemporaryFile("w", encoding="utf-8", suffix=".py", delete=False) as tmp:
+            tmp.write(source)
+            tmp_path = tmp.name
+        try:
+            self.copy_to(tmp_path, runner_path)
+        finally:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+
+    def start_exec(
+        self,
+        command: list[str],
+        *,
+        workdir: str | None = None,
+        timeout: float | None = None,
+    ) -> ContainerProcess:
+        if self._is_docker_sdk_runtime:
+            return super().start_exec(command, workdir=workdir, timeout=timeout)
+        for name in ("start_exec", "exec_stream", "popen"):
+            method = getattr(self.environment, name, None)
+            if method is None:
+                continue
+            try:
+                return self._resolve(method(command, workdir=workdir, timeout=timeout))
+            except TypeError as positional_exc:
+                try:
+                    return self._resolve(
+                        method(
+                            command=" ".join(shlex.quote(str(part)) for part in command),
+                            cwd=workdir,
+                            timeout_sec=int(timeout or self.exec_timeout),
+                        )
+                    )
+                except TypeError:
+                    raise positional_exc
+        process = self._start_docker_compose_exec(command, workdir=workdir)
+        if process is not None:
+            return process
+        raise TypeError(
+            "Harbor environment does not expose an interactive exec method and "
+            "no Docker SDK container id is available; persistent PredictRLM "
+            "runner execution requires start_exec/exec_stream/popen or docker exec -i"
+        )
+
+    def _start_docker_compose_exec(
+        self,
+        command: list[str],
+        *,
+        workdir: str | None = None,
+    ) -> ContainerProcess | None:
+        compose_paths = getattr(self.environment, "_docker_compose_paths", None)
+        environment_dir = getattr(self.environment, "environment_dir", None)
+        session_id = getattr(self.environment, "session_id", None)
+        if not compose_paths or environment_dir is None or session_id is None:
+            return None
+        docker_command = [
+            "docker",
+            "compose",
+            "--project-name",
+            _docker_compose_project_name(str(session_id)),
+            "--project-directory",
+            str(Path(environment_dir).resolve().absolute()),
+        ]
+        for path in compose_paths:
+            docker_command.extend(["-f", str(Path(path).resolve().absolute())])
+        docker_command.extend(["exec", "-T"])
+        effective_workdir = workdir or self.workdir
+        if effective_workdir:
+            docker_command.extend(["-w", effective_workdir])
+        user = self._coerce_optional_string(getattr(self.environment, "default_user", None))
+        if user:
+            docker_command.extend(["-u", user])
+        docker_command.append("main")
+        docker_command.extend(command)
+        compose_env_vars = getattr(self.environment, "_compose_env_vars", None)
+        env = compose_env_vars(include_os_env=True) if compose_env_vars is not None else None
+        return subprocess.Popen(
+            docker_command,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            env=env,
         )
 
 
@@ -493,7 +663,7 @@ class TerminalBenchRunnerInterpreter(PredictRLMInterpreter):
             return ""
 
     def _raise_for_exec_failure(self, result: Any, operation: str) -> None:
-        returncode = getattr(result, "returncode", 0)
+        returncode = getattr(result, "returncode", getattr(result, "return_code", 0))
         if returncode not in (0, None):
             stderr = getattr(result, "stderr", "")
             stdout = getattr(result, "stdout", "")
@@ -519,11 +689,14 @@ class HarborEnvironmentInterpreter(TerminalBenchRunnerInterpreter):
         workdir: str | None = None,
         exec_timeout: float = 900.0,
     ) -> None:
-        if tools:
-            raise ValueError("HarborEnvironmentInterpreter does not support host callback tools")
+        adapter = HarborEnvironmentAdapter(
+            environment,
+            loop=loop,
+            exec_timeout=exec_timeout,
+        )
         super().__init__(
             environment,
-            container_adapter=HarborContainerAdapter(environment),
+            container_adapter=adapter,
             tools=tools,
             output_fields=output_fields,
             runner_path=runner_path,
@@ -533,13 +706,18 @@ class HarborEnvironmentInterpreter(TerminalBenchRunnerInterpreter):
         )
         self.environment = environment
         self.loop = loop
-        self._runner_installed = False
         self._python_available = False
 
     def mount_file_at(self, host_path: str, virtual_path: str) -> None:
-        self._run_coro(self.environment.upload_file(host_path, virtual_path))
+        if hasattr(self.environment, "upload_file"):
+            self._run_coro(self.environment.upload_file(host_path, virtual_path))
+            return
+        super().mount_file_at(host_path, virtual_path)
 
     def mkdir_p(self, virtual_path: str) -> None:
+        if not hasattr(self.environment, "exec"):
+            super().mkdir_p(virtual_path)
+            return
         result = self._run_coro(
             self.environment.exec(
                 command=f"mkdir -p {shlex.quote(virtual_path)}",
@@ -549,6 +727,8 @@ class HarborEnvironmentInterpreter(TerminalBenchRunnerInterpreter):
         self._raise_for_harbor_exec_failure(result, f"creating {virtual_path}")
 
     def list_dir(self, virtual_path: str) -> list[str]:
+        if not hasattr(self.environment, "exec"):
+            return super().list_dir(virtual_path)
         self._ensure_python_available()
         result = self._run_coro(
             self.environment.exec(
@@ -563,42 +743,27 @@ class HarborEnvironmentInterpreter(TerminalBenchRunnerInterpreter):
         return list(json.loads(getattr(result, "stdout", "") or "[]"))
 
     def sync_file_to(self, virtual_path: str, host_path: str) -> None:
+        if not hasattr(self.environment, "download_file"):
+            super().sync_file_to(virtual_path, host_path)
+            return
         Path(host_path).parent.mkdir(parents=True, exist_ok=True)
         self._run_coro(self.environment.download_file(virtual_path, host_path))
 
+    def _ensure_process(self) -> None:
+        self._ensure_python_available()
+        super()._ensure_process()
+
     def shutdown(self) -> None:
-        self._shutdown = True
-
-    def _send_request(self, method: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
-        if method == "shutdown":
-            return {"id": None, "ok": True, "result": {"shutdown": True}}
-        self._ensure_runner_installed()
-        self._request_id += 1
-        request_id = self._request_id
-        messages = []
-        if self.output_fields:
-            messages.append(request(f"{request_id}-fields", "register_output_fields", {"fields": self.output_fields}))
-        messages.append(request(request_id, method, params or {}))
-        messages.append(request(f"{request_id}-shutdown", "shutdown", {}))
-        return self._run_runner_messages(messages, request_id)
-
-    def _ensure_runner_installed(self) -> None:
-        if self._runner_installed:
-            return
-        with tempfile.NamedTemporaryFile("w", encoding="utf-8", suffix=".py", delete=False) as tmp:
-            tmp.write(runner_source())
-            tmp_path = tmp.name
-        try:
-            self.mount_file_at(tmp_path, self.runner_path)
-        finally:
-            try:
-                os.unlink(tmp_path)
-            except OSError:
-                pass
-        self._runner_installed = True
+        super().shutdown()
 
     def _ensure_python_available(self) -> None:
         if self._python_available or self.python_executable != "python3":
+            return
+        if getattr(self.adapter, "_is_docker_sdk_runtime", False):
+            self._python_available = True
+            return
+        if not hasattr(self.environment, "exec"):
+            self._python_available = True
             return
         result = self._run_coro(
             self.environment.exec(
@@ -609,47 +774,8 @@ class HarborEnvironmentInterpreter(TerminalBenchRunnerInterpreter):
         self._raise_for_harbor_exec_failure(result, "installing Python")
         self._python_available = True
 
-    def _run_runner_messages(self, messages: list[dict[str, Any]], request_id: Any) -> dict[str, Any]:
-        self._ensure_python_available()
-        stdin = "\n".join(dumps(message) for message in messages) + "\n"
-        python_command = _shell_python_command(
-            self.python_executable,
-            ["-u", self.runner_path],
-        )
-        command = (
-            f"{python_command} <<'PREDICT_RLM_EOF'\n"
-            f"{stdin}PREDICT_RLM_EOF"
-        )
-        result = self._run_coro(
-            self.environment.exec(
-                command=command,
-                cwd=self.workdir,
-                timeout_sec=int(self.exec_timeout),
-            )
-        )
-        self._raise_for_harbor_exec_failure(result, "running PredictRLM code")
-        for line in str(getattr(result, "stdout", "")).splitlines():
-            try:
-                message = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if message.get("method") == "tool_call":
-                raise CodeInterpreterError("HarborEnvironmentInterpreter does not support host callback tools")
-            if message.get("id") == request_id:
-                return message
-        raise SandboxFatalError("Harbor runner did not return an execute response")
-
     def _run_coro(self, coro: Any) -> Any:
-        try:
-            running_loop = asyncio.get_running_loop()
-        except RuntimeError:
-            running_loop = None
-        if running_loop is self.loop:
-            coro.close()
-            raise SandboxFatalError(
-                "HarborEnvironmentInterpreter sync methods must run outside the Harbor event loop"
-            )
-        return asyncio.run_coroutine_threadsafe(coro, self.loop).result()
+        return _resolve_maybe_awaitable(coro, self.loop)
 
     def _raise_for_harbor_exec_failure(self, result: Any, operation: str) -> None:
         return_code = getattr(result, "return_code", getattr(result, "returncode", 0))

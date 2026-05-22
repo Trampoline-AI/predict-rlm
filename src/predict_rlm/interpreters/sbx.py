@@ -20,6 +20,7 @@ from typing import Any, Callable
 
 from dspy.primitives.code_interpreter import CodeInterpreterError, FinalOutput
 
+from predict_rlm.debug import debug_event
 from predict_rlm.files import get_synced_file_params
 from predict_rlm.interpreter import SandboxFatalError
 
@@ -234,27 +235,52 @@ class SbxInterpreter(PredictRLMInterpreter):
         if self._proc and self._proc.poll() is not None:
             raise SandboxFatalError("Sbx runner process exited unexpectedly")
 
-        if self._runner_command is not None:
-            command = self._runner_command
-        else:
-            command = self._start_sbx_and_build_runner_command()
-
-        env = os.environ.copy()
-        env["PREDICT_RLM_SBX_ROOT"] = str(self._staging_root)
-        self._proc = subprocess.Popen(
-            command,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            env=env,
-            bufsize=1,
+        start = time.perf_counter()
+        debug_event(
+            "predict_rlm.sandbox.process.start",
+            backend="sbx",
+            tool_count=len(self.tools),
+            preinstall_packages=self.preinstall_packages,
+            skill_package_count=len(self.skill_packages),
         )
-        self._start_stdout_reader()
-        if self.output_fields:
-            self._send_request("register_output_fields", {"fields": self.output_fields})
-        if self.tools:
-            self._send_request("register_tools", {"tools": list(self.tools)})
+        try:
+            if self._runner_command is not None:
+                command = self._runner_command
+            else:
+                command = self._start_sbx_and_build_runner_command()
+            env = os.environ.copy()
+            env["PREDICT_RLM_SBX_ROOT"] = str(self._staging_root)
+            self._proc = subprocess.Popen(
+                command,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                env=env,
+                bufsize=1,
+            )
+            self._start_stdout_reader()
+            if self.output_fields:
+                self._send_request("register_output_fields", {"fields": self.output_fields})
+            if self.tools:
+                self._send_request("register_tools", {"tools": list(self.tools)})
+        except BaseException as exc:
+            debug_event(
+                "predict_rlm.sandbox.process.end",
+                backend="sbx",
+                status="error",
+                error_type=type(exc).__name__,
+                duration_ms=round((time.perf_counter() - start) * 1000),
+            )
+            raise
+        debug_event(
+            "predict_rlm.sandbox.process.end",
+            backend="sbx",
+            status="ok",
+            duration_ms=round((time.perf_counter() - start) * 1000),
+            sandbox_name=self._sandbox_name,
+            process_pid=getattr(self._proc, "pid", None),
+        )
 
     def _start_stdout_reader(self) -> None:
         assert self._proc is not None
@@ -434,6 +460,15 @@ class SbxInterpreter(PredictRLMInterpreter):
         params = request.get("params", {})
         name = params.get("name")
         temp_dir: str | None = None
+        call_start = time.perf_counter()
+        debug_event(
+            "predict_rlm.tool_call.start",
+            backend="sbx",
+            tool_name=name,
+            tool_id=request_id,
+            arg_count=len(params.get("args", [])),
+            kwarg_count=len(params.get("kwargs", {})),
+        )
         try:
             if name not in self.tools:
                 raise CodeInterpreterError(f"Unknown tool: {name}")
@@ -453,7 +488,7 @@ class SbxInterpreter(PredictRLMInterpreter):
                 if writeback and os.path.isfile(host_path):
                     self.mount_file_at(host_path, sandbox_path)
             is_json = result is None or isinstance(result, (dict, list, int, float, bool))
-            return {
+            response = {
                 "jsonrpc": "2.0",
                 "result": {
                     "value": json.dumps(result) if is_json else str(result or ""),
@@ -461,7 +496,26 @@ class SbxInterpreter(PredictRLMInterpreter):
                 },
                 "id": request_id,
             }
+            debug_event(
+                "predict_rlm.tool_call.end",
+                backend="sbx",
+                status="ok",
+                tool_name=name,
+                tool_id=request_id,
+                duration_ms=round((time.perf_counter() - call_start) * 1000),
+                result_type="json" if is_json else "string",
+            )
+            return response
         except Exception as exc:
+            debug_event(
+                "predict_rlm.tool_call.end",
+                backend="sbx",
+                status="error",
+                tool_name=name,
+                tool_id=request_id,
+                duration_ms=round((time.perf_counter() - call_start) * 1000),
+                error_type=type(exc).__name__,
+            )
             return {
                 "jsonrpc": "2.0",
                 "error": {"code": -32000, "message": str(exc)},
@@ -539,16 +593,53 @@ class SbxInterpreter(PredictRLMInterpreter):
             self._proc.stdin.write(json.dumps(payload) + "\n")
             self._proc.stdin.flush()
         except BrokenPipeError as exc:
+            if method == "execute":
+                debug_event(
+                    "predict_rlm.sandbox.execute.end",
+                    backend="sbx",
+                    status="error",
+                    request_id=request_id,
+                    error_type=type(exc).__name__,
+                )
             raise SandboxFatalError("Sbx runner pipe broke while sending request") from exc
 
+        request_start = time.perf_counter()
+        if method == "execute":
+            debug_event(
+                "predict_rlm.sandbox.execute.start",
+                backend="sbx",
+                request_id=request_id,
+                code_chars=len(str((params or {}).get("code", ""))),
+                timeout_seconds=self.config.exec_timeout,
+                pending_tool_count=len(self._pending_tool_calls),
+            )
         deadline = time.monotonic() + self.config.exec_timeout
         stale_discards = 0
         while True:
             self._drain_completed_tool_calls()
             if self._proc.poll() is not None:
                 stderr = self._proc.stderr.read() if self._proc.stderr else ""
+                if method == "execute":
+                    debug_event(
+                        "predict_rlm.sandbox.execute.end",
+                        backend="sbx",
+                        status="error",
+                        request_id=request_id,
+                        duration_ms=round((time.perf_counter() - request_start) * 1000),
+                        error_type="SandboxFatalError",
+                    )
                 raise SandboxFatalError(f"Sbx runner exited unexpectedly: {stderr}")
             if time.monotonic() > deadline:
+                if method == "execute":
+                    debug_event(
+                        "predict_rlm.sandbox.execute.end",
+                        backend="sbx",
+                        status="timeout",
+                        request_id=request_id,
+                        duration_ms=round((time.perf_counter() - request_start) * 1000),
+                        timeout_seconds=self.config.exec_timeout,
+                        pending_tool_count=len(self._pending_tool_calls),
+                    )
                 self._fail_timed_out_request()
             line = self._read_stdout_line(deadline)
             if not line:
@@ -560,9 +651,27 @@ class SbxInterpreter(PredictRLMInterpreter):
                 self._submit_tool_call(response)
                 continue
             if response.get("id") == request_id:
+                if method == "execute":
+                    debug_event(
+                        "predict_rlm.sandbox.execute.end",
+                        backend="sbx",
+                        status="error_response" if "error" in response else "ok",
+                        request_id=request_id,
+                        duration_ms=round((time.perf_counter() - request_start) * 1000),
+                        pending_tool_count=len(self._pending_tool_calls),
+                    )
                 return response
             stale_discards += 1
             if stale_discards > STALE_RESPONSE_DISCARD_LIMIT:
+                if method == "execute":
+                    debug_event(
+                        "predict_rlm.sandbox.execute.end",
+                        backend="sbx",
+                        status="error",
+                        request_id=request_id,
+                        duration_ms=round((time.perf_counter() - request_start) * 1000),
+                        error_type="CodeInterpreterError",
+                    )
                 raise CodeInterpreterError(
                     "Too many stale top-level responses while resyncing "
                     f"SBX request id={request_id}"

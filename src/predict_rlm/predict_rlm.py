@@ -35,6 +35,7 @@ from litellm import ContextWindowExceededError
 from pydantic import ConfigDict, ValidationError, create_model
 
 from ._shared import build_rlm_signatures, format_tool_docs_full
+from .debug import debug_event, safe_model_name
 from .files import File, build_file_plan, scan_file_fields
 from .interpreter import JspiInterpreter, SandboxFatalError
 from .interpreters import (
@@ -1097,6 +1098,18 @@ class PredictRLM(dspy.RLM):
             predictor = dspy.Predict(sig)
             _call_start = time.perf_counter()
             _hist_len_before = snapshot_lm_history_len(lm)
+            rlm_instance._debug_event(
+                "predict_rlm.predict_tool_lm.start",
+                model=safe_model_name(lm),
+                signature=signature,
+                signature_chars=len(signature),
+                instruction_chars=len(instructions or ""),
+                input_field_count=len(kwargs),
+                output_field_count=(
+                    len(getattr(sig, "output_fields", {})) if not isinstance(sig, str) else None
+                ),
+                pydantic_schema_count=len(pydantic_schemas or {}),
+            )
             result: dict[str, Any] = {}
             try:
                 with dspy.context(lm=lm):
@@ -1190,6 +1203,19 @@ class PredictRLM(dspy.RLM):
                         lm=lm_finish_since(lm, _hist_len_before),
                     )
                 )
+                rlm_instance._debug_event(
+                    "predict_rlm.predict_tool_lm.end",
+                    status="error",
+                    parse_status="error",
+                    model=safe_model_name(lm),
+                    signature=signature,
+                    duration_ms=ms_since(_call_start),
+                    output_field_count=len(result),
+                    error_type=type(exc).__name__,
+                    **rlm_instance._debug_lm_metadata(
+                        lm_completion_metadata_since(lm, _hist_len_before)
+                    ),
+                )
                 raise
             else:
                 record_predict_call(
@@ -1203,6 +1229,18 @@ class PredictRLM(dspy.RLM):
                         output=result,
                         lm=lm_finish_since(lm, _hist_len_before),
                     )
+                )
+                rlm_instance._debug_event(
+                    "predict_rlm.predict_tool_lm.end",
+                    status="ok",
+                    parse_status="ok",
+                    model=safe_model_name(lm),
+                    signature=signature,
+                    duration_ms=ms_since(_call_start),
+                    output_field_count=len(result),
+                    **rlm_instance._debug_lm_metadata(
+                        lm_finish_since(lm, _hist_len_before)
+                    ),
                 )
                 return result
 
@@ -1274,8 +1312,32 @@ class PredictRLM(dspy.RLM):
     ) -> Iterator[PredictRLMInterpreter]:
         """Yield interpreter, creating the configured backend if none provided."""
         if self._interpreter is not None:
+            setup_start = time.perf_counter()
+            self._debug_event(
+                "predict_rlm.interpreter.start",
+                backend=type(self._interpreter).__name__,
+                tool_count=len(execution_tools),
+                source="provided",
+            )
             self._inject_execution_context(self._interpreter, execution_tools)
-            yield self._interpreter
+            self._debug_event(
+                "predict_rlm.interpreter.end",
+                backend=type(self._interpreter).__name__,
+                status="ok",
+                duration_ms=ms_since(setup_start),
+                source="provided",
+            )
+            try:
+                yield self._interpreter
+            except BaseException as exc:
+                self._debug_event(
+                    "predict_rlm.interpreter.error",
+                    backend=type(self._interpreter).__name__,
+                    error_type=type(exc).__name__,
+                    duration_ms=ms_since(setup_start),
+                    source="provided",
+                )
+                raise
         else:
             extra_read = list(file_plan["read_paths"]) if file_plan else []
             extra_write = (
@@ -1296,21 +1358,80 @@ class PredictRLM(dspy.RLM):
                 "extra_write_paths": extra_write,
             }
             if self._sbx_pool is not None:
-                with self._sbx_pool.lease(
-                    tools=execution_tools,
-                    output_fields=self._get_output_fields_info(),
-                ) as repl:
-                    yield repl
+                lease_start = time.perf_counter()
+                self._debug_event(
+                    "predict_rlm.interpreter.start",
+                    backend=SandboxBackend.SBX.value,
+                    tool_count=len(execution_tools),
+                    source="sbx_pool",
+                )
+                try:
+                    with self._sbx_pool.lease(
+                        tools=execution_tools,
+                        output_fields=self._get_output_fields_info(),
+                    ) as repl:
+                        self._debug_event(
+                            "predict_rlm.interpreter.end",
+                            backend=type(repl).__name__,
+                            status="ok",
+                            duration_ms=ms_since(lease_start),
+                            source="sbx_pool",
+                        )
+                        yield repl
+                except BaseException as exc:
+                    self._debug_event(
+                        "predict_rlm.interpreter.error",
+                        backend=SandboxBackend.SBX.value,
+                        error_type=type(exc).__name__,
+                        duration_ms=ms_since(lease_start),
+                        source="sbx_pool",
+                    )
+                    raise
                 return
+            setup_start = time.perf_counter()
             if self._sandbox_backend is SandboxBackend.SBX:
+                backend = SandboxBackend.SBX.value
+                self._debug_event(
+                    "predict_rlm.interpreter.start",
+                    backend=backend,
+                    tool_count=len(execution_tools),
+                    source="new",
+                    extra_read_count=len(extra_read),
+                    extra_write_count=len(extra_write or []),
+                )
                 repl = SbxInterpreter(config=self._sbx_config, **interpreter_kwargs)
             else:
+                backend = SandboxBackend.JSPI.value
+                self._debug_event(
+                    "predict_rlm.interpreter.start",
+                    backend=backend,
+                    tool_count=len(execution_tools),
+                    source="new",
+                    extra_read_count=len(extra_read),
+                    extra_write_count=len(extra_write or []),
+                )
                 repl = JspiInterpreter(
                     **interpreter_kwargs,
                     telemetry_context=self._current_telemetry_context,
                 )
             try:
+                self._debug_event(
+                    "predict_rlm.interpreter.end",
+                    backend=type(repl).__name__,
+                    status="ok",
+                    duration_ms=ms_since(setup_start),
+                    source="new",
+                )
                 yield repl
+            except BaseException as exc:
+                self._debug_event(
+                    "predict_rlm.interpreter.error",
+                    backend=type(repl).__name__,
+                    error_type=type(exc).__name__,
+                    duration_ms=ms_since(setup_start),
+                    source="new",
+                )
+                raise
             finally:
                 repl.shutdown()
 
@@ -1320,6 +1441,30 @@ class PredictRLM(dspy.RLM):
         Override parent to skip the default llm_query and llm_query_batched tools.
         """
         return {name: tool.func for name, tool in self._user_tools.items()}
+
+    def _debug_event(self, event: str, **metadata: Any) -> None:
+        call_start = getattr(self, "_debug_call_start", None)
+        if call_start is not None and "call_elapsed_ms" not in metadata:
+            metadata["call_elapsed_ms"] = ms_since(call_start)
+        debug_event(event, **metadata)
+
+    def _debug_lm_metadata(self, metadata: Any | None) -> dict[str, Any]:
+        if metadata is None:
+            return {}
+        attrs: dict[str, Any] = {}
+        for source_name, target_name in (
+            ("finish_reason", "lm_finish_reason"),
+            ("truncation_reason", "lm_truncation_reason"),
+            ("max_tokens", "lm_max_tokens"),
+            ("output_tokens", "lm_output_tokens"),
+        ):
+            value = getattr(metadata, source_name, None)
+            if value is not None:
+                attrs[target_name] = value
+        truncated = getattr(metadata, "truncated", None)
+        if truncated is not None:
+            attrs["lm_truncated"] = truncated
+        return attrs
 
     @contextmanager
     def _lm_context(self):
@@ -1567,6 +1712,91 @@ class PredictRLM(dspy.RLM):
             steps=trace_steps,
         )
 
+    def _extract_fallback(
+        self,
+        variables: list[Any],
+        history: Any,
+        output_field_names: list[str],
+    ) -> dspy.Prediction:
+        """Use extract fallback with debug visibility around its LM call."""
+        extract_start = time.perf_counter()
+        hist_len_before = snapshot_lm_history_len(dspy.settings.lm)
+        self._debug_event(
+            "predict_rlm.extract_lm.start",
+            model=safe_model_name(dspy.settings.lm),
+            output_field_count=len(output_field_names),
+            history_entries=len(getattr(history, "entries", [])),
+            variable_count=len(variables),
+        )
+        try:
+            prediction = super()._extract_fallback(variables, history, output_field_names)
+        except BaseException as exc:
+            self._debug_event(
+                "predict_rlm.extract_lm.end",
+                status="error",
+                parse_status="error",
+                error_type=type(exc).__name__,
+                duration_ms=ms_since(extract_start),
+                **self._debug_lm_metadata(
+                    lm_completion_metadata_since(dspy.settings.lm, hist_len_before)
+                ),
+            )
+            raise
+        self._debug_event(
+            "predict_rlm.extract_lm.end",
+            status="ok",
+            parse_status="ok",
+            duration_ms=ms_since(extract_start),
+            **self._debug_lm_metadata(lm_finish_since(dspy.settings.lm, hist_len_before)),
+        )
+        return prediction
+
+    async def _aextract_fallback(
+        self,
+        variables: list[Any],
+        history: Any,
+        output_field_names: list[str],
+    ) -> dspy.Prediction:
+        """Async extract fallback with debug visibility around its LM call."""
+        extract_start = time.perf_counter()
+        hist_len_before = snapshot_lm_history_len(dspy.settings.lm)
+        self._debug_event(
+            "predict_rlm.extract_lm.start",
+            model=safe_model_name(dspy.settings.lm),
+            output_field_count=len(output_field_names),
+            history_entries=len(getattr(history, "entries", [])),
+            variable_count=len(variables),
+            async_mode=True,
+        )
+        try:
+            prediction = await super()._aextract_fallback(
+                variables,
+                history,
+                output_field_names,
+            )
+        except BaseException as exc:
+            self._debug_event(
+                "predict_rlm.extract_lm.end",
+                status="error",
+                parse_status="error",
+                error_type=type(exc).__name__,
+                duration_ms=ms_since(extract_start),
+                async_mode=True,
+                **self._debug_lm_metadata(
+                    lm_completion_metadata_since(dspy.settings.lm, hist_len_before)
+                ),
+            )
+            raise
+        self._debug_event(
+            "predict_rlm.extract_lm.end",
+            status="ok",
+            parse_status="ok",
+            duration_ms=ms_since(extract_start),
+            async_mode=True,
+            **self._debug_lm_metadata(lm_finish_since(dspy.settings.lm, hist_len_before)),
+        )
+        return prediction
+
     async def aforward(self, **kwargs: Any) -> dspy.Prediction:
         """Async version of forward(). Sets the LM context for async execution.
 
@@ -1594,11 +1824,23 @@ class PredictRLM(dspy.RLM):
         """Execute one synchronous RLM iteration with PredictRLM validation."""
         variables_info = [variable.format() for variable in variables]
         action_start_ns = time.time_ns()
+        action_start = time.perf_counter()
         self._write_telemetry_span(
             "rlm.action_generation.start",
             iteration=iteration + 1,
             start_time_unix_nano=action_start_ns,
             end_time_unix_nano=action_start_ns,
+        )
+        self._debug_event(
+            "predict_rlm.action_lm.start",
+            iteration=iteration + 1,
+            max_iterations=self.max_iterations,
+            model=safe_model_name(dspy.settings.lm),
+            input_field_count=len(self.signature.input_fields),
+            output_field_count=len(self.signature.output_fields),
+            tool_count=len(self._user_tools),
+            history_entries=len(getattr(history, "entries", [])),
+            variable_count=len(variables_info),
         )
         try:
             lm_hist_before_action = snapshot_lm_history_len(dspy.settings.lm)
@@ -1631,6 +1873,15 @@ class PredictRLM(dspy.RLM):
                 ),
                 start_time_unix_nano=action_start_ns,
             )
+            self._debug_event(
+                "predict_rlm.action_lm.end",
+                iteration=iteration + 1,
+                status="error",
+                parse_status="error",
+                error_type=type(exc).__name__,
+                duration_ms=ms_since(action_start),
+                **self._debug_lm_metadata(lm_metadata),
+            )
             raise
         lm_metadata = lm_finish_since(dspy.settings.lm, lm_hist_before_action)
         self._write_telemetry_span(
@@ -1642,6 +1893,16 @@ class PredictRLM(dspy.RLM):
                 "code_chars": len(getattr(pred, "code", "") or ""),
                 "reasoning_chars": len(getattr(pred, "reasoning", "") or ""),
             },
+        )
+        self._debug_event(
+            "predict_rlm.action_lm.end",
+            iteration=iteration + 1,
+            status="ok",
+            parse_status="ok",
+            duration_ms=ms_since(action_start),
+            code_chars=len(getattr(pred, "code", "") or ""),
+            reasoning_chars=len(getattr(pred, "reasoning", "") or ""),
+            **self._debug_lm_metadata(lm_metadata),
         )
         if self.verbose:
             import logging as _logging
@@ -1704,11 +1965,24 @@ class PredictRLM(dspy.RLM):
         """
         variables_info = [variable.format() for variable in variables]
         action_start_ns = time.time_ns()
+        action_start = time.perf_counter()
         self._write_telemetry_span(
             "rlm.action_generation.start",
             iteration=iteration + 1,
             start_time_unix_nano=action_start_ns,
             end_time_unix_nano=action_start_ns,
+        )
+        self._debug_event(
+            "predict_rlm.action_lm.start",
+            iteration=iteration + 1,
+            max_iterations=self.max_iterations,
+            model=safe_model_name(dspy.settings.lm),
+            input_field_count=len(self.signature.input_fields),
+            output_field_count=len(self.signature.output_fields),
+            tool_count=len(self._user_tools),
+            history_entries=len(getattr(history, "entries", [])),
+            variable_count=len(variables_info),
+            async_mode=True,
         )
         try:
             lm_hist_before_action = snapshot_lm_history_len(dspy.settings.lm)
@@ -1741,6 +2015,16 @@ class PredictRLM(dspy.RLM):
                 ),
                 start_time_unix_nano=action_start_ns,
             )
+            self._debug_event(
+                "predict_rlm.action_lm.end",
+                iteration=iteration + 1,
+                status="error",
+                parse_status="error",
+                error_type=type(exc).__name__,
+                duration_ms=ms_since(action_start),
+                async_mode=True,
+                **self._debug_lm_metadata(lm_metadata),
+            )
             raise
         lm_metadata = lm_finish_since(dspy.settings.lm, lm_hist_before_action)
         self._write_telemetry_span(
@@ -1752,6 +2036,17 @@ class PredictRLM(dspy.RLM):
                 "code_chars": len(getattr(pred, "code", "") or ""),
                 "reasoning_chars": len(getattr(pred, "reasoning", "") or ""),
             },
+        )
+        self._debug_event(
+            "predict_rlm.action_lm.end",
+            iteration=iteration + 1,
+            status="ok",
+            parse_status="ok",
+            duration_ms=ms_since(action_start),
+            code_chars=len(getattr(pred, "code", "") or ""),
+            reasoning_chars=len(getattr(pred, "reasoning", "") or ""),
+            async_mode=True,
+            **self._debug_lm_metadata(lm_metadata),
         )
         if self.verbose:
             import logging as _logging
@@ -1865,21 +2160,45 @@ class PredictRLM(dspy.RLM):
         self, repl: PredictRLMInterpreter, file_plan: dict[str, Any]
     ) -> None:
         """Mount input files, skill modules, and create output dirs in the sandbox."""
-        if hasattr(repl, "_ensure_deno_process"):
-            repl._ensure_deno_process()
+        setup_start = time.perf_counter()
+        self._debug_event(
+            "predict_rlm.sandbox.setup.start",
+            backend=type(repl).__name__,
+            mount_count=len(file_plan["mounts"]),
+            output_dir_count=len(file_plan["output_dirs"]),
+            skill_module_count=len(self._skill_modules),
+        )
+        try:
+            if hasattr(repl, "_ensure_deno_process"):
+                repl._ensure_deno_process()
 
-        for host_path, virtual_path in file_plan["mounts"]:
-            repl.mount_file_at(host_path, virtual_path)
+            for host_path, virtual_path in file_plan["mounts"]:
+                repl.mount_file_at(host_path, virtual_path)
 
-        for virtual_dir in file_plan["output_dirs"]:
-            repl.mkdir_p(virtual_dir)
+            for virtual_dir in file_plan["output_dirs"]:
+                repl.mkdir_p(virtual_dir)
 
-        # Mount skill modules into /sandbox/lib/ so the RLM can import them
-        if self._skill_modules:
-            repl.mkdir_p("/sandbox/lib")
-            for mod_name, host_path in self._skill_modules.items():
-                repl.mount_file_at(host_path, f"/sandbox/lib/{mod_name}.py")
-            repl.execute("import sys; sys.path.insert(0, '/sandbox/lib')")
+            # Mount skill modules into /sandbox/lib/ so the RLM can import them
+            if self._skill_modules:
+                repl.mkdir_p("/sandbox/lib")
+                for mod_name, host_path in self._skill_modules.items():
+                    repl.mount_file_at(host_path, f"/sandbox/lib/{mod_name}.py")
+                repl.execute("import sys; sys.path.insert(0, '/sandbox/lib')")
+        except BaseException as exc:
+            self._debug_event(
+                "predict_rlm.sandbox.setup.end",
+                backend=type(repl).__name__,
+                status="error",
+                error_type=type(exc).__name__,
+                duration_ms=ms_since(setup_start),
+            )
+            raise
+        self._debug_event(
+            "predict_rlm.sandbox.setup.end",
+            backend=type(repl).__name__,
+            status="ok",
+            duration_ms=ms_since(setup_start),
+        )
 
     def _sync_output_files(
         self,
@@ -1962,6 +2281,8 @@ class PredictRLM(dspy.RLM):
             )
 
         run_start = time.perf_counter()
+        previous_debug_call_start = getattr(self, "_debug_call_start", None)
+        self._debug_call_start = run_start
         lm = dspy.settings.lm
         sub_lm = self._sub_lm
         # Per-RLM instance ``lm`` has its own history (via ``lm.copy()``
@@ -1972,6 +2293,16 @@ class PredictRLM(dspy.RLM):
         sub_hist_start = snapshot_lm_history_len(sub_lm) if sub_lm and sub_lm is not lm else 0
         steps: list[IterationStep] = []
         self._begin_telemetry_execution()
+        self._debug_event(
+            "predict_rlm.call.start",
+            model=safe_model_name(lm),
+            sub_model=safe_model_name(sub_lm) if sub_lm is not lm else None,
+            max_iterations=self.max_iterations,
+            input_field_count=len(self.signature.input_fields),
+            output_field_count=len(self.signature.output_fields),
+            file_io=bool(file_plan),
+            sandbox_backend=self._sandbox_backend.value,
+        )
 
         try:
             self._validate_inputs(input_args)
@@ -2006,6 +2337,12 @@ class PredictRLM(dspy.RLM):
 
                     for iteration in range(self.max_iterations):
                         iter_start = time.perf_counter()
+                        self._debug_event(
+                            "predict_rlm.iteration.start",
+                            iteration=iteration + 1,
+                            max_iterations=self.max_iterations,
+                            history_entries=len(history.entries),
+                        )
                         result = self._execute_iteration(
                             repl, variables, history, iteration, input_args, output_field_names
                         )
@@ -2053,6 +2390,19 @@ class PredictRLM(dspy.RLM):
                             lm=action_lm_metadata,
                         )
                         steps.append(step)
+                        self._debug_event(
+                            "predict_rlm.iteration.end",
+                            iteration=iteration + 1,
+                            status=(
+                                "completed"
+                                if isinstance(result, dspy.Prediction)
+                                else "continue"
+                            ),
+                            duration_ms=step.duration_ms,
+                            error=step.error,
+                            tool_call_count=len(step.tool_calls),
+                            predict_call_count=len(step.predict_calls),
+                        )
 
                         if isinstance(result, dspy.Prediction):
                             status = "completed"
@@ -2081,11 +2431,24 @@ class PredictRLM(dspy.RLM):
                         sub_hist_start=sub_hist_start,
                         run_start=run_start,
                     )
+                    self._debug_event(
+                        "predict_rlm.call.end",
+                        status=status,
+                        elapsed_ms=ms_since(run_start),
+                        iteration_count=len(steps),
+                    )
                     return prediction
                 finally:
                     reset_tool_call_collector(tool_token)
                     reset_predict_call_collector(predict_token)
         except BaseException as exc:
+            self._debug_event(
+                "predict_rlm.call.end",
+                status="error",
+                elapsed_ms=ms_since(run_start),
+                iteration_count=len(steps),
+                error_type=type(exc).__name__,
+            )
             try:
                 exc.trace = self._build_run_trace(
                     status="error",
@@ -2101,6 +2464,7 @@ class PredictRLM(dspy.RLM):
             raise
         finally:
             self._clear_telemetry_execution()
+            self._debug_call_start = previous_debug_call_start
             if file_plan:
                 self.generate_action, self.extract = orig_action, orig_extract
 
@@ -2117,6 +2481,8 @@ class PredictRLM(dspy.RLM):
             )
 
         run_start = time.perf_counter()
+        previous_debug_call_start = getattr(self, "_debug_call_start", None)
+        self._debug_call_start = run_start
         lm = dspy.settings.lm
         sub_lm = self._sub_lm
         # Snapshot lm.history lengths at run start so ``usage_since`` can
@@ -2129,6 +2495,17 @@ class PredictRLM(dspy.RLM):
         sub_hist_start = snapshot_lm_history_len(sub_lm) if sub_lm and sub_lm is not lm else 0
         steps: list[IterationStep] = []
         self._begin_telemetry_execution()
+        self._debug_event(
+            "predict_rlm.call.start",
+            model=safe_model_name(lm),
+            sub_model=safe_model_name(sub_lm) if sub_lm is not lm else None,
+            max_iterations=self.max_iterations,
+            input_field_count=len(self.signature.input_fields),
+            output_field_count=len(self.signature.output_fields),
+            file_io=bool(file_plan),
+            sandbox_backend=self._sandbox_backend.value,
+            async_mode=True,
+        )
 
         try:
             self._validate_inputs(input_args)
@@ -2163,6 +2540,13 @@ class PredictRLM(dspy.RLM):
 
                     for iteration in range(self.max_iterations):
                         iter_start = time.perf_counter()
+                        self._debug_event(
+                            "predict_rlm.iteration.start",
+                            iteration=iteration + 1,
+                            max_iterations=self.max_iterations,
+                            history_entries=len(history.entries),
+                            async_mode=True,
+                        )
                         result = await self._aexecute_iteration(
                             repl, variables, history, iteration, input_args, output_field_names
                         )
@@ -2209,6 +2593,20 @@ class PredictRLM(dspy.RLM):
                             lm=action_lm_metadata,
                         )
                         steps.append(step)
+                        self._debug_event(
+                            "predict_rlm.iteration.end",
+                            iteration=iteration + 1,
+                            status=(
+                                "completed"
+                                if isinstance(result, dspy.Prediction)
+                                else "continue"
+                            ),
+                            duration_ms=step.duration_ms,
+                            error=step.error,
+                            tool_call_count=len(step.tool_calls),
+                            predict_call_count=len(step.predict_calls),
+                            async_mode=True,
+                        )
 
                         if isinstance(result, dspy.Prediction):
                             status = "completed"
@@ -2237,11 +2635,26 @@ class PredictRLM(dspy.RLM):
                         sub_hist_start=sub_hist_start,
                         run_start=run_start,
                     )
+                    self._debug_event(
+                        "predict_rlm.call.end",
+                        status=status,
+                        elapsed_ms=ms_since(run_start),
+                        iteration_count=len(steps),
+                        async_mode=True,
+                    )
                     return prediction
                 finally:
                     reset_tool_call_collector(tool_token)
                     reset_predict_call_collector(predict_token)
         except BaseException as exc:
+            self._debug_event(
+                "predict_rlm.call.end",
+                status="error",
+                elapsed_ms=ms_since(run_start),
+                iteration_count=len(steps),
+                error_type=type(exc).__name__,
+                async_mode=True,
+            )
             try:
                 exc.trace = self._build_run_trace(
                     status="error",
@@ -2257,6 +2670,7 @@ class PredictRLM(dspy.RLM):
             raise
         finally:
             self._clear_telemetry_execution()
+            self._debug_call_start = previous_debug_call_start
             if file_plan:
                 self.generate_action, self.extract = orig_action, orig_extract
 

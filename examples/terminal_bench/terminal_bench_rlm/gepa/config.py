@@ -31,7 +31,8 @@ class TerminalBenchGepaConfig(OptimizeConfig):
     terminal_bench_executable: str = ".terminal-bench-venv/bin/tb"
     harbor_executable: str = "harbor"
     harness_backend: str = "harbor"
-    timeout_cleanup_grace_sec: int = 30
+    timeout_cleanup_grace_sec: int = 60
+    harbor_task_cache_dir: Path | None = None
     n_attempts: int = 1
     n_concurrent_trials: int = 1
     cleanup: bool = True
@@ -49,6 +50,8 @@ class TerminalBenchGepaConfig(OptimizeConfig):
         payload["train_task_ids"] = list(self.train_task_ids)
         payload["val_task_ids"] = list(self.val_task_ids)
         payload["codex_lm_exclude"] = list(self.codex_lm_exclude)
+        if self.harbor_task_cache_dir is not None:
+            payload["harbor_task_cache_dir"] = str(self.harbor_task_cache_dir)
         return payload
 
 
@@ -61,7 +64,7 @@ def default_config() -> TerminalBenchGepaConfig:
         max_metric_calls=2,
         minibatch_size=1,
         concurrency=1,
-        max_iterations=30,
+        max_iterations=20,
         task_timeout=900,
     )
 
@@ -88,7 +91,8 @@ def _format_runtime_examples() -> dict[str, list[str]]:
         ],
         "shell workflow": [
             "inspect files before editing",
-            "prefer repeatable, idempotent shell commands",
+            "make task changes boldly in small inspectable steps",
+            "avoid destructive retries or overwriting the best partial solution",
         ],
         "verification": [
             "run task-local checks when available",

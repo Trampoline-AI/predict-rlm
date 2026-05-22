@@ -287,7 +287,7 @@ def test_terminal_bench_minimal_adapter_rejects_file_sync_operations() -> None:
         interpreter.list_dir("/container")
 
 
-def test_harbor_environment_runner_uses_python_fallback_resolver() -> None:
+def test_harbor_environment_list_dir_uses_python_fallback_resolver() -> None:
     loop = asyncio.new_event_loop()
 
     class FakeEnvironment:
@@ -296,31 +296,103 @@ def test_harbor_environment_runner_uses_python_fallback_resolver() -> None:
 
         def exec(self, *, command, cwd=None, timeout_sec=None):
             self.commands.append(command)
-            return SimpleNamespace(
-                stdout=json.dumps({"id": 1, "ok": True, "result": {"output": "ok"}}) + "\n",
-                stderr="",
-                return_code=0,
-            )
+            stdout = json.dumps(["/workspace/out.txt"]) if len(self.commands) == 2 else ""
+            return SimpleNamespace(stdout=stdout, stderr="", return_code=0)
 
     environment = FakeEnvironment()
     interpreter = HarborEnvironmentInterpreter(environment, loop=loop)
-    interpreter._runner_installed = True
     interpreter._run_coro = lambda result: result
 
     try:
-        response = interpreter._run_runner_messages(
-            [{"id": 1, "method": "execute", "params": {"code": "print('ok')"}}],
-            1,
-        )
+        response = interpreter.list_dir("/workspace")
     finally:
         loop.close()
 
-    assert response["ok"] is True
+    assert response == ["/workspace/out.txt"]
     assert len(environment.commands) == 2
     command = environment.commands[1]
     assert "command -v python3" in command
     assert "elif command -v python" in command
-    assert '"$_predict_rlm_python" -u /tmp/predict_rlm_runner.py' in command
+    assert '"$_predict_rlm_python" -c' in command
+
+
+def test_harbor_environment_starts_runner_with_docker_compose_exec(monkeypatch, tmp_path: Path) -> None:
+    loop = asyncio.new_event_loop()
+    popen_calls: list[dict[str, object]] = []
+    process = FakeProcess([{"id": 1, "ok": True, "result": {"output": "ok\n"}}])
+    compose_path = tmp_path / "compose.yaml"
+    compose_path.write_text("services: {}", encoding="utf-8")
+
+    class ComposeOnlyEnvironment:
+        environment_dir = tmp_path
+        session_id = "Path.Tracing_ABC123"
+        default_user = "agent-user"
+
+        def __init__(self) -> None:
+            self.commands: list[str] = []
+            self.uploads: list[tuple[str, str]] = []
+
+        @property
+        def _docker_compose_paths(self) -> list[Path]:
+            return [compose_path]
+
+        def _compose_env_vars(self, *, include_os_env: bool = True) -> dict[str, str]:
+            return {"COMPOSE_ENV": "1"}
+
+        def exec(self, *, command, cwd=None, timeout_sec=None):
+            self.commands.append(command)
+            return SimpleNamespace(stdout="", stderr="", return_code=0)
+
+        def upload_file(self, host_path: str, environment_path: str) -> None:
+            self.uploads.append((host_path, environment_path))
+
+    def fake_popen(cmd, **kwargs):
+        popen_calls.append({"cmd": cmd, "kwargs": kwargs})
+        return process
+
+    monkeypatch.setattr(subprocess, "Popen", fake_popen)
+    environment = ComposeOnlyEnvironment()
+    interpreter = HarborEnvironmentInterpreter(environment, loop=loop, workdir="/workspace")
+    interpreter._run_coro = lambda result: result
+
+    try:
+        response = interpreter.execute("print('ok')")
+    finally:
+        loop.close()
+
+    assert response == "ok\n"
+    assert environment.uploads[0][1] == "/tmp/predict_rlm_runner.py"
+    assert popen_calls == [
+        {
+            "cmd": [
+                "docker",
+                "compose",
+                "--project-name",
+                "path-tracing_abc123",
+                "--project-directory",
+                str(tmp_path),
+                "-f",
+                str(compose_path),
+                "exec",
+                "-T",
+                "-w",
+                "/workspace",
+                "-u",
+                "agent-user",
+                "main",
+                "python3",
+                "-u",
+                "/tmp/predict_rlm_runner.py",
+            ],
+            "kwargs": {
+                "stdin": subprocess.PIPE,
+                "stdout": subprocess.PIPE,
+                "stderr": subprocess.PIPE,
+                "text": True,
+                "env": {"COMPOSE_ENV": "1"},
+            },
+        }
+    ]
 
 
 def test_harbor_environment_bootstraps_python_before_runner_execution() -> None:
@@ -329,34 +401,43 @@ def test_harbor_environment_bootstraps_python_before_runner_execution() -> None:
     class FakeEnvironment:
         def __init__(self) -> None:
             self.commands: list[str] = []
+            self.uploads: list[tuple[str, str]] = []
+            self.started: list[dict[str, object]] = []
+            self.process = FakeProcess(
+                [{"id": 1, "ok": True, "result": {"output": "ok\n"}}]
+            )
 
         def exec(self, *, command, cwd=None, timeout_sec=None):
             self.commands.append(command)
-            if len(self.commands) == 1:
-                return SimpleNamespace(stdout="", stderr="", return_code=0)
-            return SimpleNamespace(
-                stdout=json.dumps({"id": 1, "ok": True, "result": {"output": "ok"}}) + "\n",
-                stderr="",
-                return_code=0,
-            )
+            return SimpleNamespace(stdout="", stderr="", return_code=0)
+
+        def upload_file(self, host_path: str, environment_path: str) -> None:
+            self.uploads.append((host_path, environment_path))
+
+        def start_exec(self, command, *, workdir=None, timeout=None):
+            self.started.append({"command": command, "workdir": workdir, "timeout": timeout})
+            return self.process
 
     environment = FakeEnvironment()
     interpreter = HarborEnvironmentInterpreter(environment, loop=loop)
-    interpreter._runner_installed = True
     interpreter._run_coro = lambda result: result
 
     try:
-        response = interpreter._run_runner_messages(
-            [{"id": 1, "method": "execute", "params": {"code": "print('ok')"}}],
-            1,
-        )
+        response = interpreter.execute("print('ok')")
     finally:
         loop.close()
 
-    assert response["ok"] is True
+    assert response == "ok\n"
     bootstrap_command = environment.commands[0]
     assert "command -v python3" in bootstrap_command
     assert "apt-get" in bootstrap_command
     assert "apk add" in bootstrap_command
     assert "python3" in bootstrap_command
-    assert '"$_predict_rlm_python" -u /tmp/predict_rlm_runner.py' in environment.commands[1]
+    assert environment.uploads[0][1] == "/tmp/predict_rlm_runner.py"
+    assert environment.started == [
+        {
+            "command": ["python3", "-u", "/tmp/predict_rlm_runner.py"],
+            "workdir": None,
+            "timeout": 900.0,
+        }
+    ]

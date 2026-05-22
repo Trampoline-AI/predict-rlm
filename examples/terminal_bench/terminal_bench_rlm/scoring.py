@@ -4,10 +4,11 @@ from collections.abc import Mapping
 from typing import Any
 
 PASSED = "passed"
+DIAGNOSTIC_TAIL_LIMIT = 2000
 
 
 def hard_score(result_or_parser_results: Any) -> float:
-    if _has_exception(result_or_parser_results):
+    if _exception_blocks_score(result_or_parser_results):
         return 0.0
     ctrf_score = _harbor_ctrf_score(result_or_parser_results)
     if ctrf_score is not None:
@@ -23,7 +24,7 @@ def hard_score(result_or_parser_results: Any) -> float:
 
 
 def soft_score(result_or_parser_results: Any) -> float:
-    if _has_exception(result_or_parser_results):
+    if _exception_blocks_score(result_or_parser_results):
         return 0.0
     ctrf_score = _harbor_ctrf_score(result_or_parser_results)
     if ctrf_score is not None:
@@ -40,13 +41,16 @@ def soft_score(result_or_parser_results: Any) -> float:
 
 
 def score_details(result_or_parser_results: Any) -> dict[str, Any]:
-    if _has_exception(result_or_parser_results):
+    diagnostics = _diagnostic_metadata(result_or_parser_results)
+    if _exception_blocks_score(result_or_parser_results):
         return {
             "soft_score": 0.0,
             "hard_score": 0.0,
             "passed": 0,
             "total": 0,
             "is_resolved": False,
+            "failure_class": diagnostics.get("failure_class")
+            or _failure_class(result_or_parser_results),
         }
     ctrf_score = _harbor_ctrf_score(result_or_parser_results)
     if ctrf_score is not None:
@@ -65,16 +69,21 @@ def score_details(result_or_parser_results: Any) -> dict[str, Any]:
         }
         if failures:
             details["failures"] = failures
+        if diagnostics.get("failure_class"):
+            details["failure_class"] = diagnostics["failure_class"]
         return details
     reward = _harbor_reward(result_or_parser_results)
     if reward is not None:
-        return {
+        details = {
             "soft_score": reward,
             "hard_score": 1.0 if reward >= 1.0 else 0.0,
             "passed": 1 if reward >= 1.0 else 0,
             "total": 1,
             "is_resolved": reward >= 1.0,
         }
+        if diagnostics.get("failure_class"):
+            details["failure_class"] = diagnostics["failure_class"]
+        return details
     parser_results = _parser_results(result_or_parser_results)
     passed, total = _pass_counts(parser_results)
     details = {
@@ -91,6 +100,8 @@ def score_details(result_or_parser_results: Any) -> dict[str, Any]:
     }
     if failures:
         details["failures"] = failures
+    if diagnostics.get("failure_class"):
+        details["failure_class"] = diagnostics["failure_class"]
     return details
 
 
@@ -106,6 +117,9 @@ def feedback(result_or_parser_results: Any) -> str:
     if failures:
         labels = ", ".join(f"{name}={status}" for name, status in sorted(failures.items()))
         message = f"{message}; failures: {labels}"
+    failure_class = details.get("failure_class")
+    if failure_class:
+        message = f"{message}; failure_class={failure_class}"
     return message
 
 
@@ -126,6 +140,9 @@ def to_gepa_example_result(
         "total": details["total"],
         "is_resolved": 1.0 if details["is_resolved"] is True else 0.0,
     }
+    if "failure_class" in details:
+        objective_scores["failure_class"] = details["failure_class"]
+    objective_scores.update(_diagnostic_metadata(result_or_parser_results))
     return RLMGepaExampleResult(
         score=details["soft_score"],
         feedback=feedback(result_or_parser_results),
@@ -237,6 +254,127 @@ def _field(value: Any, name: str) -> Any:
 def _has_exception(result_or_parser_results: Any) -> bool:
     exception_info = _field(result_or_parser_results, "exception_info")
     return exception_info not in (None, False, {})
+
+
+def _exception_blocks_score(result_or_parser_results: Any) -> bool:
+    if not _has_exception(result_or_parser_results):
+        return False
+    failure_class = _failure_class(result_or_parser_results)
+    if failure_class not in {"outer_task_timeout", "sandbox_exec_timeout"}:
+        return True
+    return not _has_successful_harbor_verifier_evidence(result_or_parser_results)
+
+
+def _has_successful_harbor_verifier_evidence(result_or_parser_results: Any) -> bool:
+    ctrf_score = _harbor_ctrf_score(result_or_parser_results)
+    if ctrf_score is not None:
+        passed, total, _parser_results = ctrf_score
+        return bool(total and passed == total)
+    reward = _harbor_reward(result_or_parser_results)
+    return reward is not None and reward >= 1.0
+
+
+def _failure_class(result_or_parser_results: Any) -> str:
+    explicit = _field(result_or_parser_results, "failure_class")
+    if explicit:
+        return str(explicit)
+    exception_info = _field(result_or_parser_results, "exception_info")
+    exception_type = str(
+        _field(exception_info, "exception_type")
+        or _field(exception_info, "type")
+        or _field(exception_info, "class")
+        or ""
+    )
+    exception_message = str(
+        _field(exception_info, "exception_message") or _field(exception_info, "message") or ""
+    )
+    text = f"{exception_type} {exception_message}".lower()
+    if (
+        "agenttimeouterror" in text
+        or "harnesstimeouterror" in text
+        or "agent execution timed out" in text
+        or "terminal-bench cli timed out" in text
+    ):
+        return "outer_task_timeout"
+    if "sandboxfatalerror" in text or "exit code 137" in text or "exit code 143" in text:
+        return "sandbox_lifecycle_failure"
+    if "timed out" in text or "timeout" in text:
+        return "sandbox_exec_timeout"
+    return "evaluator_exception"
+
+
+def _diagnostic_metadata(result_or_parser_results: Any) -> dict[str, Any]:
+    if not _has_exception(result_or_parser_results) and not _field(
+        result_or_parser_results, "failure_class"
+    ):
+        return {}
+    exception_info = _field(result_or_parser_results, "exception_info")
+    metadata: dict[str, Any] = {"failure_class": _failure_class(result_or_parser_results)}
+    phase = _first_field(exception_info, result_or_parser_results, names=("phase", "failure_phase"))
+    if phase:
+        metadata["failure_phase"] = str(phase)
+    exception_type = _first_field(
+        exception_info,
+        result_or_parser_results,
+        names=("exception_type", "type", "class"),
+    )
+    if exception_type:
+        metadata["exception_type"] = str(exception_type)
+    diagnostic_text = _first_field(
+        exception_info,
+        result_or_parser_results,
+        names=("exception_message", "message", "diagnostic_text", "error"),
+    )
+    if diagnostic_text:
+        metadata["diagnostic_text"] = _compact_text(diagnostic_text)
+    returncode = _first_field(
+        exception_info,
+        result_or_parser_results,
+        names=("returncode", "return_code", "exit_code"),
+    )
+    if returncode is not None:
+        metadata["returncode"] = returncode
+    timed_out = _first_field(exception_info, result_or_parser_results, names=("timed_out",))
+    if timed_out is not None:
+        metadata["timed_out"] = bool(timed_out)
+    elif metadata["failure_class"] in {"outer_task_timeout", "sandbox_exec_timeout"}:
+        metadata["timed_out"] = True
+    timeout_seconds = _first_field(
+        exception_info,
+        result_or_parser_results,
+        names=("timeout_seconds", "timeout_sec", "timeout"),
+    )
+    if timeout_seconds is not None:
+        metadata["timeout_seconds"] = timeout_seconds
+    for stream in ("stdout", "stderr"):
+        tail = _first_field(
+            exception_info,
+            result_or_parser_results,
+            names=(f"{stream}_tail", stream),
+        )
+        if tail:
+            metadata[f"{stream}_tail"] = _tail_text(tail)
+    return metadata
+
+
+def _first_field(*owners: Any, names: tuple[str, ...]) -> Any:
+    for owner in owners:
+        for name in names:
+            value = _field(owner, name)
+            if value is not None:
+                return value
+    return None
+
+
+def _compact_text(value: Any) -> str:
+    return _tail_text(value)
+
+
+def _tail_text(value: Any, *, limit: int = DIAGNOSTIC_TAIL_LIMIT) -> str:
+    if isinstance(value, bytes):
+        value = value.decode(errors="replace")
+    text = str(value)
+    return text[-limit:] if len(text) > limit else text
 
 
 def _is_resolved(result_or_parser_results: Any) -> bool | None:
