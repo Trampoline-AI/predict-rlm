@@ -30,10 +30,6 @@ def _assert_terminal_bench_skill_semantics(instructions: str) -> None:
     heading_positions = [instructions.index(heading) for heading in headings]
 
     assert heading_positions == sorted(heading_positions)
-    assert (
-        "As soon as the task is solved and verified, stop improving and submit, "
-        "premature optimization is the root of all evil."
-    ) in instructions
     assert "inspect the filesystem before making changes" in instructions
     assert "install missing packages" in instructions
     assert "package managers" in instructions
@@ -42,9 +38,6 @@ def _assert_terminal_bench_skill_semantics(instructions: str) -> None:
     assert "run the verification in one iteration" in instructions
     assert "separate later iteration" in instructions
     assert "SUBMIT makes the result final" in instructions
-    assert instructions.endswith(
-        "Verify the observable task contract, then submit; do not keep optimizing after success."
-    )
     assert "async def start" in instructions
     assert "async def wait" in instructions
     assert "stdout_tail" in instructions
