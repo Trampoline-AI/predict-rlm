@@ -5,7 +5,6 @@ from __future__ import annotations
 import hashlib
 import inspect
 import logging
-import math
 import os
 import re
 import time
@@ -52,6 +51,7 @@ from ._logging import (
     suppress_interpreter_result_logging,
 )
 from ._shared import build_rlm_signatures, format_tool_docs_full
+from .execution_timeout import validate_execution_timeout
 from .files import File, build_file_plan, scan_file_fields
 from .interpreter import JspiInterpreter, SandboxFatalError
 from .interpreters import (
@@ -1806,19 +1806,13 @@ class PredictRLM(dspy.RLM):
         value = getattr(pred, "execution_timeout_seconds", None)
         if type(value).__module__ == "unittest.mock":
             return None
-        if value is None:
-            return None
-        if (
-            isinstance(value, bool)
-            or not isinstance(value, (int, float))
-            or not math.isfinite(float(value))
-            or float(value) <= 0
-        ):
+        try:
+            return validate_execution_timeout(value)
+        except ValueError as exc:
             raise RuntimeError(
                 "PredictRLM action adapter returned invalid "
                 "execution_timeout_seconds; expected a positive number or null."
-            )
-        return float(value)
+            ) from exc
 
     def _telemetry_ref(self) -> dict[str, Any] | None:
         telemetry_context = getattr(self, "_current_telemetry_context", None)
