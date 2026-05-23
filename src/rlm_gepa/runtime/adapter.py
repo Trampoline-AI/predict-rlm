@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 from collections.abc import Mapping, Sequence
 from contextlib import contextmanager
@@ -261,7 +262,7 @@ class RLMGepaAdapter:
         have_objective_scores = False
 
         self.task_trace_dir.mkdir(parents=True, exist_ok=True)
-        trace_path = self.task_trace_dir / f"{event_id}_{eval_kind}.jsonl"
+        trace_path = self.task_trace_dir / f"{_trace_file_stem(event_id, eval_kind)}.jsonl"
         with trace_path.open("x", encoding="utf-8") as f:
             for index, result in enumerate(results):
                 example_id = result.example_id or str(index)
@@ -850,6 +851,14 @@ def _compact_reason(value: Any, *, limit: int = 240) -> str:
     if len(text) <= limit:
         return text
     return text[: limit - 3] + "..."
+
+
+def _trace_file_stem(event_id: str, eval_kind: str, *, max_length: int = 160) -> str:
+    stem = f"{event_id}_{eval_kind}"
+    if len(stem) <= max_length:
+        return stem
+    digest = hashlib.sha1(stem.encode("utf-8")).hexdigest()[:12]
+    return f"{stem[: max_length - len(digest) - 1]}-{digest}"
 
 
 def _batch_signature(batch: Sequence[Any]) -> tuple[str, ...]:

@@ -21,10 +21,11 @@ class RunnerError:
 
     @classmethod
     def from_payload(cls, payload: dict[str, Any]) -> RunnerError:
+        data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
         return cls(
-            type=str(payload.get("type") or "RuntimeError"),
+            type=str(data.get("type") or payload.get("type") or "RuntimeError"),
             message=str(payload.get("message") or ""),
-            args=payload.get("args"),
+            args=data.get("args") or payload.get("args"),
         )
 
     def to_payload(self) -> dict[str, Any]:
@@ -35,7 +36,7 @@ class RunnerError:
 
 
 def request(request_id: int, method: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
-    return {"id": request_id, "method": method, "params": params or {}}
+    return {"jsonrpc": "2.0", "id": request_id, "method": method, "params": params or {}}
 
 
 def response_ok(request_id: Any, result: Any | None = None) -> dict[str, Any]:

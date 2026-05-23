@@ -8,6 +8,7 @@ from rlm_gepa.runtime.telemetry_analyzer import analyze_run, analyze_trace_rows
     ("failure_class", "expected"),
     [
         ("sandbox_lifecycle_failure", "sandbox_lifecycle_failure"),
+        ("rlm_iteration_execution_timeout", "rlm_iteration_execution_timeout"),
         ("sandbox_exec_timeout", "sandbox_exec_timeout"),
         ("host_tool_timeout_or_leak", "host_tool_timeout_or_leak"),
         ("outer_task_timeout", "outer_task_timeout"),
@@ -48,10 +49,20 @@ def test_precedence_prefers_sandbox_lifecycle_over_all_other_classes():
         {"attributes": {"failure.class": "outer_task_timeout"}},
         {"attributes": {"failure.class": "host_tool_timeout_or_leak"}},
         {"attributes": {"failure.class": "sandbox_exec_timeout"}},
+        {"attributes": {"failure.class": "rlm_iteration_execution_timeout"}},
         {"attributes": {"failure.class": "sandbox_lifecycle_failure"}},
     ]
 
     assert classify_failure({"score": 0}, events) == "sandbox_lifecycle_failure"
+
+
+def test_precedence_prefers_rlm_iteration_timeout_over_sandbox_exec_timeout():
+    events = [
+        {"attributes": {"failure.class": "sandbox_exec_timeout"}},
+        {"attributes": {"failure.class": "rlm_iteration_execution_timeout"}},
+    ]
+
+    assert classify_failure({"score": 0}, events) == "rlm_iteration_execution_timeout"
 
 
 def test_precedence_prefers_sandbox_exec_timeout_over_host_tool_and_outer_timeout():
