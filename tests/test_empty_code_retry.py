@@ -21,6 +21,7 @@ import asyncio
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
+import dspy
 import pytest
 
 
@@ -40,8 +41,10 @@ def _build_executor():
     from predict_rlm.predict_rlm import PredictRLM
 
     executor = PredictRLM.__new__(PredictRLM)
+    executor.signature = dspy.Signature("question -> answer")
     executor.max_iterations = 50
     executor.verbose = False
+    executor._user_tools = {}
     # mock generate_action.acall so we control pred.code
     executor.generate_action = MagicMock()
     executor._partial_pending_entry = None
@@ -191,7 +194,13 @@ def test_validating_adapter_retries_empty_chat_code_via_json_fallback():
         },
     )
 
-    assert result == [{"reasoning": "retry succeeded", "code": "print(1)"}]
+    assert result == [
+        {
+            "reasoning": "retry succeeded",
+            "execution_timeout_seconds": None,
+            "code": "print(1)",
+        }
+    ]
     assert len(lm.calls) == 2
 
 

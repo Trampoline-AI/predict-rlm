@@ -3,22 +3,37 @@ from __future__ import annotations
 import asyncio
 import inspect
 import json
+import math
 import os
+import queue
 import re
+import select
 import shlex
 import subprocess
 import tempfile
+import threading
 import time
 from pathlib import Path
 from typing import Any, Callable, Protocol
 
 from dspy.primitives.code_interpreter import CodeInterpreterError, FinalOutput
 
+from predict_rlm.execution_timeout import (
+    DEFAULT_RECOVERABLE_EXECUTION_TIMEOUT_GRACE_SECONDS,
+    ITERATION_TIMEOUT_FAILURE_CLASS,
+    format_recoverable_timeout_result,
+    recoverable_timeout_host_deadline_seconds,
+    validate_execution_timeout,
+)
 from predict_rlm.interpreter import SandboxFatalError
 from predict_rlm.interpreters.base import InterpreterExecutionGate, PredictRLMInterpreter
 
 from .protocol import RunnerError, dumps, request
 from .runner import runner_source
+
+TERMINAL_BENCH_RECOVERABLE_TIMEOUT_GRACE_SECONDS = (
+    DEFAULT_RECOVERABLE_EXECUTION_TIMEOUT_GRACE_SECONDS
+)
 
 
 def _shell_python_command(python_executable: str, args: list[str]) -> str:
@@ -104,6 +119,63 @@ class ContainerAdapter(Protocol):
         workdir: str | None = None,
         timeout: float | None = None,
     ) -> ContainerProcess: ...
+
+
+class _TimeoutLineReader:
+    def __init__(self, process: ContainerProcess) -> None:
+        self.process = process
+        self.pipe = process.stdout
+        self._queue: queue.Queue[str] = queue.Queue()
+        self._thread: threading.Thread | None = None
+
+    def readline(self, timeout: float) -> str | None:
+        timeout = max(0.0, timeout)
+        fd = self._fileno()
+        if fd is not None:
+            try:
+                ready, _, _ = select.select([fd], [], [], timeout)
+            except (OSError, ValueError):
+                fd = None
+            else:
+                if ready:
+                    return self.pipe.readline()
+                return None
+        self._ensure_thread()
+        try:
+            return self._queue.get(timeout=timeout)
+        except queue.Empty:
+            return None
+
+    def _fileno(self) -> int | None:
+        fileno = getattr(self.pipe, "fileno", None)
+        if fileno is None:
+            return None
+        try:
+            fd = fileno()
+        except (OSError, ValueError, AttributeError):
+            return None
+        return fd if isinstance(fd, int) and fd >= 0 else None
+
+    def _ensure_thread(self) -> None:
+        if self._thread is not None:
+            return
+        self._thread = threading.Thread(
+            target=self._read_loop,
+            name="terminal-bench-runner-stdout",
+            daemon=True,
+        )
+        self._thread.start()
+
+    def _read_loop(self) -> None:
+        while True:
+            line = self.pipe.readline()
+            if line:
+                self._queue.put(line)
+                continue
+            if self.process.poll() is not None:
+                self._queue.put("")
+                return
+            time.sleep(0.01)
 
 
 class HarborContainerAdapter:
@@ -423,6 +495,7 @@ class TerminalBenchRunnerInterpreter(PredictRLMInterpreter):
         python_executable: str = "python3",
         workdir: str | None = None,
         exec_timeout: float = 900.0,
+        recoverable_timeout_grace: float = TERMINAL_BENCH_RECOVERABLE_TIMEOUT_GRACE_SECONDS,
     ) -> None:
         self.container = container
         self.adapter = container_adapter or HarborContainerAdapter(container)
@@ -432,19 +505,35 @@ class TerminalBenchRunnerInterpreter(PredictRLMInterpreter):
         self.python_executable = python_executable
         self.workdir = workdir
         self.exec_timeout = exec_timeout
+        self.recoverable_timeout_grace = self._resolve_recoverable_timeout_grace(
+            recoverable_timeout_grace
+        )
         self._process: ContainerProcess | None = None
         self._request_id = 0
         self._shutdown = False
         self._tools_registered = False
         self._output_fields_registered = False
+        self._stdout_reader: _TimeoutLineReader | None = None
         self._execution_gate = InterpreterExecutionGate("Terminal-Bench runner")
 
-    def execute(self, code: str, variables: dict[str, Any] | None = None) -> Any:
+    def execute(
+        self,
+        code: str,
+        variables: dict[str, Any] | None = None,
+        *,
+        timeout: float | None = None,
+    ) -> Any:
         with self._execution_gate.top_level():
-            return self._execute_top_level(code, variables)
+            return self._execute_top_level(code, variables, timeout=timeout)
 
-    async def aexecute(self, code: str, variables: dict[str, Any] | None = None) -> Any:
-        return await asyncio.to_thread(self.execute, code, variables)
+    async def aexecute(
+        self,
+        code: str,
+        variables: dict[str, Any] | None = None,
+        *,
+        timeout: float | None = None,
+    ) -> Any:
+        return await asyncio.to_thread(self.execute, code, variables, timeout=timeout)
 
     def mount_file_at(self, host_path: str, virtual_path: str) -> None:
         self.adapter.copy_to(host_path, virtual_path)
@@ -503,13 +592,42 @@ class TerminalBenchRunnerInterpreter(PredictRLMInterpreter):
             self._register_runtime()
 
     def _execute_top_level(
-        self, code: str, variables: dict[str, Any] | None = None
+        self,
+        code: str,
+        variables: dict[str, Any] | None = None,
+        *,
+        timeout: float | None = None,
     ) -> Any:
         if variables:
             assignments = "\n".join(f"{name} = {value!r}" for name, value in variables.items())
             code = f"{assignments}\n{code}"
-        response = self._send_request("execute", {"code": code})
+        params: dict[str, Any] = {"code": code}
+        host_timeout = self.exec_timeout
+        if timeout is not None:
+            execution_timeout = self._resolve_execution_timeout(timeout)
+            params["execution_timeout_seconds"] = execution_timeout
+            host_timeout = recoverable_timeout_host_deadline_seconds(
+                execution_timeout,
+                ITERATION_TIMEOUT_FAILURE_CLASS,
+                grace_seconds=self.recoverable_timeout_grace,
+            )
+        response = self._send_request("execute", params, timeout=host_timeout)
         return self._unwrap_execute_response(response)
+
+    def _resolve_recoverable_timeout_grace(self, grace: float) -> float:
+        if (
+            isinstance(grace, bool)
+            or not isinstance(grace, (int, float))
+            or not math.isfinite(float(grace))
+            or float(grace) < 0
+        ):
+            raise ValueError("recoverable timeout grace must be a non-negative number")
+        return float(grace)
+
+    def _resolve_execution_timeout(self, timeout: float) -> float:
+        execution_timeout = validate_execution_timeout(timeout)
+        assert execution_timeout is not None
+        return execution_timeout
 
     def _ensure_process(self) -> None:
         if self._process is not None and self._process.poll() is None:
@@ -524,6 +642,7 @@ class TerminalBenchRunnerInterpreter(PredictRLMInterpreter):
             workdir=self.workdir,
             timeout=self.exec_timeout,
         )
+        self._stdout_reader = None
         self._register_runtime()
 
     def _copy_runner_script(self) -> None:
@@ -557,14 +676,24 @@ class TerminalBenchRunnerInterpreter(PredictRLMInterpreter):
             self._send_request_without_ensure("register_tools", {"tools": list(self.tools)})
             self._tools_registered = True
 
-    def _send_request(self, method: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
+    def _send_request(
+        self,
+        method: str,
+        params: dict[str, Any] | None = None,
+        *,
+        timeout: float | None = None,
+    ) -> dict[str, Any]:
         if method == "shutdown" and self._process is not None:
             return self._send_request_without_ensure(method, params)
         self._ensure_process()
-        return self._send_request_without_ensure(method, params)
+        return self._send_request_without_ensure(method, params, timeout=timeout)
 
     def _send_request_without_ensure(
-        self, method: str, params: dict[str, Any] | None = None
+        self,
+        method: str,
+        params: dict[str, Any] | None = None,
+        *,
+        timeout: float | None = None,
     ) -> dict[str, Any]:
         process = self._require_process()
         self._request_id += 1
@@ -576,18 +705,25 @@ class TerminalBenchRunnerInterpreter(PredictRLMInterpreter):
         except BrokenPipeError as exc:
             raise SandboxFatalError("Terminal-Bench runner pipe broke") from exc
 
-        deadline = time.monotonic() + self.exec_timeout
+        request_timeout = self.exec_timeout if timeout is None else timeout
+        deadline = time.monotonic() + request_timeout
         while True:
             if process.poll() is not None:
                 raise SandboxFatalError(
                     f"Terminal-Bench runner exited unexpectedly: {self._read_stderr()}"
                 )
-            if time.monotonic() > deadline:
-                process.kill()
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                self._kill_process_after_timeout(process)
                 raise SandboxFatalError(
-                    f"Terminal-Bench runner request timed out after {self.exec_timeout}s"
+                    f"Terminal-Bench runner request timed out after {request_timeout:g}s"
                 )
-            line = process.stdout.readline()
+            line = self._read_stdout_line(process, timeout=remaining)
+            if line is None:
+                self._kill_process_after_timeout(process)
+                raise SandboxFatalError(
+                    f"Terminal-Bench runner request timed out after {request_timeout:g}s"
+                )
             if not line:
                 time.sleep(0.01)
                 continue
@@ -600,6 +736,23 @@ class TerminalBenchRunnerInterpreter(PredictRLMInterpreter):
                 continue
             if message.get("id") == request_id:
                 return message
+
+    def _read_stdout_line(
+        self,
+        process: ContainerProcess,
+        *,
+        timeout: float,
+    ) -> str | None:
+        if self._stdout_reader is None or self._stdout_reader.process is not process:
+            self._stdout_reader = _TimeoutLineReader(process)
+        return self._stdout_reader.readline(timeout)
+
+    def _kill_process_after_timeout(self, process: ContainerProcess) -> None:
+        process.kill()
+        try:
+            process.wait(timeout=1)
+        except Exception:
+            pass
 
     def _build_tool_response(self, message: dict[str, Any]) -> dict[str, Any]:
         request_id = message.get("id")
@@ -617,18 +770,23 @@ class TerminalBenchRunnerInterpreter(PredictRLMInterpreter):
                     result = asyncio.run(result)
             is_json = result is None or isinstance(result, (dict, list, int, float, bool))
             return {
+                "jsonrpc": "2.0",
                 "id": request_id,
-                "ok": True,
                 "result": {
                     "type": "json" if is_json else "string",
-                    "value": result if is_json else str(result or ""),
+                    "value": json.dumps(result) if is_json else str(result or ""),
                 },
             }
         except BaseException as exc:
+            error = RunnerError.from_exception(exc)
             return {
+                "jsonrpc": "2.0",
                 "id": request_id,
-                "ok": False,
-                "error": RunnerError.from_exception(exc).to_payload(),
+                "error": {
+                    "code": -32000,
+                    "message": error.message,
+                    "data": error.to_payload(),
+                },
             }
 
     def _write_tool_response(self, response: dict[str, Any]) -> None:
@@ -637,12 +795,14 @@ class TerminalBenchRunnerInterpreter(PredictRLMInterpreter):
         process.stdin.flush()
 
     def _unwrap_execute_response(self, response: dict[str, Any]) -> Any:
-        if not response.get("ok"):
+        if "error" in response:
             error = RunnerError.from_payload(response.get("error") or {})
             if error.type == "SyntaxError":
                 raise SyntaxError(error.message)
             raise CodeInterpreterError(f"{error.type}: {error.message}")
         result = response.get("result") or {}
+        if isinstance(result, dict) and "timeout" in result:
+            return format_recoverable_timeout_result(result)
         if "final" in result:
             return FinalOutput(result["final"])
         return result.get("output")
@@ -688,6 +848,7 @@ class HarborEnvironmentInterpreter(TerminalBenchRunnerInterpreter):
         python_executable: str = "python3",
         workdir: str | None = None,
         exec_timeout: float = 900.0,
+        recoverable_timeout_grace: float = TERMINAL_BENCH_RECOVERABLE_TIMEOUT_GRACE_SECONDS,
     ) -> None:
         adapter = HarborEnvironmentAdapter(
             environment,
@@ -703,6 +864,7 @@ class HarborEnvironmentInterpreter(TerminalBenchRunnerInterpreter):
             python_executable=python_executable,
             workdir=workdir,
             exec_timeout=exec_timeout,
+            recoverable_timeout_grace=recoverable_timeout_grace,
         )
         self.environment = environment
         self.loop = loop

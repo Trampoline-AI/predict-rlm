@@ -93,6 +93,28 @@ class TestBuildRlmSignatures:
         assert "repl_history" in extract.input_fields
         assert "answer" in extract.output_fields
 
+    def test_action_signature_exposes_optional_execution_timeout(self):
+        sig = dspy.Signature("question -> answer")
+        action, _ = build_rlm_signatures(
+            sig, self.ACTION_TEMPLATE, {}, format_tool_docs_full
+        )
+
+        timeout_field = action.output_fields.get("execution_timeout_seconds")
+        assert timeout_field is not None
+        assert timeout_field.default is None
+        assert not timeout_field.is_required()
+        assert type(None) in getattr(timeout_field.annotation, "__args__", ())
+        desc = timeout_field.json_schema_extra["desc"]
+        assert "Use null for ordinary short, safe code" in desc
+        assert "positive number of seconds" in desc
+        assert "loops" in desc
+        assert "large scans" in desc
+        assert "tool/network fanout" in desc
+        assert "batch predict() calls" in desc
+        assert "tests/subprocesses" in desc
+        assert "stdout/stderr" in desc
+        assert "next iteration can continue" in desc
+
     def test_tool_docs_in_action_instructions(self):
         def my_tool(x: str) -> str:
             """Does something useful."""

@@ -142,6 +142,21 @@ def build_rlm_signatures(
         type_=str,
     )
     action_sig = action_sig.append(
+        "execution_timeout_seconds",
+        dspy.OutputField(
+            desc=(
+                "Optional per-iteration execution cap. Use null for ordinary "
+                "short, safe code. Use a positive number of seconds when this "
+                "iteration may hang or run long, such as loops, large scans, "
+                "tool/network fanout, batch predict() calls, tests/subprocesses, "
+                "or data/model processing. Printed stdout/stderr before a timeout "
+                "are preserved so the next iteration can continue."
+            ),
+            default=None,
+        ),
+        type_=float | None,
+    )
+    action_sig = action_sig.append(
         "code",
         # ``min_length=1`` gives PredictRLM's validating adapter a concrete
         # client-side constraint to enforce after parsing. A ChatAdapter

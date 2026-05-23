@@ -903,6 +903,34 @@ class TestPredictRLMConfiguration:
         assert "llm_query" not in instructions
         assert "sub_lm_query" not in instructions
 
+    def test_action_instructions_steer_iteration_execution_timeout(self):
+        """PredictRLM action prompt explains when and how to use timeouts."""
+        rlm = PredictRLM(ImageAnalysisSignature, sub_lm=None, max_iterations=5)
+        instructions = " ".join(str(rlm.generate_action.signature.instructions).split())
+
+        assert "execution_timeout_seconds" in instructions
+        assert "For every iteration" in instructions
+        assert "Use `null` for ordinary short, safe blocks" in instructions
+        assert "loops" in instructions
+        assert "scans over many files/items" in instructions
+        assert "network or tool fanout" in instructions
+        assert "batch `predict()` calls" in instructions
+        assert "tests/subprocesses" in instructions
+        assert "~1-5 seconds" in instructions
+        assert "~10-60 seconds" in instructions
+        assert "stdout/stderr printed before the timeout are preserved" in instructions
+        assert "next iteration can continue" in instructions
+        assert "store important partial results in variables" in instructions
+        assert "Strongly avoid long blocking calls" not in instructions
+        assert "Some operations may not be interruptible" not in instructions
+        assert "outside the Python event loop" not in instructions
+        assert "run bounded probes first" not in instructions
+        assert "scale up only after you understand the cost" not in instructions
+        assert "Prefer staged verification" not in instructions
+        assert "large SQLite queries" not in instructions
+        assert "`fetchall()` over unknown result sizes" not in instructions
+        assert "Do not run a full baseline query" not in instructions
+
     def test_allowed_domains_passed_to_interpreter(self):
         """PredictRLM passes allowed_domains to interpreter."""
         rlm = PredictRLM(
