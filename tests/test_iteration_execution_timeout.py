@@ -12,6 +12,10 @@ class _FakeRepl:
     def __init__(self):
         self.calls = []
 
+    def execute(self, code, variables=None, timeout=None):
+        self.calls.append({"code": code, "variables": variables, "timeout": timeout})
+        return "[Success] ok"
+
     async def aexecute(self, code, variables=None, timeout=None):
         self.calls.append({"code": code, "variables": variables, "timeout": timeout})
         return "[Success] ok"
@@ -95,13 +99,78 @@ def test_positive_action_timeout_is_passed_to_execution():
     assert repl.calls[0]["timeout"] == 2.5
 
 
-def test_invalid_action_timeout_fails_before_execution():
+def test_positive_action_timeout_is_passed_to_sync_execution():
+    executor = _build_executor()
+    executor.generate_action = MagicMock(
+        return_value=SimpleNamespace(
+            reasoning="run with a cap",
+            code="print('ok')",
+            execution_timeout_seconds=3,
+        )
+    )
+    repl = _FakeRepl()
+
+    executor._execute_iteration(
+        repl,
+        variables=[],
+        history=MagicMock(),
+        iteration=0,
+        input_args={},
+        output_field_names=["answer"],
+    )
+
+    assert repl.calls[0]["timeout"] == 3.0
+
+
+@pytest.mark.parametrize("timeout_value", [None, 1, 2.5])
+def test_action_timeout_accepts_null_and_finite_positive_values(timeout_value):
+    executor = _build_executor()
+    pred_kwargs = {"reasoning": "run it", "code": "print('ok')"}
+    if timeout_value is not None:
+        pred_kwargs["execution_timeout_seconds"] = timeout_value
+    pred = SimpleNamespace(**pred_kwargs)
+
+    result = executor._action_execution_timeout(pred)
+
+    assert result == (None if timeout_value is None else float(timeout_value))
+
+
+def test_action_timeout_uses_shared_validation_helper(monkeypatch):
+    from predict_rlm import predict_rlm
+
+    calls = []
+
+    def fake_validate_execution_timeout(value):
+        calls.append(value)
+        return 4.0
+
+    monkeypatch.setattr(
+        predict_rlm,
+        "validate_execution_timeout",
+        fake_validate_execution_timeout,
+    )
+    executor = _build_executor()
+    pred = SimpleNamespace(
+        reasoning="run it",
+        code="print('ok')",
+        execution_timeout_seconds=4,
+    )
+
+    assert executor._action_execution_timeout(pred) == 4.0
+    assert calls == [4]
+
+
+@pytest.mark.parametrize(
+    "timeout_value",
+    [True, False, "2", 0, -1, float("nan"), float("inf"), -float("inf")],
+)
+def test_invalid_action_timeout_fails_before_execution(timeout_value):
     executor = _build_executor()
     executor.generate_action.acall = AsyncMock(
         return_value=SimpleNamespace(
             reasoning="bad cap",
             code="print('ok')",
-            execution_timeout_seconds=0,
+            execution_timeout_seconds=timeout_value,
         )
     )
     repl = _FakeRepl()

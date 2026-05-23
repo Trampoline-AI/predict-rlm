@@ -222,8 +222,8 @@ def test_aexecute_accepts_lm_selected_execution_timeout() -> None:
     asyncio.run(scenario())
 
 
-def test_execute_timeout_kills_silent_runner_without_blocking_readline() -> None:
-    process: subprocess.Popen[str] | None = None
+def test_lm_selected_silent_runner_timeout_is_recoverable_and_restarts() -> None:
+    processes: list[subprocess.Popen[str]] = []
 
     class SilentAdapter:
         def copy_to(self, host_path: str, container_path: str) -> None:
@@ -239,19 +239,28 @@ def test_execute_timeout_kills_silent_runner_without_blocking_readline() -> None
             workdir: str | None = None,
             timeout: float | None = None,
         ):
-            nonlocal process
-            process = subprocess.Popen(
-                [
-                    sys.executable,
-                    "-u",
-                    "-c",
-                    "import sys, time\nsys.stdin.readline()\ntime.sleep(30)\n",
-                ],
-                stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-            )
+            if not processes:
+                process = subprocess.Popen(
+                    [
+                        sys.executable,
+                        "-u",
+                        "-c",
+                        "import sys, time\nsys.stdin.readline()\ntime.sleep(30)\n",
+                    ],
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                )
+            else:
+                process = subprocess.Popen(
+                    [sys.executable, "-u", "-c", runner_source()],
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                )
+            processes.append(process)
             return process
 
     interpreter = TerminalBenchRunnerInterpreter(
@@ -259,23 +268,28 @@ def test_execute_timeout_kills_silent_runner_without_blocking_readline() -> None
         container_adapter=SilentAdapter(),
         runner_path="/tmp/predict_rlm_runner.py",
         exec_timeout=30,
-        recoverable_timeout_grace=1.0,
+        recoverable_timeout_grace=0.1,
     )
     start = time.monotonic()
     try:
-        with pytest.raises(
-            SandboxFatalError,
-            match=r"Terminal-Bench runner request timed out after 1\.2s",
-        ):
-            interpreter.execute("print('never returns')", timeout=0.2)
+        timeout_result = interpreter.execute("print('never returns')", timeout=0.2)
         elapsed = time.monotonic() - start
-        assert 1.0 <= elapsed < 2
-        assert process is not None
-        assert process.wait(timeout=2) != 0
+        followup = interpreter.execute("print('fresh runner')")
     finally:
-        if process is not None and process.poll() is None:
-            process.kill()
+        for process in processes:
+            if process.poll() is None:
+                process.kill()
             process.wait(timeout=2)
+
+    assert 0.25 <= elapsed < 1
+    assert len(processes) >= 2
+    assert processes[0].poll() is not None
+    assert "[Timeout] Iteration execution timed out after 0.2s" in timeout_result
+    assert "Terminal-Bench runner request timed out after 0.3s" in timeout_result
+    assert "copied runner process was killed and restarted" in timeout_result
+    assert "Python globals from the timed-out runner were lost" in timeout_result
+    assert timeout_result.timeout_seconds == 0.2
+    assert followup == "fresh runner\n"
 
 
 def test_copied_runner_returns_structured_timeout_and_survives() -> None:
@@ -667,7 +681,46 @@ def test_harbor_environment_default_recoverable_timeout_grace_is_30s() -> None:
     assert interpreter.recoverable_timeout_grace == 30.0
 
 
-def test_harbor_environment_silent_runner_is_fatal_and_killed_by_watchdog() -> None:
+def test_host_tool_call_timeout_returns_bounded_tool_error() -> None:
+    def slow_predict() -> str:
+        time.sleep(0.8)
+        return "unreachable"
+
+    process = FakeProcess(
+        [
+            {"id": 1, "ok": True, "result": {}},
+            {
+                "jsonrpc": "2.0",
+                "id": 99,
+                "method": "tool_call",
+                "params": {"name": "predict", "args": [], "kwargs": {}},
+            },
+            {"id": 2, "ok": True, "result": {"output": "handled timeout\n"}},
+        ]
+    )
+    interpreter = TerminalBenchRunnerInterpreter(
+        object(),
+        container_adapter=FakeAdapter(process),
+        tools={"predict": slow_predict},
+        runner_path="/tmp/predict_rlm_runner.py",
+        recoverable_timeout_grace=0.2,
+    )
+
+    start = time.monotonic()
+    result = interpreter.execute("await predict()", timeout=0.1)
+    elapsed = time.monotonic() - start
+
+    assert elapsed < 0.6
+    assert result == "handled timeout\n"
+    assert len(process.requests) == 3
+    tool_response = process.requests[2]
+    assert tool_response["id"] == 99
+    assert "error" in tool_response
+    assert "timed out" in tool_response["error"]["message"]
+    assert process.killed is False
+
+
+def test_harbor_environment_default_exec_timeout_is_fatal_and_killed_by_watchdog() -> None:
     loop = asyncio.new_event_loop()
 
     class SilentHarborEnvironment:
@@ -684,21 +737,21 @@ def test_harbor_environment_silent_runner_is_fatal_and_killed_by_watchdog() -> N
     interpreter = HarborEnvironmentInterpreter(
         environment,
         loop=loop,
-        recoverable_timeout_grace=0.2,
+        exec_timeout=0.2,
     )
 
     start = time.monotonic()
     try:
         with pytest.raises(
             SandboxFatalError,
-            match=r"Terminal-Bench runner request timed out after 0\.3s",
+            match=r"Terminal-Bench runner request timed out after 0\.2s",
         ):
-            interpreter.execute("print('never')", timeout=0.1)
+            interpreter.execute("print('never')")
         elapsed = time.monotonic() - start
     finally:
         loop.close()
 
-    assert 0.25 <= elapsed < 1
+    assert 0.15 <= elapsed < 1
     assert environment.process.killed is True
     assert environment.process.waited is True
 
