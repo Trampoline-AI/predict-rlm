@@ -19,6 +19,7 @@ FailureClass = Literal[
     "model_no_code_generated",
     "model_output_truncated",
     "sandbox_lifecycle_failure",
+    "rlm_iteration_execution_timeout",
     "sandbox_exec_timeout",
     "host_tool_timeout_or_leak",
     "outer_task_timeout",
@@ -33,6 +34,7 @@ FAILURE_CLASSES: tuple[str, ...] = (
     "model_no_code_generated",
     "model_output_truncated",
     "sandbox_lifecycle_failure",
+    "rlm_iteration_execution_timeout",
     "sandbox_exec_timeout",
     "host_tool_timeout_or_leak",
     "outer_task_timeout",
@@ -44,6 +46,7 @@ FAILURE_CLASSES: tuple[str, ...] = (
 
 _PRECEDENCE: tuple[FailureClass, ...] = (
     "sandbox_lifecycle_failure",
+    "rlm_iteration_execution_timeout",
     "sandbox_exec_timeout",
     "host_tool_timeout_or_leak",
     "outer_task_timeout",

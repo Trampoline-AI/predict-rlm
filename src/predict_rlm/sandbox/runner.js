@@ -521,6 +521,128 @@ const pyodide = await pyodideModule.loadPyodide({
   stderr: (msg) => console.error(msg),
 });
 
+const SIGINT = 2;
+const interruptBuffer = new Int32Array(new SharedArrayBuffer(8));
+let interruptTimerWorker = null;
+let interruptArmId = 0;
+const pendingInterruptArms = new Map();
+
+try {
+  pyodide.setInterruptBuffer(interruptBuffer);
+  interruptTimerWorker = new Worker(URL.createObjectURL(new Blob([`
+let interruptBuffer = null;
+let timerId = null;
+
+function clearTimer(resetSignal) {
+  if (timerId !== null) {
+    clearTimeout(timerId);
+    timerId = null;
+  }
+  if (resetSignal && interruptBuffer) {
+    Atomics.store(interruptBuffer, 0, 0);
+    Atomics.store(interruptBuffer, 1, 0);
+  }
+}
+
+self.onmessage = (event) => {
+  const data = event.data || {};
+  if (data.buffer) {
+    interruptBuffer = data.buffer;
+  }
+  if (data.type === "arm") {
+    clearTimer(true);
+    const timeoutMs = Math.max(0, Number(data.timeoutMs) || 0);
+    timerId = setTimeout(() => {
+      if (!interruptBuffer) return;
+      Atomics.store(interruptBuffer, 1, 1);
+      Atomics.store(interruptBuffer, 0, ${SIGINT});
+    }, timeoutMs);
+    self.postMessage({ type: "armed", armId: data.armId });
+  } else if (data.type === "disarm") {
+    clearTimer(true);
+  }
+};
+`], { type: "application/javascript" })), { type: "module" });
+  interruptTimerWorker.onmessage = (event) => {
+    const data = event.data || {};
+    if (data.type !== "armed") return;
+    const pending = pendingInterruptArms.get(data.armId);
+    if (!pending) return;
+    clearTimeout(pending.timerId);
+    pendingInterruptArms.delete(data.armId);
+    pending.resolve(true);
+  };
+} catch (e) {
+  console.error(`[interrupt] Failed to initialize Pyodide interrupt buffer: ${e}`);
+}
+
+const armExecutionInterrupt = async (timeoutSeconds) => {
+  if (!interruptTimerWorker || !Number.isFinite(timeoutSeconds) || timeoutSeconds <= 0) {
+    return false;
+  }
+  const armId = ++interruptArmId;
+  const armed = new Promise((resolve) => {
+    const timerId = setTimeout(() => {
+      pendingInterruptArms.delete(armId);
+      resolve(false);
+    }, 1000);
+    pendingInterruptArms.set(armId, { resolve, timerId });
+  });
+  interruptTimerWorker.postMessage({
+    type: "arm",
+    buffer: interruptBuffer,
+    timeoutMs: timeoutSeconds * 1000,
+    armId,
+  });
+  return await armed;
+};
+
+const disarmExecutionInterrupt = () => {
+  if (interruptTimerWorker) {
+    interruptTimerWorker.postMessage({ type: "disarm", buffer: interruptBuffer });
+  }
+  for (const [armId, pending] of pendingInterruptArms) {
+    clearTimeout(pending.timerId);
+    pending.resolve(false);
+    pendingInterruptArms.delete(armId);
+  }
+  Atomics.store(interruptBuffer, 0, 0);
+  Atomics.store(interruptBuffer, 1, 0);
+};
+
+const enablePythonExecutionTimeout = (timeoutSeconds) => {
+  pyodide.globals.set("__predict_rlm_timeout_seconds", timeoutSeconds);
+  pyodide.globals.set("__predict_rlm_timeout_disabled", false);
+  pyodide.runPython(`
+import sys
+import time
+
+class PredictRLMExecutionTimeout(BaseException):
+    pass
+
+__predict_rlm_timeout_deadline = time.monotonic() + float(__predict_rlm_timeout_seconds)
+
+def __predict_rlm_timeout_trace(frame, event, arg):
+    if globals().get("__predict_rlm_timeout_disabled", False):
+        return None
+    if time.monotonic() >= __predict_rlm_timeout_deadline:
+        raise PredictRLMExecutionTimeout()
+    return __predict_rlm_timeout_trace
+
+sys.settrace(__predict_rlm_timeout_trace)
+`);
+};
+
+const disablePythonExecutionTimeout = () => {
+  pyodide.globals.set("__predict_rlm_timeout_disabled", true);
+  try {
+    pyodide.runPython("import sys\nsys.settrace(None)");
+  } catch (e) {
+    // The JS interrupt buffer is still the fallback for states where Python
+    // tracing cannot safely run cleanup code.
+  }
+};
+
 // Pre-install packages only if PYODIDE_PREINSTALL=1 (default for real usage, skip for fast tests)
 const preinstall = Deno.env.get("PYODIDE_PREINSTALL") !== "0";
 if (preinstall) {
@@ -966,6 +1088,10 @@ while (true) {
     // execute — run Python code
     if (method === "execute") {
       const code = params.code || "";
+      const executionTimeoutSeconds = Number(params.execution_timeout_seconds);
+      const hasExecutionTimeout = (
+        Number.isFinite(executionTimeoutSeconds) && executionTimeoutSeconds > 0
+      );
 
       try {
         // Suppress ALL stdout during package loading to avoid corrupting JSON protocol
@@ -997,7 +1123,15 @@ while (true) {
         responseReaderPromise = responseReader();
 
         // Run the user's code
+        if (hasExecutionTimeout) {
+          await armExecutionInterrupt(executionTimeoutSeconds);
+          enablePythonExecutionTimeout(executionTimeoutSeconds);
+        }
         const result = await pyodide.runPythonAsync(code);
+        if (hasExecutionTimeout) {
+          disablePythonExecutionTimeout();
+        }
+        disarmExecutionInterrupt();
 
         // Signal code execution complete
         codeExecutionInProgress = false;
@@ -1006,14 +1140,27 @@ while (true) {
         await responseReaderPromise;
 
         const capturedStdout = pyodide.runPython("buf_stdout.getvalue()");
+        const capturedStderr = pyodide.runPython("buf_stderr.getvalue()");
         pyodide.runPython("sys.stdout, sys.stderr = old_stdout, old_stderr");
 
         let output = (result === null || result === undefined)
           ? capturedStdout
           : (result.toJs?.() ?? result);
+        if (capturedStderr) {
+          if (typeof output === "string") {
+            output = output ? `${output}\n[stderr]\n${capturedStderr}` : `[stderr]\n${capturedStderr}`;
+          } else if (output === null || output === undefined) {
+            output = `[stderr]\n${capturedStderr}`;
+          }
+        }
         if (typeof output === "string") output = filterBinary(output);
         console.log(jsonrpcResult({ output }, requestId));
       } catch (error) {
+        const executionTimeoutFired = Atomics.load(interruptBuffer, 1) === 1;
+        if (hasExecutionTimeout) {
+          disablePythonExecutionTimeout();
+        }
+        disarmExecutionInterrupt();
         codeExecutionInProgress = false;
 
         // Signal the response reader to stop immediately
@@ -1077,6 +1224,30 @@ while (true) {
             );
           }
           console.log(jsonrpcResult({ final: answer }, requestId));
+          continue;
+        }
+
+        const pythonExecutionTimeoutFired = errorType === "PredictRLMExecutionTimeout";
+        if (
+          hasExecutionTimeout &&
+          (
+            pythonExecutionTimeoutFired ||
+            (executionTimeoutFired && errorType === "KeyboardInterrupt")
+          )
+        ) {
+          let capturedStdout = "";
+          let capturedStderr = "";
+          try {
+            capturedStdout = pyodide.runPython("buf_stdout.getvalue()");
+            capturedStderr = pyodide.runPython("buf_stderr.getvalue()");
+          } catch (e) {
+            // Keep the timeout recoverable even if stream capture fails.
+          }
+          console.log(jsonrpcResult({
+            timeout: { seconds: executionTimeoutSeconds },
+            stdout: filterBinary(capturedStdout),
+            stderr: filterBinary(capturedStderr),
+          }, requestId));
           continue;
         }
 

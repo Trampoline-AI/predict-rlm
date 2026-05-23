@@ -144,10 +144,20 @@ class SbxConfig(BaseModel):
 class PredictRLMInterpreter(Protocol):
     """Runtime methods PredictRLM needs from a sandbox interpreter."""
 
-    def execute(self, code: str, variables: dict[str, Any] | None = None) -> Any: ...
+    def execute(
+        self,
+        code: str,
+        variables: dict[str, Any] | None = None,
+        *,
+        timeout: float | None = None,
+    ) -> Any: ...
 
     async def aexecute(
-        self, code: str, variables: dict[str, Any] | None = None
+        self,
+        code: str,
+        variables: dict[str, Any] | None = None,
+        *,
+        timeout: float | None = None,
     ) -> Any: ...
 
     def mount_file_at(self, host_path: str, virtual_path: str) -> None: ...

@@ -9,10 +9,6 @@ DEFAULT_TERMINAL_BENCH_SKILL_INSTRUCTIONS = (
 Operating principle
 You are solving Terminal-Bench tasks inside a Linux task container. Read the task
 instruction carefully and keep enough budget for debugging and final verification.
-"""
-    "As soon as the task is solved and verified, stop improving and submit, "
-    "premature optimization is the root of all evil.\n"
-    """
 
 Inspection and changes
 First inspect the filesystem before making changes. Use Python as an orchestration layer
@@ -104,10 +100,6 @@ approach can solve the problem, and choose elegant, smart, effective strategies
 over exhaustive loops. Use programmatic tools for binary, image, audio, video,
 archive, or other non-text inputs rather than guessing.
 
-Work iteratively: establish a faithful partial solution early, keep the best-so-far
-behavior in place, and improve it step by step. When the objective is unbounded,
-first satisfy the bounded contract.
-
 Verification and final submission
 Verify the observable task contract after each major change: commands, interfaces,
 stdout/stderr, generated outputs, service behavior, exit codes, and other
@@ -116,8 +108,6 @@ run the verification in one iteration, inspect the printed output, then submit i
 separate later iteration because SUBMIT makes the result final. Use small
 verification loops: run available tests, inspect logs, and check command outputs
 before finishing.
-
-Verify the observable task contract, then submit; do not keep optimizing after success.
 """
 ).strip()
 

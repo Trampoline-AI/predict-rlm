@@ -32,6 +32,13 @@ from dspy.primitives.code_interpreter import CodeInterpreterError, FinalOutput
 from dspy.primitives.python_interpreter import PythonInterpreter
 from pydantic import BaseModel
 
+from predict_rlm.execution_timeout import (
+    ITERATION_TIMEOUT_FAILURE_CLASS,
+    RecoverableExecutionTimeout,
+    format_recoverable_timeout_result,
+    recoverable_timeout_host_deadline_seconds,
+    resolve_execution_timeout,
+)
 from predict_rlm.interpreters.base import (
     STALE_RESPONSE_DISCARD_LIMIT,
     InterpreterExecutionGate,
@@ -104,7 +111,6 @@ JSONRPC_APP_ERRORS = {
     "CodeInterpreterError": -32008,
     "Unknown": -32099,
 }
-
 
 def _jsonrpc_result(result: Any, id: int | str) -> str:
     return json.dumps({"jsonrpc": "2.0", "result": result, "id": id})
@@ -850,6 +856,8 @@ class JspiInterpreter(PythonInterpreter):
         self,
         code: str,
         variables: dict[str, Any] | None = None,
+        *,
+        timeout: float | None = None,
     ) -> Any:
         """Async execute — runs on the current event loop without blocking.
 
@@ -878,13 +886,52 @@ class JspiInterpreter(PythonInterpreter):
                 ),
             }
             try:
-                return await self._aexecute_inner(code, variables)
+                if timeout is None:
+                    return await self._aexecute_inner(code, variables)
+                return await self._aexecute_inner(code, variables, timeout=timeout)
             finally:
                 self._last_semaphore_attrs = {}
                 sem.release()
 
-    async def _aexecute_inner(self, code: str, variables: dict[str, Any] | None) -> Any:
+    def _resolve_execution_timeout(self, timeout: float | None) -> tuple[float, str]:
+        return resolve_execution_timeout(timeout, default_timeout=self._exec_timeout)
+
+    def _execute_params(
+        self,
+        code: str,
+        timeout: float | None,
+        timeout_seconds: float,
+    ) -> dict[str, Any]:
+        params: dict[str, Any] = {"code": code}
+        if timeout is not None:
+            params["execution_timeout_seconds"] = timeout_seconds
+        return params
+
+    def _host_watchdog_timeout(
+        self,
+        timeout_seconds: float,
+        timeout_failure_class: str,
+    ) -> float:
+        return recoverable_timeout_host_deadline_seconds(
+            timeout_seconds,
+            timeout_failure_class,
+        )
+
+    def _format_recoverable_timeout_result(
+        self,
+        result: dict[str, Any],
+    ) -> RecoverableExecutionTimeout:
+        return format_recoverable_timeout_result(result)
+
+    async def _aexecute_inner(
+        self,
+        code: str,
+        variables: dict[str, Any] | None,
+        *,
+        timeout: float | None = None,
+    ) -> Any:
         """Inner async execute — runs within the sandbox semaphore."""
+        timeout_seconds, timeout_failure_class = self._resolve_execution_timeout(timeout)
         self._ensure_deno_process()
         self._mount_files()
         self._register_tools()
@@ -896,7 +943,7 @@ class JspiInterpreter(PythonInterpreter):
             "sandbox.execute.start",
             attributes={
                 "rpc.request_id": execute_request_id,
-                "timeout.seconds": self._exec_timeout,
+                "timeout.seconds": timeout_seconds,
                 "sandbox.pending_tool_count": self._telemetry_pending_tool_count(),
                 "sandbox.pending_file_op_count": self._telemetry_pending_file_ops_count(),
                 **getattr(self, "_last_semaphore_attrs", {}),
@@ -905,7 +952,8 @@ class JspiInterpreter(PythonInterpreter):
         self._log_lifecycle(
             "jspi.execute.start",
             request_id=execute_request_id,
-            timeout_seconds=self._exec_timeout,
+            code_chars=len(code),
+            timeout_seconds=timeout_seconds,
             pending_tool_count=self._telemetry_pending_tool_count(),
             pending_file_op_count=self._telemetry_pending_file_ops_count(),
         )
@@ -913,7 +961,7 @@ class JspiInterpreter(PythonInterpreter):
             {
                 "jsonrpc": "2.0",
                 "method": "execute",
-                "params": {"code": code},
+                "params": self._execute_params(code, timeout, timeout_seconds),
                 "id": execute_request_id,
             }
         )
@@ -932,32 +980,84 @@ class JspiInterpreter(PythonInterpreter):
                 "restored on a fresh process, so this run is unrecoverable."
             ) from e
 
-        return await self._execute_with_timeout(execute_request_id, execute_start_time)
+        if timeout is None:
+            return await self._execute_with_timeout(
+                execute_request_id,
+                execute_start_time,
+            )
+        return await self._execute_with_timeout(
+            execute_request_id,
+            execute_start_time,
+            timeout_seconds=timeout_seconds,
+            timeout_failure_class=timeout_failure_class,
+        )
 
     async def _execute_with_timeout(
         self,
         execute_request_id: int,
         execute_start_time: int | None = None,
+        *,
+        timeout_seconds: float | None = None,
+        timeout_failure_class: str = "sandbox_exec_timeout",
     ) -> Any:
         """Run the execute loop under a wall-clock deadline.
 
-        On timeout the Deno subprocess is almost certainly CPU-bound in
-        pathological Python code (regex catastrophic backtracking, infinite
-        loop) and ``asyncio`` cancellation cannot reach it. We force-kill
-        it and raise ``SandboxFatalError`` — the run is unrecoverable
-        because ``PredictRLM._setup_sandbox_files`` (input mounts, output
-        dirs, skill imports) was only invoked on the original subprocess.
+        Constructor-level sandbox timeouts are fatal. LM-selected
+        per-iteration timeouts are enforced inside Pyodide with an
+        interrupt buffer; the host deadline here is only a recovery
+        backstop so the runner has time to return buffered output.
         """
+        timeout_seconds = self._exec_timeout if timeout_seconds is None else timeout_seconds
+        host_timeout = self._host_watchdog_timeout(
+            timeout_seconds,
+            timeout_failure_class,
+        )
         try:
             result = await asyncio.wait_for(
                 self._execute_async(execute_request_id),
-                timeout=self._exec_timeout,
+                timeout=host_timeout,
             )
+            if isinstance(result, RecoverableExecutionTimeout):
+                self._write_telemetry_span(
+                    "sandbox.execute.timeout",
+                    status={
+                        "code": "ERROR",
+                        "message": (
+                            "Iteration execution timed out after "
+                            f"{result.timeout_seconds:g}s"
+                        ),
+                    },
+                    attributes={
+                        "rpc.request_id": execute_request_id,
+                        "timeout.seconds": result.timeout_seconds,
+                        "sandbox.pending_tool_count": self._telemetry_pending_tool_count(),
+                        "sandbox.pending_file_op_count": (
+                            self._telemetry_pending_file_ops_count()
+                        ),
+                        "failure.class": ITERATION_TIMEOUT_FAILURE_CLASS,
+                        "timeout.recoverable": True,
+                    },
+                    start_time_unix_nano=execute_start_time,
+                )
+                self._log_lifecycle(
+                    "jspi.execute.timeout_recovered",
+                    status="timeout_recovered",
+                    request_id=execute_request_id,
+                    duration_ms=(
+                        round((time.time_ns() - execute_start_time) / 1_000_000)
+                        if execute_start_time is not None
+                        else None
+                    ),
+                    timeout_seconds=result.timeout_seconds,
+                    pending_tool_count=self._telemetry_pending_tool_count(),
+                    pending_file_op_count=self._telemetry_pending_file_ops_count(),
+                )
+                return result
             self._write_telemetry_span(
                 "sandbox.execute.ok",
                 attributes={
                     "rpc.request_id": execute_request_id,
-                    "timeout.seconds": self._exec_timeout,
+                    "timeout.seconds": timeout_seconds,
                     "sandbox.pending_tool_count": self._telemetry_pending_tool_count(),
                     "sandbox.pending_file_op_count": self._telemetry_pending_file_ops_count(),
                 },
@@ -966,7 +1066,7 @@ class JspiInterpreter(PythonInterpreter):
             self._log_lifecycle(
                 "jspi.execute.ok",
                 request_id=execute_request_id,
-                timeout_seconds=self._exec_timeout,
+                timeout_seconds=timeout_seconds,
                 pending_tool_count=self._telemetry_pending_tool_count(),
                 pending_file_op_count=self._telemetry_pending_file_ops_count(),
             )
@@ -976,28 +1076,51 @@ class JspiInterpreter(PythonInterpreter):
                 "sandbox.execute.timeout",
                 status={
                     "code": "ERROR",
-                    "message": f"Sandbox exec timed out after {self._exec_timeout}s",
+                    "message": f"Sandbox exec timed out after {host_timeout}s",
                 },
                 attributes={
                     "rpc.request_id": execute_request_id,
-                    "timeout.seconds": self._exec_timeout,
+                    "timeout.seconds": host_timeout,
+                    **(
+                        {
+                            "rlm_iteration_timeout.seconds": timeout_seconds,
+                            "timeout.recovery_failed": True,
+                        }
+                        if timeout_failure_class == ITERATION_TIMEOUT_FAILURE_CLASS
+                        else {}
+                    ),
                     "sandbox.pending_tool_count": self._telemetry_pending_tool_count(),
                     "sandbox.pending_file_op_count": self._telemetry_pending_file_ops_count(),
-                    "failure.class": "sandbox_exec_timeout",
+                    "failure.class": (
+                        "sandbox_exec_timeout"
+                        if timeout_failure_class == ITERATION_TIMEOUT_FAILURE_CLASS
+                        else timeout_failure_class
+                    ),
                 },
                 start_time_unix_nano=execute_start_time,
             )
             self._log_lifecycle(
                 "jspi.execute.timeout",
                 request_id=execute_request_id,
-                timeout_seconds=self._exec_timeout,
+                duration_ms=(
+                    round((time.time_ns() - execute_start_time) / 1_000_000)
+                    if execute_start_time is not None
+                    else None
+                ),
+                timeout_seconds=host_timeout,
                 pending_tool_count=self._telemetry_pending_tool_count(),
                 pending_file_op_count=self._telemetry_pending_file_ops_count(),
                 status="error",
             )
             self._kill_sandbox()
+            if timeout_failure_class == ITERATION_TIMEOUT_FAILURE_CLASS:
+                raise SandboxFatalError(
+                    f"Sandbox failed to recover from iteration timeout after "
+                    f"{timeout_seconds}s (request id {execute_request_id}); "
+                    f"waited {host_timeout}s before force-killing Deno."
+                )
             raise SandboxFatalError(
-                f"Sandbox exec timed out after {self._exec_timeout}s "
+                f"Sandbox exec timed out after {host_timeout}s "
                 f"(request id {execute_request_id}). The Deno subprocess "
                 f"was force-killed; per-run mounts are gone, so this "
                 f"interpreter is dead. Usually indicates pathological code "
@@ -1052,6 +1175,8 @@ class JspiInterpreter(PythonInterpreter):
         self,
         code: str,
         variables: dict[str, Any] | None = None,
+        *,
+        timeout: float | None = None,
     ) -> Any:
         """Execute code with concurrent async tool support.
 
@@ -1059,14 +1184,17 @@ class JspiInterpreter(PythonInterpreter):
         are executed concurrently on the host side.
         """
         with self._execution_gate.top_level():
-            return self._execute_top_level(code, variables)
+            return self._execute_top_level(code, variables, timeout=timeout)
 
     def _execute_top_level(
         self,
         code: str,
         variables: dict[str, Any] | None = None,
+        *,
+        timeout: float | None = None,
     ) -> Any:
         variables = variables or {}
+        timeout_seconds, timeout_failure_class = self._resolve_execution_timeout(timeout)
 
         # Strip markdown code fences that models often add
         code = self._strip_code_fences(code)
@@ -1084,7 +1212,7 @@ class JspiInterpreter(PythonInterpreter):
             "sandbox.execute.start",
             attributes={
                 "rpc.request_id": execute_request_id,
-                "timeout.seconds": self._exec_timeout,
+                "timeout.seconds": timeout_seconds,
                 "sandbox.pending_tool_count": self._telemetry_pending_tool_count(),
                 "sandbox.pending_file_op_count": self._telemetry_pending_file_ops_count(),
             },
@@ -1093,7 +1221,7 @@ class JspiInterpreter(PythonInterpreter):
             {
                 "jsonrpc": "2.0",
                 "method": "execute",
-                "params": {"code": code},
+                "params": self._execute_params(code, timeout, timeout_seconds),
                 "id": execute_request_id,
             }
         )
@@ -1113,8 +1241,17 @@ class JspiInterpreter(PythonInterpreter):
 
         nest_asyncio.apply()
         loop = asyncio.get_event_loop()
+        if timeout is None:
+            return loop.run_until_complete(
+                self._execute_with_timeout(execute_request_id, execute_start_time)
+            )
         return loop.run_until_complete(
-            self._execute_with_timeout(execute_request_id, execute_start_time)
+            self._execute_with_timeout(
+                execute_request_id,
+                execute_start_time,
+                timeout_seconds=timeout_seconds,
+                timeout_failure_class=timeout_failure_class,
+            )
         )
 
     async def _execute_async(self, execute_request_id: int) -> Any:
@@ -1232,6 +1369,16 @@ class JspiInterpreter(PythonInterpreter):
                 )
                 continue
 
+            if "error" in result and result.get("id") is None:
+                error = result.get("error") or {}
+                logger.warning(
+                    "Discarding uncorrelated deno error while waiting for "
+                    "execute response id=%s: %s",
+                    execute_request_id,
+                    error.get("message", error),
+                )
+                continue
+
             # Before returning, ensure all pending tool calls complete
             await self._wait_and_send_all_responses(pending_tasks)
             self._active_tool_count = len(pending_tasks)
@@ -1240,6 +1387,8 @@ class JspiInterpreter(PythonInterpreter):
             if "result" in result:
                 res = result["result"]
                 self._sync_files()
+                if isinstance(res, dict) and "timeout" in res:
+                    return self._format_recoverable_timeout_result(res)
                 if interpreter_result_logging_enabled(getattr(self, "_verbose", False)):
                     emit_trace_result(res)
                 if "final" in res:

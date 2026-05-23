@@ -4,17 +4,22 @@ import asyncio
 import json
 import subprocess
 import sys
+import threading
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 from dspy.primitives.code_interpreter import CodeInterpreterError
 
+from predict_rlm.interpreter import SandboxFatalError
+
 _EXAMPLE_DIR = Path(__file__).resolve().parent.parent
 if str(_EXAMPLE_DIR) not in sys.path:
     sys.path.insert(0, str(_EXAMPLE_DIR))
 
 from terminal_bench_rlm.tools.container_runner import (  # noqa: E402
+    TERMINAL_BENCH_RECOVERABLE_TIMEOUT_GRACE_SECONDS,
     HarborContainerAdapter,
     HarborEnvironmentInterpreter,
     TerminalBenchRunnerInterpreter,
@@ -45,7 +50,7 @@ class FakePipe:
 
 
 class FakeProcess:
-    def __init__(self, responses: list[dict]) -> None:
+    def __init__(self, responses: list[dict | tuple[float, dict]]) -> None:
         self.responses = list(responses)
         self.requests: list[dict] = []
         self.stdout = FakePipe()
@@ -58,7 +63,15 @@ class FakeProcess:
         request = json.loads(data)
         self.requests.append(request)
         if self.responses:
-            self.stdout.lines.append(json.dumps(self.responses.pop(0)) + "\n")
+            response = self.responses.pop(0)
+            if isinstance(response, tuple):
+                delay, payload = response
+                threading.Timer(delay, self._append_response, args=(payload,)).start()
+            else:
+                self._append_response(response)
+
+    def _append_response(self, response: dict) -> None:
+        self.stdout.lines.append(json.dumps(response) + "\n")
 
     def poll(self):
         return 1 if self.killed else None
@@ -134,6 +147,248 @@ def test_execute_reset_shutdown_requests_and_maps_success() -> None:
     ]
     assert adapter.copied_to[0][1] == "/tmp/predict_rlm_runner.py"
     assert process.waited is True
+
+
+def test_execute_accepts_lm_selected_execution_timeout() -> None:
+    process = FakeProcess(
+        [{"id": 1, "ok": True, "result": {"output": "bounded\n"}}]
+    )
+    interpreter = TerminalBenchRunnerInterpreter(
+        object(),
+        container_adapter=FakeAdapter(process),
+        runner_path="/tmp/predict_rlm_runner.py",
+    )
+
+    assert interpreter.execute("print('bounded')", timeout=2.5) == "bounded\n"
+
+    assert process.requests[0]["method"] == "execute"
+    assert process.requests[0]["params"] == {
+        "code": "print('bounded')",
+        "execution_timeout_seconds": 2.5,
+    }
+
+
+def test_execute_maps_structured_timeout_as_recoverable_observation() -> None:
+    process = FakeProcess(
+        [
+            {
+                "id": 1,
+                "ok": True,
+                "result": {
+                    "timeout": {"seconds": 0.2},
+                    "stdout": "before\n",
+                    "stderr": "warn\n",
+                },
+            },
+            {"id": 2, "ok": True, "result": {"output": "still alive\n"}},
+        ]
+    )
+    interpreter = TerminalBenchRunnerInterpreter(
+        object(),
+        container_adapter=FakeAdapter(process),
+        runner_path="/tmp/predict_rlm_runner.py",
+    )
+
+    timeout_result = interpreter.execute("while True: pass", timeout=0.2)
+    followup = interpreter.execute("print('still alive')")
+
+    assert "[Timeout] Iteration execution timed out after 0.2s" in timeout_result
+    assert "[stdout]\nbefore" in timeout_result
+    assert "[stderr]\nwarn" in timeout_result
+    assert timeout_result.timeout_seconds == 0.2
+    assert followup == "still alive\n"
+    assert process.killed is False
+
+
+def test_aexecute_accepts_lm_selected_execution_timeout() -> None:
+    async def scenario() -> None:
+        process = FakeProcess(
+            [{"id": 1, "ok": True, "result": {"output": "bounded async\n"}}]
+        )
+        interpreter = TerminalBenchRunnerInterpreter(
+            object(),
+            container_adapter=FakeAdapter(process),
+            runner_path="/tmp/predict_rlm_runner.py",
+        )
+
+        result = await interpreter.aexecute("print('bounded async')", timeout=3)
+
+        assert result == "bounded async\n"
+        assert process.requests[0]["params"] == {
+            "code": "print('bounded async')",
+            "execution_timeout_seconds": 3.0,
+        }
+
+    asyncio.run(scenario())
+
+
+def test_execute_timeout_kills_silent_runner_without_blocking_readline() -> None:
+    process: subprocess.Popen[str] | None = None
+
+    class SilentAdapter:
+        def copy_to(self, host_path: str, container_path: str) -> None:
+            return None
+
+        def exec(self, command: list[str], *, timeout: float | None = None):
+            return SimpleNamespace(stdout="", stderr="", returncode=0)
+
+        def start_exec(
+            self,
+            command: list[str],
+            *,
+            workdir: str | None = None,
+            timeout: float | None = None,
+        ):
+            nonlocal process
+            process = subprocess.Popen(
+                [
+                    sys.executable,
+                    "-u",
+                    "-c",
+                    "import sys, time\nsys.stdin.readline()\ntime.sleep(30)\n",
+                ],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            return process
+
+    interpreter = TerminalBenchRunnerInterpreter(
+        object(),
+        container_adapter=SilentAdapter(),
+        runner_path="/tmp/predict_rlm_runner.py",
+        exec_timeout=30,
+        recoverable_timeout_grace=1.0,
+    )
+    start = time.monotonic()
+    try:
+        with pytest.raises(
+            SandboxFatalError,
+            match=r"Terminal-Bench runner request timed out after 1\.2s",
+        ):
+            interpreter.execute("print('never returns')", timeout=0.2)
+        elapsed = time.monotonic() - start
+        assert 1.0 <= elapsed < 2
+        assert process is not None
+        assert process.wait(timeout=2) != 0
+    finally:
+        if process is not None and process.poll() is None:
+            process.kill()
+            process.wait(timeout=2)
+
+
+def test_copied_runner_returns_structured_timeout_and_survives() -> None:
+    process = subprocess.Popen(
+        [sys.executable, "-u", "-c", runner_source()],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+
+    def send(request: dict) -> dict:
+        assert process.stdin is not None
+        assert process.stdout is not None
+        process.stdin.write(json.dumps(request) + "\n")
+        process.stdin.flush()
+        return json.loads(process.stdout.readline())
+
+    try:
+        start = time.monotonic()
+        response = send(
+            {
+                "id": 1,
+                "method": "execute",
+                "params": {
+                    "code": (
+                        "import sys\n"
+                        "print('before timeout')\n"
+                        "print('stderr before timeout', file=sys.stderr)\n"
+                        "survived = 42\n"
+                        "while True:\n"
+                        "    pass\n"
+                    ),
+                    "execution_timeout_seconds": 0.1,
+                },
+            }
+        )
+        followup = send(
+            {
+                "id": 2,
+                "method": "execute",
+                "params": {"code": "print('still alive')"},
+            }
+        )
+    finally:
+        process.kill()
+        process.wait(timeout=2)
+
+    assert time.monotonic() - start < 0.8
+    assert response["id"] == 1
+    assert response["jsonrpc"] == "2.0"
+    assert response["result"] == {
+        "timeout": {"seconds": 0.1},
+        "stdout": "before timeout\n",
+        "stderr": "stderr before timeout\n",
+    }
+    assert followup["jsonrpc"] == "2.0"
+    assert followup["result"]["output"] == "still alive\n"
+
+
+def test_copied_runner_timeout_is_not_swallowed_by_exception_handler() -> None:
+    process = subprocess.Popen(
+        [sys.executable, "-u", "-c", runner_source()],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+
+    def send(request: dict) -> dict:
+        assert process.stdin is not None
+        assert process.stdout is not None
+        process.stdin.write(json.dumps(request) + "\n")
+        process.stdin.flush()
+        return json.loads(process.stdout.readline())
+
+    try:
+        response = send(
+            {
+                "id": 1,
+                "method": "execute",
+                "params": {
+                    "code": (
+                        "caught = 0\n"
+                        "while True:\n"
+                        "    try:\n"
+                        "        pass\n"
+                        "    except Exception:\n"
+                        "        caught += 1\n"
+                    ),
+                    "execution_timeout_seconds": 0.1,
+                },
+            }
+        )
+        followup = send(
+            {
+                "id": 2,
+                "method": "execute",
+                "params": {"code": "print('still alive')"},
+            }
+        )
+    finally:
+        process.kill()
+        process.wait(timeout=2)
+
+    assert response["jsonrpc"] == "2.0"
+    assert response["result"] == {
+        "timeout": {"seconds": 0.1},
+        "stdout": "",
+        "stderr": "",
+    }
+    assert followup["jsonrpc"] == "2.0"
+    assert followup["result"]["output"] == "still alive\n"
 
 
 def test_execute_maps_runner_errors() -> None:
@@ -285,6 +540,167 @@ def test_terminal_bench_minimal_adapter_rejects_file_sync_operations() -> None:
         interpreter.sync_file_to("/container/output.txt", "/host/output.txt")
     with pytest.raises(NotImplementedError, match="minimal smoke adapter.*list_dir"):
         interpreter.list_dir("/container")
+
+
+def test_harbor_environment_structured_timeout_is_recoverable_and_runner_survives() -> None:
+    loop = asyncio.new_event_loop()
+
+    class FakeHarborEnvironment:
+        def __init__(self) -> None:
+            self.uploads: list[tuple[str, str]] = []
+            self.process = FakeProcess(
+                [
+                    {
+                        "id": 1,
+                        "ok": True,
+                        "result": {
+                            "timeout": {"seconds": 0.1},
+                            "stdout": "before\n",
+                            "stderr": "warn\n",
+                        },
+                    },
+                    {"id": 2, "ok": True, "result": {"output": "after\n"}},
+                ]
+            )
+
+        def upload_file(self, host_path: str, environment_path: str) -> None:
+            self.uploads.append((host_path, environment_path))
+
+        def start_exec(self, command, *, workdir=None, timeout=None):
+            return self.process
+
+    environment = FakeHarborEnvironment()
+    interpreter = HarborEnvironmentInterpreter(
+        environment,
+        loop=loop,
+        recoverable_timeout_grace=1.5,
+    )
+
+    try:
+        timeout_result = interpreter.execute("while True: pass", timeout=0.1)
+        followup = interpreter.execute("print('after')")
+    finally:
+        loop.close()
+
+    assert "[Timeout] Iteration execution timed out after 0.1s" in timeout_result
+    assert "[stdout]\nbefore" in timeout_result
+    assert "[stderr]\nwarn" in timeout_result
+    assert timeout_result.timeout_seconds == 0.1
+    assert followup == "after\n"
+    assert environment.uploads[0][1] == "/tmp/predict_rlm_runner.py"
+    assert environment.process.killed is False
+
+
+def test_harbor_environment_delayed_structured_timeout_uses_recovery_grace() -> None:
+    loop = asyncio.new_event_loop()
+
+    class SlowHarborEnvironment:
+        def __init__(self) -> None:
+            self.process = FakeProcess(
+                [
+                    (
+                        1.2,
+                        {
+                            "id": 1,
+                            "ok": True,
+                            "result": {
+                                "timeout": {"seconds": 0.05},
+                                "stdout": "late\n",
+                                "stderr": "",
+                            },
+                        },
+                    ),
+                    {"id": 2, "ok": True, "result": {"output": "after late\n"}},
+                ]
+            )
+
+        def upload_file(self, host_path: str, environment_path: str) -> None:
+            return None
+
+        def start_exec(self, command, *, workdir=None, timeout=None):
+            return self.process
+
+    environment = SlowHarborEnvironment()
+    interpreter = HarborEnvironmentInterpreter(environment, loop=loop)
+
+    start = time.monotonic()
+    try:
+        timeout_result = interpreter.execute("while True: pass", timeout=0.05)
+        followup = interpreter.execute("print('after late')")
+    finally:
+        loop.close()
+
+    assert time.monotonic() - start >= 1.0
+    assert "[Timeout] Iteration execution timed out after 0.05s" in timeout_result
+    assert "[stdout]\nlate" in timeout_result
+    assert followup == "after late\n"
+    assert environment.process.killed is False
+
+
+def test_harbor_environment_default_recoverable_timeout_grace_is_30s() -> None:
+    from predict_rlm.execution_timeout import (
+        DEFAULT_RECOVERABLE_EXECUTION_TIMEOUT_GRACE_SECONDS,
+    )
+
+    loop = asyncio.new_event_loop()
+
+    class FakeHarborEnvironment:
+        def __init__(self) -> None:
+            self.process = FakeProcess([])
+
+        def upload_file(self, host_path: str, environment_path: str) -> None:
+            return None
+
+        def start_exec(self, command, *, workdir=None, timeout=None):
+            return self.process
+
+    try:
+        interpreter = HarborEnvironmentInterpreter(FakeHarborEnvironment(), loop=loop)
+    finally:
+        loop.close()
+
+    assert DEFAULT_RECOVERABLE_EXECUTION_TIMEOUT_GRACE_SECONDS == 30.0
+    assert (
+        TERMINAL_BENCH_RECOVERABLE_TIMEOUT_GRACE_SECONDS
+        == DEFAULT_RECOVERABLE_EXECUTION_TIMEOUT_GRACE_SECONDS
+    )
+    assert interpreter.recoverable_timeout_grace == 30.0
+
+
+def test_harbor_environment_silent_runner_is_fatal_and_killed_by_watchdog() -> None:
+    loop = asyncio.new_event_loop()
+
+    class SilentHarborEnvironment:
+        def __init__(self) -> None:
+            self.process = FakeProcess([])
+
+        def upload_file(self, host_path: str, environment_path: str) -> None:
+            return None
+
+        def start_exec(self, command, *, workdir=None, timeout=None):
+            return self.process
+
+    environment = SilentHarborEnvironment()
+    interpreter = HarborEnvironmentInterpreter(
+        environment,
+        loop=loop,
+        recoverable_timeout_grace=0.2,
+    )
+
+    start = time.monotonic()
+    try:
+        with pytest.raises(
+            SandboxFatalError,
+            match=r"Terminal-Bench runner request timed out after 0\.3s",
+        ):
+            interpreter.execute("print('never')", timeout=0.1)
+        elapsed = time.monotonic() - start
+    finally:
+        loop.close()
+
+    assert 0.25 <= elapsed < 1
+    assert environment.process.killed is True
+    assert environment.process.waited is True
 
 
 def test_harbor_environment_list_dir_uses_python_fallback_resolver() -> None:

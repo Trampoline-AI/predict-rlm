@@ -708,10 +708,6 @@ def test_default_terminal_bench_skill_includes_concurrent_timeout_snippet() -> N
     assert [skill.index(heading) for heading in headings] == sorted(
         skill.index(heading) for heading in headings
     )
-    assert (
-        "As soon as the task is solved and verified, stop improving and submit, "
-        "premature optimization is the root of all evil."
-    ) in skill
     assert "inspect the filesystem before making changes" in skill
     assert "package managers" in skill
     assert "small inspectable steps" in skill
@@ -719,10 +715,11 @@ def test_default_terminal_bench_skill_includes_concurrent_timeout_snippet() -> N
     assert "10-60 seconds" in skill
     assert "several minutes" in skill
     assert "commands, network requests, and computations" in skill
+    assert "query-optimize" not in skill.lower()
+    assert "sqlite" not in skill.lower()
     assert "Do not submit based on an unobserved verification command" in skill
     assert "separate later iteration" in skill
     assert "SUBMIT makes the result final" in skill
-    assert "Verify the observable task contract, then submit" in skill
 
     snippet = skill.split("```python\n", 1)[1].split("\n```", 1)[0]
     compile(snippet, "<terminal-bench-skill>", "exec", flags=ast.PyCF_ALLOW_TOP_LEVEL_AWAIT)

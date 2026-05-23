@@ -118,6 +118,89 @@ class TestPythonRunnerProtocol:
 
         assert result["error"]["data"]["type"] == "SyntaxError"
 
+    def test_timeout_returns_structured_result_and_runner_survives(
+        self, runner: LocalRunner
+    ):
+        result = runner.request(
+            "execute",
+            {
+                "code": (
+                    "import sys\n"
+                    "print('before timeout')\n"
+                    "print('stderr before timeout', file=sys.stderr)\n"
+                    "partial_timeout_state = 42\n"
+                    "while True:\n"
+                    "    pass\n"
+                ),
+                "execution_timeout_seconds": 0.1,
+            },
+        )
+        followup = runner.request(
+            "execute",
+            {"code": "print('partial_timeout_state' in globals())\nprint('still alive')"},
+        )
+
+        assert result["result"] == {
+            "timeout": {"seconds": 0.1},
+            "stdout": "before timeout\n",
+            "stderr": "stderr before timeout\n",
+        }
+        assert followup["result"]["output"] == "False\nstill alive\n"
+
+    def test_timeout_is_not_swallowed_by_user_exception_handler(
+        self, runner: LocalRunner
+    ):
+        result = runner.request(
+            "execute",
+            {
+                "code": (
+                    "caught = 0\n"
+                    "while True:\n"
+                    "    try:\n"
+                    "        pass\n"
+                    "    except Exception:\n"
+                    "        caught += 1\n"
+                ),
+                "execution_timeout_seconds": 0.1,
+            },
+        )
+        followup = runner.request("execute", {"code": "print(caught)"})
+
+        assert result["result"] == {
+            "timeout": {"seconds": 0.1},
+            "stdout": "",
+            "stderr": "",
+        }
+        assert followup["result"]["output"] == "0\n"
+
+    def test_timeout_cancels_pending_async_work(self, runner: LocalRunner):
+        result = runner.request(
+            "execute",
+            {
+                "code": (
+                    "import asyncio\n"
+                    "async def mutate_late():\n"
+                    "    await asyncio.sleep(1)\n"
+                    "    globals()['late_mutation'] = 'leaked'\n"
+                    "await mutate_late()\n"
+                ),
+                "execution_timeout_seconds": 0.1,
+            },
+        )
+        followup = runner.request(
+            "execute",
+            {
+                "code": (
+                    "import asyncio\n"
+                    "await asyncio.sleep(0.3)\n"
+                    "print('late_mutation' in globals())"
+                )
+            },
+        )
+
+        assert result["result"]["timeout"] == {"seconds": 0.1}
+        assert followup["result"]["output"] == "False\n"
+
     def test_file_helpers_preserve_virtual_paths(self, runner: LocalRunner, tmp_path: Path):
         source = tmp_path / "input.txt"
         source.write_text("hello", encoding="utf-8")
@@ -294,6 +377,125 @@ class TestSbxInterpreterLocalRunner:
         assert "predict_rlm.trace" not in stderr
         assert "output:" in stderr
         assert '"answer": "ok"' in stderr
+
+    def test_execute_timeout_returns_recoverable_observation(
+        self, tmp_path: Path
+    ):
+        interpreter = self.make_interpreter(tmp_path)
+        try:
+            timeout_result = interpreter.execute(
+                "import sys\n"
+                "print('before timeout')\n"
+                "print('stderr before timeout', file=sys.stderr)\n"
+                "partial_timeout_state = 42\n"
+                "while True:\n"
+                "    pass\n",
+                timeout=0.1,
+            )
+            followup = interpreter.execute(
+                "print('partial_timeout_state' in globals())\nprint('still alive')"
+            )
+        finally:
+            interpreter.shutdown()
+
+        assert "[Timeout] Iteration execution timed out after 0.1s" in timeout_result
+        assert "[stdout]\nbefore timeout" in timeout_result
+        assert "[stderr]\nstderr before timeout" in timeout_result
+        assert timeout_result.timeout_seconds == 0.1
+        assert followup == "False\nstill alive\n"
+
+    def test_default_recoverable_timeout_grace_is_shared(self, tmp_path: Path):
+        from predict_rlm.execution_timeout import (
+            DEFAULT_RECOVERABLE_EXECUTION_TIMEOUT_GRACE_SECONDS,
+            ITERATION_TIMEOUT_FAILURE_CLASS,
+        )
+
+        interpreter = self.make_interpreter(tmp_path)
+        try:
+            assert DEFAULT_RECOVERABLE_EXECUTION_TIMEOUT_GRACE_SECONDS == 30.0
+            assert (
+                interpreter._host_watchdog_timeout(
+                    2.0,
+                    ITERATION_TIMEOUT_FAILURE_CLASS,
+                )
+                == 32.0
+            )
+        finally:
+            interpreter.shutdown()
+
+    def test_delayed_structured_timeout_uses_recoverable_grace(self, tmp_path: Path):
+        runner_script = tmp_path / "delayed_timeout_runner.py"
+        runner_script.write_text(
+            """
+import json
+import sys
+import time
+
+for line in sys.stdin:
+    request = json.loads(line)
+    request_id = request["id"]
+    if request["method"] == "execute":
+        time.sleep(1.1)
+        print(json.dumps({
+            "jsonrpc": "2.0",
+            "result": {
+                "timeout": {"seconds": request["params"]["execution_timeout_seconds"]},
+                "stdout": "late timeout\\n",
+                "stderr": "",
+            },
+            "id": request_id,
+        }), flush=True)
+    elif request["method"] == "shutdown":
+        print(json.dumps({"jsonrpc": "2.0", "result": {}, "id": request_id}), flush=True)
+        break
+""".lstrip(),
+            encoding="utf-8",
+        )
+        interpreter = SbxInterpreter(
+            config=SbxConfig(name="local-test", exec_timeout=3),
+            preinstall_packages=False,
+            _runner_command=[sys.executable, "-u", str(runner_script)],
+            _staging_root=tmp_path / "staging",
+        )
+        start = time.monotonic()
+        try:
+            timeout_result = interpreter.execute("while True: pass", timeout=0.05)
+        finally:
+            interpreter.shutdown()
+
+        assert time.monotonic() - start >= 1.0
+        assert "[Timeout] Iteration execution timed out after 0.05s" in timeout_result
+        assert "[stdout]\nlate timeout" in timeout_result
+
+    def test_iteration_timeout_recovery_failure_is_bounded_by_grace(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        import predict_rlm.execution_timeout as execution_timeout
+
+        monkeypatch.setattr(
+            execution_timeout,
+            "DEFAULT_RECOVERABLE_EXECUTION_TIMEOUT_GRACE_SECONDS",
+            0.2,
+        )
+        interpreter = SbxInterpreter(
+            config=SbxConfig(name="silent-test", exec_timeout=30),
+            preinstall_packages=False,
+            _runner_command=[
+                sys.executable,
+                "-u",
+                "-c",
+                "import sys, time\nsys.stdin.readline()\ntime.sleep(30)\n",
+            ],
+            _staging_root=tmp_path / "staging",
+        )
+        start = time.monotonic()
+        try:
+            with pytest.raises(SandboxFatalError, match="failed to recover"):
+                interpreter.execute("print('never')", timeout=0.1)
+        finally:
+            interpreter.shutdown()
+
+        assert 0.25 <= time.monotonic() - start < 1.0
 
     def test_file_helpers_round_trip_virtual_paths(self, tmp_path: Path):
         interpreter = self.make_interpreter(tmp_path)
@@ -1467,3 +1669,29 @@ class TestSbxInterpreterRealSbx:
             interpreter.shutdown()
 
         assert output.strip() == "5"
+
+    def test_real_sbx_timeout_is_recoverable_and_runner_survives(self):
+        interpreter = SbxInterpreter(
+            config=SbxConfig(name=f"predict-rlm-test-timeout-{os.getpid()}"),
+            preinstall_packages=False,
+        )
+        try:
+            timeout_result = interpreter.execute(
+                "import sys\n"
+                "print('before timeout')\n"
+                "print('stderr before timeout', file=sys.stderr)\n"
+                "partial_timeout_state = 41\n"
+                "while True:\n"
+                "    pass\n",
+                timeout=0.2,
+            )
+            followup = interpreter.execute(
+                "print('partial_timeout_state' in globals())\nprint('still alive')"
+            )
+        finally:
+            interpreter.shutdown()
+
+        assert "[Timeout] Iteration execution timed out after 0.2s" in timeout_result
+        assert "[stdout]\nbefore timeout" in timeout_result
+        assert "[stderr]\nstderr before timeout" in timeout_result
+        assert followup.strip() == "False\nstill alive"

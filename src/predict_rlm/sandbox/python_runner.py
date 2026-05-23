@@ -9,11 +9,17 @@ import contextlib
 import inspect
 import io
 import json
+import math
+import multiprocessing
 import os
 import pathlib
+import pickle
+import queue
+import select
 import shutil
 import sys
 import tempfile
+import time
 from typing import Any
 
 REAL_STDOUT = sys.stdout
@@ -34,6 +40,39 @@ class _FinalOutputError(Exception):
     def __init__(self, payload: dict[str, Any]) -> None:
         super().__init__("SUBMIT")
         self.payload = payload
+
+
+class _ExecutionCapture:
+    def __init__(
+        self,
+        stdout: io.StringIO | None = None,
+        stderr: io.StringIO | None = None,
+    ) -> None:
+        self.stdout = stdout or io.StringIO()
+        self.stderr = stderr or io.StringIO()
+
+
+class _FdTextStream(io.TextIOBase):
+    def __init__(self, fd: int) -> None:
+        self.fd = fd
+        self._buffer = io.StringIO()
+
+    def writable(self) -> bool:
+        return True
+
+    def write(self, text: str) -> int:
+        if not isinstance(text, str):
+            text = str(text)
+        self._buffer.write(text)
+        if text:
+            os.write(self.fd, text.encode("utf-8", errors="replace"))
+        return len(text)
+
+    def flush(self) -> None:
+        return None
+
+    def getvalue(self) -> str:
+        return self._buffer.getvalue()
 
 
 class _VirtualPath(str):
@@ -156,11 +195,16 @@ def _response(request_id: Any, result: dict[str, Any]) -> dict[str, Any]:
     return {"jsonrpc": "2.0", "result": result, "id": request_id}
 
 
-def _error(request_id: Any, exc: BaseException) -> dict[str, Any]:
-    data = {
+def _exception_payload(exc: BaseException) -> dict[str, Any]:
+    return {
         "type": type(exc).__name__,
+        "message": str(exc),
         "args": list(getattr(exc, "args", ())),
     }
+
+
+def _error(request_id: Any, exc: BaseException) -> dict[str, Any]:
+    data = _exception_payload(exc)
     partial_output = getattr(exc, "_predict_rlm_output", "")
     if partial_output:
         data["output"] = partial_output
@@ -175,8 +219,12 @@ def _error(request_id: Any, exc: BaseException) -> dict[str, Any]:
     }
 
 
-async def _execute_code(code: str, globals_dict: dict[str, Any]) -> dict[str, Any]:
-    output = io.StringIO()
+async def _execute_code(
+    code: str,
+    globals_dict: dict[str, Any],
+    capture: _ExecutionCapture | None = None,
+) -> dict[str, Any]:
+    capture = capture or _ExecutionCapture()
     try:
         compiled = compile(
             code,
@@ -184,16 +232,210 @@ async def _execute_code(code: str, globals_dict: dict[str, Any]) -> dict[str, An
             "exec",
             flags=ast.PyCF_ALLOW_TOP_LEVEL_AWAIT,
         )
-        with contextlib.redirect_stdout(output), contextlib.redirect_stderr(output):
+        with (
+            contextlib.redirect_stdout(capture.stdout),
+            contextlib.redirect_stderr(capture.stderr),
+        ):
             result = eval(compiled, globals_dict, globals_dict)
             if inspect.isawaitable(result):
                 await result
     except _FinalOutputError as final:
         return {"final": final.payload}
     except BaseException as exc:
-        setattr(exc, "_predict_rlm_output", output.getvalue())
+        setattr(
+            exc,
+            "_predict_rlm_output",
+            capture.stdout.getvalue() + capture.stderr.getvalue(),
+        )
         raise
-    return {"output": output.getvalue()}
+    return {"output": capture.stdout.getvalue() + capture.stderr.getvalue()}
+
+
+def _execution_timeout_seconds(params: dict[str, Any]) -> float | None:
+    timeout = params.get("execution_timeout_seconds")
+    if timeout is None:
+        return None
+    if (
+        isinstance(timeout, bool)
+        or not isinstance(timeout, (int, float))
+        or not math.isfinite(float(timeout))
+        or float(timeout) <= 0
+    ):
+        raise ValueError("execution_timeout_seconds must be a positive number")
+    return float(timeout)
+
+
+def _pickleable_globals(globals_dict: dict[str, Any]) -> dict[str, Any]:
+    updates: dict[str, Any] = {}
+    for name, value in globals_dict.items():
+        if name.startswith("__") and name.endswith("__"):
+            continue
+        if name == "SUBMIT":
+            continue
+        try:
+            pickle.dumps(value)
+        except Exception:
+            continue
+        updates[name] = value
+    return updates
+
+
+def _raise_worker_error(payload: dict[str, Any]) -> None:
+    message = str(payload.get("message") or payload.get("type") or "execution failed")
+    if payload.get("type") == "SyntaxError":
+        raise SyntaxError(message)
+    raise RuntimeError(message)
+
+
+def _worker_context() -> multiprocessing.context.BaseContext:
+    try:
+        return multiprocessing.get_context("fork")
+    except ValueError as exc:
+        raise RuntimeError(
+            "execution_timeout_seconds requires a fork-capable Python runtime"
+        ) from exc
+
+
+def _execute_code_worker(
+    code: str,
+    globals_dict: dict[str, Any],
+    result_queue: multiprocessing.Queue,
+    stdout_fd: int,
+    stderr_fd: int,
+) -> None:
+    global PENDING_TOOL_RESPONSES, TOOL_RESPONSE_LOCK
+    PENDING_TOOL_RESPONSES = {}
+    TOOL_RESPONSE_LOCK = asyncio.Lock()
+    capture = _ExecutionCapture(
+        stdout=_FdTextStream(stdout_fd),
+        stderr=_FdTextStream(stderr_fd),
+    )
+    try:
+        result = asyncio.run(_execute_code(code, globals_dict, capture))
+        result_queue.put({
+            "ok": True,
+            "result": result,
+            "globals": _pickleable_globals(globals_dict),
+        })
+    except BaseException as exc:
+        result_queue.put({"ok": False, "error": _exception_payload(exc)})
+    finally:
+        with contextlib.suppress(OSError):
+            os.close(stdout_fd)
+        with contextlib.suppress(OSError):
+            os.close(stderr_fd)
+
+
+def _drain_fd(fd: int, parts: list[str]) -> bool:
+    while True:
+        try:
+            chunk = os.read(fd, 65536)
+        except BlockingIOError:
+            return True
+        except OSError:
+            return False
+        if not chunk:
+            return False
+        parts.append(chunk.decode("utf-8", errors="replace"))
+
+
+def _terminate_worker(process: multiprocessing.Process) -> None:
+    if not process.is_alive():
+        return
+    process.terminate()
+    process.join(timeout=0.5)
+    if process.is_alive() and hasattr(process, "kill"):
+        process.kill()
+        process.join(timeout=0.5)
+
+
+async def _execute_code_in_worker_with_timeout(
+    code: str,
+    globals_dict: dict[str, Any],
+    timeout_seconds: float,
+) -> dict[str, Any]:
+    ctx = _worker_context()
+    stdout_read_fd, stdout_write_fd = os.pipe()
+    stderr_read_fd, stderr_write_fd = os.pipe()
+    os.set_blocking(stdout_read_fd, False)
+    os.set_blocking(stderr_read_fd, False)
+    result_queue = ctx.Queue()
+    process = ctx.Process(
+        target=_execute_code_worker,
+        args=(code, globals_dict, result_queue, stdout_write_fd, stderr_write_fd),
+    )
+    stdout_parts: list[str] = []
+    stderr_parts: list[str] = []
+    active_fds = {stdout_read_fd: stdout_parts, stderr_read_fd: stderr_parts}
+    process.start()
+    os.close(stdout_write_fd)
+    os.close(stderr_write_fd)
+    deadline = time.monotonic() + timeout_seconds
+    worker_message: dict[str, Any] | None = None
+
+    try:
+        while True:
+            for fd, parts in list(active_fds.items()):
+                if not _drain_fd(fd, parts):
+                    active_fds.pop(fd, None)
+            try:
+                worker_message = result_queue.get_nowait()
+                break
+            except queue.Empty:
+                pass
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                _terminate_worker(process)
+                for fd, parts in list(active_fds.items()):
+                    _drain_fd(fd, parts)
+                return {
+                    "timeout": {"seconds": timeout_seconds},
+                    "stdout": "".join(stdout_parts),
+                    "stderr": "".join(stderr_parts),
+                }
+            if active_fds:
+                ready, _, _ = await asyncio.to_thread(
+                    select.select,
+                    list(active_fds),
+                    [],
+                    [],
+                    min(0.01, remaining),
+                )
+                for fd in ready:
+                    parts = active_fds.get(fd)
+                    if parts is not None and not _drain_fd(fd, parts):
+                        active_fds.pop(fd, None)
+            else:
+                await asyncio.sleep(min(0.01, remaining))
+
+        process.join(timeout=0.5)
+        if process.is_alive():
+            _terminate_worker(process)
+        for fd, parts in list(active_fds.items()):
+            if not _drain_fd(fd, parts):
+                active_fds.pop(fd, None)
+    finally:
+        for fd in (stdout_read_fd, stderr_read_fd):
+            with contextlib.suppress(OSError):
+                os.close(fd)
+        result_queue.close()
+
+    if worker_message is None:
+        raise RuntimeError("execution worker exited without a result")
+    if not worker_message.get("ok"):
+        _raise_worker_error(worker_message.get("error") or {})
+    globals_dict.update(worker_message.get("globals") or {})
+    return worker_message.get("result") or {}
+
+
+async def _execute_code_with_timeout(
+    code: str,
+    globals_dict: dict[str, Any],
+    timeout_seconds: float | None,
+) -> dict[str, Any]:
+    if timeout_seconds is None:
+        return await _execute_code(code, globals_dict)
+    return await _execute_code_in_worker_with_timeout(code, globals_dict, timeout_seconds)
 
 
 def _mount_file(params: dict[str, Any]) -> dict[str, Any]:
@@ -238,7 +480,14 @@ async def _handle_request(
 
     try:
         if method == "execute":
-            return _response(request_id, await _execute_code(params.get("code", ""), globals_dict))
+            return _response(
+                request_id,
+                await _execute_code_with_timeout(
+                    params.get("code", ""),
+                    globals_dict,
+                    _execution_timeout_seconds(params),
+                ),
+            )
         if method == "register_output_fields":
             return _response(request_id, {})
         if method == "register_tools":

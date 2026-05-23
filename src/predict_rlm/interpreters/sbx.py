@@ -28,6 +28,12 @@ from predict_rlm._logging import (
     interpreter_result_logging_enabled,
     live_tool_call_logging_enabled,
 )
+from predict_rlm.execution_timeout import (
+    ITERATION_TIMEOUT_FAILURE_CLASS,
+    format_recoverable_timeout_result,
+    recoverable_timeout_host_deadline_seconds,
+    resolve_execution_timeout,
+)
 from predict_rlm.files import get_synced_file_params
 from predict_rlm.interpreter import SandboxFatalError
 from predict_rlm.trace import ToolCall, ms_since, record_tool_call
@@ -135,11 +141,23 @@ class SbxInterpreter(PredictRLMInterpreter):
             **fields,
         )
 
-    def execute(self, code: str, variables: dict[str, Any] | None = None) -> Any:
+    def execute(
+        self,
+        code: str,
+        variables: dict[str, Any] | None = None,
+        *,
+        timeout: float | None = None,
+    ) -> Any:
         with self._execution_gate.top_level():
-            return self._execute_top_level(code, variables)
+            return self._execute_top_level(code, variables, timeout=timeout)
 
-    def _execute_top_level(self, code: str, variables: dict[str, Any] | None = None) -> Any:
+    def _execute_top_level(
+        self,
+        code: str,
+        variables: dict[str, Any] | None = None,
+        *,
+        timeout: float | None = None,
+    ) -> Any:
         if variables:
             mapped_variables = {
                 name: self._map_variable_value(value) for name, value in variables.items()
@@ -148,11 +166,21 @@ class SbxInterpreter(PredictRLMInterpreter):
                 f"{name} = {value!r}" for name, value in mapped_variables.items()
             )
             code = f"{assignments}\n{code}"
-        response = self._send_request("execute", {"code": code})
+        params: dict[str, Any] = {"code": code}
+        if timeout is not None:
+            execution_timeout, _ = self._resolve_execution_timeout(timeout)
+            params["execution_timeout_seconds"] = execution_timeout
+        response = self._send_request("execute", params, timeout=timeout)
         return self._unwrap_execute_response(response)
 
-    async def aexecute(self, code: str, variables: dict[str, Any] | None = None) -> Any:
-        return await asyncio.to_thread(self.execute, code, variables)
+    async def aexecute(
+        self,
+        code: str,
+        variables: dict[str, Any] | None = None,
+        *,
+        timeout: float | None = None,
+    ) -> Any:
+        return await asyncio.to_thread(self.execute, code, variables, timeout=timeout)
 
     def mount_file_at(self, host_path: str, virtual_path: str) -> None:
         source = Path(host_path)
@@ -538,7 +566,25 @@ class SbxInterpreter(PredictRLMInterpreter):
         except queue.Empty:
             return None
 
-    def _fail_timed_out_request(self) -> None:
+    def _resolve_execution_timeout(self, timeout: float | None) -> tuple[float, str]:
+        return resolve_execution_timeout(timeout, default_timeout=self.config.exec_timeout)
+
+    def _host_watchdog_timeout(
+        self,
+        timeout_seconds: float,
+        timeout_failure_class: str,
+    ) -> float:
+        return recoverable_timeout_host_deadline_seconds(
+            timeout_seconds,
+            timeout_failure_class,
+        )
+
+    def _fail_timed_out_request(
+        self,
+        timeout_seconds: float,
+        host_timeout_seconds: float,
+        timeout_failure_class: str,
+    ) -> None:
         assert self._proc is not None
         self._log_lifecycle(
             "sbx.request.timeout",
@@ -546,8 +592,14 @@ class SbxInterpreter(PredictRLMInterpreter):
             status="error",
         )
         self._proc.kill()
+        if timeout_failure_class == ITERATION_TIMEOUT_FAILURE_CLASS:
+            raise SandboxFatalError(
+                "Sbx runner failed to recover from iteration timeout after "
+                f"{timeout_seconds:g}s; waited {host_timeout_seconds:g}s before "
+                "force-killing runner"
+            )
         raise SandboxFatalError(
-            f"Sbx runner request timed out after {self.config.exec_timeout}s"
+            f"Sbx runner request timed out after {host_timeout_seconds:g}s"
         )
 
     def _submit_tool_call(self, request: dict[str, Any]) -> None:
@@ -706,11 +758,22 @@ class SbxInterpreter(PredictRLMInterpreter):
         self._proc.stdin.write(json.dumps(response) + "\n")
         self._proc.stdin.flush()
 
-    def _send_request(self, method: str, params: dict[str, Any] | None = None) -> dict:
+    def _send_request(
+        self,
+        method: str,
+        params: dict[str, Any] | None = None,
+        *,
+        timeout: float | None = None,
+    ) -> dict:
         self._ensure_process_for_method(method)
         assert self._proc is not None
         if self._proc.stdin is None or self._proc.stdout is None:
             raise SandboxFatalError("Sbx runner stdio is unavailable")
+        timeout_seconds, timeout_failure_class = self._resolve_execution_timeout(timeout)
+        host_timeout_seconds = self._host_watchdog_timeout(
+            timeout_seconds,
+            timeout_failure_class,
+        )
 
         self._request_id += 1
         request_id = self._request_id
@@ -739,7 +802,7 @@ class SbxInterpreter(PredictRLMInterpreter):
             )
             raise SandboxFatalError("Sbx runner pipe broke while sending request") from exc
 
-        deadline = time.monotonic() + self.config.exec_timeout
+        deadline = time.monotonic() + host_timeout_seconds
         stale_discards = 0
         while True:
             self._drain_completed_tool_calls()
@@ -754,7 +817,11 @@ class SbxInterpreter(PredictRLMInterpreter):
                 )
                 raise SandboxFatalError(f"Sbx runner exited unexpectedly: {stderr}")
             if time.monotonic() > deadline:
-                self._fail_timed_out_request()
+                self._fail_timed_out_request(
+                    timeout_seconds,
+                    host_timeout_seconds,
+                    timeout_failure_class,
+                )
             line = self._read_stdout_line(deadline)
             if not line:
                 continue
@@ -820,6 +887,8 @@ class SbxInterpreter(PredictRLMInterpreter):
             )
 
         result = response.get("result", {})
+        if isinstance(result, dict) and "timeout" in result:
+            return format_recoverable_timeout_result(result)
         if interpreter_result_logging_enabled(self.verbose):
             emit_trace_result(result)
         if "final" in result:

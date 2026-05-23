@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import json
+import select
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -11,7 +13,7 @@ _EXAMPLE_DIR = Path(__file__).resolve().parent.parent
 if str(_EXAMPLE_DIR) not in sys.path:
     sys.path.insert(0, str(_EXAMPLE_DIR))
 
-from terminal_bench_rlm.tools.runner import runner_script_path  # noqa: E402
+from terminal_bench_rlm.tools.runner import runner_script_path, runner_source  # noqa: E402
 
 
 class LocalRunner:
@@ -28,7 +30,14 @@ class LocalRunner:
 
     def request(self, method: str, params: dict | None = None) -> dict:
         self._request_id += 1
-        self.write({"id": self._request_id, "method": method, "params": params or {}})
+        self.write(
+            {
+                "jsonrpc": "2.0",
+                "id": self._request_id,
+                "method": method,
+                "params": params or {},
+            }
+        )
         return self.read()
 
     def write(self, message: dict) -> None:
@@ -65,18 +74,19 @@ def test_execute_persists_namespace_and_reset_clears_it(runner: LocalRunner) -> 
     reset = runner.request("reset")
     after = runner.request("execute", {"code": "print('x' in globals())"})
 
-    assert first == {"id": 1, "ok": True, "result": {"output": "ready\n"}}
-    assert second == {"id": 2, "ok": True, "result": {"output": "42\n"}}
-    assert reset == {"id": 3, "ok": True, "result": {}}
-    assert after == {"id": 4, "ok": True, "result": {"output": "False\n"}}
+    assert first == {"jsonrpc": "2.0", "id": 1, "result": {"output": "ready\n"}}
+    assert second == {"jsonrpc": "2.0", "id": 2, "result": {"output": "42\n"}}
+    assert reset == {"jsonrpc": "2.0", "id": 3, "result": {}}
+    assert after == {"jsonrpc": "2.0", "id": 4, "result": {"output": "False\n"}}
 
 
 def test_host_tool_call_round_trip(runner: LocalRunner) -> None:
     registered = runner.request("register_tools", {"tools": ["predict"]})
-    assert registered["ok"] is True
+    assert "error" not in registered
 
     runner.write(
         {
+            "jsonrpc": "2.0",
             "id": 2,
             "method": "execute",
             "params": {
@@ -97,13 +107,13 @@ def test_host_tool_call_round_trip(runner: LocalRunner) -> None:
 
     runner.write(
         {
+            "jsonrpc": "2.0",
             "id": tool_call["id"],
-            "ok": True,
-            "result": {"type": "json", "value": {"answer": "4"}},
+            "result": {"type": "json", "value": "{\"answer\": \"4\"}"},
         }
     )
     response = runner.read()
-    assert response == {"id": 2, "ok": True, "result": {"output": "4\n"}}
+    assert response == {"jsonrpc": "2.0", "id": 2, "result": {"output": "4\n"}}
 
 
 def test_host_tool_errors_propagate_to_execute_error(runner: LocalRunner) -> None:
@@ -111,6 +121,7 @@ def test_host_tool_errors_propagate_to_execute_error(runner: LocalRunner) -> Non
 
     runner.write(
         {
+            "jsonrpc": "2.0",
             "id": 2,
             "method": "execute",
             "params": {"code": "await predict('question -> answer', question='bad')"},
@@ -119,14 +130,94 @@ def test_host_tool_errors_propagate_to_execute_error(runner: LocalRunner) -> Non
     tool_call = runner.read()
     runner.write(
         {
+            "jsonrpc": "2.0",
             "id": tool_call["id"],
-            "ok": False,
-            "error": {"type": "RuntimeError", "message": "predict failed"},
+            "error": {"code": -32000, "message": "predict failed"},
         }
     )
     response = runner.read()
 
     assert response["id"] == 2
-    assert response["ok"] is False
-    assert response["error"]["type"] == "RuntimeError"
+    assert response["error"]["data"]["type"] == "RuntimeError"
     assert "predict failed" in response["error"]["message"]
+
+
+def test_terminal_bench_runner_payload_is_shared_with_sbx() -> None:
+    shared_runner = (
+        Path(__file__).resolve().parents[3]
+        / "src"
+        / "predict_rlm"
+        / "sandbox"
+        / "python_runner.py"
+    )
+
+    assert runner_script_path() == shared_runner
+    assert runner_source() == shared_runner.read_text(encoding="utf-8")
+
+
+def test_runner_timeout_recovers_from_blocking_native_call() -> None:
+    proc = subprocess.Popen(
+        [sys.executable, "-u", str(runner_script_path())],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        bufsize=1,
+    )
+    request = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "execute",
+        "params": {
+            "execution_timeout_seconds": 0.1,
+            "code": (
+                "import hashlib, sys\n"
+                "print('stdout before native')\n"
+                "print('stderr before native', file=sys.stderr)\n"
+                "hashlib.pbkdf2_hmac('sha256', b'x', b'y', 10_000_000)\n"
+                "print('unreachable')\n"
+            ),
+        },
+    }
+
+    try:
+        assert proc.stdin is not None
+        assert proc.stdout is not None
+        start = time.monotonic()
+        proc.stdin.write(json.dumps(request) + "\n")
+        proc.stdin.flush()
+
+        ready, _, _ = select.select([proc.stdout], [], [], 1.0)
+        assert ready, "runner did not return a recoverable timeout response"
+        response = json.loads(proc.stdout.readline())
+        followup = {
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "execute",
+            "params": {"code": "print('after timeout')"},
+        }
+        proc.stdin.write(json.dumps(followup) + "\n")
+        proc.stdin.flush()
+        followup_ready, _, _ = select.select([proc.stdout], [], [], 1.0)
+        assert followup_ready, "runner did not survive the timed-out native call"
+        after = json.loads(proc.stdout.readline())
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+        proc.wait(timeout=2)
+
+    assert time.monotonic() - start < 1.5
+    assert response == {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "result": {
+            "timeout": {"seconds": 0.1},
+            "stdout": "stdout before native\n",
+            "stderr": "stderr before native\n",
+        },
+    }
+    assert after == {
+        "jsonrpc": "2.0",
+        "id": 2,
+        "result": {"output": "after timeout\n"},
+    }

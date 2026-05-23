@@ -10,6 +10,7 @@ from predict_rlm.telemetry import FailureClass, classify_failure
 
 INFRA_FAILURE_CLASSES = {
     "sandbox_lifecycle_failure",
+    "rlm_iteration_execution_timeout",
     "sandbox_exec_timeout",
     "host_tool_timeout_or_leak",
     "outer_task_timeout",

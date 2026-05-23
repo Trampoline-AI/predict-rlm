@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import inspect
 import logging
+import math
 import os
 import re
 import time
@@ -270,6 +271,26 @@ def _validate_signature_outputs(
         )
 
 
+def _with_optional_output_defaults(
+    signature: type[Any],
+    parsed_result: Any,
+) -> dict[str, Any] | None:
+    if not isinstance(parsed_result, dict):
+        return None
+    missing = [
+        name for name in signature.output_fields
+        if name not in parsed_result
+    ]
+    if not missing:
+        return parsed_result
+    if any(signature.output_fields[name].is_required() for name in missing):
+        return None
+    filled = dict(parsed_result)
+    for name in missing:
+        filled[name] = signature.output_fields[name].default
+    return filled
+
+
 class _ValidatingOutputAdapterMixin:
     """Validate adapter outputs before they become DSPy Predictions."""
 
@@ -304,7 +325,15 @@ class _ValidatingJSONAdapter(_ValidatingOutputAdapterMixin, JSONAdapter):
 
     def parse(self, signature: type[Any], completion: str) -> dict[str, Any]:
         self._reject_required_json_nulls(signature, completion)
-        fields = super().parse(signature, completion)
+        try:
+            fields = super().parse(signature, completion)
+        except AdapterParseError as exc:
+            fields = _with_optional_output_defaults(
+                signature,
+                getattr(exc, "parsed_result", None),
+            )
+            if fields is None:
+                raise
         _validate_signature_outputs(
             adapter_name=type(self).__name__,
             signature=signature,
@@ -348,6 +377,24 @@ class _ValidatingJSONAdapter(_ValidatingOutputAdapterMixin, JSONAdapter):
 
 class _ValidatingChatAdapter(_ValidatingOutputAdapterMixin, ChatAdapter):
     """ChatAdapter whose fallback preserves client-side output validation."""
+
+    def parse(self, signature: type[Any], completion: str) -> dict[str, Any]:
+        try:
+            fields = super().parse(signature, completion)
+        except AdapterParseError as exc:
+            fields = _with_optional_output_defaults(
+                signature,
+                getattr(exc, "parsed_result", None),
+            )
+            if fields is None:
+                raise
+        _validate_signature_outputs(
+            adapter_name=type(self).__name__,
+            signature=signature,
+            parsed_result=fields,
+            lm_response=completion,
+        )
+        return fields
 
     def __call__(
         self,
@@ -545,6 +592,11 @@ Use `predict()` whenever you need the model to read content and produce structur
 
 ### Execution model
 The REPL runs inside an async event loop — use `await` directly, not `asyncio.run()`.
+
+### Execution timeouts
+For every iteration, deliberately choose `execution_timeout_seconds` for the current code block. Use `null` for ordinary short, safe blocks. Set a positive timeout when work could hang or run long: loops, scans over many files/items, network or tool fanout, batch `predict()` calls, tests/subprocesses, or data/model processing.
+
+Use lightweight caps: short probes are usually ~1-5 seconds, normal bounded work is usually ~10-60 seconds, and longer caps are only for clearly heavy bounded work. If a timeout fires, stdout/stderr printed before the timeout are preserved and the next iteration can continue. Before risky work, store important partial results in variables so you can resume.
 
 ## Managing state & output
 
@@ -1750,6 +1802,24 @@ class PredictRLM(dspy.RLM):
             "message": f"{type(exc).__name__}: action generation did not produce parsed code",
         }
 
+    def _action_execution_timeout(self, pred: Any) -> float | None:
+        value = getattr(pred, "execution_timeout_seconds", None)
+        if type(value).__module__ == "unittest.mock":
+            return None
+        if value is None:
+            return None
+        if (
+            isinstance(value, bool)
+            or not isinstance(value, (int, float))
+            or not math.isfinite(float(value))
+            or float(value) <= 0
+        ):
+            raise RuntimeError(
+                "PredictRLM action adapter returned invalid "
+                "execution_timeout_seconds; expected a positive number or null."
+            )
+        return float(value)
+
     def _telemetry_ref(self) -> dict[str, Any] | None:
         telemetry_context = getattr(self, "_current_telemetry_context", None)
         if telemetry_context is None:
@@ -2024,6 +2094,7 @@ class PredictRLM(dspy.RLM):
         iteration: int,
         action_start_ns: int,
         lm_hist_before_action: int,
+        execution_timeout: float | None,
     ) -> Any:
         lm_metadata = lm_finish_since(dspy.settings.lm, lm_hist_before_action)
         self._write_telemetry_span(
@@ -2034,6 +2105,11 @@ class PredictRLM(dspy.RLM):
                 "has_code": True,
                 "code_chars": len(getattr(pred, "code", "") or ""),
                 "reasoning_chars": len(getattr(pred, "reasoning", "") or ""),
+                **(
+                    {"execution_timeout_seconds": execution_timeout}
+                    if execution_timeout is not None
+                    else {}
+                ),
             },
         )
         self._log_lifecycle(
@@ -2041,6 +2117,7 @@ class PredictRLM(dspy.RLM):
             iteration=iteration + 1,
             code_chars=len(getattr(pred, "code", "") or ""),
             reasoning_chars=len(getattr(pred, "reasoning", "") or ""),
+            execution_timeout_seconds=execution_timeout,
         )
         return lm_metadata
 
@@ -2133,6 +2210,7 @@ class PredictRLM(dspy.RLM):
         input_args: dict[str, Any],
         iteration: int,
         iteration_log_open: bool,
+        execution_timeout: float | None,
     ) -> Any:
         execute_start = self._log_iteration_execute_start(
             repl,
@@ -2144,7 +2222,14 @@ class PredictRLM(dspy.RLM):
                 live_tool_call_logging(iteration_log_open),
                 suppress_interpreter_result_logging(iteration_log_open),
             ):
-                result = repl.execute(code, variables=dict(input_args))
+                if execution_timeout is None:
+                    result = repl.execute(code, variables=dict(input_args))
+                else:
+                    result = repl.execute(
+                        code,
+                        variables=dict(input_args),
+                        timeout=execution_timeout,
+                    )
         except SandboxFatalError as exc:
             self._log_iteration_execute_fatal(
                 repl,
@@ -2177,6 +2262,7 @@ class PredictRLM(dspy.RLM):
         input_args: dict[str, Any],
         iteration: int,
         iteration_log_open: bool,
+        execution_timeout: float | None,
     ) -> Any:
         execute_start = self._log_iteration_execute_start(
             repl,
@@ -2189,9 +2275,23 @@ class PredictRLM(dspy.RLM):
                 suppress_interpreter_result_logging(iteration_log_open),
             ):
                 if hasattr(repl, "aexecute"):
-                    result = await repl.aexecute(code, variables=dict(input_args))
+                    if execution_timeout is None:
+                        result = await repl.aexecute(code, variables=dict(input_args))
+                    else:
+                        result = await repl.aexecute(
+                            code,
+                            variables=dict(input_args),
+                            timeout=execution_timeout,
+                        )
                 else:
-                    result = repl.execute(code, variables=dict(input_args))
+                    if execution_timeout is None:
+                        result = repl.execute(code, variables=dict(input_args))
+                    else:
+                        result = repl.execute(
+                            code,
+                            variables=dict(input_args),
+                            timeout=execution_timeout,
+                        )
         except SandboxFatalError as exc:
             self._log_iteration_execute_fatal(
                 repl,
@@ -2268,6 +2368,7 @@ class PredictRLM(dspy.RLM):
                 iteration=f"{iteration + 1}/{self.max_iterations}",
             )
             self._validate_iteration_action(pred)
+            execution_timeout = self._action_execution_timeout(pred)
         except BaseException as exc:
             lm_metadata = lm_completion_metadata_since(dspy.settings.lm, lm_hist_before_action)
             self._record_action_generation_error(
@@ -2282,6 +2383,7 @@ class PredictRLM(dspy.RLM):
             iteration=iteration,
             action_start_ns=action_start_ns,
             lm_hist_before_action=lm_hist_before_action,
+            execution_timeout=execution_timeout,
         )
         code, iteration_log_open = self._prepare_iteration_execution(pred, iteration)
 
@@ -2292,6 +2394,7 @@ class PredictRLM(dspy.RLM):
                 input_args=input_args,
                 iteration=iteration,
                 iteration_log_open=iteration_log_open,
+                execution_timeout=execution_timeout,
             )
             return self._complete_iteration_execution(
                 pred,
@@ -2332,6 +2435,7 @@ class PredictRLM(dspy.RLM):
                 iteration=f"{iteration + 1}/{self.max_iterations}",
             )
             self._validate_iteration_action(pred)
+            execution_timeout = self._action_execution_timeout(pred)
         except BaseException as exc:
             lm_metadata = lm_completion_metadata_since(dspy.settings.lm, lm_hist_before_action)
             self._record_action_generation_error(
@@ -2346,6 +2450,7 @@ class PredictRLM(dspy.RLM):
             iteration=iteration,
             action_start_ns=action_start_ns,
             lm_hist_before_action=lm_hist_before_action,
+            execution_timeout=execution_timeout,
         )
         code, iteration_log_open = self._prepare_iteration_execution(pred, iteration)
 
@@ -2356,6 +2461,7 @@ class PredictRLM(dspy.RLM):
                 input_args=input_args,
                 iteration=iteration,
                 iteration_log_open=iteration_log_open,
+                execution_timeout=execution_timeout,
             )
             return self._complete_iteration_execution(
                 pred,

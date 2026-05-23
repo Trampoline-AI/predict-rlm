@@ -2982,6 +2982,38 @@ def test_adapter_progress_bar_labels_valset(tmp_path: Path, monkeypatch):
     )
 
 
+def test_adapter_caps_task_trace_filename_length(tmp_path: Path):
+    long_label = "long_evaluation_kind_with_nested_context_segments_and_repeated_observation_windows_001"
+    adapter = RLMGepaAdapter(
+        project=_ImmediateProject(),
+        lm=_DummyLM(),
+        sub_lm=_DummyLM(),
+        max_iterations=1,
+        concurrency=1,
+        task_timeout=1,
+        output_dir=tmp_path,
+        run_id=(
+            "synthetic-domain-neutral-task-with-extended-run-identifier-and-many-"
+            "descriptive-segments-for-trace-filename-stress-20260522-010041"
+        ),
+    )
+
+    batch = adapter.evaluate(
+        [long_label],
+        {"skill_instructions": "seed"},
+        capture_traces=False,
+        kind=long_label,
+    )
+
+    trace_files = list((tmp_path / "task_traces").glob("*.jsonl"))
+    assert batch.scores == [1.0]
+    assert len(trace_files) == 1
+    assert len(trace_files[0].name) < 255
+    row = json.loads(trace_files[0].read_text())
+    assert row["event_id"].endswith("attempt_0000")
+    assert row["kind"] == long_label
+
+
 def test_adapter_classifies_no_trace_repeat_batch_as_minibatch(tmp_path: Path, monkeypatch):
     import rlm_gepa.runtime.adapter as adapter_module
 
