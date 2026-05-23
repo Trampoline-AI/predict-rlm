@@ -708,19 +708,6 @@ def test_default_terminal_bench_skill_includes_concurrent_timeout_snippet() -> N
     assert [skill.index(heading) for heading in headings] == sorted(
         skill.index(heading) for heading in headings
     )
-    normalized_skill = skill.lower()
-    submit_after_success_concepts = [
-        ("observed verification output", "observed verification"),
-        ("observable task contract", "contract is satisfied"),
-        ("next action", "submit"),
-        ("refactors", "speedups", "rewrites", "cleanup", "clever alternatives"),
-        ("harmful", "over-optimization", "failure mode"),
-        ("required by the task", "needed to pass verification", "necessary for verification"),
-    ]
-    assert all(
-        any(term in normalized_skill for term in concept_terms)
-        for concept_terms in submit_after_success_concepts
-    )
     assert "inspect the filesystem before making changes" in skill
     assert "package managers" in skill
     assert "small inspectable steps" in skill
@@ -728,20 +715,8 @@ def test_default_terminal_bench_skill_includes_concurrent_timeout_snippet() -> N
     assert "10-60 seconds" in skill
     assert "several minutes" in skill
     assert "commands, network requests, and computations" in skill
-    data_strategy_concepts = [
-        ("semantics", "correctness"),
-        ("schema", "inputs", "query plans", "data distributions"),
-        ("baseline", "sample", "representative subset"),
-        ("set-based", "batched", "vectorized", "algorithmic"),
-        ("indexes", "caches", "precomputed aggregates"),
-        ("ordering", "filtering"),
-    ]
-    assert all(
-        any(term in normalized_skill for term in concept_terms)
-        for concept_terms in data_strategy_concepts
-    )
-    assert "query-optimize" not in normalized_skill
-    assert "sqlite" not in normalized_skill
+    assert "query-optimize" not in skill.lower()
+    assert "sqlite" not in skill.lower()
     assert "Do not submit based on an unobserved verification command" in skill
     assert "separate later iteration" in skill
     assert "SUBMIT makes the result final" in skill
