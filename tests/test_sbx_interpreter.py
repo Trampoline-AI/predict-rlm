@@ -12,6 +12,7 @@ import sys
 import threading
 import time
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Annotated
 
 import pytest
@@ -75,6 +76,17 @@ class LocalRunner:
                 self.request("shutdown")
             finally:
                 self.proc.wait(timeout=5)
+
+
+class SequentialActions:
+    def __init__(self, *actions: SimpleNamespace) -> None:
+        self.actions = list(actions)
+        self.calls: list[dict] = []
+
+    def __call__(self, **kwargs):
+        self.calls.append(kwargs)
+        assert self.actions, "PredictRLM requested more actions than the test provided"
+        return self.actions.pop(0)
 
 
 @pytest.fixture
@@ -1695,3 +1707,52 @@ class TestSbxInterpreterRealSbx:
         assert "[stdout]\nbefore timeout" in timeout_result
         assert "[stderr]\nstderr before timeout" in timeout_result
         assert followup.strip() == "False\nstill alive"
+
+    def test_predict_rlm_lm_selected_timeout_recovers_and_continues(self):
+        from predict_rlm import PredictRLM
+
+        actions = SequentialActions(
+            SimpleNamespace(
+                reasoning="select a short timeout for a risky loop",
+                code=(
+                    "import sys\n"
+                    "print('before rlm timeout')\n"
+                    "print('stderr before rlm timeout', file=sys.stderr)\n"
+                    "while True:\n"
+                    "    pass\n"
+                ),
+                execution_timeout_seconds=0.2,
+            ),
+            SimpleNamespace(
+                reasoning="continue after the timeout observation",
+                code="SUBMIT(answer='continued after timeout')",
+            ),
+        )
+        pool = SbxPool(
+            size=1,
+            config=SbxConfig(name=f"predict-rlm-test-rlm-timeout-{os.getpid()}"),
+            preinstall_packages=False,
+        )
+        rlm = PredictRLM(
+            "prompt -> answer",
+            max_iterations=2,
+            sandbox_backend="sbx",
+            sbx_pool=pool,
+        )
+        rlm.generate_action = actions
+        try:
+            prediction = rlm(prompt="exercise per-iteration timeout")
+        finally:
+            pool.shutdown()
+
+        assert prediction.answer == "continued after timeout"
+        assert [call["iteration"] for call in actions.calls] == ["1/2", "2/2"]
+        assert len(prediction.trace.steps) == 2
+        timeout_step, final_step = prediction.trace.steps
+        assert (
+            "[Timeout] Iteration execution timed out after 0.2s"
+            in timeout_step.untruncated_output
+        )
+        assert "[stdout]\nbefore rlm timeout" in timeout_step.untruncated_output
+        assert "[stderr]\nstderr before rlm timeout" in timeout_step.untruncated_output
+        assert final_step.output == "FINAL: {'answer': 'continued after timeout'}"

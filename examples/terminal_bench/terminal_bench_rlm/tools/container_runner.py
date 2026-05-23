@@ -34,6 +34,7 @@ from .runner import runner_source
 TERMINAL_BENCH_RECOVERABLE_TIMEOUT_GRACE_SECONDS = (
     DEFAULT_RECOVERABLE_EXECUTION_TIMEOUT_GRACE_SECONDS
 )
+HOST_TOOL_TIMEOUT_RESPONSE_MARGIN_SECONDS = 0.05
 
 
 def _shell_python_command(python_executable: str, args: list[str]) -> str:
@@ -119,6 +120,10 @@ class ContainerAdapter(Protocol):
         workdir: str | None = None,
         timeout: float | None = None,
     ) -> ContainerProcess: ...
+
+
+class _HostToolTimeoutError(TimeoutError):
+    pass
 
 
 class _TimeoutLineReader:
@@ -707,6 +712,11 @@ class TerminalBenchRunnerInterpreter(PredictRLMInterpreter):
 
         request_timeout = self.exec_timeout if timeout is None else timeout
         deadline = time.monotonic() + request_timeout
+        recoverable_timeout_seconds = self._recoverable_execution_timeout_seconds(
+            method,
+            params or {},
+        )
+        stdout_tail: list[str] = []
         while True:
             if process.poll() is not None:
                 raise SandboxFatalError(
@@ -714,15 +724,21 @@ class TerminalBenchRunnerInterpreter(PredictRLMInterpreter):
                 )
             remaining = deadline - time.monotonic()
             if remaining <= 0:
-                self._kill_process_after_timeout(process)
-                raise SandboxFatalError(
-                    f"Terminal-Bench runner request timed out after {request_timeout:g}s"
+                return self._handle_runner_request_timeout(
+                    process,
+                    request_id,
+                    request_timeout=request_timeout,
+                    recoverable_timeout_seconds=recoverable_timeout_seconds,
+                    stdout_tail="".join(stdout_tail)[-4000:],
                 )
             line = self._read_stdout_line(process, timeout=remaining)
             if line is None:
-                self._kill_process_after_timeout(process)
-                raise SandboxFatalError(
-                    f"Terminal-Bench runner request timed out after {request_timeout:g}s"
+                return self._handle_runner_request_timeout(
+                    process,
+                    request_id,
+                    request_timeout=request_timeout,
+                    recoverable_timeout_seconds=recoverable_timeout_seconds,
+                    stdout_tail="".join(stdout_tail)[-4000:],
                 )
             if not line:
                 time.sleep(0.01)
@@ -730,12 +746,73 @@ class TerminalBenchRunnerInterpreter(PredictRLMInterpreter):
             try:
                 message = json.loads(line)
             except json.JSONDecodeError:
+                stdout_tail.append(line)
                 continue
             if message.get("method") == "tool_call":
-                self._write_tool_response(self._build_tool_response(message))
+                self._write_tool_response(
+                    self._build_tool_response(message, deadline=deadline)
+                )
                 continue
             if message.get("id") == request_id:
                 return message
+
+    def _recoverable_execution_timeout_seconds(
+        self,
+        method: str,
+        params: dict[str, Any],
+    ) -> float | None:
+        if method != "execute" or "execution_timeout_seconds" not in params:
+            return None
+        return self._resolve_execution_timeout(params["execution_timeout_seconds"])
+
+    def _handle_runner_request_timeout(
+        self,
+        process: ContainerProcess,
+        request_id: int,
+        *,
+        request_timeout: float,
+        recoverable_timeout_seconds: float | None,
+        stdout_tail: str = "",
+    ) -> dict[str, Any]:
+        self._kill_process_after_timeout(process)
+        stderr = self._read_stderr_for_process(process)
+        if recoverable_timeout_seconds is None:
+            raise SandboxFatalError(
+                f"Terminal-Bench runner request timed out after {request_timeout:g}s"
+            )
+
+        self._discard_runner_process()
+        restart_error: BaseException | None = None
+        try:
+            self._ensure_process()
+        except BaseException as exc:
+            restart_error = exc
+        if restart_error is not None:
+            raise SandboxFatalError(
+                "Terminal-Bench runner request timed out after "
+                f"{request_timeout:g}s and the copied runner could not be restarted: "
+                f"{restart_error}"
+            ) from restart_error
+
+        diagnostic = (
+            "Terminal-Bench runner request timed out after "
+            f"{request_timeout:g}s before it returned a structured timeout. "
+            "The copied runner process was killed and restarted; Python globals "
+            "from the timed-out runner were lost, while task container filesystem "
+            "state is preserved. Re-run setup code before relying on in-memory "
+            "variables."
+        )
+        if stderr:
+            diagnostic = f"{diagnostic}\n[runner stderr before restart]\n{stderr.rstrip()}"
+        return {
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "result": {
+                "timeout": {"seconds": recoverable_timeout_seconds},
+                "stdout": stdout_tail,
+                "stderr": diagnostic,
+            },
+        }
 
     def _read_stdout_line(
         self,
@@ -754,7 +831,18 @@ class TerminalBenchRunnerInterpreter(PredictRLMInterpreter):
         except Exception:
             pass
 
-    def _build_tool_response(self, message: dict[str, Any]) -> dict[str, Any]:
+    def _discard_runner_process(self) -> None:
+        self._process = None
+        self._stdout_reader = None
+        self._tools_registered = False
+        self._output_fields_registered = False
+
+    def _build_tool_response(
+        self,
+        message: dict[str, Any],
+        *,
+        deadline: float | None = None,
+    ) -> dict[str, Any]:
         request_id = message.get("id")
         params = message.get("params") or {}
         name = params.get("name")
@@ -765,9 +853,12 @@ class TerminalBenchRunnerInterpreter(PredictRLMInterpreter):
             args = list(params.get("args") or [])
             kwargs = dict(params.get("kwargs") or {})
             with self._execution_gate.tool_callback():
-                result = tool(*args, **kwargs)
-                if inspect.isawaitable(result):
-                    result = asyncio.run(result)
+                result = self._run_host_tool_with_deadline(
+                    tool,
+                    args,
+                    kwargs,
+                    deadline=deadline,
+                )
             is_json = result is None or isinstance(result, (dict, list, int, float, bool))
             return {
                 "jsonrpc": "2.0",
@@ -788,6 +879,62 @@ class TerminalBenchRunnerInterpreter(PredictRLMInterpreter):
                     "data": error.to_payload(),
                 },
             }
+
+    def _run_host_tool_with_deadline(
+        self,
+        tool: Callable[..., Any],
+        args: list[Any],
+        kwargs: dict[str, Any],
+        *,
+        deadline: float | None,
+    ) -> Any:
+        if deadline is None:
+            result = tool(*args, **kwargs)
+            if inspect.isawaitable(result):
+                result = asyncio.run(result)
+            return result
+
+        remaining = deadline - time.monotonic()
+        callback_budget = remaining - HOST_TOOL_TIMEOUT_RESPONSE_MARGIN_SECONDS
+        if callback_budget <= 0:
+            raise _HostToolTimeoutError(
+                "Host tool call timed out before dispatch because the "
+                "Terminal-Bench request deadline was exhausted"
+            )
+
+        result_queue: queue.Queue[tuple[str, Any]] = queue.Queue(maxsize=1)
+
+        def run() -> None:
+            try:
+                result = tool(*args, **kwargs)
+                if inspect.isawaitable(result):
+                    result = asyncio.run(result)
+            except BaseException as exc:
+                result_queue.put(("error", exc))
+            else:
+                result_queue.put(("result", result))
+
+        thread = threading.Thread(
+            target=run,
+            name="terminal-bench-host-tool",
+            daemon=True,
+        )
+        thread.start()
+        try:
+            kind, value = result_queue.get(timeout=max(0.0, callback_budget))
+        except queue.Empty as exc:
+            raise _HostToolTimeoutError(
+                "Host tool call timed out after exhausting the remaining "
+                "Terminal-Bench request budget "
+                f"({callback_budget:g}s plus a "
+                f"{HOST_TOOL_TIMEOUT_RESPONSE_MARGIN_SECONDS:g}s response margin). "
+                "The tool runs in a single-use daemon thread, so Python cannot "
+                "forcibly stop underlying provider or library work that ignores "
+                "cancellation."
+            ) from exc
+        if kind == "error":
+            raise value
+        return value
 
     def _write_tool_response(self, response: dict[str, Any]) -> None:
         process = self._require_process()
@@ -817,8 +964,13 @@ class TerminalBenchRunnerInterpreter(PredictRLMInterpreter):
     def _read_stderr(self) -> str:
         if self._process is None or self._process.stderr is None:
             return ""
+        return self._read_stderr_for_process(self._process)
+
+    def _read_stderr_for_process(self, process: ContainerProcess) -> str:
+        if process.stderr is None:
+            return ""
         try:
-            return self._process.stderr.read()
+            return process.stderr.read()
         except Exception:
             return ""
 

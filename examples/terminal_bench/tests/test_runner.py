@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+import os
 import select
+import signal
 import subprocess
 import sys
 import time
@@ -220,4 +222,82 @@ def test_runner_timeout_recovers_from_blocking_native_call() -> None:
         "jsonrpc": "2.0",
         "id": 2,
         "result": {"output": "after timeout\n"},
+    }
+
+
+def _process_exited(pid: int, *, timeout: float = 1.0) -> bool:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return True
+        time.sleep(0.02)
+    return False
+
+
+def test_runner_timeout_kills_generated_code_child_process(tmp_path: Path) -> None:
+    pid_path = tmp_path / "child.pid"
+    proc = subprocess.Popen(
+        [sys.executable, "-u", str(runner_script_path())],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        bufsize=1,
+    )
+    child_pid: int | None = None
+    request = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "execute",
+        "params": {
+            "execution_timeout_seconds": 0.1,
+            "code": (
+                "import pathlib, signal, subprocess, sys, time\n"
+                f"pid_path = pathlib.Path({str(pid_path)!r})\n"
+                "child = subprocess.Popen([\n"
+                "    sys.executable,\n"
+                "    '-c',\n"
+                "    'import signal, time; '\n"
+                "    'signal.signal(signal.SIGINT, signal.SIG_IGN); '\n"
+                "    'signal.signal(signal.SIGTERM, signal.SIG_IGN); '\n"
+                "    'time.sleep(30)',\n"
+                "])\n"
+                "pid_path.write_text(str(child.pid), encoding='utf-8')\n"
+                "print(f'child={child.pid}')\n"
+                "time.sleep(30)\n"
+            ),
+        },
+    }
+
+    try:
+        assert proc.stdin is not None
+        assert proc.stdout is not None
+        proc.stdin.write(json.dumps(request) + "\n")
+        proc.stdin.flush()
+
+        ready, _, _ = select.select([proc.stdout], [], [], 2.0)
+        assert ready, "runner did not return a recoverable timeout response"
+        response = json.loads(proc.stdout.readline())
+        child_pid = int(pid_path.read_text(encoding="utf-8"))
+        assert _process_exited(child_pid, timeout=1.0)
+    finally:
+        if child_pid is not None:
+            try:
+                os.kill(child_pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        if proc.poll() is None:
+            proc.kill()
+        proc.wait(timeout=2)
+
+    assert response == {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "result": {
+            "timeout": {"seconds": 0.1},
+            "stdout": f"child={child_pid}\n",
+            "stderr": "",
+        },
     }

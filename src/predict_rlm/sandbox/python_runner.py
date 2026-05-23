@@ -17,6 +17,7 @@ import pickle
 import queue
 import select
 import shutil
+import signal
 import sys
 import tempfile
 import time
@@ -303,6 +304,8 @@ def _execute_code_worker(
     stdout_fd: int,
     stderr_fd: int,
 ) -> None:
+    with contextlib.suppress(OSError):
+        os.setsid()
     global PENDING_TOOL_RESPONSES, TOOL_RESPONSE_LOCK
     PENDING_TOOL_RESPONSES = {}
     TOOL_RESPONSE_LOCK = asyncio.Lock()
@@ -339,14 +342,48 @@ def _drain_fd(fd: int, parts: list[str]) -> bool:
         parts.append(chunk.decode("utf-8", errors="replace"))
 
 
+def _worker_process_group_id(process: multiprocessing.Process) -> int | None:
+    pid = process.pid
+    if pid is None:
+        return None
+    try:
+        pgid = os.getpgid(pid)
+    except OSError:
+        return None
+    return pgid if pgid == pid else None
+
+
+def _signal_worker_process_group(pgid: int | None, sig: int) -> bool:
+    if pgid is None:
+        return False
+    try:
+        os.killpg(pgid, sig)
+    except ProcessLookupError:
+        return False
+    except OSError:
+        return False
+    return True
+
+
 def _terminate_worker(process: multiprocessing.Process) -> None:
-    if not process.is_alive():
+    pgid = _worker_process_group_id(process)
+    if not process.is_alive() and pgid is None:
         return
-    process.terminate()
+
+    if not _signal_worker_process_group(pgid, signal.SIGINT) and process.is_alive():
+        process.terminate()
+    process.join(timeout=0.2)
+
+    if not _signal_worker_process_group(pgid, signal.SIGTERM) and process.is_alive():
+        process.terminate()
+    process.join(timeout=0.3)
+
+    if not _signal_worker_process_group(pgid, signal.SIGKILL) and process.is_alive():
+        if hasattr(process, "kill"):
+            process.kill()
+        else:
+            process.terminate()
     process.join(timeout=0.5)
-    if process.is_alive() and hasattr(process, "kill"):
-        process.kill()
-        process.join(timeout=0.5)
 
 
 async def _execute_code_in_worker_with_timeout(
