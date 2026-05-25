@@ -324,14 +324,14 @@ class TestPythonRunnerProtocol:
                 "execution_timeout_seconds": 0.1,
             },
         )
-        followup = runner.request("execute", {"code": "print(caught)"})
+        followup = runner.request("execute", {"code": "print('still alive')"})
 
         assert result["result"] == {
             "timeout": {"seconds": 0.1},
             "stdout": "",
             "stderr": "",
         }
-        assert followup["result"]["output"] == "0\n"
+        assert followup["result"]["output"] == "still alive\n"
 
     def test_timeout_cancels_pending_async_work(self, runner: LocalRunner):
         result = runner.request(
@@ -400,7 +400,7 @@ class TestSbxInterpreterLocalRunner:
         return SbxInterpreter(
             config=SbxConfig(name="local-test"),
             preinstall_packages=False,
-            _runner_command=[sys.executable, "-u", str(RUNNER_PATH)],
+            _supervisor_command=[sys.executable, "-u", str(RUNNER_PATH)],
             _staging_root=tmp_path / "staging",
         )
 
@@ -506,7 +506,7 @@ for line in sys.stdin:
         interpreter = SbxInterpreter(
             config=SbxConfig(name="local-test", exec_timeout=3),
             preinstall_packages=False,
-            _runner_command=[sys.executable, "-u", str(runner_script)],
+            _supervisor_command=[sys.executable, "-u", str(runner_script)],
             _staging_root=tmp_path / "staging",
         )
         start = time.monotonic()
@@ -518,6 +518,78 @@ for line in sys.stdin:
         assert time.monotonic() - start >= 1.0
         assert "[Timeout] Iteration execution timed out after 0.05s" in timeout_result
         assert "[stdout]\nlate timeout" in timeout_result
+
+    def test_execute_after_structured_timeout_restarts_dead_runner_with_diagnostic(
+        self, tmp_path: Path
+    ):
+        runner_script = tmp_path / "exit_after_timeout_runner.py"
+        runner_script.write_text(
+            """
+import json
+import os
+import pathlib
+import sys
+
+root = pathlib.Path(os.environ["PREDICT_RLM_SBX_ROOT"])
+marker = root / "already_exited"
+
+for line in sys.stdin:
+    request = json.loads(line)
+    request_id = request["id"]
+    if request["method"] == "shutdown":
+        print(json.dumps({"jsonrpc": "2.0", "result": {}, "id": request_id}), flush=True)
+        break
+    if request["method"] != "execute":
+        print(json.dumps({"jsonrpc": "2.0", "result": {}, "id": request_id}), flush=True)
+        continue
+    if not marker.exists():
+        marker.write_text("yes", encoding="utf-8")
+        print(json.dumps({
+            "jsonrpc": "2.0",
+            "result": {
+                "timeout": {"seconds": request["params"]["execution_timeout_seconds"]},
+                "stdout": "before timeout\\n",
+                "stderr": "command timed out\\n",
+            },
+            "id": request_id,
+        }), flush=True)
+        print("runner stderr tail", file=sys.stderr, flush=True)
+        raise SystemExit(137)
+    print(json.dumps({
+        "jsonrpc": "2.0",
+        "result": {"output": "fresh runner\\n"},
+        "id": request_id,
+    }), flush=True)
+""".lstrip(),
+            encoding="utf-8",
+        )
+        interpreter = SbxInterpreter(
+            config=SbxConfig(name="local-test", exec_timeout=3),
+            preinstall_packages=False,
+            _supervisor_command=[sys.executable, "-u", str(runner_script)],
+            _staging_root=tmp_path / "staging",
+        )
+        try:
+            timeout_result = interpreter.execute("run_slow_command()", timeout=0.2)
+            deadline = time.monotonic() + 2
+            while interpreter._proc and interpreter._proc.poll() is None:
+                assert time.monotonic() < deadline
+                time.sleep(0.01)
+            restart_result = interpreter.execute("print(existing_global)", timeout=0.2)
+            followup = interpreter.execute("print('fresh runner')")
+        finally:
+            interpreter.shutdown()
+
+        assert "[Timeout] Iteration execution timed out after 0.2s" in timeout_result
+        assert "Sbx supervisor exited after the previous execute response" in restart_result
+        assert "The supervisor process was restarted" in restart_result
+        assert "Python globals from the prior supervisor were lost" in restart_result
+        assert "supervisor_returncode=137" in restart_result
+        assert "previous_request_id=1" in restart_result
+        assert "previous_method=execute" in restart_result
+        assert "previous_execution_timeout_seconds=0.2" in restart_result
+        assert "runner stderr tail" in restart_result
+        assert followup == "fresh runner\n"
 
     def test_iteration_timeout_recovery_failure_is_bounded_by_grace(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -532,7 +604,7 @@ for line in sys.stdin:
         interpreter = SbxInterpreter(
             config=SbxConfig(name="silent-test", exec_timeout=30),
             preinstall_packages=False,
-            _runner_command=[
+            _supervisor_command=[
                 sys.executable,
                 "-u",
                 "-c",
@@ -577,7 +649,7 @@ for line in sys.stdin:
         interpreter = SbxInterpreter(
             config=SbxConfig(name="file-only-test"),
             preinstall_packages=False,
-            _runner_command=[sys.executable, "-c", "raise SystemExit(99)"],
+            _supervisor_command=[sys.executable, "-c", "raise SystemExit(99)"],
             _staging_root=tmp_path / "staging",
         )
         source = tmp_path / "host-input.txt"
@@ -622,7 +694,7 @@ for line in sys.stdin:
         interpreter = SbxInterpreter(
             config=SbxConfig(name="local-test"),
             preinstall_packages=False,
-            _runner_command=[sys.executable, "-u", str(RUNNER_PATH)],
+            _supervisor_command=[sys.executable, "-u", str(RUNNER_PATH)],
         )
         staging_root = interpreter._staging_root
         source = tmp_path / "input.txt"
@@ -641,7 +713,7 @@ for line in sys.stdin:
         interpreter = SbxInterpreter(
             config=SbxConfig(name="local-test"),
             preinstall_packages=False,
-            _runner_command=[sys.executable, "-u", str(RUNNER_PATH)],
+            _supervisor_command=[sys.executable, "-u", str(RUNNER_PATH)],
             _staging_root=staging_root,
         )
         source = tmp_path / "input.txt"
@@ -664,7 +736,7 @@ for line in sys.stdin:
         interpreter = SbxInterpreter(
             config=SbxConfig(name="local-test", persist=True),
             preinstall_packages=False,
-            _runner_command=[sys.executable, "-u", str(RUNNER_PATH)],
+            _supervisor_command=[sys.executable, "-u", str(RUNNER_PATH)],
         )
         staging_root = interpreter._staging_root
 
@@ -684,7 +756,7 @@ for line in sys.stdin:
             config=SbxConfig(name="local-test"),
             tools={"add": add},
             preinstall_packages=False,
-            _runner_command=[sys.executable, "-u", str(RUNNER_PATH)],
+            _supervisor_command=[sys.executable, "-u", str(RUNNER_PATH)],
             _staging_root=tmp_path / "staging",
         )
         try:
@@ -713,7 +785,7 @@ for line in sys.stdin:
             config=SbxConfig(name="local-test"),
             tools={"mutate": mutate},
             preinstall_packages=False,
-            _runner_command=[sys.executable, "-u", str(RUNNER_PATH)],
+            _supervisor_command=[sys.executable, "-u", str(RUNNER_PATH)],
             _staging_root=tmp_path / "staging",
         )
         source = tmp_path / "input.txt"
@@ -746,7 +818,7 @@ for line in sys.stdin:
             config=SbxConfig(name="local-test"),
             tools={"mutate": mutate},
             preinstall_packages=False,
-            _runner_command=[sys.executable, "-u", str(RUNNER_PATH)],
+            _supervisor_command=[sys.executable, "-u", str(RUNNER_PATH)],
             _staging_root=tmp_path / "staging",
         )
         source = tmp_path / "input.txt"
@@ -785,7 +857,7 @@ for line in sys.stdin:
             config=SbxConfig(name="local-test"),
             tools={"mutate": mutate},
             preinstall_packages=False,
-            _runner_command=[sys.executable, "-u", str(RUNNER_PATH)],
+            _supervisor_command=[sys.executable, "-u", str(RUNNER_PATH)],
             _staging_root=tmp_path / "staging",
         )
         source = tmp_path / "input.txt"
@@ -862,7 +934,7 @@ while True:
         interpreter = SbxInterpreter(
             config=SbxConfig(name="local-test", exec_timeout=2),
             preinstall_packages=False,
-            _runner_command=[sys.executable, "-u", str(runner_script)],
+            _supervisor_command=[sys.executable, "-u", str(runner_script)],
             _staging_root=tmp_path / "staging",
         )
         barrier = threading.Barrier(3)
@@ -902,7 +974,7 @@ while True:
             config=SbxConfig(name="local-test", exec_timeout=3),
             tools={"slow": slow},
             preinstall_packages=False,
-            _runner_command=[sys.executable, "-u", str(RUNNER_PATH)],
+            _supervisor_command=[sys.executable, "-u", str(RUNNER_PATH)],
             _staging_root=tmp_path / "staging",
         )
         start = time.monotonic()
@@ -932,7 +1004,7 @@ while True:
             config=SbxConfig(name="local-test", exec_timeout=3),
             tools={"reenter": reenter},
             preinstall_packages=False,
-            _runner_command=[sys.executable, "-u", str(RUNNER_PATH)],
+            _supervisor_command=[sys.executable, "-u", str(RUNNER_PATH)],
             _staging_root=tmp_path / "staging",
         )
         try:
@@ -947,7 +1019,7 @@ while True:
         interpreter = SbxInterpreter(
             config=SbxConfig(name="silent-test", exec_timeout=0.2),
             preinstall_packages=False,
-            _runner_command=[
+            _supervisor_command=[
                 sys.executable,
                 "-u",
                 "-c",
@@ -998,7 +1070,7 @@ class TestSbxCommandConstruction:
             _staging_root=tmp_path / "staging",
         )
 
-        interpreter._start_sbx_and_build_runner_command()
+        interpreter._start_sbx_and_build_supervisor_command()
 
         create_cmd = commands[0]
         assert SbxConfig().template == DEFAULT_SBX_TEMPLATE
@@ -1022,7 +1094,7 @@ class TestSbxCommandConstruction:
             _staging_root=tmp_path / "staging",
         )
 
-        interpreter._start_sbx_and_build_runner_command()
+        interpreter._start_sbx_and_build_supervisor_command()
 
         create_cmd = commands[0]
         assert create_cmd[create_cmd.index("--template") + 1] == (
@@ -1044,7 +1116,7 @@ class TestSbxCommandConstruction:
             _staging_root=tmp_path / "staging",
         )
 
-        interpreter._start_sbx_and_build_runner_command()
+        interpreter._start_sbx_and_build_supervisor_command()
 
         assert "--template" not in commands[0]
 
@@ -1063,7 +1135,7 @@ class TestSbxCommandConstruction:
             _staging_root=tmp_path / "staging",
         )
 
-        command = interpreter._start_sbx_and_build_runner_command()
+        command = interpreter._start_sbx_and_build_supervisor_command()
         interpreter.shutdown()
 
         create_cmd = commands[0]
@@ -1095,7 +1167,7 @@ class TestSbxCommandConstruction:
             _staging_root=tmp_path / "staging",
         )
 
-        interpreter._start_sbx_and_build_runner_command()
+        interpreter._start_sbx_and_build_supervisor_command()
 
         create_cmd = commands[0]
         workspace_arg = f"{tmp_path / 'staging'}:ro"
@@ -1119,14 +1191,14 @@ class TestSbxCommandConstruction:
             _staging_root=tmp_path / "staging",
         )
 
-        command = interpreter._start_sbx_and_build_runner_command()
+        command = interpreter._start_sbx_and_build_supervisor_command()
 
         create_cmd = commands[0]
         assert create_cmd[:4] == ["sbx", "create", "shell", str(tmp_path / "staging")]
         assert str(Path.cwd()) not in create_cmd
         assert command[:5] == ["sbx", "exec", "-i", "-w", str(tmp_path / "staging")]
 
-    def test_runner_command_uses_python3_executable(self, monkeypatch, tmp_path: Path):
+    def test_supervisor_command_uses_python3_executable(self, monkeypatch, tmp_path: Path):
         def fake_run(command, **kwargs):
             return subprocess.CompletedProcess(command, 0, stdout="created-name\n", stderr="")
 
@@ -1138,7 +1210,7 @@ class TestSbxCommandConstruction:
             _staging_root=tmp_path / "staging",
         )
 
-        command = interpreter._start_sbx_and_build_runner_command()
+        command = interpreter._start_sbx_and_build_supervisor_command()
 
         assert "python" not in command
         runner_path = tmp_path / "staging" / ".predict_rlm_runner" / "python_runner.py"
@@ -1146,6 +1218,30 @@ class TestSbxCommandConstruction:
             encoding="utf-8"
         )
         assert command[-3:] == ["python3", "-u", str(runner_path)]
+
+    def test_runner_restart_reuses_existing_sandbox(
+        self, monkeypatch, tmp_path: Path
+    ):
+        commands: list[list[str]] = []
+
+        def fake_run(command, **kwargs):
+            commands.append(command)
+            return subprocess.CompletedProcess(command, 0, stdout="created-name\n", stderr="")
+
+        monkeypatch.setattr(shutil, "which", lambda name: "/usr/local/bin/sbx")
+        monkeypatch.setattr(subprocess, "run", fake_run)
+        interpreter = SbxInterpreter(
+            config=SbxConfig(name="created-name"),
+            preinstall_packages=False,
+            _staging_root=tmp_path / "staging",
+        )
+        interpreter._sandbox_name = "created-name"
+
+        command = interpreter._start_sbx_and_build_supervisor_command()
+
+        assert commands == []
+        assert command[:5] == ["sbx", "exec", "-i", "-w", str(tmp_path / "staging")]
+        assert "created-name" in command
 
     def test_package_bootstrap_failure_raises_context(self, monkeypatch, tmp_path: Path):
         def fake_run(command, **kwargs):
@@ -1348,7 +1444,7 @@ class TestSbxPool:
             size=2,
             config=SbxConfig(name="pool-test"),
             preinstall_packages=False,
-            _runner_command=[sys.executable, "-u", str(RUNNER_PATH)],
+            _supervisor_command=[sys.executable, "-u", str(RUNNER_PATH)],
             _staging_root=tmp_path / "pool",
         )
 
@@ -1368,7 +1464,7 @@ class TestSbxPool:
         pool = SbxPool(
             size=2,
             preinstall_packages=False,
-            _runner_command=[sys.executable, "-u", str(RUNNER_PATH)],
+            _supervisor_command=[sys.executable, "-u", str(RUNNER_PATH)],
             _staging_root=tmp_path / "pool",
         )
 
@@ -1389,7 +1485,7 @@ class TestSbxPool:
             size=1,
             config=SbxConfig(name="pool-test"),
             preinstall_packages=False,
-            _runner_command=[sys.executable, "-u", str(RUNNER_PATH)],
+            _supervisor_command=[sys.executable, "-u", str(RUNNER_PATH)],
             _staging_root=tmp_path / "pool",
         )
         acquired = threading.Event()
