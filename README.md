@@ -210,6 +210,16 @@ additional host mounts. Real `sbx` integration tests are skipped by default; run
 them with `PREDICT_RLM_RUN_SBX_TESTS=1 uv run pytest -m sbx` after the CLI is
 installed and logged in.
 
+The persistent execution stack has three layers:
+
+```text
+host client / adapter
+  -> persistent supervisor process in the sandbox/container
+       -> per-execute runner process
+```
+
+The host client owns JSON-RPC request lifecycles, restart policy, and backend-specific adapter details such as `sbx exec`, Docker, or Harbor process management. The persistent supervisor process is the copied Python runner script inside the sandbox/container; it keeps the canonical Python globals, virtual filesystem hooks, host-tool protocol reads, stdout/stderr capture, runner cleanup, and structured JSON-RPC responses. Each `execute` request runs in a separate per-execute runner child process, so timeouts and hard exits can be killed or reaped without losing the supervisor state from the last successful execution.
+
 ### Per-iteration execution timeouts
 
 Each RLM iteration can choose its own `execution_timeout_seconds`. The timeout is an iteration-level observation, not a fixed constructor policy: when it fires, the RLM receives a recoverable `[Timeout]` result with stdout/stderr captured before the timeout and can continue to the next iteration.
@@ -219,9 +229,9 @@ JSPI/Deno/Pyodide and Docker/SBX use different interruption mechanics, so their 
 | Backend | Timeout mechanism | State after timeout |
 | --- | --- | --- |
 | JSPI/Deno/Pyodide | Interrupts the running Pyodide execution with a trace/interrupt deadline. | Globals assigned before the interrupt may remain available to the next iteration. |
-| Docker/SBX and Harbor shared runner | Runs timeout-selected code in a killable worker subprocess while the outer JSON-RPC runner stays alive. | Partial globals from the killed worker are not merged back; follow-up iterations start from the last successful runner state. |
+| Docker/SBX and Harbor shared runner | Runs timeout-selected code in a killable per-execute runner process while the persistent supervisor stays alive. | Partial globals from the killed runner are not merged back; follow-up iterations start from the last successful supervisor state. |
 
-The shared-runner behavior is intentional for native/blocking calls such as long SQLite queries or C-extension work: killing only the execution worker preserves the outer runner/session and avoids turning a model-selected iteration timeout into a sandbox lifecycle failure. The regression suite covers this at three levels: JSPI timeout recovery in `tests/test_iteration_execution_timeout.py`, shared runner and Harbor payload behavior in `examples/terminal_bench/tests/test_runner.py`, and SBX local plus optional real-Docker paths in `tests/test_sbx_interpreter.py`.
+The shared-runner behavior is intentional for native/blocking calls such as long SQLite queries or C-extension work: killing only the per-execute runner preserves the persistent supervisor/session and avoids turning a model-selected iteration timeout into a sandbox lifecycle failure. The regression suite covers this at three levels: JSPI timeout recovery in `tests/test_iteration_execution_timeout.py`, shared runner and Harbor payload behavior in `examples/terminal_bench/tests/test_runner.py`, and SBX local plus optional real-Docker paths in `tests/test_sbx_interpreter.py`.
 
 ### Using the spreadsheet skill
 
