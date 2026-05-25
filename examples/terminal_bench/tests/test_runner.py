@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import json
 import os
 import select
@@ -70,6 +71,19 @@ def runner() -> LocalRunner:
         proc.close()
 
 
+def _drain_available_pipe_text(pipe) -> str:
+    assert pipe is not None
+    chunks: list[str] = []
+    while True:
+        ready, _, _ = select.select([pipe], [], [], 0)
+        if not ready:
+            return "".join(chunks)
+        chunk = os.read(pipe.fileno(), 65536)
+        if not chunk:
+            return "".join(chunks)
+        chunks.append(chunk.decode("utf-8", errors="replace"))
+
+
 def test_execute_persists_namespace_and_reset_clears_it(runner: LocalRunner) -> None:
     first = runner.request("execute", {"code": "x = 40\nprint('ready')"})
     second = runner.request("execute", {"code": "x += 2\nprint(x)"})
@@ -118,6 +132,97 @@ def test_host_tool_call_round_trip(runner: LocalRunner) -> None:
     assert response == {"jsonrpc": "2.0", "id": 2, "result": {"output": "4\n"}}
 
 
+def test_predict_result_supports_attribute_and_subscript_access(runner: LocalRunner) -> None:
+    registered = runner.request("register_tools", {"tools": ["predict"]})
+    assert "error" not in registered
+
+    runner.write(
+        {
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "execute",
+            "params": {
+                "code": (
+                    "result = await predict('question -> answer: str, items: list[int]', "
+                    "question='2+2?')\n"
+                    "print(result.answer)\n"
+                    "print(result['answer'])\n"
+                    "print(result.items)"
+                )
+            },
+        }
+    )
+    tool_call = runner.read()
+    assert tool_call["method"] == "tool_call"
+
+    runner.write(
+        {
+            "jsonrpc": "2.0",
+            "id": tool_call["id"],
+            "result": {"type": "json", "value": "{\"answer\": \"4\", \"items\": [1, 2]}"},
+        }
+    )
+    response = runner.read()
+
+    assert response == {
+        "jsonrpc": "2.0",
+        "id": 2,
+        "result": {"output": "4\n4\n[1, 2]\n"},
+    }
+
+
+def test_predict_image_data_url_round_trips_to_host_tool(runner: LocalRunner) -> None:
+    png_bytes = b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR"
+    registered = runner.request("register_tools", {"tools": ["predict"]})
+    assert "error" not in registered
+
+    runner.write(
+        {
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "execute",
+            "params": {
+                "code": (
+                    "import base64\n"
+                    "from pathlib import Path\n"
+                    f"Path('/sandbox/image.png').write_bytes({png_bytes!r})\n"
+                    "data_url = 'data:image/png;base64,' + base64.b64encode(\n"
+                    "    Path('/sandbox/image.png').read_bytes()\n"
+                    ").decode()\n"
+                    "result = await predict(\n"
+                    "    'image: dspy.Image, question: str -> visible_text: str',\n"
+                    "    image=data_url,\n"
+                    "    question='What text is visible?',\n"
+                    ")\n"
+                    "print(result.visible_text)"
+                )
+            },
+        }
+    )
+    tool_call = runner.read()
+
+    assert tool_call["method"] == "tool_call"
+    assert tool_call["params"]["name"] == "predict"
+    assert tool_call["params"]["args"] == [
+        "image: dspy.Image, question: str -> visible_text: str"
+    ]
+    assert tool_call["params"]["kwargs"]["question"] == "What text is visible?"
+    image = tool_call["params"]["kwargs"]["image"]
+    assert image.startswith("data:image/png;base64,")
+    assert base64.b64decode(image.removeprefix("data:image/png;base64,")) == png_bytes
+
+    runner.write(
+        {
+            "jsonrpc": "2.0",
+            "id": tool_call["id"],
+            "result": {"type": "json", "value": '{"visible_text": "hello"}'},
+        }
+    )
+    response = runner.read()
+
+    assert response == {"jsonrpc": "2.0", "id": 2, "result": {"output": "hello\n"}}
+
+
 def test_host_tool_errors_propagate_to_execute_error(runner: LocalRunner) -> None:
     runner.request("register_tools", {"tools": ["predict"]})
 
@@ -155,6 +260,154 @@ def test_terminal_bench_runner_payload_is_shared_with_sbx() -> None:
 
     assert runner_script_path() == shared_runner
     assert runner_source() == shared_runner.read_text(encoding="utf-8")
+
+
+def test_runner_attributes_child_process_output_to_execute_result(
+    runner: LocalRunner,
+) -> None:
+    response = runner.request(
+        "execute",
+        {
+            "code": (
+                "import subprocess, sys\n"
+                "subprocess.run([\n"
+                "    sys.executable,\n"
+                "    '-c',\n"
+                "    \"import sys; print('child stdout'); "
+                "print('child stderr', file=sys.stderr)\",\n"
+                "])\n"
+            ),
+            "execution_timeout_seconds": 2,
+        },
+    )
+    followup = runner.request("execute", {"code": "print('runner still usable')"})
+    leaked_stderr = _drain_available_pipe_text(runner.proc.stderr)
+
+    assert response == {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "result": {"output": "child stdout\nchild stderr\n"},
+    }
+    assert followup == {
+        "jsonrpc": "2.0",
+        "id": 2,
+        "result": {"output": "runner still usable\n"},
+    }
+    assert leaked_stderr == ""
+
+
+def test_runner_timeout_preserves_child_process_output(
+    runner: LocalRunner,
+) -> None:
+    response = runner.request(
+        "execute",
+        {
+            "code": (
+                "import subprocess, sys\n"
+                "subprocess.run([\n"
+                "    sys.executable,\n"
+                "    '-c',\n"
+                "    \"import sys, time; print('child before timeout'); "
+                "print('child err before timeout', file=sys.stderr); "
+                "sys.stdout.flush(); sys.stderr.flush(); time.sleep(30)\",\n"
+                "])\n"
+            ),
+            "execution_timeout_seconds": 0.2,
+        },
+    )
+    followup = runner.request("execute", {"code": "print('runner survived timeout')"})
+    leaked_stderr = _drain_available_pipe_text(runner.proc.stderr)
+
+    assert response["jsonrpc"] == "2.0"
+    assert response["id"] == 1
+    assert response["result"]["timeout"] == {"seconds": 0.2}
+    assert response["result"]["stdout"] == "child before timeout\n"
+    assert response["result"]["stderr"].startswith("child err before timeout\n")
+    assert followup == {
+        "jsonrpc": "2.0",
+        "id": 2,
+        "result": {"output": "runner survived timeout\n"},
+    }
+    assert leaked_stderr == ""
+
+
+def test_runner_unbounded_runner_exit_returns_error_and_supervisor_survives(
+    runner: LocalRunner,
+) -> None:
+    response = runner.request("execute", {"code": "import os\nos._exit(7)"})
+    followup = runner.request(
+        "execute", {"code": "print('supervisor survived runner exit')"}
+    )
+
+    assert response["jsonrpc"] == "2.0"
+    assert response["id"] == 1
+    assert response["error"]["data"]["type"] == "RuntimeError"
+    assert "execution runner exited without a result" in response["error"]["message"]
+    assert followup == {
+        "jsonrpc": "2.0",
+        "id": 2,
+        "result": {"output": "supervisor survived runner exit\n"},
+    }
+
+
+def test_runner_survives_subprocess_timeout_error(runner: LocalRunner) -> None:
+    response = runner.request(
+        "execute",
+        {
+            "code": (
+                "import subprocess, sys\n"
+                "subprocess.run(\n"
+                "    [sys.executable, '-c', 'import time; time.sleep(30)'],\n"
+                "    timeout=0.1,\n"
+                "    check=True,\n"
+                ")\n"
+            ),
+            "execution_timeout_seconds": 2,
+        },
+    )
+    followup = runner.request("execute", {"code": "print('runner still alive')"})
+
+    assert response["jsonrpc"] == "2.0"
+    assert response["id"] == 1
+    assert response["error"]["data"]["type"] == "TimeoutExpired"
+    assert "timed out" in response["error"]["message"]
+    assert followup == {
+        "jsonrpc": "2.0",
+        "id": 2,
+        "result": {"output": "runner still alive\n"},
+    }
+
+
+def test_runner_timeout_is_not_swallowed_by_user_exception_handler(
+    runner: LocalRunner,
+) -> None:
+    response = runner.request(
+        "execute",
+        {
+            "code": (
+                "caught = 0\n"
+                "while True:\n"
+                "    try:\n"
+                "        pass\n"
+                "    except Exception:\n"
+                "        caught += 1\n"
+            ),
+            "execution_timeout_seconds": 0.1,
+        },
+    )
+    followup = runner.request("execute", {"code": "print('still alive')"})
+
+    assert response["jsonrpc"] == "2.0"
+    assert response["result"] == {
+        "timeout": {"seconds": 0.1},
+        "stdout": "",
+        "stderr": "",
+    }
+    assert followup == {
+        "jsonrpc": "2.0",
+        "id": 2,
+        "result": {"output": "still alive\n"},
+    }
 
 
 def test_runner_timeout_recovers_from_blocking_native_call() -> None:
