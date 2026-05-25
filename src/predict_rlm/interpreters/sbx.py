@@ -40,7 +40,7 @@ from predict_rlm.files import get_synced_file_params
 from predict_rlm.interpreter import SandboxFatalError
 from predict_rlm.serialization import to_plain_data
 from predict_rlm.trace import ToolCall, ms_since, record_tool_call
-from predict_rlm.workspace import WorkspaceFileInfo
+from predict_rlm.workspace import DirectWorkspaceMount, WorkspaceFileInfo
 
 from .base import (
     InterpreterExecutionGate,
@@ -117,6 +117,8 @@ class SbxInterpreter(PersistentJsonRpcRunnerClient, PredictRLMInterpreter):
         self._prepared_runner_path: Path | None = None
         self._shutdown = False
         self._post_execute_hooks: list[Callable[[Any], Any]] = []
+        self._direct_workspace_mounts: list[DirectWorkspaceMount] = []
+        self._owned_direct_aliases: list[Path] = []
 
     def configure_debug(self, enabled: bool) -> None:
         self.debug = enabled
@@ -195,25 +197,25 @@ class SbxInterpreter(PersistentJsonRpcRunnerClient, PredictRLMInterpreter):
 
     def mount_file_at(self, host_path: str, virtual_path: str) -> None:
         source = Path(host_path)
-        target = self._host_path_for_virtual_path(virtual_path)
+        target = self._host_path_for_sandbox_path(virtual_path)
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(source, target)
 
     def mkdir_p(self, virtual_path: str) -> None:
-        self._host_path_for_virtual_path(virtual_path).mkdir(parents=True, exist_ok=True)
+        self._host_path_for_sandbox_path(virtual_path).mkdir(parents=True, exist_ok=True)
 
     def list_dir(self, virtual_path: str) -> list[str]:
-        root = self._host_path_for_virtual_path(virtual_path)
+        root = self._host_path_for_sandbox_path(virtual_path)
         if not root.exists():
             return []
         return [
-            self._virtual_path_for_host_path(path)
+            self._sandbox_path_for_host_path(path)
             for path in sorted(root.rglob("*"))
             if path.is_file()
         ]
 
     def workspace_manifest(self, virtual_path: str) -> dict[str, WorkspaceFileInfo]:
-        root = self._host_path_for_virtual_path(virtual_path)
+        root = self._host_path_for_sandbox_path(virtual_path)
         if not root.exists():
             raise FileNotFoundError(f"Workspace mount does not exist: {virtual_path}")
         if not root.is_dir():
@@ -238,7 +240,7 @@ class SbxInterpreter(PersistentJsonRpcRunnerClient, PredictRLMInterpreter):
             hook(self)
 
     def sync_file_to(self, virtual_path: str, host_path: str) -> None:
-        source = self._host_path_for_virtual_path(virtual_path)
+        source = self._host_path_for_sandbox_path(virtual_path)
         target = Path(host_path)
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(source, target)
@@ -251,8 +253,6 @@ class SbxInterpreter(PersistentJsonRpcRunnerClient, PredictRLMInterpreter):
         return digest.hexdigest()
 
     def _host_path_for_virtual_path(self, virtual_path: str) -> Path:
-        if virtual_path != "/sandbox" and not virtual_path.startswith("/sandbox/"):
-            raise ValueError(f"Sbx virtual path must be under /sandbox: {virtual_path}")
         sandbox_root = (self._staging_root / "sandbox").resolve()
         rel = virtual_path.removeprefix("/sandbox").lstrip("/")
         host_path = (sandbox_root / rel).resolve()
@@ -261,6 +261,18 @@ class SbxInterpreter(PersistentJsonRpcRunnerClient, PredictRLMInterpreter):
         except ValueError as exc:
             raise ValueError(f"Sbx virtual path escapes /sandbox: {virtual_path}") from exc
         return host_path
+
+    def _host_path_for_sandbox_path(self, sandbox_path: str) -> Path:
+        for mount in self._direct_workspace_mounts:
+            rel_path = self._relative_to_prefix(sandbox_path, mount.sandbox_path)
+            if rel_path is not None:
+                return Path(mount.host_path, *rel_path.parts)
+        if sandbox_path == "/sandbox" or sandbox_path.startswith("/sandbox/"):
+            return self._host_path_for_virtual_path(sandbox_path)
+        raise ValueError(
+            "Sbx path must be under /sandbox or a direct workspace mount: "
+            f"{sandbox_path}"
+        )
 
     def _map_variable_value(self, value: Any) -> Any:
         value = to_plain_data(value)
@@ -278,6 +290,34 @@ class SbxInterpreter(PersistentJsonRpcRunnerClient, PredictRLMInterpreter):
         sandbox_root = (self._staging_root / "sandbox").resolve()
         rel = host_path.resolve().relative_to(sandbox_root)
         return "/sandbox/" + rel.as_posix()
+
+    def _sandbox_path_for_host_path(self, host_path: Path) -> str:
+        for mount in self._direct_workspace_mounts:
+            try:
+                rel = host_path.resolve().relative_to(Path(mount.host_path).resolve())
+            except ValueError:
+                continue
+            if rel.as_posix() == ".":
+                return mount.sandbox_path
+            return f"{mount.sandbox_path.rstrip('/')}/{rel.as_posix()}"
+        return self._virtual_path_for_host_path(host_path)
+
+    def _relative_to_prefix(self, path: str, prefix: str) -> Path | None:
+        try:
+            rel = Path(path).relative_to(Path(prefix))
+        except ValueError:
+            return None
+        return Path() if rel.as_posix() == "." else rel
+
+    def configure_direct_workspace_mounts(
+        self, mounts: list[DirectWorkspaceMount]
+    ) -> None:
+        if self._proc and self._proc.poll() is None:
+            raise RuntimeError(
+                "Direct workspace mounts must be configured before the SBX runner starts"
+            )
+        self._direct_workspace_mounts = list(mounts)
+        self._relocate_owned_staging_root_if_nested_in_direct_workspace()
 
     def configure_runtime(
         self,
@@ -352,6 +392,7 @@ class SbxInterpreter(PersistentJsonRpcRunnerClient, PredictRLMInterpreter):
                 )
                 self._log_lifecycle("sbx.shutdown.rm")
         self._tool_executor.shutdown(wait=False, cancel_futures=True)
+        self._cleanup_direct_workspace_aliases_host_side()
         self._cleanup_staging_root()
         self._log_lifecycle("sbx.shutdown.complete")
 
@@ -364,32 +405,55 @@ class SbxInterpreter(PersistentJsonRpcRunnerClient, PredictRLMInterpreter):
         except OSError:
             pass
 
+    def _relocate_owned_staging_root_if_nested_in_direct_workspace(self) -> None:
+        if not self._owns_staging_root:
+            return
+        staging_root = self._staging_root.resolve()
+        for mount in self._direct_workspace_mounts:
+            direct_root = Path(mount.host_path).resolve()
+            try:
+                staging_root.relative_to(direct_root)
+            except ValueError:
+                continue
+            old_staging_root = self._staging_root
+            self._staging_root = Path(tempfile.mkdtemp(prefix="predict-rlm-sbx-"))
+            shutil.rmtree(old_staging_root, ignore_errors=True)
+            try:
+                old_staging_root.parent.rmdir()
+            except OSError:
+                pass
+            return
+
     def _ensure_process(self) -> None:
         if self._proc and self._proc.poll() is None:
             return
         if self._proc and self._proc.poll() is not None:
             raise SandboxFatalError("Sbx supervisor process exited unexpectedly")
 
-        if self._supervisor_command is not None:
-            command = self._supervisor_command
-        else:
-            command = self._start_sbx_and_build_supervisor_command()
-
-        env = os.environ.copy()
-        env["PREDICT_RLM_SBX_ROOT"] = str(self._staging_root)
-        self._log_lifecycle(
-            "sbx.runner.start",
-            command=command[0] if command else None,
-        )
-        self._proc = subprocess.Popen(
-            command,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            env=env,
-            bufsize=1,
-        )
+        try:
+            if self._supervisor_command is not None:
+                self._setup_direct_workspace_aliases_host_side()
+                command = self._supervisor_command
+            else:
+                command = self._start_sbx_and_build_supervisor_command()
+            env = os.environ.copy()
+            env["PREDICT_RLM_SBX_ROOT"] = str(self._staging_root)
+            self._proc = subprocess.Popen(
+                command,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                env=env,
+                bufsize=1,
+            )
+        except BaseException as exc:
+            self._log_lifecycle(
+                "sbx.runner.error",
+                error_type=type(exc).__name__,
+                status="error",
+            )
+            raise
         self._log_lifecycle("sbx.runner.started")
         self._start_stdout_reader()
         if self.output_fields:
@@ -428,12 +492,14 @@ class SbxInterpreter(PersistentJsonRpcRunnerClient, PredictRLMInterpreter):
             primary_workspace = str(self._staging_root)
             if self.config.workspace_read_only:
                 primary_workspace = f"{primary_workspace}:ro"
+            direct_workspaces = self._direct_workspace_args()
             create_cmd = [
                 "sbx",
                 "create",
                 "shell",
                 primary_workspace,
                 *self.config.extra_workspaces,
+                *direct_workspaces,
             ]
             if self.config.name:
                 create_cmd.extend(["--name", self.config.name])
@@ -494,13 +560,14 @@ class SbxInterpreter(PersistentJsonRpcRunnerClient, PredictRLMInterpreter):
             )
             self._apply_network_policy()
             self._bootstrap_packages()
+            self._setup_direct_workspace_aliases_in_sandbox()
         else:
             runner_path = self._prepared_runner_path or self._prepare_runner_script()
 
         assert self._sandbox_name is not None
         runner_root = self._staging_root
         runner_root.mkdir(parents=True, exist_ok=True)
-        return [
+        command = [
             "sbx",
             "exec",
             "-i",
@@ -513,6 +580,87 @@ class SbxInterpreter(PersistentJsonRpcRunnerClient, PredictRLMInterpreter):
             "-u",
             str(runner_path),
         ]
+        return command
+
+    def _direct_workspace_args(self) -> list[str]:
+        seen = {str(self._staging_root)}
+        args: list[str] = []
+        for mount in self._direct_workspace_mounts:
+            if mount.host_path in seen:
+                continue
+            seen.add(mount.host_path)
+            args.append(mount.host_path)
+        return args
+
+    def _direct_workspace_aliases(self) -> list[tuple[str, str]]:
+        return [
+            (mount.host_path, mount.sandbox_path)
+            for mount in self._direct_workspace_mounts
+            if mount.host_path != mount.sandbox_path
+        ]
+
+    def _setup_direct_workspace_aliases_in_sandbox(self) -> None:
+        aliases = self._direct_workspace_aliases()
+        if not aliases:
+            return
+        assert self._sandbox_name is not None
+        script = (
+            "import json, os, pathlib, sys\n"
+            "for source, target in json.loads(sys.argv[1]):\n"
+            "    source_path = pathlib.Path(source)\n"
+            "    target_path = pathlib.Path(target)\n"
+            "    if target_path.exists() or target_path.is_symlink():\n"
+            "        if target_path.is_symlink() and os.readlink(target_path) == str(source_path):\n"
+            "            continue\n"
+            "        raise FileExistsError(f'Direct workspace alias already exists: {target}')\n"
+            "    target_path.parent.mkdir(parents=True, exist_ok=True)\n"
+            "    target_path.symlink_to(source_path, target_is_directory=True)\n"
+        )
+        result = subprocess.run(
+            [
+                "sbx",
+                "exec",
+                "-w",
+                str(self._staging_root),
+                "-u",
+                "root",
+                self._sandbox_name,
+                SBX_PYTHON_EXECUTABLE,
+                "-c",
+                script,
+                json.dumps(aliases),
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=self.config.exec_timeout,
+        )
+        if result.returncode != 0:
+            raise SandboxFatalError(
+                "Failed to configure direct workspace aliases: "
+                f"stdout: {result.stdout.strip()}; stderr: {result.stderr.strip()}"
+            )
+
+    def _setup_direct_workspace_aliases_host_side(self) -> None:
+        for source, target in self._direct_workspace_aliases():
+            source_path = Path(source)
+            target_path = Path(target)
+            if target_path.exists() or target_path.is_symlink():
+                if target_path.is_symlink() and os.readlink(target_path) == str(source_path):
+                    continue
+                raise FileExistsError(f"Direct workspace alias already exists: {target}")
+            target_path.parent.mkdir(parents=True, exist_ok=True)
+            target_path.symlink_to(source_path, target_is_directory=True)
+            self._owned_direct_aliases.append(target_path)
+
+    def _cleanup_direct_workspace_aliases_host_side(self) -> None:
+        for path in reversed(self._owned_direct_aliases):
+            try:
+                if path.is_symlink():
+                    path.unlink()
+            except OSError:
+                pass
+        self._owned_direct_aliases.clear()
 
     def _start_sbx_and_build_runner_command(self) -> list[str]:
         return self._start_sbx_and_build_supervisor_command()

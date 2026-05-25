@@ -206,9 +206,42 @@ The backend mounts only a per-run staging directory under `.predict_rlm_sbx/` by
 default, preserving model-facing paths such as `/sandbox/input/...` and
 `/sandbox/output/...` without exposing the rest of the repo workspace. Use
 `SbxConfig(extra_workspaces=[...])` only when the sandbox needs explicit
-additional host mounts. Real `sbx` integration tests are skipped by default; run
-them with `PREDICT_RLM_RUN_SBX_TESTS=1 uv run pytest -m sbx` after the CLI is
-installed and logged in.
+additional static host mounts.
+
+For coding-agent workflows that need project commands to run against the real
+tree, pass a direct `Workspace` input and use the per-call SBX backend:
+
+```python
+import dspy
+
+from predict_rlm import PredictRLM, Workspace
+
+class UpdateProject(dspy.Signature):
+    workspace: Workspace = dspy.InputField()
+    request: str = dspy.InputField()
+    summary: str = dspy.OutputField()
+
+rlm = PredictRLM(UpdateProject, sandbox_backend="sbx")
+result = rlm(
+    workspace=Workspace(
+        path="/path/to/project",
+        mount_path="/workspace",
+        mode="direct",
+    ),
+    request="Run the tests and fix the failing import.",
+)
+```
+
+`Workspace(mode="direct")` mounts the host directory directly into the Docker
+Sandbox. Python code and subprocesses see the mounted path, and file edits are
+host edits immediately; no mirror or post-execute sync is used. Direct
+workspaces require `sandbox_backend="sbx"` and are not supported with `SbxPool`
+in this version because pool sandboxes are created before per-call inputs are
+known.
+
+Real `sbx` integration tests are skipped by default; run them with
+`PREDICT_RLM_RUN_SBX_TESTS=1 uv run pytest -m sbx` after the CLI is installed
+and logged in.
 
 The native execution stack uses a persistent supervisor plus a persistent Python kernel so successful iterations preserve full REPL state. Per-iteration timeouts are recoverable when the backend can interrupt execution cleanly; native hard-kill fallback restores only a pre-timeout pickleable snapshot and tells the RLM which globals / imports were lost.
 

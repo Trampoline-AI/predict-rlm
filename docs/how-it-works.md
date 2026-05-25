@@ -90,7 +90,7 @@ results = await asyncio.gather(*[
 
 ## Mutable workspaces
 
-Use `Workspace` when the RLM should edit a host directory directly, such as fixing code, updating a project, or producing several related files whose names are not known up front. A workspace is an input-only field: predict-rlm mirrors eligible host files into the sandbox, gives the RLM the sandbox path, and syncs sandbox changes back to the host after each code block.
+Use `Workspace` when the RLM should edit a host directory, such as fixing code, updating a project, or producing several related files whose names are not known up front. A workspace is an input-only field. By default, predict-rlm mirrors eligible host files into the sandbox, gives the RLM the sandbox path, and syncs sandbox changes back to the host after each code block.
 
 ```python
 from predict_rlm import PredictRLM, Workspace
@@ -119,7 +119,7 @@ text = source.read_text()
 source.write_text(text.replace("if not value: continue", "if value is None: continue"))
 ```
 
-Workspace sync is conservative:
+Default workspace sync is conservative:
 
 - Excluded names such as `.git`, `.venv`, `node_modules`, caches, `dist`, and `build` are not mirrored or synced back.
 - Files larger than `max_file_bytes` are skipped on the way in. If a sandbox edit grows a file beyond that limit, sync raises a conflict instead of deleting or overwriting the host file.
@@ -127,3 +127,23 @@ Workspace sync is conservative:
 - If the host and sandbox both change the same path since the last sync, sync raises `WorkspaceSyncConflictError` rather than clobbering the host change.
 
 Use `File` outputs when the RLM should return specific generated artifacts. Use `Workspace` when the output is a set of edits to an existing directory.
+
+### Direct SBX workspaces
+
+For local coding-agent workflows, mirror mode can be too isolated: project commands often need the real lockfiles, generated files, local toolchains, and normal subprocess behavior. With the Docker Sandboxes backend, `Workspace(mode="direct")` mounts the host directory directly into the sandbox:
+
+```python
+rlm = PredictRLM(FixBug, sandbox_backend="sbx")
+result = rlm(
+    workspace=Workspace(
+        path="/path/to/project",
+        mount_path="/workspace",
+        mode="direct",
+    ),
+    bug_report="The CSV importer drops rows with empty optional columns.",
+)
+```
+
+In direct mode, the RLM receives the mounted sandbox path, Python code and child subprocesses can use that path, and file edits are real host workspace edits immediately. predict-rlm does not create a mirror, does not apply `exclude` or `max_file_bytes`, and does not run post-execute workspace sync.
+
+Direct mode requires `sandbox_backend="sbx"`. JSPI/Pyodide rejects direct workspaces because it cannot directly mount host directories. `SbxPool` also rejects direct workspaces in this version because pooled sandboxes are created before per-call workspace inputs are known.

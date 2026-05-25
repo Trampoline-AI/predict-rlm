@@ -16,7 +16,16 @@ Lifecycle callbacks:
                     to broadcast progress (e.g. to a websocket).
 """
 
-from .files import File, LocalDir, LocalFile, OutputDir, OutputFile, SyncedFile, Workspace
+from .files import (
+    File,
+    LocalDir,
+    LocalFile,
+    OutputDir,
+    OutputFile,
+    SyncedFile,
+    Workspace,
+    WorkspaceMode,
+)
 from .interpreters import (
     DEFAULT_SBX_TEMPLATE,
     SandboxBackend,
@@ -45,4 +54,5 @@ __all__ = [
     "SbxPool",
     "SyncedFile",
     "Workspace",
+    "WorkspaceMode",
 ]

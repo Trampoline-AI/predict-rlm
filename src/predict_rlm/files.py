@@ -33,8 +33,10 @@ from pydantic import BaseModel, Field
 
 from .workspace import (
     DEFAULT_WORKSPACE_EXCLUDES,
+    DirectWorkspaceMount,
     Workspace,
     WorkspaceFileInfo,
+    WorkspaceMode,
     WorkspaceSyncConflict,
     WorkspaceSyncConflictError,
     WorkspaceSyncState,
@@ -43,6 +45,7 @@ from .workspace import (
 __all__ = [
     "DEFAULT_WORKSPACE_EXCLUDES",
     "File",
+    "DirectWorkspaceMount",
     "LocalDir",
     "LocalFile",
     "OutputDir",
@@ -50,6 +53,7 @@ __all__ = [
     "SyncedFile",
     "Workspace",
     "WorkspaceFileInfo",
+    "WorkspaceMode",
     "WorkspaceSyncConflict",
     "WorkspaceSyncConflictError",
     "WorkspaceSyncState",
@@ -276,13 +280,38 @@ def build_file_instructions(
                 lines.append(f"- `{field_name}`: workspace at {sandbox_path}")
         lines.append(
             "Edit workspace files using standard Python/os/pathlib APIs under the "
-            "mounted path. Workspace changes sync back to the host after each "
-            "code block, including failed code blocks when the sandbox remains alive. "
+            "mounted path. Mirror-mode workspace changes sync back to the host after "
+            "each code block, including failed code blocks when the sandbox remains "
+            "alive. Direct SBX workspaces update host files immediately. "
             "Do not submit workspace files as `File` outputs; they sync automatically."
         )
         lines.append("")
 
     return "\n".join(lines)
+
+
+def _uses_default_workspace_mount_path(workspace: Workspace) -> bool:
+    return (
+        "mount_path" not in workspace.model_fields_set
+        and workspace.mount_path == Workspace.model_fields["mount_path"].default
+    )
+
+
+def _direct_workspace_sandbox_path(workspace: Workspace, workspace_root: str) -> str:
+    if os.path.islink(workspace_root):
+        raise ValueError(f"Workspace path cannot be a symlink: {workspace.path}")
+    if _uses_default_workspace_mount_path(workspace):
+        return workspace_root
+    mount_path = workspace.mount_path
+    if mount_path == "/sandbox" or mount_path.startswith("/sandbox/"):
+        raise ValueError(
+            "Workspace(mode='direct') mount_path must not be under /sandbox; "
+            "omit mount_path to use the SBX-mounted host path, or pass an absolute "
+            "sandbox path such as /workspace."
+        )
+    if not mount_path.startswith("/"):
+        raise ValueError("Workspace(mode='direct') mount_path must be absolute.")
+    return mount_path
 
 
 def build_file_plan(
@@ -318,6 +347,7 @@ def build_file_plan(
     input_mounts_for_instructions: dict[str, str | list[str]] = {}
     workspace_mounts_for_instructions: dict[str, str | list[str]] = {}
     workspace_states: list[WorkspaceSyncState] = []
+    direct_workspace_mounts: list[DirectWorkspaceMount] = []
 
     # Process input file fields
     for field_name, kind in input_file_fields.items():
@@ -381,12 +411,22 @@ def build_file_plan(
         workspaces = value if kind == "list_workspace" else [value]
         mount_paths: list[str] = []
         for workspace in workspaces:
-            state = WorkspaceSyncState(workspace)
-            workspace_states.append(state)
             workspace_root = os.path.abspath(workspace.path)
+            if workspace.mode is WorkspaceMode.DIRECT:
+                sandbox_path = _direct_workspace_sandbox_path(workspace, workspace_root)
+                direct_workspace_mounts.append(
+                    DirectWorkspaceMount(
+                        host_path=workspace_root,
+                        sandbox_path=sandbox_path,
+                    )
+                )
+                mount_paths.append(sandbox_path)
+            else:
+                state = WorkspaceSyncState(workspace)
+                workspace_states.append(state)
+                mount_paths.append(workspace.mount_path)
             read_paths.append(workspace_root)
             write_paths.append(workspace_root)
-            mount_paths.append(workspace.mount_path)
         workspace_mounts_for_instructions[field_name] = (
             mount_paths if kind == "list_workspace" else mount_paths[0]
         )
@@ -417,6 +457,7 @@ def build_file_plan(
         "write_dir": host_output_base,
         "output_field_map": output_field_map,
         "workspace_states": workspace_states,
+        "direct_workspace_mounts": direct_workspace_mounts,
         "workspace_mounts_for_instructions": workspace_mounts_for_instructions,
         "instructions": instructions,
     }

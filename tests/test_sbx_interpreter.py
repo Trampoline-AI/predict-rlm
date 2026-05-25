@@ -23,6 +23,7 @@ from dspy.primitives.code_interpreter import CodeInterpreterError, FinalOutput
 from predict_rlm.files import SyncedFile
 from predict_rlm.interpreter import SandboxFatalError
 from predict_rlm.interpreters import DEFAULT_SBX_TEMPLATE, SbxConfig, SbxInterpreter, SbxPool
+from predict_rlm.workspace import DirectWorkspaceMount
 
 RUNNER_PATH = Path(__file__).parents[1] / "src" / "predict_rlm" / "sandbox" / "python_runner.py"
 
@@ -1247,6 +1248,90 @@ while True:
         finally:
             interpreter.shutdown()
 
+    def test_direct_workspace_alias_is_usable_by_subprocess(self, tmp_path: Path):
+        workspace = tmp_path / "workspace"
+        workspace.mkdir()
+        alias = tmp_path / "alias-workspace"
+        interpreter = self.make_interpreter(tmp_path)
+        interpreter.configure_direct_workspace_mounts([
+            DirectWorkspaceMount(host_path=str(workspace), sandbox_path=str(alias))
+        ])
+        try:
+            output = interpreter.execute(
+                "import subprocess\n"
+                "from pathlib import Path\n"
+                "command = (\n"
+                "    \"from pathlib import Path; \"\n"
+                "    f\"Path({workspace!r}).joinpath('created.txt').write_text('direct')\"\n"
+                ")\n"
+                "result = subprocess.run(\n"
+                "    ['python3', '-c', command],\n"
+                "    capture_output=True,\n"
+                "    text=True,\n"
+                ")\n"
+                "print(result.returncode)\n"
+                "print(Path(workspace).joinpath('created.txt').read_text())",
+                variables={"workspace": str(alias)},
+            )
+        finally:
+            interpreter.shutdown()
+
+        assert output.strip().splitlines() == ["0", "direct"]
+        assert (workspace / "created.txt").read_text(encoding="utf-8") == "direct"
+        assert not alias.exists()
+
+    def test_owned_staging_root_relocates_outside_direct_workspace(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        workspace = tmp_path / "workspace"
+        workspace.mkdir()
+        monkeypatch.chdir(workspace)
+        interpreter = SbxInterpreter(
+            config=SbxConfig(name="local-test"),
+            preinstall_packages=False,
+            _runner_command=[sys.executable, "-u", str(RUNNER_PATH)],
+            _staging_root=None,
+        )
+        old_staging_root = interpreter._staging_root
+        try:
+            interpreter.configure_direct_workspace_mounts([
+                DirectWorkspaceMount(
+                    host_path=str(workspace),
+                    sandbox_path="/workspace",
+                )
+            ])
+
+            assert old_staging_root.is_relative_to(workspace)
+            assert interpreter._staging_root != old_staging_root
+            with pytest.raises(ValueError):
+                interpreter._staging_root.resolve().relative_to(workspace.resolve())
+        finally:
+            interpreter.shutdown()
+
+    def test_direct_workspace_file_helpers_map_alias_to_host_path(self, tmp_path: Path):
+        workspace = tmp_path / "workspace"
+        workspace.mkdir()
+        alias = tmp_path / "alias-workspace"
+        source = tmp_path / "source.txt"
+        source.write_text("copied", encoding="utf-8")
+        output = tmp_path / "output.txt"
+        interpreter = self.make_interpreter(tmp_path)
+        interpreter.configure_direct_workspace_mounts([
+            DirectWorkspaceMount(host_path=str(workspace), sandbox_path=str(alias))
+        ])
+        try:
+            interpreter.mount_file_at(str(source), f"{alias}/nested/source.txt")
+            files = interpreter.list_dir(str(alias))
+            interpreter.sync_file_to(f"{alias}/nested/source.txt", str(output))
+        finally:
+            interpreter.shutdown()
+
+        assert (workspace / "nested" / "source.txt").read_text(
+            encoding="utf-8"
+        ) == "copied"
+        assert files == [f"{alias}/nested/source.txt"]
+        assert output.read_text(encoding="utf-8") == "copied"
+
 
 class TestSbxCommandConstruction:
     def test_default_template_uses_explicit_non_docker_shell_template(
@@ -1390,7 +1475,53 @@ class TestSbxCommandConstruction:
         assert create_cmd[:4] == ["sbx", "create", "shell", workspace_arg]
         assert create_cmd[4:6] == [str(extra_one), str(extra_two)]
 
-    def test_default_workspace_is_staging_root_not_repo(self, monkeypatch, tmp_path: Path):
+    def test_direct_workspace_mounts_are_added_to_create_command_and_aliased(
+        self, monkeypatch, tmp_path: Path
+    ):
+        commands: list[list[str]] = []
+        direct_workspace = tmp_path / "direct-workspace"
+        direct_workspace.mkdir()
+
+        def fake_run(command, **kwargs):
+            commands.append(command)
+            return subprocess.CompletedProcess(command, 0, stdout="created-name\n", stderr="")
+
+        monkeypatch.setattr(shutil, "which", lambda name: "/usr/local/bin/sbx")
+        monkeypatch.setattr(subprocess, "run", fake_run)
+        interpreter = SbxInterpreter(
+            config=SbxConfig(name="created-name"),
+            preinstall_packages=False,
+            _staging_root=tmp_path / "staging",
+        )
+        interpreter.configure_direct_workspace_mounts([
+            DirectWorkspaceMount(
+                host_path=str(direct_workspace),
+                sandbox_path="/workspace",
+            )
+        ])
+
+        interpreter._start_sbx_and_build_supervisor_command()
+
+        create_cmd = commands[0]
+        alias_cmd = commands[1]
+        assert create_cmd[:4] == ["sbx", "create", "shell", str(tmp_path / "staging")]
+        assert str(direct_workspace) in create_cmd
+        assert alias_cmd[:4] == [
+            "sbx",
+            "exec",
+            "-w",
+            str(tmp_path / "staging"),
+        ]
+        assert alias_cmd[4:7] == [
+            "-u",
+            "root",
+            "created-name",
+        ]
+        assert json.loads(alias_cmd[-1]) == [[str(direct_workspace), "/workspace"]]
+
+    def test_default_workspace_is_staging_root_not_repo(
+        self, monkeypatch, tmp_path: Path
+    ):
         commands: list[list[str]] = []
 
         def fake_run(command, **kwargs):

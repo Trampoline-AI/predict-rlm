@@ -17,6 +17,9 @@ rlm = PredictRLM(
     max_output_chars=100_000, # Max chars from REPL output
     verbose=True,             # Print human-readable iteration trace blocks
     tools=None,               # Additional tool functions
+    sandbox_backend=None,     # "jspi" default, or "sbx"
+    sbx_config=None,          # Docker Sandboxes config
+    sbx_pool=None,            # Optional prewarmed SBX pool
     skills=None,              # List of Skill instances
     allowed_domains=None,     # Domains the sandbox can access
     debug=False,              # Print timestamped lifecycle diagnostics
@@ -36,6 +39,9 @@ rlm = PredictRLM(
 | `max_output_chars` | `int` | `100_000` | Maximum characters to include from REPL output per iteration. |
 | `verbose` | `bool` | `True` | Print human-readable RLM iteration blocks to stderr: reasoning, generated code, output, tool calls, errors, and `SUBMIT` payloads. Pass `False` for quiet execution. |
 | `tools` | `dict[str, Callable] \| list[Callable] \| None` | `None` | Additional tool functions callable from the sandbox. Accepts a dict mapping names to callables, or a list of callables (names inferred from `__name__`). `predict` is added automatically. |
+| `sandbox_backend` | `"jspi" \| "sbx" \| None` | `None` | Sandbox backend to create when `interpreter` is not provided. `None` uses the default JSPI/Pyodide backend; pass `"sbx"` for Docker Sandboxes. |
+| `sbx_config` | `SbxConfig \| None` | `None` | Docker Sandboxes backend configuration. Only used with `sandbox_backend="sbx"` and without `sbx_pool`. |
+| `sbx_pool` | `SbxPool \| None` | `None` | Prewarmed Docker Sandboxes interpreter pool. Requires `sandbox_backend="sbx"` and cannot be combined with `sbx_config` or direct workspaces. |
 | `skills` | `list[Skill] \| None` | `None` | [Skills](skills.md) providing domain-specific instructions, packages, and tools. Merged automatically. |
 | `allowed_domains` | `list[str] \| None` | `None` | Domains/IPs the sandbox can access via network. By default, no network access. Example: `["api.example.com", "192.168.1.100:8080"]` |
 | `debug` | `bool` | `False` | Print timestamped RLM and sandbox lifecycle diagnostics to stderr. Error-like debug records are colored red when the terminal supports ANSI colors. |
@@ -279,7 +285,7 @@ class MySignature(dspy.Signature):
 
 ## `Workspace`
 
-Mutable host directory mounted into the sandbox and synced back after execution steps. Use `Workspace` for coding-agent workflows where the RLM should edit an existing directory instead of returning one explicit `File` output.
+Mutable host directory made available in the sandbox. Use `Workspace` for coding-agent workflows where the RLM should edit an existing directory instead of returning one explicit `File` output.
 
 ```python
 from predict_rlm import PredictRLM, Workspace
@@ -296,12 +302,12 @@ result = rlm(
 )
 ```
 
-`Workspace` fields are input-only. Inside the sandbox, the field value is replaced with the workspace mount path string, so the RLM reads and writes files with standard Python APIs:
+`Workspace` fields are input-only. Inside the sandbox, the field value is replaced with the effective workspace path string, so the RLM reads and writes files with standard Python APIs:
 
 ```python
 from pathlib import Path
 
-root = Path(workspace)  # /sandbox/workspace by default
+root = Path(workspace)  # /sandbox/workspace in mirror mode by default
 config = root / "pyproject.toml"
 config.write_text(config.read_text().replace("old", "new"))
 ```
@@ -310,13 +316,14 @@ config.write_text(config.read_text().replace("old", "new"))
 
 | Field | Type | Default | Description |
 |---|---|---|---|
-| `path` | `str` | — | Host directory to mirror into the sandbox. Must exist and must not be a symlink. |
-| `mount_path` | `str` | `"/sandbox/workspace"` | Sandbox directory where the workspace is mounted. Use distinct mount paths when passing `list[Workspace]`. |
-| `sync_back` | `bool` | `True` | Whether sandbox changes are synced back to the host after each code block. |
-| `exclude` | `list[str]` | common caches/build dirs | Directory or file names excluded from mirroring and sync-back. Defaults include `.git`, `.venv`, `node_modules`, `__pycache__`, `.pytest_cache`, `.mypy_cache`, `.ruff_cache`, `dist`, `build`, and `.DS_Store`. |
-| `max_file_bytes` | `int \| None` | `5_000_000` | Maximum file size to mirror and sync. Larger host files are skipped. Oversized sandbox changes raise a sync conflict. Set to `None` to disable the size limit. |
+| `path` | `str` | — | Host directory to make available in the sandbox. Must exist. Mirror-mode workspace roots must not be symlinks. |
+| `mount_path` | `str` | `"/sandbox/workspace"` | Sandbox path given to the RLM. In mirror mode this must be a `/sandbox/...` path. In direct mode, omit it to use the SBX-mounted host absolute path, or pass an absolute alias such as `"/workspace"`. Direct mode rejects `/sandbox/...` mount paths. Use distinct mount paths when passing `list[Workspace]`. |
+| `mode` | `"mirror" \| "direct"` | `"mirror"` | Mounting strategy. `"mirror"` copies eligible files into the sandbox and syncs changes back. `"direct"` uses an SBX passthrough mount and writes to the host immediately. |
+| `sync_back` | `bool` | `True` | Mirror mode only: whether sandbox changes are synced back to the host after each code block. Direct mode ignores this because writes are immediate. |
+| `exclude` | `list[str]` | common caches/build dirs | Mirror mode only: directory or file names excluded from mirroring and sync-back. Defaults include `.git`, `.venv`, `node_modules`, `__pycache__`, `.pytest_cache`, `.mypy_cache`, `.ruff_cache`, `dist`, `build`, and `.DS_Store`. |
+| `max_file_bytes` | `int \| None` | `5_000_000` | Mirror mode only: maximum file size to mirror and sync. Larger host files are skipped. Oversized sandbox changes raise a sync conflict. Set to `None` to disable the size limit. |
 
-### Sync behavior
+### Mirror-mode sync behavior
 
 At setup time, predict-rlm scans the host workspace, skips excluded names, symlinks, non-regular files, and files larger than `max_file_bytes`, then mounts the remaining files into `mount_path`.
 
@@ -330,6 +337,28 @@ After each sandbox code block, including failed code blocks while the sandbox pr
 - Host symlinks, symlink parent paths, non-directory parent paths, and root escapes raise sync conflicts.
 
 The host workspace path is added to the sandbox's Deno read and write permissions so the runner can mount initial files and sync changes back.
+
+### Direct SBX behavior
+
+Direct mode is for SBX-backed coding-agent workflows that need project commands to operate on the real project tree:
+
+```python
+from predict_rlm import PredictRLM, Workspace
+
+rlm = PredictRLM(UpdateProject, sandbox_backend="sbx")
+result = rlm(
+    workspace=Workspace(
+        path="/path/to/project",
+        mount_path="/workspace",
+        mode="direct",
+    ),
+    request="Run pytest and fix the failing import.",
+)
+```
+
+`Workspace(mode="direct")` is mounted into Docker Sandboxes as a passthrough workspace. The RLM receives the real sandbox-visible path, Python code and subprocesses can use it directly, and file changes are host changes immediately. predict-rlm does not create `WorkspaceSyncState`, does not mirror files, and does not sync after code blocks.
+
+Direct mode requires `sandbox_backend="sbx"` with a per-call SBX interpreter. JSPI/Pyodide raises `Workspace(mode="direct") requires the SBX backend.` `SbxPool` raises a clear error in this version because pooled sandboxes are created before per-call workspace inputs are known.
 
 ### Multiple workspaces
 
