@@ -16,19 +16,22 @@ import time
 from pathlib import Path
 from typing import Any, Callable, Protocol
 
-from dspy.primitives.code_interpreter import CodeInterpreterError, FinalOutput
+from dspy.primitives.code_interpreter import CodeInterpreterError
 
 from predict_rlm.execution_timeout import (
     DEFAULT_RECOVERABLE_EXECUTION_TIMEOUT_GRACE_SECONDS,
     ITERATION_TIMEOUT_FAILURE_CLASS,
-    format_recoverable_timeout_result,
     recoverable_timeout_host_deadline_seconds,
     validate_execution_timeout,
 )
 from predict_rlm.interpreter import SandboxFatalError
 from predict_rlm.interpreters.base import InterpreterExecutionGate, PredictRLMInterpreter
+from predict_rlm.interpreters.persistent_runner import (
+    PersistentJsonRpcRunnerClient,
+    PersistentSupervisorProcess,
+)
 
-from .protocol import RunnerError, dumps, request
+from .protocol import RunnerError
 from .runner import runner_source
 
 TERMINAL_BENCH_RECOVERABLE_TIMEOUT_GRACE_SECONDS = (
@@ -44,7 +47,7 @@ def _shell_python_command(python_executable: str, args: list[str]) -> str:
     resolver = (
         "if command -v python3 >/dev/null 2>&1; then _predict_rlm_python=python3; "
         "elif command -v python >/dev/null 2>&1; then _predict_rlm_python=python; "
-        "else echo 'PredictRLM runner requires python3 or python on PATH' >&2; "
+        "else echo 'PredictRLM supervisor requires python3 or python on PATH' >&2; "
         "exit 127; fi; "
     )
     return f'{resolver}"$_predict_rlm_python" {quoted_args}'.rstrip()
@@ -60,7 +63,7 @@ def _python_bootstrap_command() -> str:
             "elif command -v microdnf >/dev/null 2>&1; then microdnf install -y python3;",
             "elif command -v dnf >/dev/null 2>&1; then dnf install -y python3;",
             "elif command -v yum >/dev/null 2>&1; then yum install -y python3;",
-            "else echo 'PredictRLM runner requires python3 or python on PATH and no supported package manager was found' >&2; exit 127; fi;",
+            "else echo 'PredictRLM supervisor requires python3 or python on PATH and no supported package manager was found' >&2; exit 127; fi;",
             "command -v python3 >/dev/null 2>&1 || command -v python >/dev/null 2>&1",
         ]
     )
@@ -166,7 +169,7 @@ class _TimeoutLineReader:
             return
         self._thread = threading.Thread(
             target=self._read_loop,
-            name="terminal-bench-runner-stdout",
+            name="terminal-bench-supervisor-stdout",
             daemon=True,
         )
         self._thread.start()
@@ -225,7 +228,7 @@ class HarborContainerAdapter:
         return NotImplementedError(
             "Terminal-Bench minimal smoke adapter does not support "
             f"{operation} yet; this smoke path only installs and starts the "
-            "persistent runner."
+            "persistent supervisor."
         )
 
     def copy_to(self, host_path: str, container_path: str) -> None:
@@ -437,7 +440,7 @@ class HarborEnvironmentAdapter(HarborContainerAdapter):
         raise TypeError(
             "Harbor environment does not expose an interactive exec method and "
             "no Docker SDK container id is available; persistent PredictRLM "
-            "runner execution requires start_exec/exec_stream/popen or docker exec -i"
+            "supervisor execution requires start_exec/exec_stream/popen or docker exec -i"
         )
 
     def _start_docker_compose_exec(
@@ -482,7 +485,7 @@ class HarborEnvironmentAdapter(HarborContainerAdapter):
         )
 
 
-class TerminalBenchRunnerInterpreter(PredictRLMInterpreter):
+class TerminalBenchRunnerInterpreter(PersistentJsonRpcRunnerClient, PredictRLMInterpreter):
     _LIST_DIR_SCRIPT = (
         "import json, pathlib, sys; "
         "root = pathlib.Path(sys.argv[1]); "
@@ -502,6 +505,10 @@ class TerminalBenchRunnerInterpreter(PredictRLMInterpreter):
         exec_timeout: float = 900.0,
         recoverable_timeout_grace: float = TERMINAL_BENCH_RECOVERABLE_TIMEOUT_GRACE_SECONDS,
     ) -> None:
+        PersistentJsonRpcRunnerClient.__init__(
+            self,
+            supervisor_name="Terminal-Bench supervisor",
+        )
         self.container = container
         self.adapter = container_adapter or HarborContainerAdapter(container)
         self.tools = tools or {}
@@ -514,12 +521,11 @@ class TerminalBenchRunnerInterpreter(PredictRLMInterpreter):
             recoverable_timeout_grace
         )
         self._process: ContainerProcess | None = None
-        self._request_id = 0
         self._shutdown = False
         self._tools_registered = False
         self._output_fields_registered = False
         self._stdout_reader: _TimeoutLineReader | None = None
-        self._execution_gate = InterpreterExecutionGate("Terminal-Bench runner")
+        self._execution_gate = InterpreterExecutionGate("Terminal-Bench supervisor")
 
     def execute(
         self,
@@ -640,7 +646,9 @@ class TerminalBenchRunnerInterpreter(PredictRLMInterpreter):
             return
         if self._process is not None and self._process.poll() is not None:
             stderr = self._read_stderr()
-            raise SandboxFatalError(f"Terminal-Bench runner exited unexpectedly: {stderr}")
+            raise SandboxFatalError(
+                f"Terminal-Bench supervisor exited unexpectedly: {stderr}"
+            )
         self._copy_runner_script()
         self._process = self.adapter.start_exec(
             [self.python_executable, "-u", self.runner_path],
@@ -688,10 +696,7 @@ class TerminalBenchRunnerInterpreter(PredictRLMInterpreter):
         *,
         timeout: float | None = None,
     ) -> dict[str, Any]:
-        if method == "shutdown" and self._process is not None:
-            return self._send_request_without_ensure(method, params)
-        self._ensure_process()
-        return self._send_request_without_ensure(method, params, timeout=timeout)
+        return self._send_json_rpc_request(method, params, timeout=timeout)
 
     def _send_request_without_ensure(
         self,
@@ -700,61 +705,48 @@ class TerminalBenchRunnerInterpreter(PredictRLMInterpreter):
         *,
         timeout: float | None = None,
     ) -> dict[str, Any]:
-        process = self._require_process()
-        self._request_id += 1
-        request_id = self._request_id
-        payload = request(request_id, method, params or {})
-        try:
-            process.stdin.write(dumps(payload) + "\n")
-            process.stdin.flush()
-        except BrokenPipeError as exc:
-            raise SandboxFatalError("Terminal-Bench runner pipe broke") from exc
-
-        request_timeout = self.exec_timeout if timeout is None else timeout
-        deadline = time.monotonic() + request_timeout
-        recoverable_timeout_seconds = self._recoverable_execution_timeout_seconds(
+        return self._send_json_rpc_request_without_ensure(
             method,
-            params or {},
+            params,
+            timeout=timeout,
         )
-        stdout_tail: list[str] = []
-        while True:
-            if process.poll() is not None:
-                raise SandboxFatalError(
-                    f"Terminal-Bench runner exited unexpectedly: {self._read_stderr()}"
-                )
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                return self._handle_runner_request_timeout(
-                    process,
-                    request_id,
-                    request_timeout=request_timeout,
-                    recoverable_timeout_seconds=recoverable_timeout_seconds,
-                    stdout_tail="".join(stdout_tail)[-4000:],
-                )
-            line = self._read_stdout_line(process, timeout=remaining)
-            if line is None:
-                return self._handle_runner_request_timeout(
-                    process,
-                    request_id,
-                    request_timeout=request_timeout,
-                    recoverable_timeout_seconds=recoverable_timeout_seconds,
-                    stdout_tail="".join(stdout_tail)[-4000:],
-                )
-            if not line:
-                time.sleep(0.01)
-                continue
-            try:
-                message = json.loads(line)
-            except json.JSONDecodeError:
-                stdout_tail.append(line)
-                continue
-            if message.get("method") == "tool_call":
-                self._write_tool_response(
-                    self._build_tool_response(message, deadline=deadline)
-                )
-                continue
-            if message.get("id") == request_id:
-                return message
+
+    def _get_supervisor_process(self) -> ContainerProcess | None:
+        return self._process
+
+    def _ensure_process_for_request(self, method: str) -> None:
+        if method == "shutdown" and self._process is not None:
+            return
+        self._ensure_process()
+
+    def _request_timeout_seconds(
+        self,
+        method: str,
+        params: dict[str, Any],
+        timeout: float | None,
+    ) -> float:
+        return self.exec_timeout if timeout is None else timeout
+
+    def _handle_supervisor_send_error(
+        self,
+        method: str,
+        request_id: int,
+        exc: BrokenPipeError,
+    ) -> None:
+        raise SandboxFatalError("Terminal-Bench supervisor pipe broke") from exc
+
+    def _handle_supervisor_exit_during_request(
+        self,
+        method: str,
+        *,
+        request_id: int,
+        request_start: float,
+        process: PersistentSupervisorProcess,
+    ) -> None:
+        raise SandboxFatalError(
+            f"Terminal-Bench supervisor exited unexpectedly: "
+            f"{self._read_stderr_for_process(process)}"
+        )
 
     def _recoverable_execution_timeout_seconds(
         self,
@@ -765,23 +757,29 @@ class TerminalBenchRunnerInterpreter(PredictRLMInterpreter):
             return None
         return self._resolve_execution_timeout(params["execution_timeout_seconds"])
 
-    def _handle_runner_request_timeout(
+    def _handle_supervisor_request_timeout(
         self,
-        process: ContainerProcess,
-        request_id: int,
+        method: str,
+        params: dict[str, Any],
+        process: PersistentSupervisorProcess,
         *,
+        request_id: int,
         request_timeout: float,
-        recoverable_timeout_seconds: float | None,
+        request_start: float,
         stdout_tail: str = "",
     ) -> dict[str, Any]:
+        recoverable_timeout_seconds = self._recoverable_execution_timeout_seconds(
+            method,
+            params,
+        )
         self._kill_process_after_timeout(process)
         stderr = self._read_stderr_for_process(process)
         if recoverable_timeout_seconds is None:
             raise SandboxFatalError(
-                f"Terminal-Bench runner request timed out after {request_timeout:g}s"
+                f"Terminal-Bench supervisor request timed out after {request_timeout:g}s"
             )
 
-        self._discard_runner_process()
+        self._discard_supervisor_process()
         restart_error: BaseException | None = None
         try:
             self._ensure_process()
@@ -789,21 +787,21 @@ class TerminalBenchRunnerInterpreter(PredictRLMInterpreter):
             restart_error = exc
         if restart_error is not None:
             raise SandboxFatalError(
-                "Terminal-Bench runner request timed out after "
-                f"{request_timeout:g}s and the copied runner could not be restarted: "
+                "Terminal-Bench supervisor request timed out after "
+                f"{request_timeout:g}s and the copied supervisor could not be restarted: "
                 f"{restart_error}"
             ) from restart_error
 
         diagnostic = (
-            "Terminal-Bench runner request timed out after "
+            "Terminal-Bench supervisor request timed out after "
             f"{request_timeout:g}s before it returned a structured timeout. "
-            "The copied runner process was killed and restarted; Python globals "
-            "from the timed-out runner were lost, while task container filesystem "
+            "The copied supervisor process was killed and restarted; Python globals "
+            "from the timed-out supervisor were lost, while task container filesystem "
             "state is preserved. Re-run setup code before relying on in-memory "
             "variables."
         )
         if stderr:
-            diagnostic = f"{diagnostic}\n[runner stderr before restart]\n{stderr.rstrip()}"
+            diagnostic = f"{diagnostic}\n[supervisor stderr before restart]\n{stderr.rstrip()}"
         return {
             "jsonrpc": "2.0",
             "id": request_id,
@@ -814,15 +812,29 @@ class TerminalBenchRunnerInterpreter(PredictRLMInterpreter):
             },
         }
 
-    def _read_stdout_line(
+    def _read_supervisor_stdout_line(
         self,
-        process: ContainerProcess,
+        process: PersistentSupervisorProcess,
         *,
+        deadline: float,
         timeout: float,
     ) -> str | None:
         if self._stdout_reader is None or self._stdout_reader.process is not process:
             self._stdout_reader = _TimeoutLineReader(process)
         return self._stdout_reader.readline(timeout)
+
+    def _handle_supervisor_control_message(
+        self,
+        message: dict[str, Any],
+        *,
+        deadline: float,
+    ) -> bool:
+        if message.get("method") != "tool_call":
+            return False
+        self._write_tool_response(
+            self._build_tool_response(message, deadline=deadline)
+        )
+        return True
 
     def _kill_process_after_timeout(self, process: ContainerProcess) -> None:
         process.kill()
@@ -831,11 +843,32 @@ class TerminalBenchRunnerInterpreter(PredictRLMInterpreter):
         except Exception:
             pass
 
-    def _discard_runner_process(self) -> None:
+    def _discard_supervisor_process(self) -> None:
         self._process = None
         self._stdout_reader = None
         self._tools_registered = False
         self._output_fields_registered = False
+
+    def _format_supervisor_restart_diagnostic(
+        self,
+        returncode: int | None,
+        context: dict[str, Any],
+        *,
+        stderr: str,
+    ) -> str:
+        diagnostic = (
+            "Terminal-Bench supervisor exited after the previous execute response. "
+            "The copied supervisor process was restarted; Python globals from the "
+            "prior supervisor were lost, while task container filesystem state is "
+            "preserved. Re-run setup code before relying on in-memory variables."
+            "\n"
+            f"[supervisor lifecycle] {self._format_supervisor_exit_evidence(returncode, context)}"
+        )
+        if stderr:
+            diagnostic = (
+                f"{diagnostic}\n[supervisor stderr before restart]\n{stderr.rstrip()}"
+            )
+        return diagnostic
 
     def _build_tool_response(
         self,
@@ -938,28 +971,17 @@ class TerminalBenchRunnerInterpreter(PredictRLMInterpreter):
 
     def _write_tool_response(self, response: dict[str, Any]) -> None:
         process = self._require_process()
-        process.stdin.write(dumps(response) + "\n")
+        process.stdin.write(json.dumps(response, default=str, separators=(",", ":")) + "\n")
         process.stdin.flush()
 
-    def _unwrap_execute_response(self, response: dict[str, Any]) -> Any:
-        if "error" in response:
-            error = RunnerError.from_payload(response.get("error") or {})
-            if error.type == "SyntaxError":
-                raise SyntaxError(error.message)
-            raise CodeInterpreterError(f"{error.type}: {error.message}")
-        result = response.get("result") or {}
-        if isinstance(result, dict) and "timeout" in result:
-            return format_recoverable_timeout_result(result)
-        if "final" in result:
-            return FinalOutput(result["final"])
-        return result.get("output")
+    def _raise_execute_error(self, response: dict[str, Any]) -> None:
+        error = RunnerError.from_payload(response.get("error") or {})
+        if error.type == "SyntaxError":
+            raise SyntaxError(error.message)
+        raise CodeInterpreterError(f"{error.type}: {error.message}")
 
     def _require_process(self) -> ContainerProcess:
-        if self._process is None:
-            raise SandboxFatalError("Terminal-Bench runner is not started")
-        if self._process.stdin is None or self._process.stdout is None:
-            raise SandboxFatalError("Terminal-Bench runner stdio is unavailable")
-        return self._process
+        return self._require_supervisor_process()
 
     def _read_stderr(self) -> str:
         if self._process is None or self._process.stderr is None:
