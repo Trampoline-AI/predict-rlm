@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -25,30 +26,96 @@ def _assert_terminal_bench_skill_semantics(instructions: str) -> None:
         "Inspection and changes",
         "Timeouts and long-running work",
         "Problem-solving strategy",
+        "Required verification and final QA",
         "Verification and final submission",
     ]
     heading_positions = [instructions.index(heading) for heading in headings]
+    normalized_instructions = " ".join(instructions.split())
+    bad_required_verification_prefix = "+Required" + " verification:"
+    obsolete_schema_terms = [
+        "acceptance" + "_contract",
+        "expected" + "_final_state",
+        "status: " + '"pending|verified|blocked"',
+    ]
 
     assert heading_positions == sorted(heading_positions)
+    assert "command-line tasks in a Linux environment" in instructions
+    assert "Terminal-Bench tasks inside a Linux task container" not in instructions
     assert "inspect the filesystem before making changes" in instructions
     assert "install missing packages" in instructions
     assert "package managers" in instructions
     assert "small inspectable steps" in instructions
-    assert "Do not submit based on an unobserved verification command" in instructions
-    assert "run the verification in one iteration" in instructions
-    assert "separate later iteration" in instructions
+    assert "unobserved verification command" in instructions
+    assert bad_required_verification_prefix not in instructions
+    assert "@dataclass" in instructions
+    assert "class RequiredVerification" in instructions
+    assert "requirement: str" in instructions
+    assert "verification: str" in instructions
+    assert "required verification list" in instructions
+    assert "required checks" in instructions
+    assert "short list" in instructions
+    assert "extracted from the task" in instructions
+    assert "verification:" in instructions
+    assert "schema" not in instructions.lower()
+    assert "yaml" not in instructions.lower()
+    assert all(term not in instructions for term in obsolete_schema_terms)
+    assert "ledger" not in instructions.lower()
+    assert "task requirements" in instructions
+    assert "Before SUBMIT" in instructions
+    assert "proportional evidence" in instructions
+    assert "literal paths/endpoints" in instructions
+    assert "config values" in instructions
+    assert "processes or services" in normalized_instructions
+    assert "absolute minimum" in instructions
+    assert "files, processes, services, and configs" in instructions
+    assert "initial state" in instructions
+    assert "no extra modified files" in instructions
+    assert "copied artifacts" in instructions
+    assert "debug helpers" in instructions
+    assert "alternate runtime artifacts" in normalized_instructions
+    assert "temporary services" in instructions
+    assert "config side effects" in instructions
+    assert (
+        "paths, endpoints, flags, and config values named by the task"
+        in normalized_instructions
+    )
+    assert "visible tests" in instructions
+    assert "verifier-shaped checks" in instructions
+    assert "hidden tests" in instructions
+    assert "parse/load/exercise" in instructions
+    assert "semantic/reference" in instructions
+    assert "stdout/progress text" in instructions
+    assert "command behavior" in instructions
+    assert "emulator, interpreter, VM, service, or wrapper tasks" in instructions
+    assert "named binary, program, protocol, or mechanism" in normalized_instructions
+    assert "shortcut or native/source-level stand-in" in instructions
+    assert "negative constraints" in normalized_instructions
+    assert "debug/runtime state" in instructions
+    assert "stdout/stderr" in instructions
+    assert "exit code" in normalized_instructions or "exit codes" in normalized_instructions
+    assert "service behavior" in instructions
     assert "SUBMIT makes the result final" in instructions
-    assert "async def start" in instructions
-    assert "async def wait" in instructions
-    assert "stdout_tail" in instructions
-    assert "stderr_tail" in instructions
-    assert "call wait(job, seconds=5) again" in instructions
+    assert "stale debug history" in instructions
+    assert "Once the observable task contract is satisfied" not in instructions
+    assert "run the verification in one iteration" not in instructions
+    assert "separate later iteration" not in instructions
+    assert "always run the full verifier" not in instructions.lower()
+    assert "must reproduce the full verifier" not in instructions.lower()
+    for term in ["windows", "win311", "qemu", "mips", "bmp", "doom", "PIL"]:
+        assert re.search(rf"\b{re.escape(term)}\b", instructions, re.IGNORECASE) is None
+    assert "async def start" not in instructions
+    assert "async def wait" not in instructions
+    assert "await start(" not in instructions
+    assert "await wait(" not in instructions
+    assert "subprocess.Popen" not in instructions
+    assert "stdout_tail" not in instructions
+    assert "stderr_tail" not in instructions
+    assert "job = await start" not in instructions
+    assert "progress = await wait" not in instructions
+    assert "poll it again" not in instructions
+    assert "For foreground commands, use async/await run()" in instructions
     assert (
         "# Use run() for bounded foreground commands; inspect output before continuing."
-        in instructions
-    )
-    assert (
-        "# Use start()/wait() for longer jobs; poll briefly, return to loop, inspect tails later."
         in instructions
     )
     assert "# Use requests timeouts for network calls." in instructions
