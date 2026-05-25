@@ -2230,6 +2230,7 @@ class PredictRLM(dspy.RLM):
         )
         if not file_plan:
             return None, input_args
+        self._validate_file_plan_backend(file_plan)
 
         # Validate input files exist, then replace File values with sandbox path strings
         transformed = dict(input_args)
@@ -2272,19 +2273,39 @@ class PredictRLM(dspy.RLM):
                         raise FileNotFoundError(
                             f"Workspace for field '{field_name}' not found: {workspace.path}"
                         )
-                transformed[field_name] = [workspace.mount_path for workspace in value]
+                transformed[field_name] = file_plan["workspace_mounts_for_instructions"][
+                    field_name
+                ]
             elif kind == "workspace":
                 if not os.path.isdir(value.path):
                     raise FileNotFoundError(
                         f"Workspace for field '{field_name}' not found: {value.path}"
                     )
-                transformed[field_name] = value.mount_path
+                transformed[field_name] = file_plan["workspace_mounts_for_instructions"][
+                    field_name
+                ]
 
         # Remove output file fields from input_args (they aren't RLM inputs)
         for field_name in output_file_fields:
             transformed.pop(field_name, None)
 
         return file_plan, transformed
+
+    def _validate_file_plan_backend(self, file_plan: dict[str, Any]) -> None:
+        direct_mounts = file_plan.get("direct_workspace_mounts") or []
+        if not direct_mounts:
+            return
+        if self._sbx_pool is not None:
+            raise ValueError(
+                "Workspace(mode='direct') requires a per-call SBX interpreter; "
+                "prewarmed SbxPool instances cannot add workspace mounts after creation."
+            )
+        if self._interpreter is not None:
+            if not hasattr(self._interpreter, "configure_direct_workspace_mounts"):
+                raise ValueError("Workspace(mode='direct') requires the SBX backend.")
+            return
+        if self._sandbox_backend is not SandboxBackend.SBX:
+            raise ValueError("Workspace(mode='direct') requires the SBX backend.")
 
     def _setup_sandbox_files(
         self, repl: PredictRLMInterpreter, file_plan: dict[str, Any]
@@ -2299,6 +2320,12 @@ class PredictRLM(dspy.RLM):
             skill_module_count=len(self._skill_modules),
         )
         try:
+            direct_mounts = file_plan.get("direct_workspace_mounts") or []
+            if direct_mounts:
+                if not hasattr(repl, "configure_direct_workspace_mounts"):
+                    raise ValueError("Workspace(mode='direct') requires the SBX backend.")
+                repl.configure_direct_workspace_mounts(direct_mounts)
+
             if hasattr(repl, "_ensure_deno_process"):
                 repl._ensure_deno_process()
 

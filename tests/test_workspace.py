@@ -13,7 +13,7 @@ import dspy
 import pytest
 from dspy.primitives.code_interpreter import CodeInterpreterError
 
-from predict_rlm import File, PredictRLM, Workspace
+from predict_rlm import File, PredictRLM, Workspace, WorkspaceMode
 from predict_rlm.files import (
     build_file_instructions,
     build_file_plan,
@@ -40,10 +40,16 @@ class TestWorkspace:
         workspace = Workspace(path="/tmp/repo")
         assert workspace.path == "/tmp/repo"
         assert workspace.mount_path == "/sandbox/workspace"
+        assert workspace.mode is WorkspaceMode.MIRROR
         assert workspace.sync_back is True
         assert ".git" in workspace.exclude
         assert "node_modules" in workspace.exclude
         assert workspace.max_file_bytes == 5_000_000
+
+    def test_create_direct_mode(self):
+        workspace = Workspace(path="/tmp/repo", mount_path="/workspace", mode="direct")
+        assert workspace.mode is WorkspaceMode.DIRECT
+        assert workspace.mount_path == "/workspace"
 
 
 class TestIsWorkspaceType:
@@ -93,7 +99,8 @@ class TestWorkspaceInstructions:
         )
         assert "Workspace directories" in result
         assert "/sandbox/workspace" in result
-        assert "sync back to the host after each code block" in result
+        assert "Mirror-mode workspace changes sync back" in result
+        assert "Direct SBX workspaces update host files immediately" in result
 
 
 class TestWorkspaceFilePlan:
@@ -125,6 +132,65 @@ class TestWorkspaceFilePlan:
             mounts = state.iter_mounts()
             virtual_paths = [virtual for _, virtual in mounts]
             assert virtual_paths == ["/sandbox/workspace/keep.txt"]
+
+    def test_direct_workspace_plan_does_not_create_sync_state(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workspace = Workspace(
+                path=tmpdir,
+                mount_path="/workspace",
+                mode=WorkspaceMode.DIRECT,
+            )
+
+            plan = build_file_plan(
+                input_args={"workspace": workspace},
+                input_file_fields={},
+                output_file_fields={},
+                input_workspace_fields={"workspace": "workspace"},
+            )
+
+            assert plan is not None
+            assert plan["workspace_states"] == []
+            assert len(plan["direct_workspace_mounts"]) == 1
+            assert plan["direct_workspace_mounts"][0].host_path == os.path.abspath(tmpdir)
+            assert plan["direct_workspace_mounts"][0].sandbox_path == "/workspace"
+            assert plan["workspace_mounts_for_instructions"] == {
+                "workspace": "/workspace"
+            }
+
+    def test_direct_workspace_default_mount_path_uses_host_path(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workspace = Workspace(path=tmpdir, mode=WorkspaceMode.DIRECT)
+
+            plan = build_file_plan(
+                input_args={"workspace": workspace},
+                input_file_fields={},
+                output_file_fields={},
+                input_workspace_fields={"workspace": "workspace"},
+            )
+
+            assert plan is not None
+            assert plan["direct_workspace_mounts"][0].sandbox_path == os.path.abspath(
+                tmpdir
+            )
+            assert plan["workspace_mounts_for_instructions"] == {
+                "workspace": os.path.abspath(tmpdir)
+            }
+
+    def test_direct_workspace_rejects_sandbox_mount_path(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with pytest.raises(ValueError, match="must not be under /sandbox"):
+                build_file_plan(
+                    input_args={
+                        "workspace": Workspace(
+                            path=tmpdir,
+                            mount_path="/sandbox/workspace",
+                            mode=WorkspaceMode.DIRECT,
+                        )
+                    },
+                    input_file_fields={},
+                    output_file_fields={},
+                    input_workspace_fields={"workspace": "workspace"},
+                )
 
     def test_duplicate_workspace_mount_paths_rejected_for_list(self):
         with tempfile.TemporaryDirectory() as one, tempfile.TemporaryDirectory() as two:
@@ -303,6 +369,70 @@ class TestPredictRLMWorkspacePreparation:
             assert plan is not None
             assert args["workspace"] == "/sandbox/project"
             assert len(plan["workspace_states"]) == 1
+
+    def test_direct_workspace_transformed_to_effective_sandbox_path(self):
+        class Sig(dspy.Signature):
+            workspace: Workspace = dspy.InputField()
+            answer: str = dspy.OutputField()
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            rlm = PredictRLM(
+                Sig,
+                sub_lm=MagicMock(),
+                max_iterations=1,
+                sandbox_backend="sbx",
+            )
+            plan, args = rlm._prepare_file_io({
+                "workspace": Workspace(
+                    path=tmpdir,
+                    mount_path="/workspace",
+                    mode=WorkspaceMode.DIRECT,
+                )
+            })
+
+            assert plan is not None
+            assert args["workspace"] == "/workspace"
+            assert plan["workspace_states"] == []
+            assert len(plan["direct_workspace_mounts"]) == 1
+
+    def test_direct_workspace_rejects_default_jspi_backend(self):
+        class Sig(dspy.Signature):
+            workspace: Workspace = dspy.InputField()
+            answer: str = dspy.OutputField()
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            rlm = self._make_rlm(Sig)
+            with pytest.raises(ValueError, match="requires the SBX backend"):
+                rlm._prepare_file_io({
+                    "workspace": Workspace(
+                        path=tmpdir,
+                        mount_path="/workspace",
+                        mode=WorkspaceMode.DIRECT,
+                    )
+                })
+
+    def test_direct_workspace_rejects_sbx_pool(self):
+        class Sig(dspy.Signature):
+            workspace: Workspace = dspy.InputField()
+            answer: str = dspy.OutputField()
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            pool = MagicMock()
+            rlm = PredictRLM(
+                Sig,
+                sub_lm=MagicMock(),
+                max_iterations=1,
+                sandbox_backend="sbx",
+                sbx_pool=pool,
+            )
+            with pytest.raises(ValueError, match="SbxPool"):
+                rlm._prepare_file_io({
+                    "workspace": Workspace(
+                        path=tmpdir,
+                        mount_path="/workspace",
+                        mode=WorkspaceMode.DIRECT,
+                    )
+                })
 
     def test_missing_workspace_raises(self):
         class Sig(dspy.Signature):

@@ -6,6 +6,7 @@ import hashlib
 import os
 import stat
 from dataclasses import dataclass
+from enum import Enum
 from pathlib import Path
 from typing import Any
 
@@ -25,17 +26,34 @@ DEFAULT_WORKSPACE_EXCLUDES = [
 ]
 
 
+class WorkspaceMode(str, Enum):
+    """How a Workspace is made available inside the sandbox."""
+
+    MIRROR = "mirror"
+    DIRECT = "direct"
+
+
 class Workspace(BaseModel):
     """A mutable host directory mounted into the sandbox for coding-agent RLMs."""
 
-    path: str = Field(description="Host directory to mirror into the sandbox.")
+    path: str = Field(description="Host directory to make available in the sandbox.")
     mount_path: str = Field(
         default="/sandbox/workspace",
         description="Sandbox directory where the workspace is mounted.",
     )
+    mode: WorkspaceMode = Field(
+        default=WorkspaceMode.MIRROR,
+        description=(
+            "Workspace mounting strategy. 'mirror' copies files into the sandbox "
+            "and syncs changes back; 'direct' uses an SBX passthrough mount."
+        ),
+    )
     sync_back: bool = Field(
         default=True,
-        description="Whether sandbox changes are synced back to the host after each code block.",
+        description=(
+            "Whether mirror-mode sandbox changes are synced back to the host "
+            "after each code block."
+        ),
     )
     exclude: list[str] = Field(
         default_factory=lambda: list(DEFAULT_WORKSPACE_EXCLUDES),
@@ -49,6 +67,12 @@ class Workspace(BaseModel):
 
 class WorkspaceSyncConflictError(RuntimeError):
     """Raised when host and sandbox both changed a workspace path."""
+
+
+@dataclass(frozen=True)
+class DirectWorkspaceMount:
+    host_path: str
+    sandbox_path: str
 
 
 @dataclass
