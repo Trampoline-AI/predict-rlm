@@ -23,7 +23,8 @@ import tempfile
 import time
 from typing import Any
 
-REAL_STDOUT = sys.stdout
+PROTOCOL_STDIN = sys.stdin
+PROTOCOL_STDOUT = sys.stdout
 REAL_OPEN = builtins.open
 REAL_PATH = type(pathlib.Path())
 SANDBOX_ROOT = REAL_PATH(
@@ -40,6 +41,13 @@ PENDING_TOOL_RESPONSES: dict[int, dict[str, Any]] = {}
 class _FinalOutputError(Exception):
     def __init__(self, payload: dict[str, Any]) -> None:
         super().__init__("SUBMIT")
+        self.payload = payload
+
+
+class _RunnerExecutionError(Exception):
+    def __init__(self, payload: dict[str, Any]) -> None:
+        message = payload.get("message") or payload.get("type") or "execution failed"
+        super().__init__(str(message))
         self.payload = payload
 
 
@@ -83,7 +91,56 @@ class _VirtualPath(str):
         return obj
 
 
+class _PredictResult:
+    __slots__ = ("_store",)
+
+    def __init__(self, value: dict[str, Any] | None) -> None:
+        object.__setattr__(self, "_store", dict(value or {}))
+
+    def __getattribute__(self, key: str) -> Any:
+        if not key.startswith("_"):
+            store = object.__getattribute__(self, "_store")
+            if key in store:
+                return store[key]
+        return object.__getattribute__(self, key)
+
+    def __getitem__(self, key: str) -> Any:
+        return object.__getattribute__(self, "_store")[key]
+
+    def __setitem__(self, key: str, value: Any) -> None:
+        object.__getattribute__(self, "_store")[key] = value
+
+    def __contains__(self, key: object) -> bool:
+        return key in object.__getattribute__(self, "_store")
+
+    def __iter__(self):
+        return iter(object.__getattribute__(self, "_store"))
+
+    def __len__(self) -> int:
+        return len(object.__getattribute__(self, "_store"))
+
+    def __repr__(self) -> str:
+        return f"PredictResult({object.__getattribute__(self, '_store')!r})"
+
+    def keys(self) -> list[str]:
+        return list(object.__getattribute__(self, "_store").keys())
+
+    def values(self) -> list[Any]:
+        return list(object.__getattribute__(self, "_store").values())
+
+    def items(self) -> list[tuple[str, Any]]:
+        return list(object.__getattribute__(self, "_store").items())
+
+    def get(self, key: str, default: Any = None) -> Any:
+        return object.__getattribute__(self, "_store").get(key, default)
+
+    def to_dict(self) -> dict[str, Any]:
+        return dict(object.__getattribute__(self, "_store"))
+
+
 def _to_jsonable(value: Any) -> Any:
+    if isinstance(value, _PredictResult):
+        return _to_jsonable(value.to_dict())
     if hasattr(value, "model_dump"):
         return value.model_dump()
     if isinstance(value, dict):
@@ -123,13 +180,13 @@ def _submit(**kwargs: Any) -> None:
 
 
 def _send_protocol(message: dict[str, Any]) -> None:
-    REAL_STDOUT.write(json.dumps(message, default=str) + "\n")
-    REAL_STDOUT.flush()
+    PROTOCOL_STDOUT.write(json.dumps(message, default=str) + "\n")
+    PROTOCOL_STDOUT.flush()
 
 
 def _read_protocol_response_line() -> dict[str, Any]:
     while True:
-        line = sys.stdin.readline()
+        line = PROTOCOL_STDIN.readline()
         if not line:
             raise RuntimeError("Host closed stdin while waiting for tool response")
         try:
@@ -167,7 +224,9 @@ async def _call_host_tool(name: str, *args: Any, **kwargs: Any) -> Any:
     result = response.get("result", {})
     value = result.get("value")
     if result.get("type") == "json":
-        return json.loads(value)
+        value = json.loads(value)
+    if name == "predict" and isinstance(value, dict):
+        return _PredictResult(value)
     return value
 
 
@@ -197,6 +256,8 @@ def _response(request_id: Any, result: dict[str, Any]) -> dict[str, Any]:
 
 
 def _exception_payload(exc: BaseException) -> dict[str, Any]:
+    if isinstance(exc, _RunnerExecutionError):
+        return exc.payload
     return {
         "type": type(exc).__name__,
         "message": str(exc),
@@ -281,34 +342,38 @@ def _pickleable_globals(globals_dict: dict[str, Any]) -> dict[str, Any]:
     return updates
 
 
-def _raise_worker_error(payload: dict[str, Any]) -> None:
-    message = str(payload.get("message") or payload.get("type") or "execution failed")
-    if payload.get("type") == "SyntaxError":
-        raise SyntaxError(message)
-    raise RuntimeError(message)
+def _raise_runner_error(payload: dict[str, Any]) -> None:
+    raise _RunnerExecutionError(payload)
 
 
-def _worker_context() -> multiprocessing.context.BaseContext:
+def _runner_context() -> multiprocessing.context.BaseContext:
     try:
         return multiprocessing.get_context("fork")
     except ValueError as exc:
-        raise RuntimeError(
-            "execution_timeout_seconds requires a fork-capable Python runtime"
-        ) from exc
+        raise RuntimeError("isolated execution requires a fork-capable Python runtime") from exc
 
 
-def _execute_code_worker(
+def _execute_code_runner(
     code: str,
     globals_dict: dict[str, Any],
     result_queue: multiprocessing.Queue,
+    stdin_fd: int,
     stdout_fd: int,
     stderr_fd: int,
 ) -> None:
     with contextlib.suppress(OSError):
         os.setsid()
+    global PROTOCOL_STDIN, PROTOCOL_STDOUT
+    PROTOCOL_STDIN = os.fdopen(stdin_fd, "r", encoding="utf-8", buffering=1)
+    PROTOCOL_STDOUT = os.fdopen(os.dup(1), "w", encoding="utf-8", buffering=1)
+    devnull_stdin = open(os.devnull, "r", encoding="utf-8")
+    os.dup2(devnull_stdin.fileno(), 0)
+    sys.stdin = devnull_stdin
     global PENDING_TOOL_RESPONSES, TOOL_RESPONSE_LOCK
     PENDING_TOOL_RESPONSES = {}
     TOOL_RESPONSE_LOCK = asyncio.Lock()
+    os.dup2(stdout_fd, 1)
+    os.dup2(stderr_fd, 2)
     capture = _ExecutionCapture(
         stdout=_FdTextStream(stdout_fd),
         stderr=_FdTextStream(stderr_fd),
@@ -342,7 +407,7 @@ def _drain_fd(fd: int, parts: list[str]) -> bool:
         parts.append(chunk.decode("utf-8", errors="replace"))
 
 
-def _worker_process_group_id(process: multiprocessing.Process) -> int | None:
+def _runner_process_group_id(process: multiprocessing.Process) -> int | None:
     pid = process.pid
     if pid is None:
         return None
@@ -353,7 +418,7 @@ def _worker_process_group_id(process: multiprocessing.Process) -> int | None:
     return pgid if pgid == pid else None
 
 
-def _signal_worker_process_group(pgid: int | None, sig: int) -> bool:
+def _signal_runner_process_group(pgid: int | None, sig: int) -> bool:
     if pgid is None:
         return False
     try:
@@ -365,20 +430,20 @@ def _signal_worker_process_group(pgid: int | None, sig: int) -> bool:
     return True
 
 
-def _terminate_worker(process: multiprocessing.Process) -> None:
-    pgid = _worker_process_group_id(process)
+def _terminate_runner(process: multiprocessing.Process) -> None:
+    pgid = _runner_process_group_id(process)
     if not process.is_alive() and pgid is None:
         return
 
-    if not _signal_worker_process_group(pgid, signal.SIGINT) and process.is_alive():
+    if not _signal_runner_process_group(pgid, signal.SIGINT) and process.is_alive():
         process.terminate()
     process.join(timeout=0.2)
 
-    if not _signal_worker_process_group(pgid, signal.SIGTERM) and process.is_alive():
+    if not _signal_runner_process_group(pgid, signal.SIGTERM) and process.is_alive():
         process.terminate()
     process.join(timeout=0.3)
 
-    if not _signal_worker_process_group(pgid, signal.SIGKILL) and process.is_alive():
+    if not _signal_runner_process_group(pgid, signal.SIGKILL) and process.is_alive():
         if hasattr(process, "kill"):
             process.kill()
         else:
@@ -386,29 +451,40 @@ def _terminate_worker(process: multiprocessing.Process) -> None:
     process.join(timeout=0.5)
 
 
-async def _execute_code_in_worker_with_timeout(
+async def _execute_code_in_runner_with_timeout(
     code: str,
     globals_dict: dict[str, Any],
-    timeout_seconds: float,
+    timeout_seconds: float | None,
 ) -> dict[str, Any]:
-    ctx = _worker_context()
+    ctx = _runner_context()
     stdout_read_fd, stdout_write_fd = os.pipe()
     stderr_read_fd, stderr_write_fd = os.pipe()
+    protocol_stdin_fd = os.dup(0)
     os.set_blocking(stdout_read_fd, False)
     os.set_blocking(stderr_read_fd, False)
     result_queue = ctx.Queue()
     process = ctx.Process(
-        target=_execute_code_worker,
-        args=(code, globals_dict, result_queue, stdout_write_fd, stderr_write_fd),
+        target=_execute_code_runner,
+        args=(
+            code,
+            globals_dict,
+            result_queue,
+            protocol_stdin_fd,
+            stdout_write_fd,
+            stderr_write_fd,
+        ),
     )
     stdout_parts: list[str] = []
     stderr_parts: list[str] = []
     active_fds = {stdout_read_fd: stdout_parts, stderr_read_fd: stderr_parts}
     process.start()
+    os.close(protocol_stdin_fd)
     os.close(stdout_write_fd)
     os.close(stderr_write_fd)
-    deadline = time.monotonic() + timeout_seconds
-    worker_message: dict[str, Any] | None = None
+    deadline = (
+        time.monotonic() + timeout_seconds if timeout_seconds is not None else None
+    )
+    runner_message: dict[str, Any] | None = None
 
     try:
         while True:
@@ -416,38 +492,45 @@ async def _execute_code_in_worker_with_timeout(
                 if not _drain_fd(fd, parts):
                     active_fds.pop(fd, None)
             try:
-                worker_message = result_queue.get_nowait()
+                runner_message = result_queue.get_nowait()
                 break
             except queue.Empty:
                 pass
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                _terminate_worker(process)
-                for fd, parts in list(active_fds.items()):
-                    _drain_fd(fd, parts)
-                return {
-                    "timeout": {"seconds": timeout_seconds},
-                    "stdout": "".join(stdout_parts),
-                    "stderr": "".join(stderr_parts),
-                }
+            if deadline is not None:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    _terminate_runner(process)
+                    for fd, parts in list(active_fds.items()):
+                        _drain_fd(fd, parts)
+                    return {
+                        "timeout": {"seconds": timeout_seconds},
+                        "stdout": "".join(stdout_parts),
+                        "stderr": "".join(stderr_parts),
+                    }
+                select_timeout = min(0.01, remaining)
+            else:
+                if not process.is_alive():
+                    process.join(timeout=0.5)
+                    break
+                select_timeout = 0.01
             if active_fds:
                 ready, _, _ = await asyncio.to_thread(
                     select.select,
                     list(active_fds),
                     [],
                     [],
-                    min(0.01, remaining),
+                    select_timeout,
                 )
                 for fd in ready:
                     parts = active_fds.get(fd)
                     if parts is not None and not _drain_fd(fd, parts):
                         active_fds.pop(fd, None)
             else:
-                await asyncio.sleep(min(0.01, remaining))
+                await asyncio.sleep(select_timeout)
 
         process.join(timeout=0.5)
         if process.is_alive():
-            _terminate_worker(process)
+            _terminate_runner(process)
         for fd, parts in list(active_fds.items()):
             if not _drain_fd(fd, parts):
                 active_fds.pop(fd, None)
@@ -457,12 +540,21 @@ async def _execute_code_in_worker_with_timeout(
                 os.close(fd)
         result_queue.close()
 
-    if worker_message is None:
-        raise RuntimeError("execution worker exited without a result")
-    if not worker_message.get("ok"):
-        _raise_worker_error(worker_message.get("error") or {})
-    globals_dict.update(worker_message.get("globals") or {})
-    return worker_message.get("result") or {}
+    if runner_message is None:
+        exitcode = process.exitcode
+        if exitcode is None:
+            raise RuntimeError("execution runner exited without a result")
+        raise RuntimeError(
+            f"execution runner exited without a result (exitcode={exitcode})"
+        )
+    if not runner_message.get("ok"):
+        _raise_runner_error(runner_message.get("error") or {})
+    globals_dict.update(runner_message.get("globals") or {})
+    result = runner_message.get("result") or {}
+    if isinstance(result, dict) and "output" in result:
+        result = dict(result)
+        result["output"] = "".join(stdout_parts) + "".join(stderr_parts)
+    return result
 
 
 async def _execute_code_with_timeout(
@@ -470,9 +562,7 @@ async def _execute_code_with_timeout(
     globals_dict: dict[str, Any],
     timeout_seconds: float | None,
 ) -> dict[str, Any]:
-    if timeout_seconds is None:
-        return await _execute_code(code, globals_dict)
-    return await _execute_code_in_worker_with_timeout(code, globals_dict, timeout_seconds)
+    return await _execute_code_in_runner_with_timeout(code, globals_dict, timeout_seconds)
 
 
 def _mount_file(params: dict[str, Any]) -> dict[str, Any]:
