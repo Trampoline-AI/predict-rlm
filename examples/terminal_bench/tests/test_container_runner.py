@@ -50,14 +50,22 @@ class FakePipe:
 
 
 class FakeProcess:
-    def __init__(self, responses: list[dict | tuple[float, dict]]) -> None:
+    def __init__(
+        self,
+        responses: list[dict | tuple[float, dict]],
+        *,
+        stderr: str = "",
+    ) -> None:
         self.responses = list(responses)
         self.requests: list[dict] = []
         self.stdout = FakePipe()
         self.stderr = FakePipe()
+        if stderr:
+            self.stderr.lines.append(stderr)
         self.stdin = FakePipe(self._on_stdin)
         self.killed = False
         self.waited = False
+        self.returncode: int | None = None
 
     def _on_stdin(self, data: str) -> None:
         request = json.loads(data)
@@ -74,19 +82,25 @@ class FakeProcess:
         self.stdout.lines.append(json.dumps(response) + "\n")
 
     def poll(self):
+        if self.returncode is not None:
+            return self.returncode
         return 1 if self.killed else None
 
     def wait(self, timeout=None):
         self.waited = True
+        if self.returncode is None:
+            self.returncode = 0
         return 0
 
     def kill(self) -> None:
         self.killed = True
+        self.returncode = -9
 
 
 class FakeAdapter:
-    def __init__(self, process: FakeProcess) -> None:
-        self.process = process
+    def __init__(self, process: FakeProcess | list[FakeProcess]) -> None:
+        self.process = process[0] if isinstance(process, list) else process
+        self.processes = list(process) if isinstance(process, list) else [process]
         self.started: list[dict] = []
         self.copied_to: list[tuple[str, str]] = []
         self.copied_from: list[tuple[str, str]] = []
@@ -113,7 +127,9 @@ class FakeAdapter:
         timeout: float | None = None,
     ) -> FakeProcess:
         self.started.append({"command": command, "workdir": workdir, "timeout": timeout})
-        return self.process
+        process = self.processes[min(len(self.started) - 1, len(self.processes) - 1)]
+        self.process = process
+        return process
 
 
 def test_execute_reset_shutdown_requests_and_maps_success() -> None:
@@ -198,6 +214,67 @@ def test_execute_maps_structured_timeout_as_recoverable_observation() -> None:
     assert timeout_result.timeout_seconds == 0.2
     assert followup == "still alive\n"
     assert process.killed is False
+
+
+def test_user_subprocess_stdin_is_isolated_from_terminal_bench_runner_protocol() -> None:
+    processes: list[subprocess.Popen[str]] = []
+
+    class LocalAdapter:
+        def copy_to(self, host_path: str, container_path: str) -> None:
+            return None
+
+        def copy_from(self, container_path: str, host_path: str) -> None:
+            return None
+
+        def exec(self, command: list[str], *, timeout: float | None = None):
+            return SimpleNamespace(stdout="", stderr="", returncode=0)
+
+        def start_exec(
+            self,
+            command: list[str],
+            *,
+            workdir: str | None = None,
+            timeout: float | None = None,
+        ):
+            process = subprocess.Popen(
+                [sys.executable, "-u", "-c", runner_source()],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            processes.append(process)
+            return process
+
+    interpreter = TerminalBenchRunnerInterpreter(
+        object(),
+        container_adapter=LocalAdapter(),
+        runner_path="/tmp/predict_rlm_runner.py",
+        exec_timeout=30,
+    )
+    try:
+        interpreter.execute("sentinel = 123\nprint('set')")
+        result = interpreter.execute(
+            "import subprocess, sys\n"
+            "subprocess.run(\n"
+            "    [sys.executable, '-c', 'import os; print(os.read(0, 1))'],\n"
+            "    capture_output=True,\n"
+            "    text=True,\n"
+            "    timeout=0.2,\n"
+            ")\n",
+            timeout=1,
+        )
+        followup = interpreter.execute("print(sentinel)")
+    finally:
+        interpreter.shutdown()
+        for process in processes:
+            if process.poll() is None:
+                process.kill()
+            process.wait(timeout=2)
+
+    assert len(processes) == 1
+    assert result == ""
+    assert followup == "123\n"
 
 
 def test_aexecute_accepts_lm_selected_execution_timeout() -> None:
@@ -285,124 +362,88 @@ def test_lm_selected_silent_runner_timeout_is_recoverable_and_restarts() -> None
     assert len(processes) >= 2
     assert processes[0].poll() is not None
     assert "[Timeout] Iteration execution timed out after 0.2s" in timeout_result
-    assert "Terminal-Bench runner request timed out after 0.3s" in timeout_result
-    assert "copied runner process was killed and restarted" in timeout_result
-    assert "Python globals from the timed-out runner were lost" in timeout_result
+    assert "Terminal-Bench supervisor request timed out after 0.3s" in timeout_result
+    assert "copied supervisor process was killed and restarted" in timeout_result
+    assert "Python globals from the timed-out supervisor were lost" in timeout_result
     assert timeout_result.timeout_seconds == 0.2
     assert followup == "fresh runner\n"
 
 
-def test_copied_runner_returns_structured_timeout_and_survives() -> None:
-    process = subprocess.Popen(
-        [sys.executable, "-u", "-c", runner_source()],
-        stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-    )
-
-    def send(request: dict) -> dict:
-        assert process.stdin is not None
-        assert process.stdout is not None
-        process.stdin.write(json.dumps(request) + "\n")
-        process.stdin.flush()
-        return json.loads(process.stdout.readline())
-
-    try:
-        start = time.monotonic()
-        response = send(
+def test_execute_after_structured_timeout_restarts_dead_runner_with_diagnostic() -> None:
+    first_process = FakeProcess(
+        [
             {
                 "id": 1,
-                "method": "execute",
-                "params": {
-                    "code": (
-                        "import sys\n"
-                        "print('before timeout')\n"
-                        "print('stderr before timeout', file=sys.stderr)\n"
-                        "survived = 42\n"
-                        "while True:\n"
-                        "    pass\n"
-                    ),
-                    "execution_timeout_seconds": 0.1,
+                "ok": True,
+                "result": {
+                    "timeout": {"seconds": 0.2},
+                    "stdout": "before timeout\n",
+                    "stderr": "command timed out\n",
                 },
-            }
-        )
-        followup = send(
-            {
-                "id": 2,
-                "method": "execute",
-                "params": {"code": "print('still alive')"},
-            }
-        )
-    finally:
-        process.kill()
-        process.wait(timeout=2)
-
-    assert time.monotonic() - start < 0.8
-    assert response["id"] == 1
-    assert response["jsonrpc"] == "2.0"
-    assert response["result"] == {
-        "timeout": {"seconds": 0.1},
-        "stdout": "before timeout\n",
-        "stderr": "stderr before timeout\n",
-    }
-    assert followup["jsonrpc"] == "2.0"
-    assert followup["result"]["output"] == "still alive\n"
-
-
-def test_copied_runner_timeout_is_not_swallowed_by_exception_handler() -> None:
-    process = subprocess.Popen(
-        [sys.executable, "-u", "-c", runner_source()],
-        stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
+            },
+        ],
+        stderr="runner stderr tail\n",
+    )
+    restarted_process = FakeProcess([])
+    adapter = FakeAdapter([first_process, restarted_process])
+    interpreter = TerminalBenchRunnerInterpreter(
+        object(),
+        container_adapter=adapter,
+        runner_path="/tmp/predict_rlm_runner.py",
     )
 
-    def send(request: dict) -> dict:
-        assert process.stdin is not None
-        assert process.stdout is not None
-        process.stdin.write(json.dumps(request) + "\n")
-        process.stdin.flush()
-        return json.loads(process.stdout.readline())
+    timeout_result = interpreter.execute("run_slow_command()", timeout=0.2)
+    first_process.returncode = 137
+    restart_result = interpreter.execute("print(existing_global)", timeout=0.2)
 
-    try:
-        response = send(
+    assert "[Timeout] Iteration execution timed out after 0.2s" in timeout_result
+    assert len(adapter.started) == 2
+    assert restarted_process.requests == []
+    assert "Terminal-Bench supervisor exited after the previous execute response" in restart_result
+    assert "The copied supervisor process was restarted" in restart_result
+    assert "Python globals from the prior supervisor were lost" in restart_result
+    assert "supervisor_returncode=137" in restart_result
+    assert "previous_request_id=1" in restart_result
+    assert "previous_method=execute" in restart_result
+    assert "previous_execution_timeout_seconds=0.2" in restart_result
+    assert "runner stderr tail" in restart_result
+
+
+def test_execute_after_structured_error_restarts_dead_runner_with_diagnostic() -> None:
+    first_process = FakeProcess(
+        [
             {
                 "id": 1,
-                "method": "execute",
-                "params": {
-                    "code": (
-                        "caught = 0\n"
-                        "while True:\n"
-                        "    try:\n"
-                        "        pass\n"
-                        "    except Exception:\n"
-                        "        caught += 1\n"
-                    ),
-                    "execution_timeout_seconds": 0.1,
+                "error": {
+                    "code": -32000,
+                    "message": "Command 'node /app/vm.js' timed out after 45 seconds",
+                    "data": {
+                        "type": "RuntimeError",
+                        "message": "Command 'node /app/vm.js' timed out after 45 seconds",
+                    },
                 },
-            }
-        )
-        followup = send(
-            {
-                "id": 2,
-                "method": "execute",
-                "params": {"code": "print('still alive')"},
-            }
-        )
-    finally:
-        process.kill()
-        process.wait(timeout=2)
+            },
+        ]
+    )
+    restarted_process = FakeProcess([])
+    adapter = FakeAdapter([first_process, restarted_process])
+    interpreter = TerminalBenchRunnerInterpreter(
+        object(),
+        container_adapter=adapter,
+        runner_path="/tmp/predict_rlm_runner.py",
+    )
 
-    assert response["jsonrpc"] == "2.0"
-    assert response["result"] == {
-        "timeout": {"seconds": 0.1},
-        "stdout": "",
-        "stderr": "",
-    }
-    assert followup["jsonrpc"] == "2.0"
-    assert followup["result"]["output"] == "still alive\n"
+    with pytest.raises(CodeInterpreterError, match="node /app/vm.js"):
+        interpreter.execute("run_node()", timeout=45)
+    first_process.returncode = 0
+    restart_result = interpreter.execute("print('next iteration')", timeout=45)
+
+    assert len(adapter.started) == 2
+    assert restarted_process.requests == []
+    assert "Terminal-Bench supervisor exited after the previous execute response" in restart_result
+    assert "previous_response=structured_error" in restart_result
+    assert "previous_execution_timeout_seconds=45" in restart_result
+    assert "supervisor_returncode=0" in restart_result
 
 
 def test_execute_maps_runner_errors() -> None:
@@ -744,7 +785,7 @@ def test_harbor_environment_default_exec_timeout_is_fatal_and_killed_by_watchdog
     try:
         with pytest.raises(
             SandboxFatalError,
-            match=r"Terminal-Bench runner request timed out after 0\.2s",
+            match=r"Terminal-Bench supervisor request timed out after 0\.2s",
         ):
             interpreter.execute("print('never')")
         elapsed = time.monotonic() - start
