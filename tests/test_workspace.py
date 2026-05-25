@@ -22,6 +22,7 @@ from predict_rlm.files import (
 )
 from predict_rlm.interpreters import SbxConfig, SbxInterpreter
 from predict_rlm.workspace import (
+    DirectWorkspaceMount,
     WorkspaceFileInfo,
     WorkspaceSyncConflictError,
     WorkspaceSyncState,
@@ -433,6 +434,49 @@ class TestPredictRLMWorkspacePreparation:
                         mode=WorkspaceMode.DIRECT,
                     )
                 })
+
+    def test_external_sbx_interpreter_reuses_direct_workspace_setup(self, tmp_path: Path):
+        class Sig(dspy.Signature):
+            workspace: Workspace = dspy.InputField()
+            answer: str = dspy.OutputField()
+
+        workspace = tmp_path / "workspace"
+        workspace.mkdir()
+        mount = DirectWorkspaceMount(
+            host_path=os.path.abspath(workspace),
+            sandbox_path="/workspace",
+        )
+        interpreter = SbxInterpreter(
+            config=SbxConfig(name="local-test"),
+            preinstall_packages=False,
+            direct_workspace_mounts=[mount],
+            _runner_command=[sys.executable, "-u", str(RUNNER_PATH)],
+            _staging_root=tmp_path / "staging",
+        )
+        rlm = PredictRLM(
+            Sig,
+            sub_lm=MagicMock(),
+            max_iterations=1,
+            interpreter=interpreter,
+        )
+
+        try:
+            plan, _ = rlm._prepare_file_io({
+                "workspace": Workspace(
+                    path=str(workspace),
+                    mount_path="/workspace",
+                    mode=WorkspaceMode.DIRECT,
+                )
+            })
+            assert plan is not None
+
+            rlm._setup_sandbox_files(interpreter, plan)
+            interpreter._proc = MagicMock()
+            interpreter._proc.poll.return_value = None
+            rlm._setup_sandbox_files(interpreter, plan)
+        finally:
+            interpreter._proc = None
+            interpreter.shutdown()
 
     def test_missing_workspace_raises(self):
         class Sig(dspy.Signature):

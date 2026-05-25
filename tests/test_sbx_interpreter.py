@@ -41,6 +41,11 @@ def _drain_available_pipe_text(pipe) -> str:
         chunks.append(chunk.decode("utf-8", errors="replace"))
 
 
+class FakeRunningProc:
+    def poll(self):
+        return None
+
+
 def _real_sbx_available() -> bool:
     if os.environ.get("PREDICT_RLM_RUN_SBX_TESTS") != "1":
         return False
@@ -508,6 +513,110 @@ class TestSbxInterpreterLocalRunner:
             _supervisor_command=[sys.executable, "-u", str(RUNNER_PATH)],
             _staging_root=tmp_path / "staging",
         )
+
+    def test_constructor_accepts_direct_workspace_mounts(self, tmp_path: Path):
+        mount = DirectWorkspaceMount(host_path="/host/repo", sandbox_path="/host/repo")
+
+        interpreter = SbxInterpreter(
+            config=SbxConfig(name="local-test"),
+            preinstall_packages=False,
+            direct_workspace_mounts=[mount],
+            _runner_command=[sys.executable, "-u", str(RUNNER_PATH)],
+            _staging_root=tmp_path / "staging",
+        )
+        try:
+            assert interpreter._direct_workspace_mounts == [mount]
+        finally:
+            interpreter.shutdown()
+
+    def test_constructor_direct_workspace_mounts_relocate_owned_staging_root(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        workspace = tmp_path / "workspace"
+        workspace.mkdir()
+        monkeypatch.chdir(workspace)
+
+        interpreter = SbxInterpreter(
+            config=SbxConfig(name="local-test"),
+            preinstall_packages=False,
+            direct_workspace_mounts=[
+                DirectWorkspaceMount(host_path=str(workspace), sandbox_path="/workspace")
+            ],
+            _runner_command=[sys.executable, "-u", str(RUNNER_PATH)],
+            _staging_root=None,
+        )
+        try:
+            with pytest.raises(ValueError):
+                interpreter._staging_root.resolve().relative_to(workspace.resolve())
+        finally:
+            interpreter.shutdown()
+
+    def test_configure_direct_workspace_mounts_is_idempotent_after_process_start(
+        self, tmp_path: Path
+    ):
+        mount = DirectWorkspaceMount(host_path="/host/repo", sandbox_path="/host/repo")
+        interpreter = SbxInterpreter(
+            config=SbxConfig(name="local-test"),
+            preinstall_packages=False,
+            direct_workspace_mounts=[mount],
+            _runner_command=[sys.executable, "-u", str(RUNNER_PATH)],
+            _staging_root=tmp_path / "staging",
+        )
+        interpreter._proc = FakeRunningProc()
+        try:
+            interpreter.configure_direct_workspace_mounts([mount])
+        finally:
+            interpreter._proc = None
+            interpreter.shutdown()
+
+    def test_configure_direct_workspace_mounts_rejects_changes_after_process_start(
+        self, tmp_path: Path
+    ):
+        mount = DirectWorkspaceMount(host_path="/host/repo", sandbox_path="/host/repo")
+        different_mount = DirectWorkspaceMount(
+            host_path="/host/other",
+            sandbox_path="/host/other",
+        )
+        interpreter = SbxInterpreter(
+            config=SbxConfig(name="local-test"),
+            preinstall_packages=False,
+            direct_workspace_mounts=[mount],
+            _runner_command=[sys.executable, "-u", str(RUNNER_PATH)],
+            _staging_root=tmp_path / "staging",
+        )
+        interpreter._proc = FakeRunningProc()
+        try:
+            with pytest.raises(RuntimeError, match="configured before the SBX runner starts"):
+                interpreter.configure_direct_workspace_mounts([different_mount])
+        finally:
+            interpreter._proc = None
+            interpreter.shutdown()
+
+    def test_reset_preserves_direct_workspace_mounts(self, tmp_path: Path, monkeypatch):
+        workspace = tmp_path / "workspace"
+        workspace.mkdir()
+        mount = DirectWorkspaceMount(host_path=str(workspace), sandbox_path="/workspace")
+        interpreter = SbxInterpreter(
+            config=SbxConfig(name="local-test"),
+            preinstall_packages=False,
+            direct_workspace_mounts=[mount],
+            _runner_command=[sys.executable, "-u", str(RUNNER_PATH)],
+            _staging_root=tmp_path / "staging",
+        )
+        sandbox_file = interpreter._staging_root / "sandbox" / "scratch.txt"
+        sandbox_file.parent.mkdir(parents=True, exist_ok=True)
+        sandbox_file.write_text("staged", encoding="utf-8")
+        workspace_file = workspace / "kept.txt"
+        workspace_file.write_text("direct", encoding="utf-8")
+        monkeypatch.setattr(interpreter, "_send_request", lambda method, params: {})
+        try:
+            interpreter.reset()
+
+            assert interpreter._direct_workspace_mounts == [mount]
+            assert not sandbox_file.exists()
+            assert workspace_file.read_text(encoding="utf-8") == "direct"
+        finally:
+            interpreter.shutdown()
 
     def test_execute_and_state_persistence(self, tmp_path: Path):
         interpreter = self.make_interpreter(tmp_path)
