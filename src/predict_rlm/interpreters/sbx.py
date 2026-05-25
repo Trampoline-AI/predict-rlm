@@ -64,6 +64,7 @@ class SbxInterpreter(PersistentJsonRpcRunnerClient, PredictRLMInterpreter):
         extra_read_paths: list[str] | None = None,
         extra_write_paths: list[str] | None = None,
         _supervisor_command: list[str] | None = None,
+        direct_workspace_mounts: list[DirectWorkspaceMount] | None = None,
         _runner_command: list[str] | None = None,
         _staging_root: str | Path | None = None,
     ) -> None:
@@ -78,6 +79,7 @@ class SbxInterpreter(PersistentJsonRpcRunnerClient, PredictRLMInterpreter):
         self.extra_read_paths = extra_read_paths or []
         self.extra_write_paths = extra_write_paths or []
         self._supervisor_command = _supervisor_command or _runner_command
+        self._direct_workspace_mounts = list(direct_workspace_mounts or [])
         self._host_workspace = Path.cwd()
         self._owns_staging_root = _staging_root is None
         self._staging_root = Path(_staging_root) if _staging_root else (
@@ -96,8 +98,8 @@ class SbxInterpreter(PersistentJsonRpcRunnerClient, PredictRLMInterpreter):
         self._prepared_runner_path: Path | None = None
         self._shutdown = False
         self._post_execute_hooks: list[Callable[[Any], Any]] = []
-        self._direct_workspace_mounts: list[DirectWorkspaceMount] = []
         self._owned_direct_aliases: list[Path] = []
+        self._relocate_owned_staging_root_if_nested_in_direct_workspace()
 
     def execute(
         self,
@@ -260,12 +262,31 @@ class SbxInterpreter(PersistentJsonRpcRunnerClient, PredictRLMInterpreter):
     def configure_direct_workspace_mounts(
         self, mounts: list[DirectWorkspaceMount]
     ) -> None:
+        mounts = list(mounts)
+        if self._same_direct_workspace_mounts(mounts):
+            return
         if self._proc and self._proc.poll() is None:
             raise RuntimeError(
                 "Direct workspace mounts must be configured before the SBX runner starts"
             )
-        self._direct_workspace_mounts = list(mounts)
+        self._direct_workspace_mounts = mounts
         self._relocate_owned_staging_root_if_nested_in_direct_workspace()
+
+    def _same_direct_workspace_mounts(self, mounts: list[DirectWorkspaceMount]) -> bool:
+        return self._direct_workspace_mount_keys(mounts) == self._direct_workspace_mount_keys(
+            self._direct_workspace_mounts
+        )
+
+    def _direct_workspace_mount_keys(
+        self, mounts: list[DirectWorkspaceMount]
+    ) -> list[tuple[str, str]]:
+        return [
+            (
+                os.path.abspath(mount.host_path),
+                os.path.normpath(mount.sandbox_path),
+            )
+            for mount in mounts
+        ]
 
     def configure_runtime(
         self,
