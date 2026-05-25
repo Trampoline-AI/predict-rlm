@@ -4,6 +4,7 @@ import argparse
 import ast
 import asyncio
 import json
+import re
 import subprocess
 import sys
 import types
@@ -697,17 +698,27 @@ def test_seed_candidate_uses_shared_default_terminal_bench_skill_text() -> None:
 
 def test_default_terminal_bench_skill_includes_concurrent_timeout_snippet() -> None:
     skill = DEFAULT_TERMINAL_BENCH_SKILL_INSTRUCTIONS
+    normalized_skill = " ".join(skill.split())
     headings = [
         "Operating principle",
         "Inspection and changes",
         "Timeouts and long-running work",
         "Problem-solving strategy",
+        "Required verification and final QA",
         "Verification and final submission",
+    ]
+    bad_required_verification_prefix = "+Required" + " verification:"
+    obsolete_schema_terms = [
+        "acceptance" + "_contract",
+        "expected" + "_final_state",
+        "status: " + '"pending|verified|blocked"',
     ]
 
     assert [skill.index(heading) for heading in headings] == sorted(
         skill.index(heading) for heading in headings
     )
+    assert "command-line tasks in a Linux environment" in skill
+    assert "Terminal-Bench tasks inside a Linux task container" not in skill
     assert "inspect the filesystem before making changes" in skill
     assert "package managers" in skill
     assert "small inspectable steps" in skill
@@ -717,9 +728,61 @@ def test_default_terminal_bench_skill_includes_concurrent_timeout_snippet() -> N
     assert "commands, network requests, and computations" in skill
     assert "query-optimize" not in skill.lower()
     assert "sqlite" not in skill.lower()
-    assert "Do not submit based on an unobserved verification command" in skill
-    assert "separate later iteration" in skill
+    assert "unobserved verification command" in skill
+    assert bad_required_verification_prefix not in skill
+    assert "@dataclass" in skill
+    assert "class RequiredVerification" in skill
+    assert "requirement: str" in skill
+    assert "verification: str" in skill
+    assert "required verification list" in skill
+    assert "required checks" in skill
+    assert "short list" in skill
+    assert "extracted from the task" in skill
+    assert "verification:" in skill
+    assert "schema" not in skill.lower()
+    assert "yaml" not in skill.lower()
+    assert all(term not in skill for term in obsolete_schema_terms)
+    assert "ledger" not in skill.lower()
+    assert "task requirements" in skill
+    assert "Before SUBMIT" in skill
+    assert "proportional evidence" in skill
+    assert "literal paths/endpoints" in skill
+    assert "config values" in skill
+    assert "processes or services" in normalized_skill
+    assert "absolute minimum" in skill
+    assert "files, processes, services, and configs" in skill
+    assert "initial state" in skill
+    assert "no extra modified files" in skill
+    assert "copied artifacts" in skill
+    assert "debug helpers" in skill
+    assert "alternate runtime artifacts" in normalized_skill
+    assert "temporary services" in skill
+    assert "config side effects" in skill
+    assert "paths, endpoints, flags, and config values named by the task" in normalized_skill
+    assert "visible tests" in skill
+    assert "verifier-shaped checks" in skill
+    assert "hidden tests" in skill
+    assert "parse/load/exercise" in skill
+    assert "semantic/reference" in skill
+    assert "stdout/progress text" in skill
+    assert "command behavior" in skill
+    assert "emulator, interpreter, VM, service, or wrapper tasks" in skill
+    assert "named binary, program, protocol, or mechanism" in normalized_skill
+    assert "shortcut or native/source-level stand-in" in skill
+    assert "negative constraints" in normalized_skill
+    assert "debug/runtime state" in skill
+    assert "stdout/stderr" in skill
+    assert "exit code" in normalized_skill or "exit codes" in normalized_skill
+    assert "service behavior" in skill
     assert "SUBMIT makes the result final" in skill
+    assert "stale debug history" in skill
+    assert "Once the observable task contract is satisfied" not in skill
+    assert "run the verification in one iteration" not in skill
+    assert "separate later iteration" not in skill
+    assert "always run the full verifier" not in skill.lower()
+    assert "must reproduce the full verifier" not in skill.lower()
+    for term in ["windows", "win311", "qemu", "mips", "bmp", "doom", "PIL"]:
+        assert re.search(rf"\b{re.escape(term)}\b", skill, re.IGNORECASE) is None
 
     snippet = skill.split("```python\n", 1)[1].split("\n```", 1)[0]
     compile(snippet, "<terminal-bench-skill>", "exec", flags=ast.PyCF_ALLOW_TOP_LEVEL_AWAIT)
@@ -727,10 +790,6 @@ def test_default_terminal_bench_skill_includes_concurrent_timeout_snippet() -> N
         (
             "# Use run() for bounded foreground commands; inspect output before continuing.",
             "async def run(cmd, timeout=60):",
-        ),
-        (
-            "# Use start()/wait() for longer jobs; poll briefly, return to loop, inspect tails later.",
-            "async def start(cmd):",
         ),
         (
             "# Use requests timeouts for network calls.",
@@ -755,17 +814,27 @@ def test_default_terminal_bench_skill_includes_concurrent_timeout_snippet() -> N
         "subprocess.run",
         "capture_output=True",
         "timeout=timeout",
-        "async def start(cmd):",
-        "subprocess.Popen",
-        "async def wait(job, seconds=5):",
         "requests.get(url, timeout=10)",
         "asyncio.wait_for",
         "await asyncio.gather",
-        "stdout_tail",
-        "stderr_tail",
-        "print(progress)",
+        "print(result.returncode)",
+        "print(result.stdout[-2000:])",
+        "print(result.stderr[-2000:])",
     ]:
         assert anchor in snippet
+
+    for removed_anchor in [
+        "async def start",
+        "async def wait",
+        "await start(",
+        "await wait(",
+        "subprocess.Popen",
+        "stdout_tail",
+        "stderr_tail",
+        "job = await start",
+        "progress = await wait",
+    ]:
+        assert removed_anchor not in snippet
 
 
 def test_seed_candidate_skill_is_passed_to_terminal_bench_agent(monkeypatch) -> None:
