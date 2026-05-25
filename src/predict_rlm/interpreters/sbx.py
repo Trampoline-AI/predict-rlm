@@ -39,12 +39,12 @@ from predict_rlm.interpreter import SandboxFatalError
 from predict_rlm.trace import ToolCall, ms_since, record_tool_call
 
 from .base import (
-    STALE_RESPONSE_DISCARD_LIMIT,
     InterpreterExecutionGate,
     PredictRLMInterpreter,
     SandboxExecutionError,
     SbxConfig,
 )
+from .persistent_runner import PersistentJsonRpcRunnerClient, PersistentSupervisorProcess
 from .sbx_logging import log_interpreter_lifecycle, log_partial_output
 from .sbx_pool import SbxPool as SbxPool
 
@@ -53,10 +53,10 @@ DEFAULT_PACKAGE_DOMAINS = ["pypi.org", "files.pythonhosted.org"]
 SBX_PYTHON_EXECUTABLE = "python3"
 
 
-class SbxInterpreter(PredictRLMInterpreter):
+class SbxInterpreter(PersistentJsonRpcRunnerClient, PredictRLMInterpreter):
     """Interpreter backend powered by Docker Sandboxes.
 
-    The backend starts a Python JSON-RPC runner inside a Docker Sandbox and
+    The backend starts a Python JSON-RPC supervisor inside a Docker Sandbox and
     maps predict-rlm virtual paths under a per-run workspace staging root.
     """
 
@@ -73,9 +73,11 @@ class SbxInterpreter(PredictRLMInterpreter):
         verbose: bool = False,
         extra_read_paths: list[str] | None = None,
         extra_write_paths: list[str] | None = None,
+        _supervisor_command: list[str] | None = None,
         _runner_command: list[str] | None = None,
         _staging_root: str | Path | None = None,
     ) -> None:
+        PersistentJsonRpcRunnerClient.__init__(self, supervisor_name="Sbx supervisor")
         self.config = config or SbxConfig()
         self.allowed_domains = allowed_domains
         self.tools = tools or {}
@@ -90,7 +92,7 @@ class SbxInterpreter(PredictRLMInterpreter):
         )
         self.extra_read_paths = extra_read_paths or []
         self.extra_write_paths = extra_write_paths or []
-        self._runner_command = _runner_command
+        self._supervisor_command = _supervisor_command or _runner_command
         self._host_workspace = Path.cwd()
         self._owns_staging_root = _staging_root is None
         self._staging_root = (
@@ -108,7 +110,7 @@ class SbxInterpreter(PredictRLMInterpreter):
         self._pending_tool_calls: dict[concurrent.futures.Future[dict[str, Any]], int] = {}
         self._execution_gate = InterpreterExecutionGate("SBX interpreter")
         self._sandbox_name: str | None = None
-        self._request_id = 0
+        self._prepared_runner_path: Path | None = None
         self._shutdown = False
 
     def configure_debug(self, enabled: bool) -> None:
@@ -298,11 +300,7 @@ class SbxInterpreter(PredictRLMInterpreter):
                 self._log_lifecycle("sbx.shutdown.kill", kill_result="sent")
         self._proc = None
 
-        if (
-            self._runner_command is None
-            and self._sandbox_name
-            and self.config.remove_on_shutdown
-        ):
+        if self._supervisor_command is None and self._sandbox_name and self.config.remove_on_shutdown:
             if not self.config.persist:
                 subprocess.run(
                     ["sbx", "rm", self._sandbox_name],
@@ -328,12 +326,12 @@ class SbxInterpreter(PredictRLMInterpreter):
         if self._proc and self._proc.poll() is None:
             return
         if self._proc and self._proc.poll() is not None:
-            raise SandboxFatalError("Sbx runner process exited unexpectedly")
+            raise SandboxFatalError("Sbx supervisor process exited unexpectedly")
 
-        if self._runner_command is not None:
-            command = self._runner_command
+        if self._supervisor_command is not None:
+            command = self._supervisor_command
         else:
-            command = self._start_sbx_and_build_runner_command()
+            command = self._start_sbx_and_build_supervisor_command()
 
         env = os.environ.copy()
         env["PREDICT_RLM_SBX_ROOT"] = str(self._staging_root)
@@ -374,7 +372,7 @@ class SbxInterpreter(PredictRLMInterpreter):
         )
         self._stdout_reader.start()
 
-    def _start_sbx_and_build_runner_command(self) -> list[str]:
+    def _start_sbx_and_build_supervisor_command(self) -> list[str]:
         if shutil.which("sbx") is None:
             self._log_lifecycle("sbx.create.missing_cli", status="error")
             raise SandboxFatalError(
@@ -382,63 +380,67 @@ class SbxInterpreter(PredictRLMInterpreter):
                 "Install it with `brew install docker/tap/sbx` and run `sbx login`."
             )
 
-        runner_path = self._prepare_runner_script()
+        if self._sandbox_name is None:
+            runner_path = self._prepare_runner_script()
 
-        primary_workspace = str(self._staging_root)
-        if self.config.workspace_read_only:
-            primary_workspace = f"{primary_workspace}:ro"
-        create_cmd = [
-            "sbx",
-            "create",
-            "shell",
-            primary_workspace,
-            *self.config.extra_workspaces,
-        ]
-        if self.config.name:
-            create_cmd.extend(["--name", self.config.name])
-        for flag, value in (
-            ("--cpus", self.config.cpus),
-            ("--memory", self.config.memory),
-            ("--template", self.config.template),
-            ("--kit", self.config.kit),
-            ("--branch", self.config.branch),
-        ):
-            if value is not None:
-                create_cmd.extend([flag, str(value)])
-        create_start = time.perf_counter()
-        self._log_lifecycle(
-            "sbx.create.start",
-            create_timeout=self.config.create_timeout,
-            workspace_read_only=self.config.workspace_read_only,
-            extra_workspaces=len(self.config.extra_workspaces),
-        )
-        try:
-            created = subprocess.run(
-                create_cmd,
-                check=True,
-                capture_output=True,
-                text=True,
-                timeout=self.config.create_timeout,
-            )
-        except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
+            primary_workspace = str(self._staging_root)
+            if self.config.workspace_read_only:
+                primary_workspace = f"{primary_workspace}:ro"
+            create_cmd = [
+                "sbx",
+                "create",
+                "shell",
+                primary_workspace,
+                *self.config.extra_workspaces,
+            ]
+            if self.config.name:
+                create_cmd.extend(["--name", self.config.name])
+            for flag, value in (
+                ("--cpus", self.config.cpus),
+                ("--memory", self.config.memory),
+                ("--template", self.config.template),
+                ("--kit", self.config.kit),
+                ("--branch", self.config.branch),
+            ):
+                if value is not None:
+                    create_cmd.extend([flag, str(value)])
+            create_start = time.perf_counter()
             self._log_lifecycle(
-                "sbx.create.error",
-                duration_ms=ms_since(create_start),
-                error_type=type(exc).__name__,
-                status="error",
+                "sbx.create.start",
+                create_timeout=self.config.create_timeout,
+                workspace_read_only=self.config.workspace_read_only,
+                extra_workspaces=len(self.config.extra_workspaces),
             )
-            raise SandboxFatalError(f"Failed to create sbx sandbox: {exc}") from exc
+            try:
+                created = subprocess.run(
+                    create_cmd,
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                    timeout=self.config.create_timeout,
+                )
+            except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
+                self._log_lifecycle(
+                    "sbx.create.error",
+                    duration_ms=ms_since(create_start),
+                    error_type=type(exc).__name__,
+                    status="error",
+                )
+                raise SandboxFatalError(f"Failed to create sbx sandbox: {exc}") from exc
 
-        self._sandbox_name = self.config.name or self._parse_sandbox_name(created.stdout)
-        self._log_lifecycle(
-            "sbx.create.ok",
-            duration_ms=ms_since(create_start),
-            stdout_chars=len(created.stdout or ""),
-            stderr_chars=len(created.stderr or ""),
-        )
-        self._apply_network_policy()
-        self._bootstrap_packages()
+            self._sandbox_name = self.config.name or self._parse_sandbox_name(created.stdout)
+            self._log_lifecycle(
+                "sbx.create.ok",
+                duration_ms=ms_since(create_start),
+                stdout_chars=len(created.stdout or ""),
+                stderr_chars=len(created.stderr or ""),
+            )
+            self._apply_network_policy()
+            self._bootstrap_packages()
+        else:
+            runner_path = self._prepared_runner_path or self._prepare_runner_script()
 
+        assert self._sandbox_name is not None
         runner_root = self._staging_root
         runner_root.mkdir(parents=True, exist_ok=True)
         return [
@@ -455,11 +457,15 @@ class SbxInterpreter(PredictRLMInterpreter):
             str(runner_path),
         ]
 
+    def _start_sbx_and_build_runner_command(self) -> list[str]:
+        return self._start_sbx_and_build_supervisor_command()
+
     def _prepare_runner_script(self) -> Path:
         runner_dir = self._staging_root / ".predict_rlm_runner"
         runner_dir.mkdir(parents=True, exist_ok=True)
         runner_path = runner_dir / "python_runner.py"
         shutil.copy2(RUNNER_PATH, runner_path)
+        self._prepared_runner_path = runner_path
         return runner_path
 
     def _parse_sandbox_name(self, stdout: str) -> str:
@@ -566,6 +572,15 @@ class SbxInterpreter(PredictRLMInterpreter):
         except queue.Empty:
             return None
 
+    def _read_supervisor_stdout_line(
+        self,
+        process: PersistentSupervisorProcess,
+        *,
+        deadline: float,
+        timeout: float,
+    ) -> str | None:
+        return self._read_stdout_line(deadline) or ""
+
     def _resolve_execution_timeout(self, timeout: float | None) -> tuple[float, str]:
         return resolve_execution_timeout(timeout, default_timeout=self.config.exec_timeout)
 
@@ -594,13 +609,33 @@ class SbxInterpreter(PredictRLMInterpreter):
         self._proc.kill()
         if timeout_failure_class == ITERATION_TIMEOUT_FAILURE_CLASS:
             raise SandboxFatalError(
-                "Sbx runner failed to recover from iteration timeout after "
+                "Sbx supervisor failed to recover from iteration timeout after "
                 f"{timeout_seconds:g}s; waited {host_timeout_seconds:g}s before "
-                "force-killing runner"
+                "force-killing supervisor"
             )
         raise SandboxFatalError(
-            f"Sbx runner request timed out after {host_timeout_seconds:g}s"
+            f"Sbx supervisor request timed out after {host_timeout_seconds:g}s"
         )
+
+    def _get_supervisor_process(self) -> subprocess.Popen[str] | None:
+        return self._proc
+
+    def _request_timeout_seconds(
+        self,
+        method: str,
+        params: dict[str, Any],
+        timeout: float | None,
+    ) -> float:
+        timeout_seconds, timeout_failure_class = self._resolve_execution_timeout(timeout)
+        return self._host_watchdog_timeout(timeout_seconds, timeout_failure_class)
+
+    def _execution_timeout_metadata_from_params(
+        self,
+        params: dict[str, Any],
+    ) -> tuple[float, str]:
+        if "execution_timeout_seconds" in params:
+            return float(params["execution_timeout_seconds"]), ITERATION_TIMEOUT_FAILURE_CLASS
+        return self._resolve_execution_timeout(None)
 
     def _submit_tool_call(self, request: dict[str, Any]) -> None:
         request_id = request.get("id")
@@ -626,6 +661,20 @@ class SbxInterpreter(PredictRLMInterpreter):
         for future in completed:
             self._pending_tool_calls.pop(future)
             self._write_tool_response(future.result())
+
+    def _drain_completed_supervisor_work(self) -> None:
+        self._drain_completed_tool_calls()
+
+    def _handle_supervisor_control_message(
+        self,
+        message: dict[str, Any],
+        *,
+        deadline: float,
+    ) -> bool:
+        if message.get("method") != "tool_call":
+            return False
+        self._submit_tool_call(message)
+        return True
 
     def _build_tool_response(self, request: dict[str, Any]) -> dict[str, Any]:
         request_id = request.get("id")
@@ -765,100 +814,127 @@ class SbxInterpreter(PredictRLMInterpreter):
         *,
         timeout: float | None = None,
     ) -> dict:
-        self._ensure_process_for_method(method)
-        assert self._proc is not None
-        if self._proc.stdin is None or self._proc.stdout is None:
-            raise SandboxFatalError("Sbx runner stdio is unavailable")
-        timeout_seconds, timeout_failure_class = self._resolve_execution_timeout(timeout)
-        host_timeout_seconds = self._host_watchdog_timeout(
-            timeout_seconds,
-            timeout_failure_class,
-        )
+        return self._send_json_rpc_request(method, params, timeout=timeout)
 
-        self._request_id += 1
-        request_id = self._request_id
-        payload = {
-            "jsonrpc": "2.0",
-            "method": method,
-            "params": params or {},
-            "id": request_id,
-        }
-        request_start = time.perf_counter()
+    def _on_supervisor_request_start(
+        self,
+        method: str,
+        params: dict[str, Any],
+        *,
+        request_id: int,
+        request_timeout: float,
+    ) -> None:
+        timeout_seconds, _ = self._execution_timeout_metadata_from_params(params)
         self._log_lifecycle(
             "sbx.request.start",
             method=method,
             request_id=request_id,
-            timeout_seconds=self.config.exec_timeout,
+            timeout_seconds=timeout_seconds,
+            request_timeout=request_timeout,
+            pending_tool_count=len(self._pending_tool_calls),
+            code_chars=len(str((params or {}).get("code", ""))) if method == "execute" else None,
         )
-        try:
-            self._proc.stdin.write(json.dumps(payload) + "\n")
-            self._proc.stdin.flush()
-        except BrokenPipeError as exc:
-            self._log_lifecycle(
-                "sbx.request.broken_pipe",
-                method=method,
-                request_id=request_id,
-                status="error",
-            )
-            raise SandboxFatalError("Sbx runner pipe broke while sending request") from exc
 
-        request_start = time.perf_counter()
-        deadline = time.monotonic() + host_timeout_seconds
-        stale_discards = 0
-        while True:
-            self._drain_completed_tool_calls()
-            if self._proc.poll() is not None:
-                stderr = self._proc.stderr.read() if self._proc.stderr else ""
-                self._log_lifecycle(
-                    "sbx.runner.exited",
-                    method=method,
-                    request_id=request_id,
-                    stderr_chars=len(stderr or ""),
-                    status="error",
-                )
-                raise SandboxFatalError(f"Sbx runner exited unexpectedly: {stderr}")
-            if time.monotonic() > deadline:
-                self._fail_timed_out_request(
-                    timeout_seconds,
-                    host_timeout_seconds,
-                    timeout_failure_class,
-                )
-            line = self._read_stdout_line(deadline)
-            if not line:
-                continue
-            if not line.startswith("{"):
-                self._log_lifecycle(
-                    "sbx.protocol.non_json_stdout",
-                    method=method,
-                    request_id=request_id,
-                    preview=line[:200],
-                )
-                continue
-            response = json.loads(line)
-            if response.get("method") == "tool_call":
-                self._submit_tool_call(response)
-                continue
-            if response.get("id") == request_id:
-                self._log_lifecycle(
-                    "sbx.request.ok",
-                    method=method,
-                    request_id=request_id,
-                    duration_ms=ms_since(request_start),
-                )
-                return response
-            stale_discards += 1
-            self._log_lifecycle(
-                "sbx.protocol.stale_response",
-                method=method,
-                request_id=request_id,
-                response_id=response.get("id"),
-                stale_discards=stale_discards,
-            )
-            if stale_discards > STALE_RESPONSE_DISCARD_LIMIT:
-                raise CodeInterpreterError(
-                    "Too many stale top-level responses while resyncing "
-                    f"SBX request id={request_id}"
-                )
+    def _on_supervisor_request_response(
+        self,
+        method: str,
+        *,
+        request_id: int,
+        request_start: float,
+        response: dict[str, Any],
+    ) -> None:
+        self._log_lifecycle(
+            "sbx.request.ok",
+            method=method,
+            request_id=request_id,
+            duration_ms=ms_since(request_start),
+            status="error_response" if "error" in response else "ok",
+            pending_tool_count=len(self._pending_tool_calls),
+        )
+
+    def _handle_supervisor_send_error(
+        self,
+        method: str,
+        request_id: int,
+        exc: BrokenPipeError,
+    ) -> None:
+        self._log_lifecycle(
+            "sbx.request.broken_pipe",
+            method=method,
+            request_id=request_id,
+            error_type=type(exc).__name__,
+            status="error",
+        )
+        raise SandboxFatalError("Sbx supervisor pipe broke while sending request") from exc
+
+    def _handle_supervisor_exit_during_request(
+        self,
+        method: str,
+        *,
+        request_id: int,
+        request_start: float,
+        process: PersistentSupervisorProcess,
+    ) -> None:
+        stderr = self._read_stderr_for_process(process)
+        self._log_lifecycle(
+            "sbx.runner.exited",
+            method=method,
+            request_id=request_id,
+            duration_ms=ms_since(request_start),
+            stderr_chars=len(stderr or ""),
+            status="error",
+        )
+        raise SandboxFatalError(f"Sbx supervisor exited unexpectedly: {stderr}")
+
+    def _handle_supervisor_request_timeout(
+        self,
+        method: str,
+        params: dict[str, Any],
+        process: PersistentSupervisorProcess,
+        *,
+        request_id: int,
+        request_timeout: float,
+        request_start: float,
+        stdout_tail: str,
+    ) -> dict[str, Any]:
+        timeout_seconds, timeout_failure_class = self._execution_timeout_metadata_from_params(
+            params
+        )
+        self._log_lifecycle(
+            "sbx.request.timeout",
+            method=method,
+            request_id=request_id,
+            duration_ms=ms_since(request_start),
+            timeout_seconds=timeout_seconds,
+            request_timeout=request_timeout,
+            pending_tool_count=len(self._pending_tool_calls),
+            failure_class=timeout_failure_class,
+            status="error",
+        )
+        self._fail_timed_out_request(
+            timeout_seconds,
+            request_timeout,
+            timeout_failure_class,
+        )
+
+    def _handle_stale_response_limit(
+        self,
+        method: str,
+        *,
+        request_id: int,
+        request_start: float,
+    ) -> None:
+        self._log_lifecycle(
+            "sbx.protocol.stale_response_limit",
+            method=method,
+            request_id=request_id,
+            duration_ms=ms_since(request_start),
+            status="error",
+        )
+        raise CodeInterpreterError(
+            "Too many stale top-level responses while resyncing "
+            f"SBX request id={request_id}"
+        )
 
     def _ensure_process_for_method(self, method: str) -> None:
         if method == "shutdown" and self._proc is not None:
@@ -895,3 +971,61 @@ class SbxInterpreter(PredictRLMInterpreter):
         if "final" in result:
             return FinalOutput(result["final"])
         return result.get("output")
+
+    def _ensure_process_for_request(self, method: str) -> None:
+        self._ensure_process_for_method(method)
+
+    def _discard_supervisor_process(self) -> None:
+        self._proc = None
+        self._stdout_lines = queue.Queue()
+        self._stdout_reader = None
+        self._pending_tool_calls.clear()
+
+    def _read_stderr_for_process(self, process: PersistentSupervisorProcess) -> str:
+        stderr = process.stderr
+        if stderr is None:
+            return ""
+        try:
+            return stderr.read() or ""
+        except Exception:
+            return ""
+
+    def _format_supervisor_restart_diagnostic(
+        self,
+        returncode: int | None,
+        context: dict[str, Any],
+        *,
+        stderr: str,
+    ) -> str:
+        diagnostic = (
+            "Sbx supervisor exited after the previous execute response. "
+            "The supervisor process was restarted; Python globals from the "
+            "prior supervisor were lost, while sandbox filesystem state is "
+            "preserved. Re-run setup code before relying on in-memory variables."
+            "\n"
+            f"[supervisor lifecycle] {self._format_supervisor_exit_evidence(returncode, context)}"
+        )
+        if stderr:
+            diagnostic = f"{diagnostic}\n[supervisor stderr before restart]\n{stderr.rstrip()}"
+        return diagnostic
+
+    def _raise_execute_error(self, response: dict[str, Any]) -> None:
+        error = response["error"]
+        error_data = error.get("data", {})
+        error_type = error_data.get("type", "Sandbox Error")
+        partial_output = error_data.get("output") or ""
+        if partial_output:
+            self._log_partial_output(partial_output, error_type=error_type)
+        if interpreter_result_logging_enabled(self.verbose):
+            if partial_output:
+                emit_trace_result({"output": partial_output})
+            emit_trace_error(
+                error_type,
+                error.get("message") or error_data.get("args", []),
+            )
+        if error_type == "SyntaxError":
+            raise SyntaxError(error.get("message", "Invalid Python syntax"))
+        raise SandboxExecutionError(
+            f"{error_type}: {error_data.get('args') or error.get('message', '')}",
+            partial_output=partial_output,
+        )
