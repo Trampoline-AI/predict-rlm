@@ -1371,7 +1371,14 @@ class PredictRLM(dspy.RLM):
                 tool_count=len(execution_tools),
                 source="provided",
             )
-            self._inject_execution_context(self._interpreter, execution_tools)
+            configure_runtime = getattr(self._interpreter, "configure_runtime", None)
+            if configure_runtime is not None:
+                configure_runtime(
+                    tools=execution_tools,
+                    output_fields=self._get_output_fields_info(),
+                )
+            else:
+                self._inject_execution_context(self._interpreter, execution_tools)
             self._debug_event(
                 "predict_rlm.interpreter.end",
                 backend=type(self._interpreter).__name__,
@@ -1390,6 +1397,11 @@ class PredictRLM(dspy.RLM):
                     source="provided",
                 )
                 raise
+            finally:
+                reset = getattr(self._interpreter, "reset", None)
+                if reset is not None:
+                    reset()
+            return
         else:
             extra_read = list(file_plan["read_paths"]) if file_plan else []
             extra_write = list(file_plan.get("write_paths", [])) if file_plan else []

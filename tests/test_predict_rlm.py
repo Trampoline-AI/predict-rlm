@@ -3,6 +3,8 @@
 import asyncio
 import hashlib
 import logging
+import sys
+from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -11,11 +13,13 @@ import pytest
 from dspy.primitives.repl_types import REPLEntry, REPLHistory
 from pydantic import BaseModel
 
-from predict_rlm import PredictRLM, SbxPool
+from predict_rlm import PredictRLM, SbxConfig, SbxInterpreter, SbxPool
 from predict_rlm.predict_rlm import _models_from_schema
 from predict_rlm.rlm_skills import Skill
 from predict_rlm.telemetry import TelemetryContext, classify_failure
 from predict_rlm.trace import drain_predict_calls, init_predict_call_collector
+
+RUNNER_PATH = Path(__file__).parents[1] / "src" / "predict_rlm" / "sandbox" / "python_runner.py"
 
 
 def _run(coro):
@@ -161,6 +165,150 @@ class TestSandboxBackendSelection:
         mock_sbx.assert_not_called()
         leased.shutdown.assert_not_called()
 
+    def test_external_configurable_interpreter_is_configured_and_reset(self):
+        class FakeConfigurableInterpreter:
+            def __init__(self):
+                self.configured = []
+                self.reset_count = 0
+
+            def configure_runtime(self, *, tools=None, output_fields=None):
+                self.configured.append((tools, output_fields))
+
+            def reset(self):
+                self.reset_count += 1
+
+            def shutdown(self):
+                raise AssertionError("external interpreter should not be shut down")
+
+        interpreter = FakeConfigurableInterpreter()
+        rlm = PredictRLM(
+            ImageAnalysisSignature,
+            sub_lm=MagicMock(),
+            max_iterations=1,
+            interpreter=interpreter,
+        )
+        execution_tools = {"predict": MagicMock()}
+
+        with rlm._interpreter_context(execution_tools=execution_tools) as repl:
+            assert repl is interpreter
+            assert interpreter.reset_count == 0
+
+        assert interpreter.configured == [
+            (execution_tools, rlm._get_output_fields_info())
+        ]
+        assert interpreter.reset_count == 1
+
+    def test_external_interpreter_reset_runs_on_exception(self):
+        class FakeConfigurableInterpreter:
+            def __init__(self):
+                self.reset_count = 0
+
+            def configure_runtime(self, *, tools=None, output_fields=None):
+                pass
+
+            def reset(self):
+                self.reset_count += 1
+
+        interpreter = FakeConfigurableInterpreter()
+        rlm = PredictRLM(
+            ImageAnalysisSignature,
+            sub_lm=MagicMock(),
+            max_iterations=1,
+            interpreter=interpreter,
+        )
+
+        with pytest.raises(RuntimeError, match="boom"):
+            with rlm._interpreter_context(execution_tools={"predict": MagicMock()}):
+                raise RuntimeError("boom")
+
+        assert interpreter.reset_count == 1
+
+    def test_external_non_configurable_interpreter_uses_injection_and_resets(self):
+        class FakeInterpreter:
+            def __init__(self):
+                self.tools = {}
+                self.output_fields = []
+                self.reset_count = 0
+
+            def reset(self):
+                self.reset_count += 1
+
+            def shutdown(self):
+                raise AssertionError("external interpreter should not be shut down")
+
+        interpreter = FakeInterpreter()
+        rlm = PredictRLM(
+            ImageAnalysisSignature,
+            sub_lm=MagicMock(),
+            max_iterations=1,
+            interpreter=interpreter,
+        )
+        execution_tools = {"predict": MagicMock()}
+
+        with rlm._interpreter_context(execution_tools=execution_tools) as repl:
+            assert repl is interpreter
+            assert interpreter.tools["predict"] is execution_tools["predict"]
+            assert interpreter.output_fields == rlm._get_output_fields_info()
+
+        assert interpreter.reset_count == 1
+
+    def test_external_sbx_interpreter_reregisters_tools_after_auto_reset(
+        self, tmp_path: Path
+    ):
+        calls = []
+
+        async def fake_predict(value: str) -> dict[str, str]:
+            calls.append(value)
+            await asyncio.sleep(0)
+            return {"seen": value}
+
+        interpreter = SbxInterpreter(
+            config=SbxConfig(name="local-test"),
+            preinstall_packages=False,
+            _runner_command=[sys.executable, "-u", str(RUNNER_PATH)],
+            _staging_root=tmp_path / "staging",
+        )
+        try:
+            rlm1 = PredictRLM(
+                ImageAnalysisSignature,
+                sub_lm=MagicMock(),
+                max_iterations=1,
+                interpreter=interpreter,
+            )
+            with rlm1._interpreter_context(
+                execution_tools={"predict": fake_predict}
+            ) as repl:
+                output = repl.execute(
+                    "value = 123\n"
+                    "result = await predict('first')\n"
+                    "print(result['seen'])"
+                )
+                assert output.strip() == "first"
+
+            rlm2 = PredictRLM(
+                ImageAnalysisSignature,
+                sub_lm=MagicMock(),
+                max_iterations=1,
+                interpreter=interpreter,
+            )
+            with rlm2._interpreter_context(
+                execution_tools={"predict": fake_predict}
+            ) as repl:
+                output = repl.execute(
+                    "try:\n"
+                    "    value\n"
+                    "except NameError:\n"
+                    "    print('clean')\n"
+                    "else:\n"
+                    "    print('dirty')\n"
+                    "result = await predict('second')\n"
+                    "print(result['seen'])"
+                )
+
+            assert output.strip().splitlines() == ["clean", "second"]
+            assert calls == ["first", "second"]
+        finally:
+            interpreter.shutdown()
 
 
 class TestPredictTool:
