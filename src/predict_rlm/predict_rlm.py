@@ -1407,8 +1407,19 @@ class PredictRLM(dspy.RLM):
     ) -> Iterator[PredictRLMInterpreter]:
         """Yield interpreter, creating the configured backend if none provided."""
         if self._interpreter is not None:
-            self._inject_execution_context(self._interpreter, execution_tools)
             backend = self._interpreter_backend_label(self._interpreter)
+            configure_runtime = self._declared_callable(self._interpreter, "configure_runtime")
+            runtime_kwargs: dict[str, Any] = {}
+            if configure_runtime is not None:
+                runtime_kwargs = self._accepted_kwargs(
+                    configure_runtime,
+                    tools=execution_tools,
+                    output_fields=self._get_output_fields_info(),
+                )
+            if configure_runtime is not None and runtime_kwargs:
+                configure_runtime(**runtime_kwargs)
+            else:
+                self._inject_execution_context(self._interpreter, execution_tools)
             configured = self._configure_interpreter_debug(self._interpreter)
             self._log_lifecycle(
                 "interpreter.injected",
@@ -1427,6 +1438,9 @@ class PredictRLM(dspy.RLM):
                     interpreter=type(self._interpreter).__name__,
                     owner="caller",
                 )
+                reset = self._declared_callable(self._interpreter, "reset")
+                if reset is not None:
+                    reset()
         else:
             extra_read = list(file_plan["read_paths"]) if file_plan else []
             extra_write = list(file_plan.get("write_paths", [])) if file_plan else []
