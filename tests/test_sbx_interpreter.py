@@ -168,11 +168,9 @@ class TestPythonRunnerProtocol:
             {
                 "code": (
                     "import base64\n"
-                    "from pathlib import Path\n"
-                    f"Path('/sandbox/image.png').write_bytes({png_bytes!r})\n"
-                    "data_url = 'data:image/png;base64,' + base64.b64encode(\n"
-                    "    Path('/sandbox/image.png').read_bytes()\n"
-                    ").decode()\n"
+                    f"open('/sandbox/image.png', 'wb').write({png_bytes!r})\n"
+                    "image_bytes = open('/sandbox/image.png', 'rb').read()\n"
+                    "data_url = 'data:image/png;base64,' + base64.b64encode(image_bytes).decode()\n"
                     "result = await predict(\n"
                     "    'image: dspy.Image, question: str -> visible_text: str',\n"
                     "    image=data_url,\n"
@@ -379,9 +377,10 @@ class TestPythonRunnerProtocol:
             "execute",
             {
                 "code": (
-                    "from pathlib import Path\n"
-                    "text = Path('/sandbox/input/source/input.txt').read_text()\n"
-                    "Path('/sandbox/output/result/output.txt').write_text(text + ' world')"
+                    "with open('/sandbox/input/source/input.txt', encoding='utf-8') as f:\n"
+                    "    text = f.read()\n"
+                    "with open('/sandbox/output/result/output.txt', 'w', encoding='utf-8') as f:\n"
+                    "    f.write(text + ' world')"
                 )
             },
         )
@@ -397,6 +396,94 @@ class TestPythonRunnerProtocol:
 
         assert files["result"]["files"] == ["/sandbox/output/result/output.txt"]
         assert out.read_text(encoding="utf-8") == "hello world"
+
+    def test_pathlib_path_remains_a_type(self, runner: LocalRunner):
+        result = runner.request(
+            "execute",
+            {
+                "code": (
+                    "import pathlib\n"
+                    "print(isinstance(pathlib.Path, type))\n"
+                    "print(isinstance('/tmp/example', pathlib.Path))"
+                )
+            },
+        )
+
+        assert result["result"]["output"] == "True\nFalse\n"
+
+    def test_windows311_visual_predict_path_handles_pillow_style_path_checks(
+        self, runner: LocalRunner
+    ):
+        runner.request("register_tools", {"tools": ["predict"]})
+        tool_call = runner.request(
+            "execute",
+            {
+                "code": (
+                    "import base64, pathlib\n"
+                    "ppm = b'P6\\n1 1\\n255\\n' + bytes([255, 255, 255])\n"
+                    "pathlib.Path('/tmp/win311-screen.ppm').write_bytes(ppm)\n"
+                    "\n"
+                    "class PillowStyleImage:\n"
+                    "    def __init__(self, data):\n"
+                    "        self.data = data\n"
+                    "        self.size = (1, 1)\n"
+                    "\n"
+                    "    def save(self, path):\n"
+                    "        pathlib.Path(path).write_bytes(self.data)\n"
+                    "\n"
+                    "def image_open_like_pillow(fp):\n"
+                    "    isinstance(fp, pathlib.Path)\n"
+                    "    return PillowStyleImage(pathlib.Path(fp).read_bytes())\n"
+                    "\n"
+                    "im = image_open_like_pillow('/tmp/win311-screen.ppm')\n"
+                    "im.save('/tmp/win311-screen.png')\n"
+                    "data_url = 'data:image/png;base64,' + base64.b64encode(\n"
+                    "    pathlib.Path('/tmp/win311-screen.png').read_bytes()\n"
+                    ").decode()\n"
+                    "vision = await predict(\n"
+                    "    'image: dspy.Image, question: str -> visible_text: str, answer: str',\n"
+                    "    instructions='Inspect this VM screenshot.',\n"
+                    "    image=data_url,\n"
+                    "    question='Does this show the Windows 3.11 desktop?',\n"
+                    ")\n"
+                    "print(vision.visible_text)\n"
+                    "print(vision.answer)"
+                )
+            },
+        )
+
+        assert tool_call["method"] == "tool_call"
+        assert tool_call["params"]["name"] == "predict"
+        assert tool_call["params"]["args"] == [
+            "image: dspy.Image, question: str -> visible_text: str, answer: str"
+        ]
+        assert tool_call["params"]["kwargs"]["instructions"] == "Inspect this VM screenshot."
+        assert tool_call["params"]["kwargs"]["question"] == "Does this show the Windows 3.11 desktop?"
+        image = tool_call["params"]["kwargs"]["image"]
+        assert image.startswith("data:image/png;base64,")
+        assert base64.b64decode(image.removeprefix("data:image/png;base64,")) == (
+            b"P6\n1 1\n255\n" + bytes([255, 255, 255])
+        )
+
+        assert runner.proc.stdin is not None
+        assert runner.proc.stdout is not None
+        runner.proc.stdin.write(
+            json.dumps(
+                {
+                    "jsonrpc": "2.0",
+                    "id": tool_call["id"],
+                    "result": {
+                        "type": "json",
+                        "value": '{"visible_text": "desktop", "answer": "yes"}',
+                    },
+                }
+            )
+            + "\n"
+        )
+        runner.proc.stdin.flush()
+        response = json.loads(runner.proc.stdout.readline())
+
+        assert response["result"]["output"] == "desktop\nyes\n"
 
 
 class TestSbxInterpreterLocalRunner:
@@ -745,7 +832,8 @@ for line in sys.stdin:
                 "from pathlib import Path\n"
                 "print(Path(input_path).exists())\n"
                 "text = Path(input_path).read_text()\n"
-                "Path('/sandbox/output/result/output.txt').write_text(text + ' sbx')",
+                "with open('/sandbox/output/result/output.txt', 'w', encoding='utf-8') as f:\n"
+                "    f.write(text + ' sbx')",
                 variables={"input_path": "/sandbox/input/source/input.txt"},
             )
             files = interpreter.list_dir("/sandbox/output/result")
@@ -892,10 +980,10 @@ for line in sys.stdin:
         try:
             interpreter.mount_file_at(str(source), "/sandbox/input/source/input.txt")
             output = interpreter.execute(
-                "from pathlib import Path\n"
                 "result = await mutate('/sandbox/input/source/input.txt')\n"
                 "print(result)\n"
-                "print(Path('/sandbox/input/source/input.txt').read_text())"
+                "with open('/sandbox/input/source/input.txt', encoding='utf-8') as f:\n"
+                "    print(f.read())"
             )
         finally:
             interpreter.shutdown()
@@ -925,10 +1013,10 @@ for line in sys.stdin:
         try:
             interpreter.mount_file_at(str(source), "/sandbox/input/source/input.txt")
             output = interpreter.execute(
-                "from pathlib import Path\n"
                 "result = await mutate(path='/sandbox/input/source/input.txt')\n"
                 "print(result)\n"
-                "print(Path('/sandbox/input/source/input.txt').read_text())"
+                "with open('/sandbox/input/source/input.txt', encoding='utf-8') as f:\n"
+                "    print(f.read())"
             )
         finally:
             interpreter.shutdown()
@@ -964,10 +1052,10 @@ for line in sys.stdin:
         try:
             interpreter.mount_file_at(str(source), "/sandbox/input/source/input.txt")
             output = interpreter.execute(
-                "from pathlib import Path\n"
                 "received = await mutate(path='/sandbox/input/source/input.txt')\n"
                 "print(received)\n"
-                "print(Path('/sandbox/input/source/input.txt').read_text())"
+                "with open('/sandbox/input/source/input.txt', encoding='utf-8') as f:\n"
+                "    print(f.read())"
             )
         finally:
             interpreter.shutdown()
