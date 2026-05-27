@@ -151,8 +151,12 @@ def test_agent_raises_clear_error_when_codex_lm_dependency_missing(monkeypatch) 
 
     agent = tbench_agent.TerminalBenchRLMBaseAgent(codex_lm=True)
 
-    with pytest.raises(RuntimeError, match="dspy-codex-lm.*Terminal-Bench"):
+    with pytest.raises(RuntimeError) as exc_info:
         agent.perform_task("solve it", SimpleNamespace(container="container"))
+
+    message = str(exc_info.value)
+    assert "predict-rlm[codex-lm]" in message
+    assert "dspy-codex-lm" not in message
 
 
 def test_agent_exports_predict_rlm_trace_to_logging_dir(monkeypatch, tmp_path: Path) -> None:
