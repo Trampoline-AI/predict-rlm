@@ -78,6 +78,7 @@ class HarborSubprocessHarnessRunner:
 
     def __init__(self, *, cwd: Path | None = None) -> None:
         self.cwd = cwd or Path(__file__).resolve().parents[2]
+        self._result_retry_limit = 1
 
     async def run(self, request: TerminalBenchTaskRunRequest) -> TerminalBenchTaskRunResult:
         return await asyncio.to_thread(self._run_sync, request)
@@ -112,61 +113,85 @@ class HarborSubprocessHarnessRunner:
         else:
             cmd.append("--force-build")
         cmd.append("--delete" if config.cleanup else "--no-delete")
-        started = time.monotonic()
-        _write_phase_event(
-            phase_log_path,
-            event="harbor_subprocess_start",
-            phase="environment_setup",
-            request=request,
-            status="started",
-            agent_timeout_seconds=_agent_timeout(request),
-            outer_timeout_seconds=_subprocess_timeout(request),
-            harbor_run_dir=str(output_dir / request.run_id),
-        )
-        try:
-            completed = subprocess.run(cmd, **_subprocess_run_kwargs(request, cwd=self.cwd))
-        except subprocess.TimeoutExpired as exc:
+        max_attempts = self._result_retry_limit + 1
+        for attempt in range(1, max_attempts + 1):
+            started = time.monotonic()
+            _write_phase_event(
+                phase_log_path,
+                event="harbor_subprocess_start",
+                phase="environment_setup",
+                request=request,
+                status="started",
+                agent_timeout_seconds=_agent_timeout(request),
+                outer_timeout_seconds=_subprocess_timeout(request),
+                harbor_run_dir=str(output_dir / request.run_id),
+                attempt=attempt,
+                max_attempts=max_attempts,
+            )
+            try:
+                completed = subprocess.run(cmd, **_subprocess_run_kwargs(request, cwd=self.cwd))
+            except subprocess.TimeoutExpired as exc:
+                run_dir = output_dir / request.run_id
+                _write_phase_event(
+                    phase_log_path,
+                    event="harbor_subprocess_end",
+                    phase="harness_subprocess",
+                    request=request,
+                    status="timeout",
+                    duration_seconds=time.monotonic() - started,
+                    agent_timeout_seconds=_agent_timeout(request),
+                    outer_timeout_seconds=_subprocess_timeout(request),
+                    harbor_run_dir=str(run_dir),
+                    attempt=attempt,
+                    max_attempts=max_attempts,
+                )
+                return TerminalBenchTaskRunResult(
+                    task_id=request.task_id,
+                    trial_result=_timeout_trial_result(exc),
+                    traces=[],
+                    run_dir=run_dir,
+                    error=_subprocess_timeout_error(exc),
+                )
             run_dir = output_dir / request.run_id
             _write_phase_event(
                 phase_log_path,
                 event="harbor_subprocess_end",
                 phase="harness_subprocess",
                 request=request,
-                status="timeout",
+                status="completed" if completed.returncode == 0 else "failed",
                 duration_seconds=time.monotonic() - started,
                 agent_timeout_seconds=_agent_timeout(request),
                 outer_timeout_seconds=_subprocess_timeout(request),
+                returncode=completed.returncode,
+                harbor_run_dir=str(run_dir),
+                attempt=attempt,
+                max_attempts=max_attempts,
+            )
+            if completed.returncode != 0:
+                return TerminalBenchTaskRunResult(
+                    task_id=request.task_id,
+                    trial_result=_subprocess_failure_trial_result(completed),
+                    traces=[],
+                    run_dir=run_dir,
+                    error=_subprocess_error(completed),
+                )
+            result = self._load_result(request, run_dir)
+            retry_reason = _retryable_harbor_trial_exception_reason(result.trial_result)
+            if retry_reason is None or attempt >= max_attempts:
+                return result
+            _write_phase_event(
+                phase_log_path,
+                event="harbor_subprocess_retry",
+                phase="environment_setup",
+                request=request,
+                status="retrying",
+                attempt=attempt,
+                next_attempt=attempt + 1,
+                max_attempts=max_attempts,
+                retry_reason=retry_reason,
                 harbor_run_dir=str(run_dir),
             )
-            return TerminalBenchTaskRunResult(
-                task_id=request.task_id,
-                trial_result=_timeout_trial_result(exc),
-                traces=[],
-                run_dir=run_dir,
-                error=_subprocess_timeout_error(exc),
-            )
-        run_dir = output_dir / request.run_id
-        _write_phase_event(
-            phase_log_path,
-            event="harbor_subprocess_end",
-            phase="harness_subprocess",
-            request=request,
-            status="completed" if completed.returncode == 0 else "failed",
-            duration_seconds=time.monotonic() - started,
-            agent_timeout_seconds=_agent_timeout(request),
-            outer_timeout_seconds=_subprocess_timeout(request),
-            returncode=completed.returncode,
-            harbor_run_dir=str(run_dir),
-        )
-        if completed.returncode != 0:
-            return TerminalBenchTaskRunResult(
-                task_id=request.task_id,
-                trial_result=_subprocess_failure_trial_result(completed),
-                traces=[],
-                run_dir=run_dir,
-                error=_subprocess_error(completed),
-            )
-        return self._load_result(request, run_dir)
+        raise AssertionError("unreachable Harbor subprocess retry loop exit")
 
     def _load_result(
         self,
@@ -622,6 +647,77 @@ def _subprocess_failure_trial_result(completed: subprocess.CompletedProcess[str]
             "stderr_tail": _tail_text(completed.stderr),
         },
     }
+
+
+_NON_RETRYABLE_HARBOR_EXCEPTION_TYPES = {
+    "AgentTimeoutError",
+    "HarnessSubprocessError",
+    "HarnessTimeoutError",
+}
+_HARBOR_REGISTRY_CONTEXT_MARKERS = (
+    "auth.docker.io",
+    "containerd",
+    "docker",
+    "docker hub",
+    "docker.io",
+    "ghcr.io",
+    "pull",
+    "registry",
+    "registry-1.docker.io",
+)
+
+
+def _retryable_harbor_trial_exception_reason(trial_result: Any) -> str | None:
+    if not isinstance(trial_result, dict):
+        return None
+    exception_info = trial_result.get("exception_info")
+    if not isinstance(exception_info, dict):
+        return None
+
+    exception_type = str(
+        exception_info.get("exception_type")
+        or exception_info.get("type")
+        or exception_info.get("class")
+        or ""
+    )
+    if exception_type in _NON_RETRYABLE_HARBOR_EXCEPTION_TYPES:
+        return None
+
+    text = _exception_info_text(exception_info)
+    normalized = text.lower()
+    if "agenttimeouterror" in normalized:
+        return None
+    if "failed to fetch anonymous token" in normalized:
+        return "docker_registry_anonymous_token"
+    if "failed to resolve reference" in normalized and _has_harbor_registry_context(normalized):
+        return "docker_registry_reference_resolution"
+    if "500 internal server error" in normalized and _has_harbor_registry_context(normalized):
+        return "docker_registry_500"
+    if "too many requests" in normalized and _has_harbor_registry_context(normalized):
+        return "docker_registry_rate_limit"
+    if "tls handshake timeout" in normalized and _has_harbor_registry_context(normalized):
+        return "docker_registry_tls_timeout"
+    if "connection reset" in normalized and _has_harbor_registry_context(normalized):
+        return "docker_registry_connection_reset"
+    if "i/o timeout" in normalized and _has_harbor_registry_context(normalized):
+        return "docker_registry_io_timeout"
+    return None
+
+
+def _exception_info_text(exception_info: dict[str, Any]) -> str:
+    fields = (
+        "exception_type",
+        "exception_message",
+        "message",
+        "diagnostic_text",
+        "error",
+        "exception_traceback",
+    )
+    return "\n".join(str(exception_info[field]) for field in fields if exception_info.get(field))
+
+
+def _has_harbor_registry_context(text: str) -> bool:
+    return any(marker in text for marker in _HARBOR_REGISTRY_CONTEXT_MARKERS)
 
 
 def _load_task_run_result(
