@@ -29,12 +29,14 @@ def _assert_task_instruction_signature(signature, task_instruction: str) -> None
 
 def _assert_terminal_bench_skill_semantics(instructions: str) -> None:
     headings = [
-        "Operating principle",
-        "Inspection and changes",
-        "Timeouts and long-running work",
-        "Problem-solving strategy",
-        "Required verification and final QA",
-        "Verification and final submission",
+        "## Operating principle",
+        "## Inspection and changes",
+        "## Evidence preservation and stopping discipline",
+        "## Timeouts and long-running work",
+        "### Command helper pattern",
+        "## Problem-solving strategy",
+        "## Required verification and final QA",
+        "## Verification and final submission",
     ]
     heading_positions = [instructions.index(heading) for heading in headings]
     normalized_instructions = " ".join(instructions.split())
@@ -52,17 +54,31 @@ def _assert_terminal_bench_skill_semantics(instructions: str) -> None:
     assert "install missing packages" in instructions
     assert "package managers" in instructions
     assert "small inspectable steps" in instructions
+    assert "preserve the raw inputs or sidecar files" in instructions
+    assert "reversible working copies" in instructions
+    assert "Create the requested artifact or service as soon as a plausible solution exists" in instructions
+    assert "do not keep changing a working artifact" in instructions
+    assert "remaining uncertainty is only speculative" in normalized_instructions
+    assert "keep the artifact stable" in instructions
+    assert "clean temporary side effects" in instructions
+    assert "while budget remains" in instructions
+    assert "direct, sampled, analytical, or tool-assisted" in instructions
+    assert "choose elegant, smart, effective strategies" in instructions
+    assert "exhaustive loops" in instructions
     assert "unobserved verification command" in instructions
     assert bad_required_verification_prefix not in instructions
     assert "@dataclass" in instructions
     assert "class RequiredVerification" in instructions
     assert "requirement: str" in instructions
-    assert "verification: str" in instructions
+    assert "verified: bool = False" in instructions
+    assert 'evidence: str = ""' in instructions
+    assert "verification: str" not in instructions
     assert "required verification list" in instructions
     assert "required checks" in instructions
+    assert "Mark an" in instructions
     assert "short list" in instructions
     assert "extracted from the task" in instructions
-    assert "verification:" in instructions
+    assert "verified:" in instructions
     assert "schema" not in instructions.lower()
     assert "yaml" not in instructions.lower()
     assert all(term not in instructions for term in obsolete_schema_terms)
