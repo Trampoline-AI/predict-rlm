@@ -14,6 +14,13 @@ if str(_EXAMPLE_DIR) not in sys.path:
 from terminal_bench_rlm.tools import tbench_agent  # noqa: E402
 
 
+def _assert_task_instruction_signature(signature, task_instruction: str) -> None:
+    assert list(signature.input_fields) == []
+    assert list(signature.output_fields) == ["answer"]
+    assert "Terminal-Bench task instruction" in signature.instructions
+    assert task_instruction in signature.instructions
+
+
 def test_agent_exposes_terminal_bench_name() -> None:
     assert tbench_agent.TerminalBenchRLMBaseAgent.name() == "predict-rlm"
 
@@ -58,12 +65,13 @@ def test_agent_constructs_predict_rlm_with_container_interpreter(monkeypatch) ->
 
     interpreter = events[0][1]
     rlm = events[1][1]
+    call = events[2][1]
     assert result.total_input_tokens == 0
     assert result.total_output_tokens == 0
     assert result.failure_mode is None
     assert result.timestamped_markers == []
     assert interpreter.container is session
-    assert rlm.signature == "instruction -> answer"
+    _assert_task_instruction_signature(rlm.signature, "solve it")
     assert rlm.kwargs["interpreter"] is interpreter
     assert rlm.kwargs["lm"] == "main"
     assert rlm.kwargs["sub_lm"] == "sub"
@@ -72,7 +80,43 @@ def test_agent_constructs_predict_rlm_with_container_interpreter(monkeypatch) ->
         set(rlm.kwargs.get("tools") or {})
         & tbench_agent.TERMINAL_WRAPPER_TOOL_NAMES
     )
+    assert call == {}
     assert events[-1] == ("shutdown", interpreter)
+
+
+def test_agent_preserves_custom_signature_instructions(monkeypatch) -> None:
+    captured: dict[str, object] = {}
+
+    class FakeInterpreter:
+        def __init__(self, *_args, **_kwargs) -> None:
+            pass
+
+        def shutdown(self) -> None:
+            pass
+
+    class FakePredictRLM:
+        def __init__(self, signature, **_kwargs) -> None:
+            captured["signature"] = signature
+
+        def __call__(self, **kwargs):
+            captured["call_kwargs"] = kwargs
+            return SimpleNamespace(answer="done")
+
+    monkeypatch.setattr(tbench_agent, "TerminalBenchRunnerInterpreter", FakeInterpreter)
+    monkeypatch.setattr(tbench_agent, "PredictRLM", FakePredictRLM)
+
+    base_signature = tbench_agent.dspy.Signature(
+        "instruction -> answer",
+        "Keep existing benchmark guidance.",
+    )
+    agent = tbench_agent.TerminalBenchRLMBaseAgent(signature=base_signature)
+
+    agent.perform_task("solve the custom task", SimpleNamespace(container="container"))
+
+    signature = captured["signature"]
+    _assert_task_instruction_signature(signature, "solve the custom task")
+    assert "Keep existing benchmark guidance." in signature.instructions
+    assert captured["call_kwargs"] == {}
 
 
 def test_agent_installs_codex_lm_before_constructing_predict_rlm(monkeypatch) -> None:
