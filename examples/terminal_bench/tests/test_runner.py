@@ -184,11 +184,9 @@ def test_predict_image_data_url_round_trips_to_host_tool(runner: LocalRunner) ->
             "params": {
                 "code": (
                     "import base64\n"
-                    "from pathlib import Path\n"
-                    f"Path('/sandbox/image.png').write_bytes({png_bytes!r})\n"
-                    "data_url = 'data:image/png;base64,' + base64.b64encode(\n"
-                    "    Path('/sandbox/image.png').read_bytes()\n"
-                    ").decode()\n"
+                    f"open('/sandbox/image.png', 'wb').write({png_bytes!r})\n"
+                    "image_bytes = open('/sandbox/image.png', 'rb').read()\n"
+                    "data_url = 'data:image/png;base64,' + base64.b64encode(image_bytes).decode()\n"
                     "result = await predict(\n"
                     "    'image: dspy.Image, question: str -> visible_text: str',\n"
                     "    image=data_url,\n"
@@ -221,6 +219,105 @@ def test_predict_image_data_url_round_trips_to_host_tool(runner: LocalRunner) ->
     response = runner.read()
 
     assert response == {"jsonrpc": "2.0", "id": 2, "result": {"output": "hello\n"}}
+
+
+def test_pathlib_path_remains_a_type(runner: LocalRunner) -> None:
+    result = runner.request(
+        "execute",
+        {
+            "code": (
+                "import pathlib\n"
+                "print(isinstance(pathlib.Path, type))\n"
+                "print(isinstance('/tmp/example', pathlib.Path))"
+            )
+        },
+    )
+
+    assert result == {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "result": {"output": "True\nFalse\n"},
+    }
+
+
+def test_windows311_visual_predict_path_handles_pillow_style_path_checks(
+    runner: LocalRunner,
+) -> None:
+    registered = runner.request("register_tools", {"tools": ["predict"]})
+    assert "error" not in registered
+
+    runner.write(
+        {
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "execute",
+            "params": {
+                "code": (
+                    "import base64, pathlib\n"
+                    "ppm = b'P6\\n1 1\\n255\\n' + bytes([255, 255, 255])\n"
+                    "pathlib.Path('/tmp/win311-screen.ppm').write_bytes(ppm)\n"
+                    "\n"
+                    "class PillowStyleImage:\n"
+                    "    def __init__(self, data):\n"
+                    "        self.data = data\n"
+                    "        self.size = (1, 1)\n"
+                    "\n"
+                    "    def save(self, path):\n"
+                    "        pathlib.Path(path).write_bytes(self.data)\n"
+                    "\n"
+                    "def image_open_like_pillow(fp):\n"
+                    "    isinstance(fp, pathlib.Path)\n"
+                    "    return PillowStyleImage(pathlib.Path(fp).read_bytes())\n"
+                    "\n"
+                    "im = image_open_like_pillow('/tmp/win311-screen.ppm')\n"
+                    "im.save('/tmp/win311-screen.png')\n"
+                    "data_url = 'data:image/png;base64,' + base64.b64encode(\n"
+                    "    pathlib.Path('/tmp/win311-screen.png').read_bytes()\n"
+                    ").decode()\n"
+                    "vision = await predict(\n"
+                    "    'image: dspy.Image, question: str -> visible_text: str, answer: str',\n"
+                    "    instructions='Inspect this VM screenshot.',\n"
+                    "    image=data_url,\n"
+                    "    question='Does this show the Windows 3.11 desktop?',\n"
+                    ")\n"
+                    "print(vision.visible_text)\n"
+                    "print(vision.answer)"
+                )
+            },
+        }
+    )
+    tool_call = runner.read()
+
+    assert tool_call["method"] == "tool_call"
+    assert tool_call["params"]["name"] == "predict"
+    assert tool_call["params"]["args"] == [
+        "image: dspy.Image, question: str -> visible_text: str, answer: str"
+    ]
+    assert tool_call["params"]["kwargs"]["instructions"] == "Inspect this VM screenshot."
+    assert tool_call["params"]["kwargs"]["question"] == "Does this show the Windows 3.11 desktop?"
+    image = tool_call["params"]["kwargs"]["image"]
+    assert image.startswith("data:image/png;base64,")
+    assert base64.b64decode(image.removeprefix("data:image/png;base64,")) == (
+        b"P6\n1 1\n255\n" + bytes([255, 255, 255])
+    )
+
+    runner.write(
+        {
+            "jsonrpc": "2.0",
+            "id": tool_call["id"],
+            "result": {
+                "type": "json",
+                "value": '{"visible_text": "desktop", "answer": "yes"}',
+            },
+        }
+    )
+    response = runner.read()
+
+    assert response == {
+        "jsonrpc": "2.0",
+        "id": 2,
+        "result": {"output": "desktop\nyes\n"},
+    }
 
 
 def test_host_tool_errors_propagate_to_execute_error(runner: LocalRunner) -> None:

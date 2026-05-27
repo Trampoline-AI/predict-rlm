@@ -169,12 +169,6 @@ def _open(path: Any, *args: Any, **kwargs: Any):
     return REAL_OPEN(_map_virtual_path(path), *args, **kwargs)
 
 
-def _path_factory(*args: Any, **kwargs: Any) -> pathlib.Path:
-    if args:
-        args = (_map_virtual_path(args[0]), *args[1:])
-    return REAL_PATH(*args, **kwargs)
-
-
 def _submit(**kwargs: Any) -> None:
     raise _FinalOutputError(_to_jsonable(kwargs))
 
@@ -241,7 +235,6 @@ def _register_tools(params: dict[str, Any], globals_dict: dict[str, Any]) -> dic
 
 def _install_virtual_filesystem(globals_dict: dict[str, Any]) -> None:
     builtins.open = _open
-    pathlib.Path = _path_factory  # type: ignore[assignment]
     globals_dict.setdefault("SUBMIT", _submit)
 
 
