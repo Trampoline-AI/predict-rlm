@@ -91,6 +91,20 @@ def test_cli_accepts_harbor_backend_and_executable_args() -> None:
     assert config.harbor_dataset == "terminal-bench/terminal-bench-2"
 
 
+def test_cli_codex_lm_missing_dependency_points_to_local_extra(monkeypatch) -> None:
+    parser = argparse.ArgumentParser()
+    gepa_cli._add_project_args(parser)
+    args = parser.parse_args(["--codex-lm"])
+    monkeypatch.setattr(gepa_cli.importlib.util, "find_spec", lambda name: None)
+
+    with pytest.raises(RuntimeError) as exc_info:
+        gepa_cli._install_codex_lm(args)
+
+    message = str(exc_info.value)
+    assert "predict-rlm[codex-lm" in message
+    assert "dspy-codex-lm" not in message
+
+
 def test_build_project_uses_harbor_harness_by_default() -> None:
     project = TerminalBenchGepaProject(default_config())
 

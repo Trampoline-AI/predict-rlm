@@ -12,13 +12,14 @@ VENV_PYTHON="${TB_VENV}/bin/python"
 
 uv venv --python "${PYTHON_VERSION}" "${TB_VENV}"
 uv pip install --python "${VENV_PYTHON}" \
-    -e "${REPO_ROOT}" \
+    -e "${REPO_ROOT}[codex-lm]" \
     -e "${EXAMPLE_DIR}" \
     "terminal-bench==${TERMINAL_BENCH_VERSION}"
 
 "${VENV_PYTHON}" - <<'PY'
 import terminal_bench
 import predict_rlm
+import dspy_codex_lm
 import terminal_bench_rlm.tools.tbench_agent as tbench_agent
 
 agent_class = tbench_agent.TerminalBenchRLMAgent
@@ -27,6 +28,6 @@ if agent_class.name() != "predict-rlm":
 if not issubclass(agent_class, tbench_agent.TerminalBenchRLMBaseAgent):
     raise RuntimeError("TerminalBenchRLMAgent must inherit TerminalBenchRLMBaseAgent")
 
-print("Verified imports: terminal_bench, predict_rlm, terminal_bench_rlm.tools.tbench_agent")
+print("Verified imports: terminal_bench, predict_rlm, dspy_codex_lm, terminal_bench_rlm.tools.tbench_agent")
 print("Terminal-Bench import path: terminal_bench_rlm.tools.tbench_agent:TerminalBenchRLMAgent")
 PY
