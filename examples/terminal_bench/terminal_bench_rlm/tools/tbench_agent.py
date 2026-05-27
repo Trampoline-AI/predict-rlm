@@ -91,9 +91,9 @@ def _install_codex_lm_monkeypatch(exclude: tuple[str, ...]) -> None:
     except ImportError as exc:
         raise RuntimeError(
             "CodexLM was requested for the Terminal-Bench PredictRLM agent, "
-            "but dspy-codex-lm is not importable in the Terminal-Bench agent "
-            "process. Install or include dspy-codex-lm in the Terminal-Bench "
-            "venv used by `tb run`."
+            "but predict-rlm[codex-lm] is not importable in the Terminal-Bench "
+            "agent process. Run examples/terminal_bench/scripts/setup_terminal_bench.sh "
+            "to install the local predict-rlm package with its codex-lm extra."
         ) from exc
     os.environ.setdefault("OPENAI_API_KEY", "codex-lm")
     cli_module.install_monkeypatch(exclude=exclude)

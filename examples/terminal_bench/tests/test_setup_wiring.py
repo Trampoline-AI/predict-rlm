@@ -31,7 +31,7 @@ def test_example_pyproject_installs_terminal_bench_rlm_without_terminal_bench_de
         "terminal_bench_rlm"
     ]
     dependencies = "\n".join(_project_dependencies(pyproject))
-    assert "predict-rlm[gepa,gepa-viz]" in dependencies
+    assert "predict-rlm[codex-lm,gepa,gepa-viz]" in dependencies
     assert "terminal-bench" not in dependencies
     assert "terminal-bench" not in "\n".join(
         _all_project_dependencies(REPO_ROOT / "pyproject.toml")
@@ -57,10 +57,11 @@ def test_setup_script_contains_venv_install_and_import_verification_contract() -
     assert 'TB_VENV="${TB_VENV:-${EXAMPLE_DIR}/.terminal-bench-venv}"' in text
     assert 'uv venv --python "${PYTHON_VERSION}" "${TB_VENV}"' in text
     assert '"terminal-bench==${TERMINAL_BENCH_VERSION}"' in text
-    assert '-e "${REPO_ROOT}"' in text
+    assert '-e "${REPO_ROOT}[codex-lm]"' in text
     assert '-e "${EXAMPLE_DIR}"' in text
     assert "import terminal_bench" in text
     assert "import predict_rlm" in text
+    assert "import dspy_codex_lm" in text
     assert "import terminal_bench_rlm.tools.tbench_agent as tbench_agent" in text
     assert "TerminalBenchRLMAgent" in text
 

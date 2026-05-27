@@ -115,10 +115,9 @@ def _install_codex_lm(args: Any) -> bool:
         return False
     if not codex_available:
         raise RuntimeError(
-            "--codex-lm requires dspy-codex-lm in the uv run environment. "
-            "Use: uv run --project examples/terminal_bench "
-            "--with-editable /Users/gabriel/Workspace/dspy-codex-lm "
-            "rlm-gepa optimize --codex-lm ..."
+            "--codex-lm requires predict-rlm[codex-lm] in the uv run environment. "
+            "Use: uv sync --project examples/terminal_bench, then "
+            "uv run --project examples/terminal_bench rlm-gepa optimize --codex-lm ..."
         )
 
     from dspy_codex_lm.cli import install_monkeypatch
