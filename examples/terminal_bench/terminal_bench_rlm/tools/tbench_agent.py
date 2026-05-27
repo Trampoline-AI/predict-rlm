@@ -107,6 +107,19 @@ def _get_task_instruction(task: Any) -> str:
     return str(task)
 
 
+def _signature_with_task_instruction(signature: Any, task_instruction: str) -> Any:
+    base_signature = (
+        signature if hasattr(signature, "output_fields") else dspy.Signature(signature, "")
+    )
+    instructions = (getattr(base_signature, "instructions", "") or "").strip()
+    task_block = f"## Terminal-Bench task instruction\n\n{task_instruction.strip()}"
+    if instructions:
+        instructions = f"{instructions}\n\n{task_block}"
+    else:
+        instructions = task_block
+    return dspy.Signature({**base_signature.output_fields}, instructions)
+
+
 def _get_runtime(task: Any = None, session: Any = None, **kwargs: Any) -> Any:
     if "container" in kwargs and kwargs["container"] is not None:
         return kwargs["container"]
@@ -294,7 +307,7 @@ class _TerminalBenchRLMBaseAgentMixin:
     def __init__(
         self,
         *,
-        signature: str = "instruction -> answer",
+        signature: Any = "instruction -> answer",
         tools: dict[str, Callable[..., Any]] | list[Callable[..., Any]] | None = None,
         skill_instructions: str | None = None,
         interpreter_kwargs: dict[str, Any] | None = None,
@@ -368,8 +381,9 @@ class _TerminalBenchRLMBaseAgentMixin:
                 rlm_kwargs["max_iterations"] = int(rlm_kwargs["max_iterations"])
             if self.tools is not None:
                 rlm_kwargs["tools"] = self.tools
-            rlm = _predict_rlm_class()(self.signature, **rlm_kwargs)
-            result = rlm(instruction=task_instruction)
+            signature = _signature_with_task_instruction(self.signature, task_instruction)
+            rlm = _predict_rlm_class()(signature, **rlm_kwargs)
+            result = rlm()
             if inspect.isawaitable(result):
                 result = asyncio.run(result)
             _write_trace(getattr(result, "trace", None), logging_dir)
@@ -528,8 +542,9 @@ class HarborPredictRLMAgent(_TerminalBenchRLMBaseAgentMixin):
                 rlm_kwargs["max_iterations"] = int(rlm_kwargs["max_iterations"])
             if self.tools is not None:
                 rlm_kwargs["tools"] = self.tools
-            rlm = _predict_rlm_class()(self.signature, **rlm_kwargs)
-            result = rlm.acall(instruction=instruction)
+            signature = _signature_with_task_instruction(self.signature, instruction)
+            rlm = _predict_rlm_class()(signature, **rlm_kwargs)
+            result = rlm.acall()
             if inspect.isawaitable(result):
                 result = await result
             _write_trace(getattr(result, "trace", None), self.logs_dir)

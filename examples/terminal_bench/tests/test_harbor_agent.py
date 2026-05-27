@@ -20,6 +20,13 @@ from terminal_bench_rlm.skills import (  # noqa: E402
 from terminal_bench_rlm.tools import tbench_agent  # noqa: E402
 
 
+def _assert_task_instruction_signature(signature, task_instruction: str) -> None:
+    assert list(signature.input_fields) == []
+    assert list(signature.output_fields) == ["answer"]
+    assert "Terminal-Bench task instruction" in signature.instructions
+    assert task_instruction in signature.instructions
+
+
 def _assert_terminal_bench_skill_semantics(instructions: str) -> None:
     headings = [
         "Operating principle",
@@ -173,12 +180,12 @@ def test_harbor_agent_runs_predict_rlm_async_against_harbor_environment(
     asyncio.run(agent.run("solve this task", environment, context))
 
     assert captured["environment"] is environment
-    assert captured["signature"] == "instruction -> answer"
+    _assert_task_instruction_signature(captured["signature"], "solve this task")
     assert captured["kwargs"]["interpreter"] is not None
     assert captured["kwargs"]["max_iterations"] == 3
     assert captured["kwargs"]["skills"][0].name == "terminal-bench"
     assert captured["kwargs"]["skills"][0].instructions == "Use shell commands and verify outputs."
-    assert captured["acall_kwargs"] == {"instruction": "solve this task"}
+    assert captured["acall_kwargs"] == {}
     assert captured["shutdown"] is True
 
 
