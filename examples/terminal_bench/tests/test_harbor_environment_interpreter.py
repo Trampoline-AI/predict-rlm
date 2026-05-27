@@ -166,9 +166,9 @@ def test_harbor_environment_interpreter_uses_persistent_exec_for_predict_round_t
         ]
         assert process.requests[0]["params"] == {"tools": ["predict"]}
         assert process.requests[2] == {
+            "jsonrpc": "2.0",
             "id": 1,
-            "ok": True,
-            "result": {"type": "json", "value": {"answer": "4"}},
+            "result": {"type": "json", "value": '{"answer": "4"}'},
         }
 
     asyncio.run(scenario())
