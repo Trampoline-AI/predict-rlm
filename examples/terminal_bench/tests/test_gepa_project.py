@@ -814,12 +814,14 @@ def test_default_terminal_bench_skill_includes_concurrent_timeout_snippet() -> N
     skill = DEFAULT_TERMINAL_BENCH_SKILL_INSTRUCTIONS
     normalized_skill = " ".join(skill.split())
     headings = [
-        "Operating principle",
-        "Inspection and changes",
-        "Timeouts and long-running work",
-        "Problem-solving strategy",
-        "Required verification and final QA",
-        "Verification and final submission",
+        "## Operating principle",
+        "## Inspection and changes",
+        "## Evidence preservation and stopping discipline",
+        "## Timeouts and long-running work",
+        "### Command helper pattern",
+        "## Problem-solving strategy",
+        "## Required verification and final QA",
+        "## Verification and final submission",
     ]
     bad_required_verification_prefix = "+Required" + " verification:"
     obsolete_schema_terms = [
@@ -836,10 +838,21 @@ def test_default_terminal_bench_skill_includes_concurrent_timeout_snippet() -> N
     assert "inspect the filesystem before making changes" in skill
     assert "package managers" in skill
     assert "small inspectable steps" in skill
+    assert "preserve the raw inputs or sidecar files" in skill
+    assert "reversible working copies" in skill
+    assert "Create the requested artifact or service as soon as a plausible solution exists" in skill
+    assert "do not keep changing a working artifact" in skill
+    assert "remaining uncertainty is only speculative" in normalized_skill
+    assert "keep the artifact stable" in skill
+    assert "clean temporary side effects" in skill
+    assert "while budget remains" in skill
     assert "1-5 seconds" in skill
     assert "10-60 seconds" in skill
     assert "several minutes" in skill
     assert "commands, network requests, and computations" in skill
+    assert "direct, sampled, analytical, or tool-assisted" in skill
+    assert "choose elegant, smart, effective strategies" in skill
+    assert "exhaustive loops" in skill
     assert "query-optimize" not in skill.lower()
     assert "sqlite" not in skill.lower()
     assert "unobserved verification command" in skill
@@ -847,12 +860,15 @@ def test_default_terminal_bench_skill_includes_concurrent_timeout_snippet() -> N
     assert "@dataclass" in skill
     assert "class RequiredVerification" in skill
     assert "requirement: str" in skill
-    assert "verification: str" in skill
+    assert "verified: bool = False" in skill
+    assert 'evidence: str = ""' in skill
+    assert "verification: str" not in skill
     assert "required verification list" in skill
     assert "required checks" in skill
+    assert "Mark an" in skill
     assert "short list" in skill
     assert "extracted from the task" in skill
-    assert "verification:" in skill
+    assert "verified:" in skill
     assert "schema" not in skill.lower()
     assert "yaml" not in skill.lower()
     assert all(term not in skill for term in obsolete_schema_terms)
