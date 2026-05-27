@@ -216,6 +216,106 @@ def test_harbor_runner_builds_harbor_run_command(monkeypatch, tmp_path: Path) ->
     assert result.trial_result["verifier_result"]["rewards"]["reward"] == 1.0
 
 
+def test_harbor_subprocess_runner_retries_transient_registry_exception_result(
+    monkeypatch, tmp_path: Path
+) -> None:
+    config = default_config()
+    config.terminal_bench_output_dir = tmp_path / "harbor-runs"
+    calls: list[list[str]] = []
+
+    def fake_run(cmd, **_kwargs):
+        calls.append(cmd)
+        run_dir = config.terminal_bench_output_dir / "gepa-val-task"
+        run_dir.mkdir(parents=True, exist_ok=True)
+        if len(calls) == 1:
+            trial_result = {
+                "task_name": "task",
+                "exception_info": {
+                    "exception_type": "RuntimeError",
+                    "exception_message": (
+                        "failed to fetch anonymous token: unexpected status from GET request "
+                        "to https://auth.docker.io/token: 500 Internal Server Error"
+                    ),
+                },
+            }
+        else:
+            trial_result = {
+                "task_name": "task",
+                "exception_info": None,
+                "verifier_result": {"rewards": {"reward": 1.0}},
+            }
+        (run_dir / "result.json").write_text(json.dumps({"trial_results": [trial_result]}))
+        return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    result = HarborSubprocessHarnessRunner(cwd=tmp_path)._run_sync(
+        TerminalBenchTaskRunRequest(
+            task_id="task",
+            instruction="",
+            skill_instructions="skill",
+            lm="main",
+            sub_lm="sub",
+            max_iterations=3,
+            task_timeout=30,
+            verbose_rlm=False,
+            output_dir=tmp_path,
+            run_id="gepa-val-task",
+            config=config,
+        )
+    )
+
+    assert len(calls) == 2
+    assert result.error is None
+    assert result.trial_result["exception_info"] is None
+    assert result.trial_result["verifier_result"]["rewards"]["reward"] == 1.0
+
+
+def test_harbor_subprocess_runner_does_not_retry_non_registry_exception_result(
+    monkeypatch, tmp_path: Path
+) -> None:
+    config = default_config()
+    config.terminal_bench_output_dir = tmp_path / "harbor-runs"
+    calls: list[list[str]] = []
+
+    def fake_run(cmd, **_kwargs):
+        calls.append(cmd)
+        run_dir = config.terminal_bench_output_dir / "gepa-val-task"
+        run_dir.mkdir(parents=True, exist_ok=True)
+        trial_result = {
+            "task_name": "task",
+            "exception_info": {
+                "exception_type": "RuntimeError",
+                "exception_message": "image parser service returned 500 Internal Server Error",
+            },
+        }
+        (run_dir / "result.json").write_text(json.dumps({"trial_results": [trial_result]}))
+        return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    result = HarborSubprocessHarnessRunner(cwd=tmp_path)._run_sync(
+        TerminalBenchTaskRunRequest(
+            task_id="task",
+            instruction="",
+            skill_instructions="skill",
+            lm="main",
+            sub_lm="sub",
+            max_iterations=3,
+            task_timeout=30,
+            verbose_rlm=False,
+            output_dir=tmp_path,
+            run_id="gepa-val-task",
+            config=config,
+        )
+    )
+
+    assert len(calls) == 1
+    assert result.trial_result["exception_info"]["exception_message"] == (
+        "image parser service returned 500 Internal Server Error"
+    )
+
+
 def test_phase_duration_summary_aggregates_task_phase_event_logs(tmp_path: Path) -> None:
     task_a_log = tmp_path / "jobs" / "run-a" / "task_phase_events.jsonl"
     task_a_log.parent.mkdir(parents=True)
