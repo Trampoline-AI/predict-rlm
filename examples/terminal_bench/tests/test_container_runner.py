@@ -55,6 +55,7 @@ class FakeProcess:
         responses: list[dict | tuple[float, dict]],
         *,
         stderr: str = "",
+        wait_callback=None,
     ) -> None:
         self.responses = list(responses)
         self.requests: list[dict] = []
@@ -66,6 +67,7 @@ class FakeProcess:
         self.killed = False
         self.waited = False
         self.returncode: int | None = None
+        self.wait_callback = wait_callback
 
     def _on_stdin(self, data: str) -> None:
         request = json.loads(data)
@@ -88,6 +90,8 @@ class FakeProcess:
 
     def wait(self, timeout=None):
         self.waited = True
+        if self.wait_callback is not None:
+            return self.wait_callback()
         if self.returncode is None:
             self.returncode = 0
         return 0
@@ -163,6 +167,34 @@ def test_execute_reset_shutdown_requests_and_maps_success() -> None:
     ]
     assert adapter.copied_to[0][1] == "/tmp/predict_rlm_runner.py"
     assert process.waited is True
+
+
+def test_shutdown_kills_original_process_if_wait_races_with_process_clear() -> None:
+    interpreter: TerminalBenchRunnerInterpreter | None = None
+
+    def clear_process_then_timeout() -> None:
+        assert interpreter is not None
+        interpreter._process = None
+        raise TimeoutError("wait timed out")
+
+    process = FakeProcess(
+        [
+            {"id": 1, "ok": True, "result": {"output": "hi\n"}},
+            {"id": 2, "ok": True, "result": {"shutdown": True}},
+        ],
+        wait_callback=clear_process_then_timeout,
+    )
+    interpreter = TerminalBenchRunnerInterpreter(
+        object(),
+        container_adapter=FakeAdapter(process),
+        runner_path="/tmp/predict_rlm_runner.py",
+    )
+
+    assert interpreter.execute("print('hi')") == "hi\n"
+    interpreter.shutdown()
+
+    assert process.killed is True
+    assert interpreter._process is None
 
 
 def test_execute_accepts_lm_selected_execution_timeout() -> None:

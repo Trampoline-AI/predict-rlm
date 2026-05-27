@@ -576,15 +576,16 @@ class TerminalBenchRunnerInterpreter(PersistentJsonRpcRunnerClient, PredictRLMIn
         if self._shutdown:
             return
         self._shutdown = True
-        if self._process is not None and self._process.poll() is None:
+        process = self._process
+        if process is not None and process.poll() is None:
             try:
                 self._send_request("shutdown", {})
             except Exception:
                 pass
             try:
-                self._process.wait(timeout=5)
+                process.wait(timeout=5)
             except Exception:
-                self._process.kill()
+                process.kill()
         self._process = None
 
     def configure_runtime(
