@@ -71,6 +71,7 @@ codex-lm usage
 - **Prompt-optimized skills & tools** — predict-rlm skills comes tested and optimized to ensure maximum LM interoperability and performance, bundling instructions, PyPI packages, and tools for domain-specific tasks
 - **Simple file I/O** — pass local or cloud files as typed inputs and outputs via `File`, keeping interop with your existing data pipelines straightforward. (S3 files support soon)
 - **Structured sub-LM calls** — native Pydantic and DSPy signature support for type-safe sub-LM invocations with structured outputs
+- **Runtime event hooks** — observe selected SBX REPL function calls from host code for auditing, instrumentation, and eval traces
 
 ## Demos
 
@@ -182,6 +183,28 @@ result = rlm(
 ```
 
 `Workspace(mode="direct")` mounts the host directory directly into the Docker Sandbox. Python code and subprocesses see the mounted path, and file edits are host edits immediately; no mirror or post-execute sync is used. Direct workspaces require `sandbox_backend="sbx"` and are not supported with `SbxPool` in this version because pool sandboxes are created before per-call inputs are known.
+
+#### Runtime event hooks
+
+The SBX backend can emit host-side events when generated REPL code calls selected runtime functions. Use this for auditing or instrumentation that should not be exposed as a model-callable tool.
+
+```python
+from predict_rlm import PredictRLM, RuntimeHook
+
+events = []
+
+rlm = PredictRLM(
+    "request -> summary",
+    sandbox_backend="sbx",
+    runtime_hooks=[
+        RuntimeHook(target="pathlib.Path.write_text", phases={"before", "after"}),
+        RuntimeHook(target="subprocess.run", phases={"before", "after", "error"}),
+    ],
+    on_runtime_hook_event=events.append,
+)
+```
+
+Each callback receives a `RuntimeHookEvent` with the target, phase, sanitized arguments, optional result or error, duration, and timestamp. See the [API reference](docs/api.md#runtime-hooks) for the full interface and supported target families.
 
 Real `sbx` integration tests are skipped by default; run them with `PREDICT_RLM_RUN_SBX_TESTS=1 uv run pytest -m sbx` after the CLI is installed and logged in.
 

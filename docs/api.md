@@ -23,6 +23,8 @@ rlm = PredictRLM(
     allowed_domains=None,     # Domains the sandbox can access
     debug=False,              # Print REPL activity to stderr
     output_dir=None,          # Host directory for output files
+    runtime_hooks=None,       # SBX runtime function hooks
+    on_runtime_hook_event=None, # Host callback for hook events
 )
 ```
 
@@ -45,6 +47,8 @@ rlm = PredictRLM(
 | `allowed_domains` | `list[str] \| None` | `None` | Domains/IPs the sandbox can access via network. By default, no network access. Example: `["api.example.com", "192.168.1.100:8080"]` |
 | `debug` | `bool` | `False` | Print REPL code, output, errors, and tool calls to stderr in real-time. |
 | `output_dir` | `str \| Path \| None` | `None` | Host directory for output files. When set, `File` output fields without an explicit path are written here. If `None`, a temp directory is used. |
+| `runtime_hooks` | `list[RuntimeHook] \| None` | `None` | SBX-only hooks for observing selected Python runtime function calls inside the sandbox REPL. Requires `sandbox_backend="sbx"` unless a custom interpreter implements compatible runtime hook configuration. |
+| `on_runtime_hook_event` | `Callable[[RuntimeHookEvent], Any] \| None` | `None` | Host callback invoked for each sanitized runtime hook event. Callback return values are ignored, and callback errors do not affect sandbox execution. |
 
 ### Usage
 
@@ -89,6 +93,65 @@ result = await predict(
     page=page_image,
 )
 ```
+
+### Runtime hooks
+
+Runtime hooks let host code observe selected function calls made by the generated Python code inside the SBX REPL. They are useful for auditing filesystem writes, subprocess execution, or other sandbox runtime behavior without adding extra tools to the model-facing API.
+
+Hooks are observational: they do not change the function arguments or return value, and the callback return value is ignored.
+
+```python
+from predict_rlm import PredictRLM, RuntimeHook, RuntimeHookEvent
+
+events: list[RuntimeHookEvent] = []
+
+
+def record_runtime_event(event: RuntimeHookEvent) -> None:
+    events.append(event)
+    print(f"{event.phase} {event.target}: {event.args}")
+
+
+rlm = PredictRLM(
+    "request -> summary",
+    sandbox_backend="sbx",
+    runtime_hooks=[
+        RuntimeHook(target="pathlib.Path.write_text", phases={"before", "after"}),
+        RuntimeHook(target="subprocess.run", phases={"before", "after", "error"}),
+    ],
+    on_runtime_hook_event=record_runtime_event,
+)
+
+result = rlm(request="Create a README and run the test suite.")
+```
+
+Current SBX runtime hook targets must name callable Python runtime functions in one of these supported target families:
+
+- `builtins.open`
+- `pathlib.Path.<method>`, such as `pathlib.Path.write_text`
+- `os.<function>`, such as `os.pwrite`
+- `subprocess.<function>`, such as `subprocess.run`
+
+`RuntimeHook` fields:
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `target` | `str` | — | Dotted function target to observe inside the sandbox runtime. |
+| `phases` | `set["before" \| "after" \| "error"]` | `{"before"}` | Event phases to emit for the target. `before` fires before the original call, `after` fires after a successful return, and `error` fires when the call raises. |
+
+`RuntimeHookEvent` fields:
+
+| Field | Type | Description |
+|---|---|---|
+| `target` | `str` | Hook target that emitted the event. |
+| `phase` | `"before" \| "after" \| "error"` | Event phase. |
+| `args` | `list[Any]` | Sanitized positional arguments. |
+| `kwargs` | `dict[str, Any]` | Sanitized keyword arguments. |
+| `result` | `Any` | Sanitized return value for `after` events, otherwise `None`. |
+| `error` | `str \| None` | Error message for `error` events. |
+| `duration_ms` | `int \| None` | Call duration for `after` and `error` events. |
+| `timestamp` | `float` | Unix timestamp when the event was emitted. |
+
+Event payloads are summarized before leaving the sandbox. Long strings and bytes are truncated, containers are bounded, `subprocess.CompletedProcess` values include metadata such as `returncode` and output lengths, and arbitrary objects are represented by type and shortened `repr`.
 
 ---
 

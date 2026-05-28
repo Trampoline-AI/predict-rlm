@@ -13,7 +13,7 @@ import pytest
 from dspy.primitives.repl_types import REPLEntry, REPLHistory
 from pydantic import BaseModel
 
-from predict_rlm import PredictRLM, SbxConfig, SbxInterpreter, SbxPool
+from predict_rlm import PredictRLM, RuntimeHook, SbxConfig, SbxInterpreter, SbxPool
 from predict_rlm.predict_rlm import _models_from_schema
 from predict_rlm.rlm_skills import Skill
 from predict_rlm.telemetry import TelemetryContext, classify_failure
@@ -29,6 +29,11 @@ def _run(coro):
     nest_asyncio.apply()
     loop = asyncio.get_event_loop()
     return loop.run_until_complete(coro)
+
+
+def test_predict_rlm_runtime_hooks_require_sbx_backend_by_default():
+    with pytest.raises(ValueError, match="runtime_hooks require the SBX backend"):
+        PredictRLM("x -> y", runtime_hooks=[RuntimeHook(target="builtins.open")])
 
 
 class ImageAnalysisSignature(dspy.Signature):
@@ -80,6 +85,8 @@ class TestSandboxBackendSelection:
 
         mock_jspi.assert_called_once()
         assert mock_jspi.call_args.kwargs["tools"] == execution_tools
+        assert "runtime_hooks" not in mock_jspi.call_args.kwargs
+        assert "on_runtime_hook_event" not in mock_jspi.call_args.kwargs
 
     def test_explicit_sbx_backend_uses_sbx_interpreter(self):
         from predict_rlm import SandboxBackend, SbxConfig
@@ -251,6 +258,25 @@ class TestSandboxBackendSelection:
             assert interpreter.output_fields == rlm._get_output_fields_info()
 
         assert interpreter.reset_count == 1
+
+    def test_runtime_hooks_require_compatible_external_interpreter(self):
+        class FakeInterpreter:
+            def __init__(self):
+                self.tools = {}
+                self.output_fields = []
+
+        interpreter = FakeInterpreter()
+        rlm = PredictRLM(
+            ImageAnalysisSignature,
+            sub_lm=MagicMock(),
+            max_iterations=1,
+            interpreter=interpreter,
+            runtime_hooks=[RuntimeHook(target="builtins.open")],
+        )
+
+        with pytest.raises(ValueError, match="runtime_hooks require an SBX-compatible interpreter"):
+            with rlm._interpreter_context(execution_tools={"predict": MagicMock()}):
+                pass
 
     def test_external_sbx_interpreter_reregisters_tools_after_auto_reset(
         self, tmp_path: Path

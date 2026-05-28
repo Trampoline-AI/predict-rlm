@@ -19,6 +19,7 @@ from typing import Annotated
 import pytest
 from dspy.primitives.code_interpreter import CodeInterpreterError, FinalOutput
 
+from predict_rlm import RuntimeHook
 from predict_rlm.files import SyncedFile
 from predict_rlm.interpreter import SandboxFatalError
 from predict_rlm.interpreters import DEFAULT_SBX_TEMPLATE, SbxConfig, SbxInterpreter, SbxPool
@@ -365,6 +366,173 @@ class TestPythonRunnerProtocol:
         assert result["result"]["timeout"] == {"seconds": 0.1}
         assert followup["result"]["output"] == "False\n"
 
+    def test_runtime_hooks_are_opt_in(self, runner: LocalRunner, tmp_path: Path):
+        path = tmp_path / "no-hook.txt"
+        result = runner.request("execute", {"code": f"open({str(path)!r}, 'w').close()"})
+
+        assert result["result"]["output"] == ""
+
+    def test_runtime_hooks_emit_function_events(self, runner: LocalRunner, tmp_path: Path):
+        path = tmp_path / "hooked.txt"
+        registered = runner.request(
+            "register_runtime_hooks",
+            {
+                "hooks": [
+                    {"target": "builtins.open", "phases": ["before", "after"]},
+                    {"target": "pathlib.Path.write_text", "phases": ["before", "after"]},
+                    {"target": "os.pwrite", "phases": ["before"]},
+                    {"target": "subprocess.run", "phases": ["before", "after"]},
+                ]
+            },
+        )
+
+        assert registered["result"] == {}
+        execute = runner.request(
+            "execute",
+            {
+                "code": (
+                    "from pathlib import Path\n"
+                    "import os, subprocess, sys\n"
+                    f"Path({str(path)!r}).write_text('hello')\n"
+                    f"fd = os.open({str(path)!r}, os.O_RDWR)\n"
+                    "os.pwrite(fd, b'!', 0)\n"
+                    "os.close(fd)\n"
+                    "subprocess.run([sys.executable, '-c', 'print(123)'], capture_output=True, text=True)\n"
+                )
+            },
+        )
+        events = []
+        while "method" in execute:
+            events.append(execute["params"])
+            execute = json.loads(runner.proc.stdout.readline())
+
+        assert execute["result"]["output"] == ""
+        assert [event["target"] for event in events] == [
+            "pathlib.Path.write_text",
+            "pathlib.Path.write_text",
+            "os.pwrite",
+            "subprocess.run",
+            "subprocess.run",
+        ]
+        assert events[0]["phase"] == "before"
+        assert events[1]["phase"] == "after"
+        assert events[2]["args"][0] >= 3
+        assert events[3]["args"][0][0] == sys.executable
+
+    def test_runtime_hooks_emit_error_events(self, runner: LocalRunner):
+        runner.request(
+            "register_runtime_hooks",
+            {"hooks": [{"target": "builtins.open", "phases": ["error"]}]},
+        )
+        execute = runner.request("execute", {"code": "open('/definitely/missing')"})
+        event = execute
+        final = json.loads(runner.proc.stdout.readline())
+
+        assert event["method"] == "runtime_hook_event"
+        assert event["params"]["target"] == "builtins.open"
+        assert event["params"]["phase"] == "error"
+        assert "No such file" in event["params"]["error"]
+        assert final["error"]["data"]["type"] == "FileNotFoundError"
+
+    def test_runtime_hooks_merge_duplicate_targets_without_stacking(
+        self, runner: LocalRunner, tmp_path: Path
+    ):
+        path = tmp_path / "duplicate-hooks.txt"
+        runner.request(
+            "register_runtime_hooks",
+            {
+                "hooks": [
+                    {"target": "builtins.open", "phases": ["before"]},
+                    {"target": "builtins.open", "phases": ["after"]},
+                ]
+            },
+        )
+
+        execute = runner.request(
+            "execute",
+            {"code": f"open({str(path)!r}, 'w').close()"},
+        )
+        events = []
+        while "method" in execute:
+            events.append(execute["params"])
+            execute = json.loads(runner.proc.stdout.readline())
+
+        assert execute["result"]["output"] == ""
+        assert [event["phase"] for event in events] == ["before", "after"]
+
+        runner.request("register_runtime_hooks", {"hooks": []})
+        runner.request(
+            "register_runtime_hooks",
+            {"hooks": [{"target": "builtins.open", "phases": ["before"]}]},
+        )
+
+        execute = runner.request(
+            "execute",
+            {"code": f"open({str(path)!r}, 'a').close()"},
+        )
+        events = []
+        while "method" in execute:
+            events.append(execute["params"])
+            execute = json.loads(runner.proc.stdout.readline())
+
+        assert execute["result"]["output"] == ""
+        assert [event["phase"] for event in events] == ["before"]
+
+    def test_runtime_hooks_reject_non_callable_targets_without_mutating_state(
+        self, runner: LocalRunner
+    ):
+        registered = runner.request(
+            "register_runtime_hooks",
+            {"hooks": [{"target": "os.path", "phases": ["before"]}]},
+        )
+
+        assert registered["error"]["data"]["type"] == "ValueError"
+        assert "not callable" in registered["error"]["message"]
+
+        execute = runner.request(
+            "execute",
+            {"code": "import os\nprint(callable(os.path), type(os.path).__name__)"},
+        )
+
+        assert execute["result"]["output"] == "False module\n"
+
+    def test_runtime_hooks_can_target_injected_module_functions(
+        self, runner: LocalRunner, tmp_path: Path
+    ):
+        module_dir = tmp_path / "runtime_modules"
+        module_dir.mkdir()
+        (module_dir / "hook_module.py").write_text(
+            (
+                "def touch(path):\n"
+                "    with open(path, 'w') as handle:\n"
+                "        handle.write('ok')\n"
+                "    return 'done'\n"
+            ),
+            encoding="utf-8",
+        )
+        runner.request("execute", {"code": f"import sys\nsys.path.insert(0, {str(module_dir)!r})"})
+        path = tmp_path / "custom-target.txt"
+
+        registered = runner.request(
+            "register_runtime_hooks",
+            {"hooks": [{"target": "hook_module.touch", "phases": ["before", "after"]}]},
+        )
+
+        assert registered["result"] == {}
+
+        execute = runner.request(
+            "execute",
+            {"code": f"import hook_module\nprint(hook_module.touch({str(path)!r}))"},
+        )
+        events = []
+        while "method" in execute:
+            events.append(execute["params"])
+            execute = json.loads(runner.proc.stdout.readline())
+
+        assert execute["result"]["output"] == "done\n"
+        assert [event["phase"] for event in events] == ["before", "after"]
+        assert {event["target"] for event in events} == {"hook_module.touch"}
+
     def test_file_helpers_preserve_virtual_paths(self, runner: LocalRunner, tmp_path: Path):
         source = tmp_path / "input.txt"
         source.write_text("hello", encoding="utf-8")
@@ -600,6 +768,52 @@ class TestSbxInterpreterLocalRunner:
             assert workspace_file.read_text(encoding="utf-8") == "direct"
         finally:
             interpreter.shutdown()
+
+    def test_runtime_hook_callback_failure_is_ignored(self, tmp_path: Path):
+        events: list[object] = []
+
+        def fail_callback(event: object) -> None:
+            events.append(event)
+            raise RuntimeError("callback failed")
+
+        interpreter = SbxInterpreter(
+            config=SbxConfig(name="local-test"),
+            preinstall_packages=False,
+            runtime_hooks=[RuntimeHook(target="builtins.open", phases={"before"})],
+            on_runtime_hook_event=fail_callback,
+            _runner_command=[sys.executable, "-u", str(RUNNER_PATH)],
+            _staging_root=tmp_path / "staging",
+        )
+        path = tmp_path / "callback.txt"
+        try:
+            result = interpreter.execute(f"open({str(path)!r}, 'w').close()\nprint('ok')")
+        finally:
+            interpreter.shutdown()
+
+        assert result == "ok\n"
+        assert len(events) == 1
+
+    def test_configure_runtime_can_clear_runtime_hooks(self, tmp_path: Path):
+        events: list[object] = []
+        interpreter = SbxInterpreter(
+            config=SbxConfig(name="local-test"),
+            preinstall_packages=False,
+            runtime_hooks=[RuntimeHook(target="builtins.open", phases={"before"})],
+            on_runtime_hook_event=events.append,
+            _runner_command=[sys.executable, "-u", str(RUNNER_PATH)],
+            _staging_root=tmp_path / "staging",
+        )
+        first = tmp_path / "first.txt"
+        second = tmp_path / "second.txt"
+        try:
+            interpreter.execute(f"open({str(first)!r}, 'w').close()")
+            interpreter.configure_runtime(runtime_hooks=[], on_runtime_hook_event=None)
+            interpreter.execute(f"open({str(second)!r}, 'w').close()")
+        finally:
+            interpreter.shutdown()
+
+        assert len(events) == 1
+
 
     def test_execute_and_state_persistence(self, tmp_path: Path):
         interpreter = self.make_interpreter(tmp_path)
