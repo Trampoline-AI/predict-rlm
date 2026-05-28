@@ -314,6 +314,35 @@ def test_sbx_send_request_exhausted_resync_raises_cleanly(tmp_path):
         _close_sbx_request_interp(interp)
 
 
+def test_sbx_send_request_routes_runtime_hook_events_without_counting_them_stale(
+    tmp_path, monkeypatch
+):
+    hook_events = [
+        json.dumps({
+            "jsonrpc": "2.0",
+            "method": "runtime_hook_event",
+            "params": {
+                "target": "builtins.open",
+                "phase": "before",
+                "timestamp": 1.0,
+            },
+        })
+        for _ in range(STALE_RESPONSE_DISCARD_LIMIT + 1)
+    ]
+    fresh = json.dumps({"jsonrpc": "2.0", "id": 1, "result": {"output": "fresh"}})
+    interp = _build_sbx_request_interp(tmp_path, [*hook_events, fresh])
+    seen: list[object] = []
+    interp.on_runtime_hook_event = seen.append
+
+    try:
+        result = interp._send_request("execute", {"code": "print('fresh')"})
+    finally:
+        _close_sbx_request_interp(interp)
+
+    assert result["result"]["output"] == "fresh"
+    assert len(seen) == STALE_RESPONSE_DISCARD_LIMIT + 1
+
+
 def test_sbx_send_request_routes_tool_calls_without_counting_them_stale(
     tmp_path, monkeypatch
 ):

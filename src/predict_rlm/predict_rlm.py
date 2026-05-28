@@ -62,6 +62,7 @@ from .interpreters import (
     SbxPool,
 )
 from .rlm_skills import Skill, merge_skills
+from .runtime_hooks import RuntimeHook, RuntimeHookEvent
 from .telemetry import TelemetryContext, make_span_id
 from .trace import (
     IterationStep,
@@ -852,6 +853,8 @@ class PredictRLM(dspy.RLM):
         debug: bool = False,
         output_dir: str | Path | None = None,
         telemetry_context: TelemetryContext | None = None,
+        runtime_hooks: list[RuntimeHook] | None = None,
+        on_runtime_hook_event: Callable[[RuntimeHookEvent], Any] | None = None,
     ):
         """
         Args:
@@ -895,6 +898,10 @@ class PredictRLM(dspy.RLM):
             telemetry_context: Optional run/case telemetry context for
                        OTel-shaped local JSONL events. Disabled/failed
                        telemetry writes are always ignored.
+            runtime_hooks: Optional SBX-only runtime function hooks. Each hook
+                       names a dotted Python target to observe inside the sandbox.
+            on_runtime_hook_event: Optional host callback for sanitized runtime
+                       hook events. Callback errors are ignored.
         """
         if interpreter is not None and sbx_pool is not None:
             raise ValueError(
@@ -911,6 +918,11 @@ class PredictRLM(dspy.RLM):
             raise ValueError("sbx_pool requires sandbox_backend='sbx'.")
         if sbx_pool is not None and sbx_config is not None:
             raise ValueError("Pass sbx_config to SbxPool when using sbx_pool.")
+        runtime_hooks = list(runtime_hooks or [])
+        if runtime_hooks and interpreter is None and sbx_pool is None and self._sandbox_backend is not SandboxBackend.SBX:
+            raise ValueError("runtime_hooks require the SBX backend in PredictRLM v1")
+        self._runtime_hooks = runtime_hooks
+        self._on_runtime_hook_event = on_runtime_hook_event
         self._sbx_pool = sbx_pool
         self._sbx_config = sbx_config or SbxConfig()
 
@@ -1415,10 +1427,16 @@ class PredictRLM(dspy.RLM):
                     configure_runtime,
                     tools=execution_tools,
                     output_fields=self._get_output_fields_info(),
+                    runtime_hooks=self._runtime_hooks,
+                    on_runtime_hook_event=self._on_runtime_hook_event,
                 )
+                if self._runtime_hooks and "runtime_hooks" not in runtime_kwargs:
+                    raise ValueError("runtime_hooks require an SBX-compatible interpreter")
             if configure_runtime is not None and runtime_kwargs:
                 configure_runtime(**runtime_kwargs)
             else:
+                if self._runtime_hooks:
+                    raise ValueError("runtime_hooks require an SBX-compatible interpreter")
                 self._inject_execution_context(self._interpreter, execution_tools)
             configured = self._configure_interpreter_debug(self._interpreter)
             self._log_lifecycle(
@@ -1473,6 +1491,8 @@ class PredictRLM(dspy.RLM):
                     output_fields=self._get_output_fields_info(),
                     debug=self._debug,
                     verbose=self._iteration_logging_enabled(),
+                    runtime_hooks=self._runtime_hooks,
+                    on_runtime_hook_event=self._on_runtime_hook_event,
                 ) as repl:
                     self._log_lifecycle(
                         "sbx.pool.lease.acquired",
@@ -1497,7 +1517,12 @@ class PredictRLM(dspy.RLM):
                     allowed_domains=len(self._allowed_domains or []),
                     skill_packages=len(self._skill_packages or []),
                 )
-                repl = SbxInterpreter(config=self._sbx_config, **interpreter_kwargs)
+                repl = SbxInterpreter(
+                    config=self._sbx_config,
+                    runtime_hooks=self._runtime_hooks,
+                    on_runtime_hook_event=self._on_runtime_hook_event,
+                    **interpreter_kwargs,
+                )
             else:
                 self._log_lifecycle(
                     "interpreter.create",

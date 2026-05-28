@@ -38,6 +38,7 @@ from predict_rlm.execution_timeout import (
 )
 from predict_rlm.files import get_synced_file_params
 from predict_rlm.interpreter import SandboxFatalError
+from predict_rlm.runtime_hooks import RuntimeHook, RuntimeHookEvent
 from predict_rlm.serialization import to_plain_data
 from predict_rlm.trace import ToolCall, ms_since, record_tool_call
 from predict_rlm.workspace import DirectWorkspaceMount, WorkspaceFileInfo
@@ -79,6 +80,8 @@ class SbxInterpreter(PersistentJsonRpcRunnerClient, PredictRLMInterpreter):
         extra_write_paths: list[str] | None = None,
         _supervisor_command: list[str] | None = None,
         direct_workspace_mounts: list[DirectWorkspaceMount] | None = None,
+        runtime_hooks: list[RuntimeHook] | None = None,
+        on_runtime_hook_event: Callable[[RuntimeHookEvent], Any] | None = None,
         _runner_command: list[str] | None = None,
         _staging_root: str | Path | None = None,
     ) -> None:
@@ -99,6 +102,8 @@ class SbxInterpreter(PersistentJsonRpcRunnerClient, PredictRLMInterpreter):
         self.extra_write_paths = extra_write_paths or []
         self._supervisor_command = _supervisor_command or _runner_command
         self._direct_workspace_mounts = list(direct_workspace_mounts or [])
+        self.runtime_hooks = list(runtime_hooks or [])
+        self.on_runtime_hook_event = on_runtime_hook_event
         self._host_workspace = Path.cwd()
         self._owns_staging_root = _staging_root is None
         self._staging_root = (
@@ -347,6 +352,8 @@ class SbxInterpreter(PersistentJsonRpcRunnerClient, PredictRLMInterpreter):
         output_fields: list[dict] | None = None,
         debug: bool | None = None,
         verbose: bool | None = None,
+        runtime_hooks: list[RuntimeHook] | None = None,
+        on_runtime_hook_event: Callable[[RuntimeHookEvent], Any] | None = None,
     ) -> None:
         if debug is not None:
             self.configure_debug(debug)
@@ -360,16 +367,26 @@ class SbxInterpreter(PersistentJsonRpcRunnerClient, PredictRLMInterpreter):
             )
         if output_fields is not None:
             self.output_fields = output_fields
+        if runtime_hooks is not None:
+            self.runtime_hooks = list(runtime_hooks)
+            self.on_runtime_hook_event = on_runtime_hook_event
         if self._proc and self._proc.poll() is None:
             if self.output_fields:
                 self._send_request("register_output_fields", {"fields": self.output_fields})
             if self.tools:
                 self._send_request("register_tools", {"tools": list(self.tools)})
+            self._register_runtime_hooks()
         self._log_lifecycle(
             "sbx.runtime.configured",
             tools=len(self.tools),
             output_fields=len(self.output_fields),
             process_running=bool(self._proc and self._proc.poll() is None),
+        )
+
+    def _register_runtime_hooks(self) -> None:
+        self._send_request(
+            "register_runtime_hooks",
+            {"hooks": [hook.model_dump(mode="json") for hook in self.runtime_hooks]},
         )
 
     def prewarm(self) -> None:
@@ -481,6 +498,7 @@ class SbxInterpreter(PersistentJsonRpcRunnerClient, PredictRLMInterpreter):
             self._send_request("register_output_fields", {"fields": self.output_fields})
         if self.tools:
             self._send_request("register_tools", {"tools": list(self.tools)})
+        self._register_runtime_hooks()
 
     def _start_stdout_reader(self) -> None:
         assert self._proc is not None
@@ -897,10 +915,13 @@ class SbxInterpreter(PersistentJsonRpcRunnerClient, PredictRLMInterpreter):
         *,
         deadline: float,
     ) -> bool:
-        if message.get("method") != "tool_call":
-            return False
-        self._submit_tool_call(message)
-        return True
+        if message.get("method") == "tool_call":
+            self._submit_tool_call(message)
+            return True
+        if message.get("method") == "runtime_hook_event":
+            self._handle_runtime_hook_event(message)
+            return True
+        return False
 
     def _build_tool_response(self, request: dict[str, Any]) -> dict[str, Any]:
         request_id = request.get("id")
@@ -1162,6 +1183,15 @@ class SbxInterpreter(PersistentJsonRpcRunnerClient, PredictRLMInterpreter):
             "Too many stale top-level responses while resyncing "
             f"SBX request id={request_id}"
         )
+
+    def _handle_runtime_hook_event(self, request: dict[str, Any]) -> None:
+        if self.on_runtime_hook_event is None:
+            return
+        try:
+            event = RuntimeHookEvent.model_validate(request.get("params") or {})
+            self.on_runtime_hook_event(event)
+        except Exception:
+            return
 
     def _ensure_process_for_method(self, method: str) -> None:
         if method == "shutdown" and self._proc is not None:

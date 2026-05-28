@@ -7,6 +7,7 @@ import asyncio
 import builtins
 import contextlib
 import hashlib
+import importlib
 import inspect
 import io
 import json
@@ -21,7 +22,7 @@ import signal
 import sys
 import tempfile
 import time
-from typing import Any
+from typing import Any, Callable
 
 PROTOCOL_STDIN = sys.stdin
 PROTOCOL_STDOUT = sys.stdout
@@ -36,6 +37,8 @@ SANDBOX_DIR.mkdir(parents=True, exist_ok=True)
 TOOL_REQUEST_ID = 0
 TOOL_RESPONSE_LOCK = asyncio.Lock()
 PENDING_TOOL_RESPONSES: dict[int, dict[str, Any]] = {}
+RUNTIME_HOOK_ORIGINALS: dict[str, tuple[Any, str, Callable[..., Any]]] = {}
+RUNTIME_HOOK_SPECS: dict[str, set[str]] = {}
 _TRUE_VALUES = {"1", "true", "yes", "on"}
 _KERNEL_PROCESS: multiprocessing.Process | None = None
 _KERNEL_REQUEST_QUEUE: multiprocessing.Queue | None = None
@@ -214,6 +217,175 @@ def _send_protocol(message: dict[str, Any]) -> None:
     PROTOCOL_STDOUT.flush()
 
 
+def _summarize_hook_value(value: Any, *, depth: int = 0) -> Any:
+    if depth > 2:
+        return {"type": type(value).__name__, "repr": _short_repr(value)}
+    if value is None or isinstance(value, (bool, int, float, str)):
+        if isinstance(value, str) and len(value) > 500:
+            return value[:500] + f"... ({len(value)} chars)"
+        return value
+    if isinstance(value, os.PathLike):
+        return os.fspath(value)
+    if type(value).__name__ == "CompletedProcess":
+        return {
+            "type": "CompletedProcess",
+            "args": _summarize_hook_value(getattr(value, "args", None), depth=depth + 1),
+            "returncode": getattr(value, "returncode", None),
+            "stdout_chars": len(getattr(value, "stdout", "") or ""),
+            "stderr_chars": len(getattr(value, "stderr", "") or ""),
+        }
+    if isinstance(value, bytes):
+        if len(value) > 128:
+            return {"type": "bytes", "len": len(value), "preview": value[:128].hex()}
+        return {"type": "bytes", "len": len(value), "preview": value.hex()}
+    if isinstance(value, (list, tuple)):
+        return [_summarize_hook_value(item, depth=depth + 1) for item in list(value)[:20]]
+    if isinstance(value, dict):
+        return {
+            str(key): _summarize_hook_value(val, depth=depth + 1)
+            for key, val in list(value.items())[:20]
+        }
+    if isinstance(value, BaseException):
+        return {"type": type(value).__name__, "message": str(value)}
+    return {"type": type(value).__name__, "repr": _short_repr(value)}
+
+
+def _short_repr(value: Any) -> str:
+    text = repr(value)
+    return text if len(text) <= 500 else text[:500] + f"... ({len(text)} chars)"
+
+
+def _emit_runtime_hook_event(
+    target: str,
+    phase: str,
+    args: tuple[Any, ...],
+    kwargs: dict[str, Any],
+    *,
+    result: Any = None,
+    error: BaseException | None = None,
+    duration_ms: int | None = None,
+) -> None:
+    if phase not in RUNTIME_HOOK_SPECS.get(target, set()):
+        return
+    params = {
+        "target": target,
+        "phase": phase,
+        "args": [_summarize_hook_value(arg) for arg in args],
+        "kwargs": _summarize_hook_value(kwargs),
+        "result": _summarize_hook_value(result),
+        "error": str(error) if error is not None else None,
+        "duration_ms": duration_ms,
+        "timestamp": time.time(),
+    }
+    _send_protocol({"jsonrpc": "2.0", "method": "runtime_hook_event", "params": params})
+
+
+def _runtime_hook_owner(target: str) -> tuple[Any, str]:
+    if target == "builtins.open":
+        return builtins, "open"
+    if target.startswith("pathlib.Path."):
+        return REAL_PATH, target.rsplit(".", 1)[1]
+    return _resolve_dotted_runtime_hook_owner(target)
+
+
+def _resolve_dotted_runtime_hook_owner(target: str) -> tuple[Any, str]:
+    parts = target.split(".")
+    if len(parts) < 2 or any(not part for part in parts):
+        raise ValueError(f"Runtime hook target must be a dotted path: {target}")
+    for module_end in range(len(parts) - 1, 0, -1):
+        module_name = ".".join(parts[:module_end])
+        try:
+            owner = importlib.import_module(module_name)
+        except ModuleNotFoundError as exc:
+            if exc.name == module_name or module_name.startswith(f"{exc.name}."):
+                continue
+            raise ValueError(
+                f"Runtime hook target module import failed: {module_name}"
+            ) from exc
+        except Exception as exc:
+            raise ValueError(
+                f"Runtime hook target module import failed: {module_name}"
+            ) from exc
+        for attr in parts[module_end:-1]:
+            try:
+                owner = getattr(owner, attr)
+            except AttributeError as exc:
+                raise ValueError(f"Runtime hook target does not exist: {target}") from exc
+        return owner, parts[-1]
+    raise ValueError(f"Unsupported runtime hook target: {target}")
+
+
+def _runtime_hook_callable(target: str) -> tuple[Any, str, Callable[..., Any]]:
+    owner, attr = _runtime_hook_owner(target)
+    try:
+        original = getattr(owner, attr)
+    except AttributeError as exc:
+        raise ValueError(f"Runtime hook target does not exist: {target}") from exc
+    if not callable(original):
+        raise ValueError(f"Runtime hook target is not callable: {target}")
+    return owner, attr, original
+
+
+def _restore_runtime_hooks() -> None:
+    for target, (owner, attr, original) in reversed(list(RUNTIME_HOOK_ORIGINALS.items())):
+        setattr(owner, attr, original)
+    RUNTIME_HOOK_ORIGINALS.clear()
+    RUNTIME_HOOK_SPECS.clear()
+
+
+def _make_runtime_hook_wrapper(target: str, original: Callable[..., Any]) -> Callable[..., Any]:
+    def _wrapped(*args: Any, **kwargs: Any) -> Any:
+        _emit_runtime_hook_event(target, "before", args, kwargs)
+        started = time.perf_counter()
+        try:
+            result = original(*args, **kwargs)
+        except BaseException as exc:
+            _emit_runtime_hook_event(
+                target,
+                "error",
+                args,
+                kwargs,
+                error=exc,
+                duration_ms=int((time.perf_counter() - started) * 1000),
+            )
+            raise
+        _emit_runtime_hook_event(
+            target,
+            "after",
+            args,
+            kwargs,
+            result=result,
+            duration_ms=int((time.perf_counter() - started) * 1000),
+        )
+        return result
+
+    return _wrapped
+
+
+def _runtime_hook_specs_by_target(params: dict[str, Any]) -> dict[str, set[str]]:
+    specs_by_target: dict[str, set[str]] = {}
+    for hook in params.get("hooks", []):
+        target = hook.get("target")
+        if not isinstance(target, str):
+            continue
+        phases = hook.get("phases") or ["before"]
+        specs_by_target.setdefault(target, set()).update(str(phase) for phase in phases)
+    return specs_by_target
+
+
+def _register_runtime_hooks(params: dict[str, Any]) -> dict[str, Any]:
+    _restore_runtime_hooks()
+    planned_hooks = []
+    for target, phases in _runtime_hook_specs_by_target(params).items():
+        owner, attr, original = _runtime_hook_callable(target)
+        planned_hooks.append((target, phases, owner, attr, original))
+    for target, phases, owner, attr, original in planned_hooks:
+        RUNTIME_HOOK_SPECS[target] = phases
+        RUNTIME_HOOK_ORIGINALS[target] = (owner, attr, original)
+        setattr(owner, attr, _make_runtime_hook_wrapper(target, original))
+    return {}
+
+
 def _read_protocol_response_line() -> dict[str, Any]:
     while True:
         line = PROTOCOL_STDIN.readline()
@@ -278,6 +450,7 @@ def _install_virtual_filesystem(globals_dict: dict[str, Any]) -> None:
 
 
 def _new_globals() -> dict[str, Any]:
+    _restore_runtime_hooks()
     globals_dict: dict[str, Any] = {"__name__": "__main__"}
     _install_virtual_filesystem(globals_dict)
     return globals_dict
@@ -990,6 +1163,8 @@ async def _handle_request(
             return _response(request_id, {})
         if method == "register_tools":
             return _response(request_id, _register_tools(params, globals_dict))
+        if method == "register_runtime_hooks":
+            return _response(request_id, _register_runtime_hooks(params))
         if method == "mount_file":
             return _response(request_id, _mount_file(params))
         if method == "mkdir_p":

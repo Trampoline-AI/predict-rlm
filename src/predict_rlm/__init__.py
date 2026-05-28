@@ -35,6 +35,7 @@ from .interpreters import (
 )
 from .predict_rlm import PredictRLM
 from .rlm_skills import Skill
+from .runtime_hooks import RuntimeHook, RuntimeHookEvent
 from .trace import IterationStep, RunTrace
 
 __all__ = [
@@ -46,6 +47,8 @@ __all__ = [
     "OutputFile",
     "PredictRLM",
     "RunTrace",
+    "RuntimeHook",
+    "RuntimeHookEvent",
     "DEFAULT_SBX_TEMPLATE",
     "SandboxBackend",
     "Skill",
