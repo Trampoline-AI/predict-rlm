@@ -65,11 +65,13 @@ repository.
   conversations
 - Include a Test Plan with checkable items
 
-### 10. Commit Scopes
+### 10. Commit Messages
 
-- Use Conventional Commits.
+- Use Conventional Commits: `type(scope): imperative lowercase subject`.
+- Use established types like `feat`, `fix`, `chore`, `docs`, and `perf`.
 - The scope in parentheses must be one of: `rlm-gepa`, `predict-rlm`, or
   `examples/[example-name]`.
+- Example: `feat(predict-rlm): add runtime hooks`
 
 ## Core Principles
 
