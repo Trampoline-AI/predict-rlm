@@ -48,6 +48,12 @@ This file provides guidance to Codex (Codex.ai/code) when working with code in t
 - Assume the reader has no prior context -- don't reference earlier commits or conversations
 - Include a Test Plan with checkable items
 
+### 10. Commit Messages
+- Match the existing conventional commit style in this repository: `type(scope): imperative lowercase subject`
+- Use established types like `feat`, `fix`, `chore`, `docs`, and `perf`
+- Prefer existing scopes from the touched area, such as `predict-rlm`, `sbx`, `agents`, `serialization`, or `examples/spreadbench`
+- Example: `feat(sbx): add runtime hooks`
+
 ## Core Principles
 
 - **Simplicity First**: Make every change as simple as possible. Impact minimal code.
