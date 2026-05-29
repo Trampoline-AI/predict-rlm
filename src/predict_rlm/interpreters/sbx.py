@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
+import contextvars
 import hashlib
 import inspect
 import json
@@ -760,7 +761,12 @@ class SbxInterpreter(PersistentJsonRpcRunnerClient, PredictRLMInterpreter):
 
     def _submit_tool_call(self, request: dict[str, Any]) -> None:
         request_id = request.get("id")
-        future = self._tool_executor.submit(self._build_tool_response, request)
+        context = contextvars.copy_context()
+        future = self._tool_executor.submit(
+            context.run,
+            self._build_tool_response,
+            request,
+        )
         self._pending_tool_calls[future] = request_id
 
     def _drain_completed_tool_calls(self) -> None:
