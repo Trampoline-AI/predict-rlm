@@ -896,8 +896,12 @@ class SbxInterpreter(PersistentJsonRpcRunnerClient, PredictRLMInterpreter):
             tool=params.get("name"),
             request_id=request_id,
         )
-        ctx = contextvars.copy_context()
-        future = self._tool_executor.submit(ctx.run, self._build_tool_response, request)
+        context = contextvars.copy_context()
+        future = self._tool_executor.submit(
+            context.run,
+            self._build_tool_response,
+            request,
+        )
         self._pending_tool_calls[future] = request_id
 
     def _drain_completed_tool_calls(self) -> None:

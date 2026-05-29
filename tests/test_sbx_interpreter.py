@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import contextvars
 import json
 import logging
 import os
@@ -1291,7 +1292,143 @@ for line in sys.stdin:
 
         assert output.strip() == "5"
 
-    def test_host_tool_synced_file_writeback_updates_sandbox_file(self, tmp_path: Path):
+    def test_host_tool_calls_preserve_trace_collector_context(self, tmp_path: Path):
+        tool_context = contextvars.ContextVar("tool_context")
+
+        async def read_context() -> dict[str, str]:
+            return {"value": tool_context.get()}
+
+        interpreter = SbxInterpreter(
+            config=SbxConfig(name="local-test"),
+            tools={"read_context": read_context},
+            preinstall_packages=False,
+            _runner_command=[sys.executable, "-u", str(RUNNER_PATH)],
+            _staging_root=tmp_path / "staging",
+        )
+        token = tool_context.set("preserved")
+        try:
+            output = interpreter.execute(
+                "result = await read_context()\n"
+                "print(result['value'])"
+            )
+        finally:
+            tool_context.reset(token)
+            interpreter.shutdown()
+
+        assert output.strip() == "preserved"
+
+    def test_predict_tool_result_supports_attribute_access(self, tmp_path: Path):
+        async def predict(_signature: str, **_kwargs) -> dict[str, str]:
+            return {"answer": "ok", "items": "field wins"}
+
+        interpreter = SbxInterpreter(
+            config=SbxConfig(name="local-test"),
+            tools={"predict": predict},
+            preinstall_packages=False,
+            _runner_command=[sys.executable, "-u", str(RUNNER_PATH)],
+            _staging_root=tmp_path / "staging",
+        )
+        try:
+            output = interpreter.execute(
+                "result = await predict('question -> answer', question='q')\n"
+                "print(result.answer)\n"
+                "print(result['answer'])\n"
+                "print(result.items)"
+            )
+        finally:
+            interpreter.shutdown()
+
+        assert output.strip().splitlines() == ["ok", "ok", "field wins"]
+
+    def test_predict_tool_serializes_pydantic_inputs_and_forwards_schema(
+        self,
+        tmp_path: Path,
+    ):
+        received: list[dict] = []
+
+        async def predict(_signature: str, **kwargs) -> dict[str, str]:
+            received.append(kwargs)
+            return {"answer": kwargs["query"]["text"].upper()}
+
+        interpreter = SbxInterpreter(
+            config=SbxConfig(name="local-test"),
+            tools={"predict": predict},
+            preinstall_packages=False,
+            _runner_command=[sys.executable, "-u", str(RUNNER_PATH)],
+            _staging_root=tmp_path / "staging",
+        )
+        try:
+            output = interpreter.execute("""
+from pydantic import BaseModel
+
+class Query(BaseModel):
+    text: str
+
+query = Query(text="hello")
+result = await predict("query: Query -> answer: str", query=query)
+print(result.answer)
+""")
+        finally:
+            interpreter.shutdown()
+
+        assert output.strip() == "HELLO"
+        assert received == [
+            {
+                "query": {"text": "hello"},
+                "pydantic_schemas": {
+                    "Query": {
+                        "properties": {
+                            "text": {"title": "Text", "type": "string"},
+                        },
+                        "required": ["text"],
+                        "title": "Query",
+                        "type": "object",
+                    }
+                },
+            }
+        ]
+
+    def test_predict_tool_reconstructs_pydantic_outputs(self, tmp_path: Path):
+        async def predict(_signature: str, **_kwargs) -> dict[str, list[dict[str, str]]]:
+            return {
+                "tasks": [
+                    {
+                        "category": "Cert",
+                        "title": "Get ISO cert",
+                        "extra_field": "bonus",
+                    }
+                ]
+            }
+
+        interpreter = SbxInterpreter(
+            config=SbxConfig(name="local-test"),
+            tools={"predict": predict},
+            preinstall_packages=False,
+            _runner_command=[sys.executable, "-u", str(RUNNER_PATH)],
+            _staging_root=tmp_path / "staging",
+        )
+        try:
+            output = interpreter.execute("""
+from pydantic import BaseModel
+
+class TaskItem(BaseModel):
+    category: str
+    title: str
+
+result = await predict("doc: str -> tasks: list[TaskItem]", doc="test")
+task = result.tasks[0]
+print(task.title)
+print(task.category)
+print(task.extra_field)
+""")
+        finally:
+            interpreter.shutdown()
+
+        assert output.strip().splitlines() == ["Get ISO cert", "Cert", "bonus"]
+
+    def test_host_tool_synced_file_writeback_updates_sandbox_file(
+        self, tmp_path: Path
+    ):
         received_paths: list[str] = []
 
         def mutate(path: Annotated[str, SyncedFile(writeback=True)]) -> str:

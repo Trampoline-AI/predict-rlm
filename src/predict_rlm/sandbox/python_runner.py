@@ -17,6 +17,8 @@ import os
 import pathlib
 import pickle
 import queue
+import re
+import select
 import shutil
 import signal
 import sys
@@ -47,6 +49,18 @@ _DEFAULT_TIMEOUT_INTERRUPT_GRACE_SECONDS = 0.5
 _INTERNAL_GLOBAL_NAMES = {
     "SUBMIT",
     "__predict_rlm_tool_names__",
+}
+PREDICT_SCHEMA_BUILTINS = {
+    "Any",
+    "BaseModel",
+    "Dict",
+    "Image",
+    "List",
+    "Literal",
+    "Optional",
+    "Set",
+    "Tuple",
+    "Union",
 }
 
 
@@ -181,10 +195,10 @@ def _to_jsonable(value: Any) -> Any:
     if isinstance(value, _PredictResult):
         return _to_jsonable(value.to_dict())
     if hasattr(value, "model_dump"):
-        return value.model_dump()
+        return _to_jsonable(value.model_dump())
     if isinstance(value, dict):
         return {key: _to_jsonable(val) for key, val in value.items()}
-    if isinstance(value, (list, tuple)):
+    if isinstance(value, (list, tuple, set)):
         return [_to_jsonable(val) for val in value]
     if isinstance(value, _VirtualPath):
         return value.virtual_path
@@ -206,6 +220,18 @@ def _virtual_from_real(path: pathlib.Path) -> str:
 
 def _open(path: Any, *args: Any, **kwargs: Any):
     return REAL_OPEN(_map_virtual_path(path), *args, **kwargs)
+
+
+class _SandboxPath(REAL_PATH):
+    def __new__(cls, *args: Any, **kwargs: Any):
+        if args:
+            args = (_map_virtual_path(args[0]), *args[1:])
+        return super().__new__(cls, *args, **kwargs)
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        if args:
+            args = (_map_virtual_path(args[0]), *args[1:])
+        super().__init__(*args, **kwargs)
 
 
 def _submit(**kwargs: Any) -> None:
@@ -432,11 +458,124 @@ async def _call_host_tool(name: str, *args: Any, **kwargs: Any) -> Any:
     return value
 
 
+def _lookup_type(name: str, globals_dict: dict[str, Any]) -> Any:
+    if name in globals_dict:
+        return globals_dict[name]
+
+    main_module = sys.modules.get("__main__")
+    if main_module is not None and name in main_module.__dict__:
+        return main_module.__dict__[name]
+
+    frame = inspect.currentframe()
+    while frame is not None:
+        if name in frame.f_globals:
+            return frame.f_globals[name]
+        if name in frame.f_locals:
+            return frame.f_locals[name]
+        frame = frame.f_back
+
+    return None
+
+
+def _get_pydantic_schemas(signature: str, globals_dict: dict[str, Any]) -> dict[str, dict]:
+    schemas: dict[str, dict] = {}
+    for match in re.finditer(r"(?<![.\w])([A-Z][A-Za-z0-9_]*)", signature):
+        name = match.group(1)
+        if name in PREDICT_SCHEMA_BUILTINS:
+            continue
+
+        model_type = _lookup_type(name, globals_dict)
+        if model_type is None or not hasattr(model_type, "model_json_schema"):
+            continue
+
+        schema = model_type.model_json_schema()
+        json.dumps(schema)
+        schemas[name] = schema
+
+    return schemas
+
+
+def _predict_signature(args: tuple[Any, ...], kwargs: dict[str, Any]) -> str:
+    signature = args[0] if args else kwargs["signature"]
+    if not isinstance(signature, str):
+        raise TypeError(f"predict signature must be str, got {type(signature).__name__}")
+    return signature
+
+
+def _reconstruct_output_types(
+    signature: str,
+    result: Any,
+    globals_dict: dict[str, Any],
+) -> Any:
+    if not isinstance(result, dict):
+        return result
+
+    outputs_part = signature.split("->", 1)[1] if "->" in signature else ""
+    pattern = r"(\w+)\s*:\s*((?:Optional\[|list\[|List\[)*)\s*([A-Z][A-Za-z0-9_]*)"
+    for match in re.finditer(pattern, outputs_part):
+        field_name = match.group(1)
+        wrapper = match.group(2) or ""
+        type_name = match.group(3)
+        if type_name in PREDICT_SCHEMA_BUILTINS:
+            continue
+
+        model_type = _lookup_type(type_name, globals_dict)
+        if (
+            model_type is None
+            or not hasattr(model_type, "model_validate")
+            or not hasattr(model_type, "model_fields")
+        ):
+            continue
+
+        from pydantic import ConfigDict
+
+        output_type = type(
+            model_type.__name__,
+            (model_type,),
+            {"model_config": ConfigDict(extra="allow")},
+        )
+        value = result.get(field_name)
+        if value is None:
+            continue
+        if "list[" in wrapper.lower() and isinstance(value, list):
+            if all(isinstance(item, dict) for item in value):
+                result[field_name] = [output_type.model_validate(item) for item in value]
+        elif isinstance(value, dict):
+            result[field_name] = output_type.model_validate(value)
+
+    return _PredictResult(result)
+
+
+async def _call_predict_tool(
+    *args: Any,
+    globals_dict: dict[str, Any],
+    **kwargs: Any,
+) -> Any:
+    signature = _predict_signature(args, kwargs)
+    safe_args = _to_jsonable(list(args))
+    safe_kwargs = _to_jsonable(kwargs)
+
+    pydantic_schemas = _get_pydantic_schemas(signature, globals_dict)
+    if pydantic_schemas:
+        safe_kwargs["pydantic_schemas"] = pydantic_schemas
+
+    result = await _call_host_tool("predict", *safe_args, **safe_kwargs)
+    return _reconstruct_output_types(signature, result, globals_dict)
+
+
 def _register_tools(params: dict[str, Any], globals_dict: dict[str, Any]) -> dict[str, Any]:
     tool_names = globals_dict.setdefault("__predict_rlm_tool_names__", set())
     for name in params.get("tools", []):
-        async def _tool(*args: Any, __tool_name: str = name, **kwargs: Any) -> Any:
-            return await _call_host_tool(__tool_name, *args, **kwargs)
+        if name == "predict":
+            async def _tool(*args: Any, **kwargs: Any) -> Any:
+                return await _call_predict_tool(
+                    *args,
+                    globals_dict=globals_dict,
+                    **kwargs,
+                )
+        else:
+            async def _tool(*args: Any, __tool_name: str = name, **kwargs: Any) -> Any:
+                return await _call_host_tool(__tool_name, *args, **kwargs)
 
         globals_dict[name] = _tool
         tool_names.add(name)
@@ -446,6 +585,7 @@ def _register_tools(params: dict[str, Any], globals_dict: dict[str, Any]) -> dic
 
 def _install_virtual_filesystem(globals_dict: dict[str, Any]) -> None:
     builtins.open = _open
+    pathlib.Path = _SandboxPath  # type: ignore[assignment]
     globals_dict.setdefault("SUBMIT", _submit)
 
 
