@@ -36,14 +36,15 @@ itself. For contribution work, use Contributor mode first.
 
 When this skill is loaded in an environment with shell, filesystem, and network
 access, run a lightweight update check at most once per day. Keep the last-check
-marker under `${HERMES_HOME:-$HOME/.hermes}/skills/.rlm-skill-update-check.json`.
-Compare the installed `SKILL.md` against
+marker under
+`${HERMES_HOME:-$HOME/.hermes}/skills/.rlm-skill-update-check.json`. Compare the
+installed `SKILL.md` against
 `https://raw.githubusercontent.com/Trampoline-AI/predict-rlm/main/.agents/skills/rlm/SKILL.md`
 using a content hash, ETag, or commit SHA.
 
-If a newer skill is available, tell the user the `/rlm` skill has updates and ask
-whether they want to update or reinstall it. Do not update automatically. Suggested
-commands are `hermes skills update` for Hermes-managed installs, or
+If a newer skill is available, tell the user the `/rlm` skill has updates and
+ask whether they want to update or reinstall it. Do not update automatically.
+Suggested commands are `hermes skills update` for Hermes-managed installs, or
 `npx skills add Trampoline-AI/predict-rlm` for direct Skills CLI installs.
 
 Skip the check silently when tools, network, or a writable marker path are not
@@ -60,8 +61,8 @@ requested change, and the relevant implementation/docs paths.
 
 Contributor rules:
 
-- PredictRLM is for callable, repeatable, deep-context workflows, not
-  open-ended interactive chat flows.
+- PredictRLM is for callable, repeatable, deep-context workflows, not open-ended
+  interactive chat flows.
 - Keep large inputs as `File` references or metadata. Use focused `predict()`
   calls, and keep LLM-facing Pydantic schemas lean with
   `Field(description=...)`.
@@ -87,9 +88,11 @@ Contributor rules:
   `predict-rlm` package, ask the user whether they want it reported as a GitHub
   issue as soon as that attribution is clear. Do not open the issue without that
   explicit approval.
-- For verification, docs-only changes need markdown sanity or `git diff
-  --check`. Code changes need targeted tests, plus broader tests when touching
-  shared interfaces, sandbox execution, optimizer behavior, or examples.
+- For verification, docs-only changes need markdown sanity or
+  `git diff
+  --check`. Code changes need targeted tests, plus broader tests
+  when touching shared interfaces, sandbox execution, optimizer behavior, or
+  examples.
 
 ---
 
@@ -288,23 +291,26 @@ required for every RLM.
 
 ### RLM-GEPA scoping interview
 
-When the user asks for optimization wiring but has not supplied enough context to
-write a concrete `AgentSpec`, run a short interview before writing the plan. Do
-not invent the AgentSpec from a vague task description. Gather enough to define:
+When the user asks for optimization wiring but has not supplied enough context
+to write a concrete `AgentSpec`, run a short interview before writing the plan.
+Do not invent the AgentSpec from a vague task description. Gather enough to
+define:
 
 - the product or optimization goal GEPA should improve for;
 - the input distribution, scale, and examples that represent real work;
 - the output schema and the failure modes users care about most;
-- the train/validation data source and whether labels or reference outputs exist;
+- the train/validation data source and whether labels or reference outputs
+  exist;
 - the scoring rule, partial-credit feedback, and anti-overfitting boundaries;
 - the tools, sandbox constraints, file conventions, and runtime facts the
   proposer must preserve.
 
 The interview should scope the RLM that owns the real DSPy signature and tools;
 do not ask the user to restate `target_signature`, `tool_signatures`, or a broad
-agent description as separate prose artifacts. Generate the signature/tool fields
-from the constructed RLM with `agent_spec_from_rlm(...)`; omit `agent_type` unless
-the user volunteers a product or optimization anchor that adds useful context.
+agent description as separate prose artifacts. Generate the signature/tool
+fields from the constructed RLM with `agent_spec_from_rlm(...)`; omit
+`agent_type` unless the user volunteers a product or optimization anchor that
+adds useful context.
 
 If the user cannot answer everything, proceed with explicit assumptions and mark
 the generated `AgentSpec` fields that should be revisited before spending model
@@ -328,17 +334,17 @@ Use split semantics consistently:
   on it unless the user asks for a benchmark/eval harness or has enough labeled
   data to justify it.
 
-Prefer deterministic splits. Put the random seed, split ratio/counts, grouping key
-(if examples share source documents/users/tasks), and any sampling limits in
+Prefer deterministic splits. Put the random seed, split ratio/counts, grouping
+key (if examples share source documents/users/tasks), and any sampling limits in
 `bench/config.py` or `gepa/config.py`. Split by group when leakage is plausible;
 never let near-identical cases from the same source land in both train and
 validation without calling it out. If the dataset is tiny, prefer explicit
 hand-authored train/validation files over random splitting.
 
 For GEPA, the project-local `gepa/` code owns train/validation loading and the
-seed candidate text. The seed candidate means the initial mutable component, such
-as baseline skill instructions; it is separate from the random seed used for
-splits, sampling, or optimizer reproducibility.
+seed candidate text. The seed candidate means the initial mutable component,
+such as baseline skill instructions; it is separate from the random seed used
+for splits, sampling, or optimizer reproducibility.
 
 For benchmarks with official splits, preserve the benchmark's public semantics.
 Use the official train split for optimization data, carve GEPA validation from
@@ -352,8 +358,8 @@ into seed instructions or candidate selection.
 Keep benchmark evaluators and oracle-style answer checkers harness-side. The RLM
 may see environment-safe tools, docs, state APIs, or session controls, but it
 should not see evaluator feedback or hidden scoring APIs while solving an
-example. After the attempt, the harness can call the evaluator and pass score and
-feedback to GEPA as the learning signal.
+example. After the attempt, the harness can call the evaluator and pass score
+and feedback to GEPA as the learning signal.
 
 When benchmark packages conflict with predict-rlm, DSPy, Pyodide, or the main
 project environment, prefer an isolated host-side runner/tool behind a typed
@@ -366,9 +372,9 @@ For eval and optimization CLIs, route task execution through the shared
 candidate loading, and `eval.json` summary shaping, but should reuse the adapter
 for concurrency, per-task timeouts, progress bars, verbose RLM log handling,
 `task_traces/*.jsonl`, and `cost_log.jsonl`. If the eval command is async, call
-`await adapter.aevaluate(...)`; if it is synchronous, call `adapter.evaluate(...)`.
-Write `eval.json` in the run directory so `rlm-gepa stats <run_dir>` works for
-held-out evals as well as optimize runs.
+`await adapter.aevaluate(...)`; if it is synchronous, call
+`adapter.evaluate(...)`. Write `eval.json` in the run directory so
+`rlm-gepa stats <run_dir>` works for held-out evals as well as optimize runs.
 
 ## Feasibility Checklist
 
@@ -401,11 +407,13 @@ Write the plan to the Claude Code plan file with these sections:
    ```
 
 9. **Optional eval/optimization design** — only if requested. Include dataset
-   audit findings, split policy, scoring feedback shape, and reproducibility seed.
-   For optimization, also include the `AgentSpec` interview summary, train/validation
-   source, seed candidate source, and the exact `gepa/` files to create.
+   audit findings, split policy, scoring feedback shape, and reproducibility
+   seed. For optimization, also include the `AgentSpec` interview summary,
+   train/validation source, seed candidate source, and the exact `gepa/` files
+   to create.
 10. **Feasibility notes** — constraints, risks, alternatives
-11. **Estimated complexity** — iteration count, sub-LM calls, cost range, runtime
+11. **Estimated complexity** — iteration count, sub-LM calls, cost range,
+    runtime
 12. **Smoke tests** — test files to create and commands to run. Every generated
     RLM must include at least one fast no-network smoke test that imports the
     generated package and constructs the service without making LLM calls.
@@ -492,8 +500,8 @@ features = ["agent"]
 
 If the project uses built-in example skills, add only the required extras or
 packages. If it uses GEPA, add the GEPA extras and project-local `rlm-gepa`
-script as the main UX. Do not include optimization dependencies for an agent-only
-or eval-only project.
+script as the main UX. Do not include optimization dependencies for an
+agent-only or eval-only project.
 
 ```toml
 dependencies = [
@@ -737,28 +745,29 @@ bench/
 ```
 
 For benchmark eval and optimize entrypoints, use the shared RLM-GEPA runtime
-adapter semantics in `src/rlm_gepa/runtime/adapter.py` unless the user explicitly
-asks for a one-off local harness. Put dataset loading, scoring, setup, and task
-cleanup behind the project contract; let the shared adapter own concurrency,
-timeouts, progress/tqdm display, trace capture, and report semantics.
+adapter semantics in `src/rlm_gepa/runtime/adapter.py` unless the user
+explicitly asks for a one-off local harness. Put dataset loading, scoring,
+setup, and task cleanup behind the project contract; let the shared adapter own
+concurrency, timeouts, progress/tqdm display, trace capture, and report
+semantics.
 
 ## Optional gepa/ package — Optimization
 
-Create optimization wiring only when the user asks for it. The shared
-`rlm_gepa` package provides generic orchestration; the generated project owns
-its task loading, metric, seed candidate, and defaults. Import
-`agent_spec_from_rlm`, `OptimizeConfig`, `RLMGepaExampleResult`,
-`RLMGepaProject`, and `EvaluationContext` from `rlm_gepa` rather than copying
-optimizer internals into the project.
+Create optimization wiring only when the user asks for it. The shared `rlm_gepa`
+package provides generic orchestration; the generated project owns its task
+loading, metric, seed candidate, and defaults. Import `agent_spec_from_rlm`,
+`OptimizeConfig`, `RLMGepaExampleResult`, `RLMGepaProject`, and
+`EvaluationContext` from `rlm_gepa` rather than copying optimizer internals into
+the project.
 
-The generated `AgentSpec` should be interview-backed, but it should not duplicate
-facts already present on the RLM. Define a single `build_rlm(...)` helper that
-constructs the PredictRLM with the real DSPy signature, skills, and tools. Use
-`agent_spec_from_rlm(build_rlm(seed_instructions), ...)` so GEPA derives
-`target_signature` and `tool_signatures` from that object. Omit `agent_type` by
-default; set it only for a short product or optimization anchor that adds
-non-duplicative framing beyond the signature, tools, or output schema. The
-interview should supply only the extra GEPA brief: transfer use cases,
+The generated `AgentSpec` should be interview-backed, but it should not
+duplicate facts already present on the RLM. Define a single `build_rlm(...)`
+helper that constructs the PredictRLM with the real DSPy signature, skills, and
+tools. Use `agent_spec_from_rlm(build_rlm(seed_instructions), ...)` so GEPA
+derives `target_signature` and `tool_signatures` from that object. Omit
+`agent_type` by default; set it only for a short product or optimization anchor
+that adds non-duplicative framing beyond the signature, tools, or output schema.
+The interview should supply only the extra GEPA brief: transfer use cases,
 runtime-grounding examples, scoring signal, and anti-overfitting boundary. If
 any of those are weakly specified, add a `TODO` in `config.py` and keep
 `optimize --check` available so the user can catch missing setup before spending

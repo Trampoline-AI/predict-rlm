@@ -1,6 +1,7 @@
 # Invoice Processing
 
-Extract vendor info, line items, and totals from PDF invoices into a consolidated Excel spreadsheet.
+Extract vendor info, line items, and totals from PDF invoices into a
+consolidated Excel spreadsheet.
 
 ## Setup
 
@@ -34,11 +35,14 @@ uv run examples/invoice_processing/run.py --debug
 | `--max-iterations` | `30`             | Max REPL iterations           |
 | `--debug`          | off              | Print REPL activity to stderr |
 
-Outputs (Excel workbook + report) are saved to `output/{timestamp}/` inside this directory.
+Outputs (Excel workbook + report) are saved to `output/{timestamp}/` inside this
+directory.
 
 ## Sample output
 
-The [`sample/`](sample/) directory contains 2 PDF invoices and the [extracted output](sample/output/) — structured data plus a consolidated Excel workbook.
+The [`sample/`](sample/) directory contains 2 PDF invoices and the
+[extracted output](sample/output/) — structured data plus a consolidated Excel
+workbook.
 
 ## Structure
 

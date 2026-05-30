@@ -1,10 +1,10 @@
-# RLM ♥ GEPA: You can use RLMs to improve RLMs with GEPA
+# RLM-GEPA: You can use RLMs to improve RLMs
 
 > [!NOTE]
 > Originally published as an
 > [X Article](https://x.com/i/article/2046247680255344640).
 
-**TL;DR** We adapt GEPA so a
+**TL;DR** We use RLM-GEPA so a
 [predict-RLM](https://github.com/trampoline-ai/predict-rlm) improves another
 predict-RLM.
 
@@ -16,8 +16,8 @@ hard, which would land at #5.
 That is a 23% and 27% hard-error reduction over their respective unoptimized
 seed baselines.
 
-That would make our predict-RLM ♥ GEPA optimized skill the only open-source
-solution in SpreadsheetBench Verified top-5 territory.
+That would make our RLM-GEPA optimized skill the only open-source solution in
+SpreadsheetBench Verified top-5 territory.
 
 The optimized skill is
 [available on GitHub today](https://github.com/trampoline-ai/predict-rlm).
@@ -30,15 +30,16 @@ Caption: candidate lineage
 
 [Recursive Language Models](https://arxiv.org/abs/2512.24601)
 ([Alex L. Zhang](https://x.com/a1zhang) et al.) traces are large: a single eval
-batch can easily exceed 10M tokens. [GEPA](https://arxiv.org/abs/2507.19457)
-([Lakshya Agrawal](https://x.com/LakshyAAAgrawal) et al.) optimizes prompts
+batch can easily exceed 10M tokens. RLM-GEPA adapts
+[GEPA](https://arxiv.org/abs/2507.19457)
+([Lakshya Agrawal](https://x.com/LakshyAAAgrawal) et al.) to optimize RLM skills
 through structured reflection: a proposer LM reads execution outcomes,
-identifies failure patterns, and rewrites the prompt.
+identifies failure patterns, and rewrites the skill instructions.
 
-Stock GEPA's proposer sees a compact rendered summary of each task; by wiring a
-predict-RLM as the proposer, we expose the full trace corpus and let the
-proposer read, filter, and distill it programmatically, thereby letting the
-model reason over the full execution evidence rather than a lossy summary.
+The original proposer sees a compact rendered summary of each task; RLM-GEPA
+wires a predict-RLM in as the proposer, exposes the full trace corpus, and lets
+the proposer read, filter, and distill it programmatically. The model can reason
+over full execution evidence rather than a lossy summary.
 
 Same tool stack, same iteration protocol, applied recursively.
 
@@ -74,10 +75,9 @@ Here, we ask the empirical question: how far can a simple predict-RLM be pushed
 against SOTA and specialized agents on SpreadsheetBench purely by managing the
 model better, rather than swapping the model?
 
-To answer this, we pair RLMs with GEPA prompt optimization, and replace the
-standard proposer with an RLM: an RLM proposer reads, filters, and distills
-another RLM’s execution traces, then proposes improved prompts for the next
-iteration.
+To answer this, we use RLM-GEPA and replace the standard proposer with an RLM:
+an RLM proposer reads, filters, and distills another RLM’s execution traces,
+then proposes improved skill instructions for the next iteration.
 
 The same architecture optimizes itself: one RLM improves another RLM without
 updating model weights. We improve an RLM without updating model weights, by
@@ -118,7 +118,7 @@ For our seed baseline skill instructions, we adapt
 with minimal changes.
 
 This skill + RLM combination is our seed baseline. The skill is also the target
-of GEPA optimization.
+of RLM-GEPA optimization.
 
 ## 4. Baselines
 
@@ -153,8 +153,8 @@ mutation semantics, and instruction interpretation.
 More thinking is a blunt tool for that. Better operating instructions are
 sharper.
 
-That is what the skill is. GEPA turns the skill from a hand-written prompt into
-an optimized artifact: read traces, find recurring mistakes, rewrite the
+That is what the skill is. RLM-GEPA turns the skill from a hand-written prompt
+into an optimized artifact: read traces, find recurring mistakes, rewrite the
 instructions, run again. Same model family, same tools, better management.
 
 ## 5. Results
@@ -166,7 +166,7 @@ instructions, run again. Same model family, same tools, better management.
 | gpt-5.5 - low |  0.9092 → 0.9288 ↓22% |  0.8500 → 0.8775 ↓18% | $0.119 → $0.110 ↓8% |
 | gpt-5.5 - med |  0.9142 → 0.9411 ↓31% |  0.8600 → 0.8925 ↓23% | $0.134 → $0.139 ↑4% |
 
-_Seed skill vs. RLM♥GEPA optimized skill on the held-out 400-task
+_Seed skill vs. RLM-GEPA optimized skill on the held-out 400-task
 SpreadsheetBench Verified set. Error reduction is measured against remaining
 error, e.g. hard error = 1 − hard score._
 
@@ -205,7 +205,7 @@ Same model family. Same tools. Same executor architecture. Better management.
 ## 6. What's next?
 
 I do not think SpreadsheetBench is unique. My intuition is that we can apply
-this RLM♥GEPA approach to many more problems and many more benchmarks.
+this RLM-GEPA approach to many more problems and many more benchmarks.
 
 The loop is simple: cheap executor RLM produces readable traces → proposer RLM
 distills them into a skill patch → stronger executor RLM runs again.
@@ -213,7 +213,7 @@ distills them into a skill patch → stronger executor RLM runs again.
 [predict-RLM](https://github.com/trampoline-ai/predict-rlm) is on GitHub, MIT
 licensed. The optimized SpreadsheetBench skill is available now.
 
-The RLM♥GEPA adapter is next in the coming days.
+The RLM-GEPA adapter is next in the coming days.
 
 Like, star, & follow for more ;-)
 

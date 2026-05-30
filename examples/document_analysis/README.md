@@ -1,6 +1,7 @@
 # Document Analysis
 
-Analyze documents and extract key dates, entities, and financial information into a structured report.
+Analyze documents and extract key dates, entities, and financial information
+into a structured report.
 
 ## Setup
 
@@ -38,16 +39,25 @@ Outputs are saved to `output/{timestamp}/` inside this directory.
 
 ## How it works
 
-The RLM receives `File` references as input. The files are mounted into the sandbox, and the RLM opens them directly with pymupdf. The RLM **manages its own context window** — given a 200-page document set, it doesn't process everything at once. Instead, it:
+The RLM receives `File` references as input. The files are mounted into the
+sandbox, and the RLM opens them directly with pymupdf. The RLM **manages its own
+context window** — given a 200-page document set, it doesn't process everything
+at once. Instead, it:
 
-1. **Surveys** the documents — checks file names and page counts to understand the structure
-2. **Samples** strategically — renders a few pages to understand the format and identify where key information lives
-3. **Extracts in parallel** — uses `asyncio.gather()` to send multiple pages to `predict()` concurrently
-4. **Synthesizes** — aggregates findings across pages, deduplicates, and produces the final structured output
+1. **Surveys** the documents — checks file names and page counts to understand
+   the structure
+2. **Samples** strategically — renders a few pages to understand the format and
+   identify where key information lives
+3. **Extracts in parallel** — uses `asyncio.gather()` to send multiple pages to
+   `predict()` concurrently
+4. **Synthesizes** — aggregates findings across pages, deduplicates, and
+   produces the final structured output
 
 ## Sample output
 
-The [`sample/`](sample/) directory contains a 136-page airport parking management RFP and the [output report](sample/output/report.md) produced by the RLM.
+The [`sample/`](sample/) directory contains a 136-page airport parking
+management RFP and the [output report](sample/output/report.md) produced by the
+RLM.
 
 |               | Main LM (`gpt-5.4`) | Sub-LM (`gpt-5.1`) |
 | ------------- | ------------------- | ------------------ |

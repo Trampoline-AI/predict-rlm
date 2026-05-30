@@ -38,22 +38,33 @@ uv run examples/document_redaction/run.py --debug
 | `--criteria`       | PII redaction    | What to redact                |
 | `--debug`          | off              | Print REPL activity to stderr |
 
-Outputs (redacted PDFs + report) are saved to `output/{timestamp}/` inside this directory.
+Outputs (redacted PDFs + report) are saved to `output/{timestamp}/` inside this
+directory.
 
 ## How it works
 
-The RLM is an **autonomous executor that modifies files**. It inspects pages, identifies sensitive content, applies redactions, and then re-inspects the pages to verify the redactions worked.
+The RLM is an **autonomous executor that modifies files**. It inspects pages,
+identifies sensitive content, applies redactions, and then re-inspects the pages
+to verify the redactions worked.
 
-1. **Scans pages in parallel** — renders pages as images and fans out `predict()` calls via `asyncio.gather()` to identify text matching the redaction criteria
-2. **Applies redactions** — uses pymupdf's `search_for()` and `add_redact_annot()` to black out identified strings
-3. **Handles non-text content** — for signatures, logos, or images, it estimates bounding box coordinates and redacts by area
-4. **Verifies** — re-renders redacted pages and confirms the sensitive content is gone
+1. **Scans pages in parallel** — renders pages as images and fans out
+   `predict()` calls via `asyncio.gather()` to identify text matching the
+   redaction criteria
+2. **Applies redactions** — uses pymupdf's `search_for()` and
+   `add_redact_annot()` to black out identified strings
+3. **Handles non-text content** — for signatures, logos, or images, it estimates
+   bounding box coordinates and redacts by area
+4. **Verifies** — re-renders redacted pages and confirms the sensitive content
+   is gone
 
-Redacted PDFs are written to a `list[File]` output and synced back to the host automatically.
+Redacted PDFs are written to a `list[File]` output and synced back to the host
+automatically.
 
 ## Sample output
 
-The [`sample/`](sample/) directory contains a 6-page mock employment agreement and the [redaction output](sample/output/output.md) — 96 redactions across 6 categories.
+The [`sample/`](sample/) directory contains a 6-page mock employment agreement
+and the [redaction output](sample/output/output.md) — 96 redactions across 6
+categories.
 
 |               | Main LM (`gpt-5.4`) | Sub-LM (`gpt-5.1`) |
 | ------------- | ------------------- | ------------------ |

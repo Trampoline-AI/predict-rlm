@@ -1,14 +1,16 @@
 # Long-Running Local Runs
 
-Project-local guidance for evals, benchmarks, training-like jobs, and release checks
-that are likely to outlive one assistant turn.
+Project-local guidance for evals, benchmarks, training-like jobs, and release
+checks that are likely to outlive one assistant turn.
 
 ## Default stance
 
 Choose the observability mode before launch:
-- Use `tmux` when the user wants inspectability, live shells, or reruns in place.
-- Use a Hermes-tracked background process with `notify_on_complete=true` when the
-  user cares more about completion notification than shell visibility.
+
+- Use `tmux` when the user wants inspectability, live shells, or reruns in
+  place.
+- Use a Hermes-tracked background process with `notify_on_complete=true` when
+  the user cares more about completion notification than shell visibility.
 - Do not hide the actual long-running command behind detached `tmux` if the goal
   is Hermes completion notification; Hermes only sees the launcher exit.
 
@@ -41,8 +43,8 @@ tmux attach -t <session>
 
 ## Run artifacts
 
-Prefer a small checked-or-temporary run script over sending a long opaque command
-into `tmux`. The script should:
+Prefer a small checked-or-temporary run script over sending a long opaque
+command into `tmux`. The script should:
 
 - `set -euo pipefail`.
 - `cd` to the project root.
@@ -52,9 +54,9 @@ into `tmux`. The script should:
 - pipe stdout/stderr through `tee`.
 - summarize results after success when the canonical result artifact exists.
 
-The stats/watch command should be useful before and after result artifacts exist:
-show canonical stats when possible, otherwise tail the log and print what it is
-waiting for.
+The stats/watch command should be useful before and after result artifacts
+exist: show canonical stats when possible, otherwise tail the log and print what
+it is waiting for.
 
 ## Preflight
 
@@ -63,7 +65,8 @@ Before launching expensive or long runs:
 - verify required credentials and provider-specific environment variables when
   switching model families.
 - verify the intended semantic/code change actually landed.
-- ensure artifacts will not overwrite previous results unless explicitly intended.
+- ensure artifacts will not overwrite previous results unless explicitly
+  intended.
 - confirm destructive or high-impact operations; ordinary local eval launches
   scoped to new output directories are normally OK.
 
@@ -94,6 +97,6 @@ One concrete root cause was the JSONL client reading `proc.stderr.read()` after
 worker stdout EOF. Even when `proc.poll()` reports the direct worker has exited,
 that read can still block if a descendant inherited the stderr fd and keeps the
 pipe open. The safe recovery/fix pattern is to close/terminate the worker and
-raise an error without doing an unbounded stderr read on the EOF path. Cover both
-cases in tests: `poll() is None` and `poll() == 0` with stderr reads that would
-block.
+raise an error without doing an unbounded stderr read on the EOF path. Cover
+both cases in tests: `poll() is None` and `poll() == 0` with stderr reads that
+would block.

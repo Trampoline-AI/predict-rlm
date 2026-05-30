@@ -1,16 +1,23 @@
 # How it works
 
-1. You define **inputs**, **outputs**, and **tools** — what the RLM receives, what it should produce, and what actions it can take
+1. You define **inputs**, **outputs**, and **tools** — what the RLM receives,
+   what it should produce, and what actions it can take
 2. The outer LLM writes Python code in a sandboxed Pyodide/WASM REPL
-3. Inside the sandbox, it calls `await predict(signature, **kwargs)` to invoke the sub-LM for understanding and extraction
-4. It iterates — exploring data, calling tools, building up intermediate results, and handling errors
+3. Inside the sandbox, it calls `await predict(signature, **kwargs)` to invoke
+   the sub-LM for understanding and extraction
+4. It iterates — exploring data, calling tools, building up intermediate
+   results, and handling errors
 5. When done, it calls `SUBMIT()` with the final structured output
 
-Each iteration is a REPL turn: the LLM sees the output of its previous code, decides what to do next, and writes more code. State persists between iterations, so it can accumulate findings across many steps.
+Each iteration is a REPL turn: the LLM sees the output of its previous code,
+decides what to do next, and writes more code. State persists between
+iterations, so it can accumulate findings across many steps.
 
 ## Signatures and file I/O
 
-The DSPy signature defines the **inputs**, **outputs**, and **strategy** (via the docstring). Use `File` for file-typed fields — input files are mounted into the sandbox, output files are synced back (see [API](api.md#file) for details).
+The DSPy signature defines the **inputs**, **outputs**, and **strategy** (via
+the docstring). Use `File` for file-typed fields — input files are mounted into
+the sandbox, output files are synced back (see [API](api.md#file) for details).
 
 ```python
 from predict_rlm import File, PredictRLM, Skill

@@ -1,10 +1,19 @@
 > [!NOTE]
-> Read the launch post for our optimized [SpreadsheetBench skill](https://x.com/GabLesperance/status/2048072367876735415).
+> Read the launch post for our optimized
+> [SpreadsheetBench skill](https://x.com/GabLesperance/status/2048072367876735415).
 
 # predict-rlm
-Production focused Self-harnessed LM runtime (RLM) that allows the LM to call its sub-lm with [DSPy](https://dspy.ai) signatures. Define your inputs, outputs, and tools — the model handles its own control flow. Get fully interpretable trajectories and performance that scales directly with model improvements. Without context rot.
 
-Based on the [Recursive Language Models](https://arxiv.org/abs/2512.24601v1) paper by [Alex L. Zhang](https://x.com/a1zhang), [Tim Kraska](https://x.com/tim_kraska), and [Omar Khattab](https://x.com/lateinteraction) from MIT CSAIL.<br/>
+Production focused Self-harnessed LM runtime (RLM) that allows the LM to call
+its sub-lm with [DSPy](https://dspy.ai) signatures. Define your inputs, outputs,
+and tools — the model handles its own control flow. Get fully interpretable
+trajectories and performance that scales directly with model improvements.
+Without context rot.
+
+Based on the [Recursive Language Models](https://arxiv.org/abs/2512.24601v1)
+paper by [Alex L. Zhang](https://x.com/a1zhang),
+[Tim Kraska](https://x.com/tim_kraska), and
+[Omar Khattab](https://x.com/lateinteraction) from MIT CSAIL.<br/>
 
 <br>
 <p align="center">
@@ -16,7 +25,7 @@ Based on the [Recursive Language Models](https://arxiv.org/abs/2512.24601v1) pap
   <a href="https://discord.gg/BAkd288sGN"><img src="https://img.shields.io/badge/Discord-Join-5865F2?style=flat&logo=discord&logoColor=white" alt="Discord"></a>
   <a href="https://github.com/Trampoline-AI/predict-rlm"><img src="https://img.shields.io/github/stars/trampoline-ai/predict-rlm?cacheSeconds=3600" alt="GitHub stars"></a>
   <br/>
-  crafted  with ♥ in MTL · NYC · FLP<br>by <a href="https://trampoline.ai">Trampoline AI</a> 
+  crafted  with ♥ in MTL · NYC · FLP<br>by <a href="https://trampoline.ai">Trampoline AI</a>
 </p>
 
 ## Installation
@@ -53,11 +62,28 @@ codex-lm usage
   <img src="https://raw.githubusercontent.com/Trampoline-AI/predict-rlm/main/docs/bitter_lesson_spectrum.svg" alt="Bitter Lesson Spectrum — from hand-written prompts to RLMs" width="680"/>
 </p>
 
-- **Avoid context rot** —  The root LM only interacts with its context programmatically through the REPL, staying well within its comfortable operating range — enabling complex, long-horizon tasks that would otherwise cause models to silently degrade.
-- **Bitter lesson-proof: RLMs improve as LMs improve** — Unlike harnesses, which can cap or constrain the base model's capabilities, the performance, speed, and cost of RLM calls correlate directly with improvements to base model capabilities. [If the base model handles 10M tokens tomorrow, the RLM handles 100M.](https://alexzhang13.github.io/blog/2025/rlm/)
-- **Symbolic reasoning & recursion** — like algebra, RLMs express the *structure* of computation rather than performing each operation individually; a single line can represent 1M sub-calls — in direct contrast to agents like Claude Code that must mechanically emit each sub-agent call one at a time.
-- **Interpretability** — RLM trajectories are fully readable: you can trace every peek, chunk, sub-call, and verification step the model takes. This not only reveals *how* the model decomposed a problem, but provides concrete optimization signals which tools like [GEPA](https://gepa-ai.github.io/gepa) can ingest to evolve the RLM's strategies.
-- **Ideal for improving performance per token** — RLMs allow small models to punch way above their weight (RLM(GPT-5-mini) outperforms base GPT-5) providing great opportunities for reducing costs or stretching limited compute budgets without sacrificing quality.
+- **Avoid context rot** — The root LM only interacts with its context
+  programmatically through the REPL, staying well within its comfortable
+  operating range — enabling complex, long-horizon tasks that would otherwise
+  cause models to silently degrade.
+- **Bitter lesson-proof: RLMs improve as LMs improve** — Unlike harnesses, which
+  can cap or constrain the base model's capabilities, the performance, speed,
+  and cost of RLM calls correlate directly with improvements to base model
+  capabilities.
+  [If the base model handles 10M tokens tomorrow, the RLM handles 100M.](https://alexzhang13.github.io/blog/2025/rlm/)
+- **Symbolic reasoning & recursion** — like algebra, RLMs express the
+  _structure_ of computation rather than performing each operation individually;
+  a single line can represent 1M sub-calls — in direct contrast to agents like
+  Claude Code that must mechanically emit each sub-agent call one at a time.
+- **Interpretability** — RLM trajectories are fully readable: you can trace
+  every peek, chunk, sub-call, and verification step the model takes. This not
+  only reveals _how_ the model decomposed a problem, but provides concrete
+  optimization signals which tools like [GEPA](https://gepa-ai.github.io/gepa)
+  can ingest to evolve the RLM's strategies.
+- **Ideal for improving performance per token** — RLMs allow small models to
+  punch way above their weight (RLM(GPT-5-mini) outperforms base GPT-5)
+  providing great opportunities for reducing costs or stretching limited compute
+  budgets without sacrificing quality.
 
 ## Features
 
@@ -65,27 +91,34 @@ codex-lm usage
   <img src="https://raw.githubusercontent.com/Trampoline-AI/predict-rlm/main/docs/harness_vs_rlm.svg" alt="Classic harness vs RLM architecture" width="600"/>
 </p>
 
-
-- **Multimodal** — process images, documents, audio, and video through sub-LM calls using native provider multimodal APIs. 
-- **Async tool calling** — native RLM async support in the WASM sandbox, enabling concurrent sub-LM invocations and tool calls
-- **Prompt-optimized skills & tools** — predict-rlm skills comes tested and optimized to ensure maximum LM interoperability and performance, bundling instructions, PyPI packages, and tools for domain-specific tasks
-- **Simple file I/O** — pass local or cloud files as typed inputs and outputs via `File`, keeping interop with your existing data pipelines straightforward. (S3 files support soon)
-- **Structured sub-LM calls** — native Pydantic and DSPy signature support for type-safe sub-LM invocations with structured outputs
+- **Multimodal** — process images, documents, audio, and video through sub-LM
+  calls using native provider multimodal APIs.
+- **Async tool calling** — native RLM async support in the WASM sandbox,
+  enabling concurrent sub-LM invocations and tool calls
+- **Prompt-optimized skills & tools** — predict-rlm skills comes tested and
+  optimized to ensure maximum LM interoperability and performance, bundling
+  instructions, PyPI packages, and tools for domain-specific tasks
+- **Simple file I/O** — pass local or cloud files as typed inputs and outputs
+  via `File`, keeping interop with your existing data pipelines straightforward.
+  (S3 files support soon)
+- **Structured sub-LM calls** — native Pydantic and DSPy signature support for
+  type-safe sub-LM invocations with structured outputs
 
 ## Demos
 
-| Description | Input / Output | Preview |
-|---|---|---|
-| [Document Analysis](examples/document_analysis/) — Analyze documents and extract key dates, entities, and financial information into a structured report | **Input:** PDFs<br>**Output:** Structured briefing report ([example output](examples/document_analysis/sample/output/report.md)) | <a href="examples/document_analysis/sample/output/report.md"><img src="https://raw.githubusercontent.com/Trampoline-AI/predict-rlm/main/examples/document_analysis/sample/output/screenshot.png" width="280"></a> |
-| [Document Redaction](examples/document_redaction/) — Redact PII from PDFs based on a policy, then verify the redactions visually | **Input:** PDFs<br>**Output:** Redacted PDFs ([example output](examples/document_redaction/sample/output/output.md)) | <a href="examples/document_redaction/sample/output/output.md"><img src="https://raw.githubusercontent.com/Trampoline-AI/predict-rlm/main/examples/document_redaction/sample/output/screenshot.png" width="280"></a> |
-| [Invoice Processing](examples/invoice_processing/) — Extract vendor info, line items, and totals from PDF invoices into a consolidated Excel spreadsheet | **Input:** PDF invoices<br>**Output:** Excel spreadsheet ([example output](examples/invoice_processing/sample/output/)) | <a href="examples/invoice_processing/sample/output/output.md"><img src="https://raw.githubusercontent.com/Trampoline-AI/predict-rlm/main/examples/invoice_processing/sample/output/screenshot.png" width="280"></a> |
-| [Contract Comparison](examples/contract_comparison/) — Compare two contract versions and produce a structured diff report with per-section analysis | **Input:** 2 PDF contracts<br>**Output:** Structured diff report ([example output](examples/contract_comparison/sample/output/)) | <a href="examples/contract_comparison/sample/output/comparison-report.md"><img src="https://raw.githubusercontent.com/Trampoline-AI/predict-rlm/main/examples/contract_comparison/sample/output/screenshot.png" width="280"></a> |
+| Description                                                                                                                                              | Input / Output                                                                                                                   | Preview                                                                                                                                                                                                                          |
+| -------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| [Document Analysis](examples/document_analysis/) — Analyze documents and extract key dates, entities, and financial information into a structured report | **Input:** PDFs<br>**Output:** Structured briefing report ([example output](examples/document_analysis/sample/output/report.md)) | <a href="examples/document_analysis/sample/output/report.md"><img src="https://raw.githubusercontent.com/Trampoline-AI/predict-rlm/main/examples/document_analysis/sample/output/screenshot.png" width="280"></a>                |
+| [Document Redaction](examples/document_redaction/) — Redact PII from PDFs based on a policy, then verify the redactions visually                         | **Input:** PDFs<br>**Output:** Redacted PDFs ([example output](examples/document_redaction/sample/output/output.md))             | <a href="examples/document_redaction/sample/output/output.md"><img src="https://raw.githubusercontent.com/Trampoline-AI/predict-rlm/main/examples/document_redaction/sample/output/screenshot.png" width="280"></a>              |
+| [Invoice Processing](examples/invoice_processing/) — Extract vendor info, line items, and totals from PDF invoices into a consolidated Excel spreadsheet | **Input:** PDF invoices<br>**Output:** Excel spreadsheet ([example output](examples/invoice_processing/sample/output/))          | <a href="examples/invoice_processing/sample/output/output.md"><img src="https://raw.githubusercontent.com/Trampoline-AI/predict-rlm/main/examples/invoice_processing/sample/output/screenshot.png" width="280"></a>              |
+| [Contract Comparison](examples/contract_comparison/) — Compare two contract versions and produce a structured diff report with per-section analysis      | **Input:** 2 PDF contracts<br>**Output:** Structured diff report ([example output](examples/contract_comparison/sample/output/)) | <a href="examples/contract_comparison/sample/output/comparison-report.md"><img src="https://raw.githubusercontent.com/Trampoline-AI/predict-rlm/main/examples/contract_comparison/sample/output/screenshot.png" width="280"></a> |
 
 ## Quick start
 
 ### With your coding agent
 
-Install the [predict-rlm skill](.agents/skills/rlm/SKILL.md) in Claude Code, Codex, Cursor, or any compatible coding agent:
+Install the [predict-rlm skill](.agents/skills/rlm/SKILL.md) in Claude Code,
+Codex, Cursor, or any compatible coding agent:
 
 ```bash
 npx skills add Trampoline-AI/predict-rlm
@@ -126,7 +159,8 @@ print(result.answer)
 
 ### Optional: Docker Sandboxes backend
 
-JSPI/Deno/Pyodide remains the default sandbox. Use Docker Sandboxes (`sbx`) when you want an explicit opt-in Linux Python runner:
+JSPI/Deno/Pyodide remains the default sandbox. Use Docker Sandboxes (`sbx`) when
+you want an explicit opt-in Linux Python runner:
 
 ```bash
 brew install docker/tap/sbx
@@ -143,9 +177,13 @@ rlm = PredictRLM(
 )
 ```
 
-By default, `SbxConfig` passes the explicit non-Docker shell template `docker.io/docker/sandbox-templates:shell` to `sbx create`. Pass a custom `template="..."` to override it, or `template=None` to omit `--template` and use Docker's CLI default behavior.
+By default, `SbxConfig` passes the explicit non-Docker shell template
+`docker.io/docker/sandbox-templates:shell` to `sbx create`. Pass a custom
+`template="..."` to override it, or `template=None` to omit `--template` and use
+Docker's CLI default behavior.
 
-For throughput-sensitive evals or optimization loops, create a pool of prewarmed runners and pass it explicitly:
+For throughput-sensitive evals or optimization loops, create a pool of prewarmed
+runners and pass it explicitly:
 
 ```python
 with SbxPool(size=4, config=SbxConfig()) as pool:
@@ -156,11 +194,20 @@ with SbxPool(size=4, config=SbxConfig()) as pool:
     )
 ```
 
-The backend mounts only a per-run staging directory under `.predict_rlm_sbx/` by default, preserving model-facing paths such as `/sandbox/input/...` and `/sandbox/output/...` without exposing the rest of the repo workspace. Use `SbxConfig(extra_workspaces=[...])` only when the sandbox needs explicit additional host mounts. Real `sbx` integration tests are skipped by default; run them with `PREDICT_RLM_RUN_SBX_TESTS=1 uv run pytest -m sbx` after the CLI is installed and logged in.
+The backend mounts only a per-run staging directory under `.predict_rlm_sbx/` by
+default, preserving model-facing paths such as `/sandbox/input/...` and
+`/sandbox/output/...` without exposing the rest of the repo workspace. Use
+`SbxConfig(extra_workspaces=[...])` only when the sandbox needs explicit
+additional host mounts. Real `sbx` integration tests are skipped by default; run
+them with `PREDICT_RLM_RUN_SBX_TESTS=1 uv run pytest -m sbx` after the CLI is
+installed and logged in.
 
 ### Using the spreadsheet skill
 
-The optimized spreadsheet skill is built in. Import it and pass it through `skills=[spreadsheet]` so the RLM gets the spreadsheet-specific instructions, `openpyxl`, `pandas`, `formulas`, and the `formula_eval` verification module inside its sandbox.
+The optimized spreadsheet skill is built in. Import it and pass it through
+`skills=[spreadsheet]` so the RLM gets the spreadsheet-specific instructions,
+`openpyxl`, `pandas`, `formulas`, and the `formula_eval` verification module
+inside its sandbox.
 
 ```python
 import dspy
@@ -206,8 +253,11 @@ rlm = PredictRLM(ProcessInvoices, skills=[pdf, spreadsheet])
 
 ## Next steps
 
-- [How it works](docs/how-it-works.md) — understand the sandbox, REPL loop, signatures, and file I/O
-- [API reference](docs/api.md) — constructor params for `PredictRLM`, `File`, and `Skill`
+- [How it works](docs/how-it-works.md) — understand the sandbox, REPL loop,
+  signatures, and file I/O
+- [API reference](docs/api.md) — constructor params for `PredictRLM`, `File`,
+  and `Skill`
 - [Skills](docs/skills.md) — define, compose, and mount custom skills
-- [RLM-GEPA](src/rlm_gepa/README.md) — optimize RLM skills from traces and configure `AgentSpec`
+- [RLM-GEPA](src/rlm_gepa/README.md) — optimize RLM skills from traces and
+  configure `AgentSpec`
 - [Examples](examples/) — end-to-end demos with setup instructions

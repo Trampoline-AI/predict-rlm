@@ -1,6 +1,7 @@
 # Contract Comparison
 
-Compare two contract versions and produce a structured diff report with per-section analysis.
+Compare two contract versions and produce a structured diff report with
+per-section analysis.
 
 ## Setup
 
@@ -40,7 +41,9 @@ Outputs are saved to `output/{timestamp}/` inside this directory.
 
 ## Sample output
 
-The [`sample/`](sample/) directory contains two versions of a microFIT contract (45 pages total) and the [comparison report](sample/output/comparison-report.md).
+The [`sample/`](sample/) directory contains two versions of a microFIT contract
+(45 pages total) and the
+[comparison report](sample/output/comparison-report.md).
 
 ## Structure
 

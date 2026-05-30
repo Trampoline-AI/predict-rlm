@@ -112,12 +112,11 @@ signature separately. For ICL, the repo stores only the official demo task ID
 manifest for provenance. At runtime, it loads those demo tasks from the user's
 local AppWorld data and renders their ground-truth compiled solutions as
 tutorial solution sketches. Those sketches translate direct `apis.app.api(...)`
-calls into an RLM-facing
-`await call_appworld_api(app_name, api_name, kwargs)` helper and
-translate `apis.supervisor.complete_task(...)` into the terminal `SUBMIT(...)`
-interface. The checked-in repo does not contain worked demo traces, `demos.json`
-content, generated app state, train/dev/test evaluator feedback, or reference
-answers for non-demo benchmark tasks.
+calls into an RLM-facing `await call_appworld_api(app_name, api_name, kwargs)`
+helper and translate `apis.supervisor.complete_task(...)` into the terminal
+`SUBMIT(...)` interface. The checked-in repo does not contain worked demo
+traces, `demos.json` content, generated app state, train/dev/test evaluator
+feedback, or reference answers for non-demo benchmark tasks.
 
 The completion protocol is also adapted to the RLM interface. The RLM terminates
 with `SUBMIT(answer=value)` for answer tasks or `SUBMIT()` for state-change-only
@@ -189,13 +188,26 @@ SGC for comparisons to AppWorld/HALO charts labeled "Scenario Goal Completion".
 
 ## Results
 
-### Baselines
+### Held-out AppWorld evals
 
-| Model          |             TGC |           SGC |     Cost / task |
-| -------------- | --------------: | ------------: | --------------: |
-| GPT-5.4-low    | 72.0% (121/168) | 50.0% (28/56) |  $0.26 ($43.85) |
-| GPT-5.5-low    | 89.9% (151/168) | 80.4% (45/56) |  $0.35 ($58.72) |
-| Sonnet-4.6-low | 63.1% (106/168) | 44.6% (25/56) | $0.73 ($123.19) |
+These are single-pass held-out evals using the RLM interface described above.
+Gemini 3 Flash runs use `reasoning_effort=none`, which means no explicit
+provider reasoning-effort parameter is passed for Gemini in this runner.
+
+| Split            | Run                      | TGC             | SGC            | Cost   |
+| ---------------- | ------------------------ | --------------- | -------------- | ------ |
+| `test_normal`    | Gemini 3 Flash, seed     | 69.6% (117/168) | 42.9% (24/56)  | $18.29 |
+| `test_normal`    | Gemini 3 Flash, RLM-GEPA | 78.6% (132/168) | 55.4% (31/56)  | $16.48 |
+| `test_normal`    | Sonnet 4.6, seed         | 88.1% (148/168) | 78.6% (44/56)  | $69.61 |
+| `test_normal`    | Sonnet 4.6, RLM-GEPA     | 83.9% (141/168) | 71.4% (40/56)  | $77.16 |
+| `test_normal`    | GPT-5.4 low, RLM-GEPA    | 86.3% (145/168) | 75.0% (42/56)  | $43.60 |
+| `test_challenge` | Gemini 3 Flash, seed     | 66.4% (277/417) | 39.6% (55/139) | $45.50 |
+| `test_challenge` | Gemini 3 Flash, RLM-GEPA | 64.0% (267/417) | 38.8% (54/139) | $51.13 |
+
+Gemini 3 Flash RLM-GEPA improves `test_normal` by **+9.0 pp TGC / +12.5 pp SGC**
+over the matched seed baseline, but does not transfer on `test_challenge`
+(**-2.4 pp TGC / -0.7 pp SGC**). Sonnet 4.6 RLM-GEPA trails its matched
+`test_normal` seed baseline by **-4.2 pp TGC / -7.1 pp SGC**.
 
 ## Commands
 

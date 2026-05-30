@@ -1385,6 +1385,22 @@ def test_best_lineage_annotation_reserves_horizontal_space_from_same_layer_nodes
     } == {}
 
 
+def test_lineage_spaces_nodes_away_from_unowned_straight_edges():
+    data = {
+        "n": 13,
+        "scores": [0.899, 0.895, 0.934, 0.898, 0.873, 0.945, 0.931, 0.900, 0.925, 0.951, 0.952, 0.910, 0.970],
+        "parents": [[None], [0], [1], [0], [0], [2], [0], [0], [5], [8, 7], [8], [5], [2]],
+        "best_idx": 12,
+        "pareto_map": {},
+    }
+
+    fig = make_lineage(data, _fake_plotly_go)
+    edge_trace = fig.traces[0]
+
+    assert edge_trace.x.count(None) == 13
+    assert _lineage_edge_node_intersections(fig) == []
+
+
 def _annotation_horizontal_footprint(annotation: dict[str, object]) -> tuple[float, float]:
     x = float(annotation["x"])
     width = 1.5
@@ -1471,6 +1487,54 @@ def _edge_crossing_count(
         for index, edge in enumerate(edges)
         for other_edge in edges[index + 1 :]
     )
+
+
+def _lineage_edge_node_intersections(fig, node_radius: float = 0.25) -> list[tuple[tuple[float, float], tuple[float, float], int]]:
+    positions = _lineage_node_positions(fig)
+    edge_trace = fig.traces[0]
+    intersections = []
+    polyline: list[tuple[float, float]] = []
+    for x, y in zip(edge_trace.x, edge_trace.y, strict=True):
+        if x is None or y is None:
+            intersections.extend(_polyline_node_intersections(polyline, positions, node_radius))
+            polyline = []
+        else:
+            polyline.append((float(x), float(y)))
+    intersections.extend(_polyline_node_intersections(polyline, positions, node_radius))
+    return intersections
+
+
+def _polyline_node_intersections(
+    polyline: list[tuple[float, float]],
+    positions: dict[int, tuple[float, float]],
+    node_radius: float,
+) -> list[tuple[tuple[float, float], tuple[float, float], int]]:
+    if len(polyline) < 2:
+        return []
+    endpoints = {polyline[0], polyline[-1]}
+    return [
+        (start, end, candidate)
+        for start, end in zip(polyline, polyline[1:])
+        for candidate, position in positions.items()
+        if position not in endpoints and _point_segment_distance(position, start, end) < node_radius
+    ]
+
+
+def _point_segment_distance(
+    point: tuple[float, float], start: tuple[float, float], end: tuple[float, float]
+) -> float:
+    px, py = point
+    sx, sy = start
+    ex, ey = end
+    dx = ex - sx
+    dy = ey - sy
+    segment_len_sq = dx * dx + dy * dy
+    if segment_len_sq == 0:
+        return ((px - sx) ** 2 + (py - sy) ** 2) ** 0.5
+    t = max(0.0, min(1.0, ((px - sx) * dx + (py - sy) * dy) / segment_len_sq))
+    nearest_x = sx + t * dx
+    nearest_y = sy + t * dy
+    return ((px - nearest_x) ** 2 + (py - nearest_y) ** 2) ** 0.5
 
 
 def _segments_cross(

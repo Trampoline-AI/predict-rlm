@@ -261,6 +261,38 @@ def test_score_runner_result_feedback():
     assert "missing email" in feedback
 
 
+def test_score_runner_result_derives_soft_score_from_appworld_test_counts():
+    score, feedback = score_runner_result(
+        {
+            "success": False,
+            "num_tests": 4,
+            "passes": [{"label": "a"}, {"label": "b"}],
+            "failures": [{"label": "c"}, {"label": "d"}],
+        }
+    )
+
+    assert score == 0.5
+    assert "AppWorld score=0.500" in feedback
+
+
+def test_score_runner_result_derives_soft_score_from_worker_result_counts():
+    score, feedback = score_runner_result(
+        {
+            "success": False,
+            "score": 0.0,
+            "result": {
+                "success": False,
+                "num_tests": 4,
+                "passes": [{"label": "a"}],
+                "failures": [{"label": "b"}, {"label": "c"}, {"label": "d"}],
+            },
+        }
+    )
+
+    assert score == 0.25
+    assert "AppWorld score=0.250" in feedback
+
+
 def test_score_runner_result_parses_evaluator_json():
     text = _runner_result_text(success=True, score=1.0, stdout="ok", feedback="done")
     assert score_runner_result(text) == (1.0, "done")

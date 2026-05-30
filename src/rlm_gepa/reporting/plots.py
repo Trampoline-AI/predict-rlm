@@ -17,6 +17,7 @@ C_PAPER_BG = "#1e1e1e"
 FONT_FAMILY = "Inter, Helvetica, Arial, sans-serif"
 LINEAGE_X_GAP = 0.75
 LINEAGE_ANNOTATION_X_FOOTPRINT = 1.5
+LINEAGE_EDGE_NODE_RADIUS = 0.25
 
 
 def write_plots(run_dir: str | Path, output: str | Path | None = None) -> list[Path]:
@@ -317,6 +318,7 @@ def make_lineage(data: dict[str, Any], go: Any) -> Any:
         layout(root)
 
     x_pos = _reflow_lineage_x_positions(x_pos, depth, all_parents)
+    x_pos = _separate_lineage_nodes_from_edges(x_pos, depth, all_parents)
     best_annotation_place_right: bool | None = None
     if 0 <= best_idx < n:
         x_pos, best_annotation_place_right = _reserve_lineage_annotation_space(x_pos, depth, best_idx)
@@ -423,6 +425,90 @@ def _primary_parent(parent_ids: list[int], child: int) -> int | None:
         if 0 <= parent < child:
             return parent
     return None
+
+
+def _separate_lineage_nodes_from_edges(
+    x_pos: dict[int, float],
+    depth: list[int],
+    all_parents: list[list[int]],
+) -> dict[int, float]:
+    separated = dict(x_pos)
+    y_pos = {index: float(-candidate_depth) for index, candidate_depth in enumerate(depth)}
+    for _ in range(20):
+        shift = _next_lineage_node_edge_shift(separated, y_pos, all_parents)
+        if shift is None:
+            return separated
+        candidate, new_x = shift
+        separated[candidate] = new_x
+    return separated
+
+
+def _next_lineage_node_edge_shift(
+    x_pos: dict[int, float],
+    y_pos: dict[int, float],
+    all_parents: list[list[int]],
+) -> tuple[int, float] | None:
+    for child, parent_ids in enumerate(all_parents):
+        for parent in parent_ids:
+            start = (x_pos[parent], y_pos[parent])
+            end = (x_pos[child], y_pos[child])
+            for candidate, candidate_x in x_pos.items():
+                if candidate in {parent, child}:
+                    continue
+                point = (candidate_x, y_pos[candidate])
+                if not _point_lies_between_y(point, start, end):
+                    continue
+                edge_x = _lineage_edge_x_at_y(start, end, y_pos[candidate])
+                if abs(candidate_x - edge_x) < LINEAGE_EDGE_NODE_RADIUS:
+                    return candidate, _shift_lineage_node_x(candidate, candidate_x, edge_x, x_pos, y_pos)
+    return None
+
+
+def _shift_lineage_node_x(
+    candidate: int,
+    candidate_x: float,
+    edge_x: float,
+    x_pos: dict[int, float],
+    y_pos: dict[int, float],
+) -> float:
+    options = []
+    preferred_direction = 1.0 if candidate_x >= edge_x else -1.0
+    for direction in (preferred_direction, -preferred_direction):
+        shifted_x = edge_x + direction * LINEAGE_X_GAP
+        shifted_x = _space_lineage_x_from_layer(candidate, shifted_x, direction, x_pos, y_pos)
+        options.append((abs(shifted_x - candidate_x), shifted_x))
+    return min(options)[1]
+
+
+def _space_lineage_x_from_layer(
+    candidate: int,
+    shifted_x: float,
+    direction: float,
+    x_pos: dict[int, float],
+    y_pos: dict[int, float],
+) -> float:
+    same_layer = [
+        other_x
+        for other, other_x in x_pos.items()
+        if other != candidate and y_pos[other] == y_pos[candidate]
+    ]
+    while any(abs(shifted_x - other_x) < LINEAGE_X_GAP for other_x in same_layer):
+        blockers = [other_x for other_x in same_layer if abs(shifted_x - other_x) < LINEAGE_X_GAP]
+        shifted_x = (max(blockers) if direction > 0 else min(blockers)) + direction * LINEAGE_X_GAP
+    return shifted_x
+
+
+def _point_lies_between_y(
+    point: tuple[float, float], start: tuple[float, float], end: tuple[float, float]
+) -> bool:
+    return min(start[1], end[1]) < point[1] < max(start[1], end[1])
+
+
+def _lineage_edge_x_at_y(start: tuple[float, float], end: tuple[float, float], y: float) -> float:
+    if start[1] == end[1]:
+        return start[0]
+    ratio = (y - start[1]) / (end[1] - start[1])
+    return start[0] + ratio * (end[0] - start[0])
 
 
 def _valid_parent_ids(raw: Any, *, child: int) -> list[int]:

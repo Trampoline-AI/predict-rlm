@@ -339,7 +339,7 @@ Example `--table iterations --format markdown` output:
 
 | iter     | soft: par → child    | hard: par → child              | flips    | p    | outcome  |
 | -------- | -------------------- | ------------------------------ | -------- | ---- | -------- |
-|    0 [0] | 0.500 → 1.000 +0.500 | 0.500 → 1.000 +0.500; 1 → 2 /2 | +1/-0 +1 | 1.00 | → cand 1 |
+| 0 [0]    | 0.500 → 1.000 +0.500 | 0.500 → 1.000 +0.500; 1 → 2 /2 | +1/-0 +1 | 1.00 | → cand 1 |
 | 1 [0, 1] | 1.000 → 1.000 +0.000 | 0.500 → 0.500 +0.000; 1 → 1 /2 | +0/-0 +0 | 1.00 | REJECTED |
 
 Example plot artifacts from the SpreadsheetBench run:

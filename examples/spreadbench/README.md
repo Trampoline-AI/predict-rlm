@@ -10,12 +10,12 @@ runs.
 All results are on the held-out 400-task SpreadsheetBench Verified set. The
 optimized skill was trained only on the non-Verified 512-task remainder.
 
-| Executor | Seed soft | Seed hard | Optimized soft | Optimized hard |
-| --- | ---: | ---: | ---: | ---: |
-| `gpt-5.4`, low | 0.8710 | 0.7800 | 0.8980 | 0.8150 |
-| `gpt-5.4`, medium | 0.8750 | 0.7950 | 0.9259 | 0.8500 |
-| `gpt-5.5`, low | 0.9092 | 0.8500 | 0.9288 | 0.8775 |
-| `gpt-5.5`, medium | 0.9142 | 0.8600 | 0.9411 | 0.8925 |
+| Executor          | Seed soft | Seed hard | Optimized soft | Optimized hard |
+| ----------------- | --------: | --------: | -------------: | -------------: |
+| `gpt-5.4`, low    |    0.8710 |    0.7800 |         0.8980 |         0.8150 |
+| `gpt-5.4`, medium |    0.8750 |    0.7950 |         0.9259 |         0.8500 |
+| `gpt-5.5`, low    |    0.9092 |    0.8500 |         0.9288 |         0.8775 |
+| `gpt-5.5`, medium |    0.9142 |    0.8600 |         0.9411 |         0.8925 |
 
 ## Requirements
 
@@ -173,8 +173,10 @@ Create `runs/<optimize-run>/gepa.stop` to request a graceful stop.
 
 - `spreadsheet_rlm/agent/`: PredictRLM module, signature, and seed spreadsheet
   skill.
-- `spreadsheet_rlm/tools/`: LibreOffice recalculation and workbook rendering tools.
-- `spreadsheet_rlm/bench/`: dataset loading, scoring, eval CLI, candidate extraction.
+- `spreadsheet_rlm/tools/`: LibreOffice recalculation and workbook rendering
+  tools.
+- `spreadsheet_rlm/bench/`: dataset loading, scoring, eval CLI, candidate
+  extraction.
 - `spreadsheet_rlm/gepa/`: optimizer project config and CLI.
 - `run_artifacts/`: tracked release eval/optimization archives.
 - `blog_assets/`: release plots.

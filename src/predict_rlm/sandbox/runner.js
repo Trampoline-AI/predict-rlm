@@ -48,7 +48,7 @@ const jsonrpcRequest = (method, params, id) =>
 /** Replace contiguous runs of binary characters (surrogates, control chars)
  *  with a human-readable placeholder so JSON.stringify produces valid UTF-8. */
 const filterBinary = (s) => {
-  if (typeof s !== 'string') return s;
+  if (typeof s !== "string") return s;
   return s.replace(
     /[\uD800-\uDFFF\x00-\x08\x0B\x0C\x0E-\x1F]+/g,
     (m) => `<${m.length} binary bytes>`,
@@ -472,7 +472,7 @@ def SUBMIT(output):
   }
 
   const allowDefaults = outputs.length === 1;
-  const sigParts = outputs.map(o => {
+  const sigParts = outputs.map((o) => {
     let part = o.name;
     if (o.type) part += `: ${o.type}`;
     if (allowDefaults && o.has_default) part += `=_SUBMIT_MISSING`;
@@ -480,18 +480,22 @@ def SUBMIT(output):
   });
   const defaultLines = allowDefaults
     ? outputs
-        .filter(o => o.has_default)
-        .map(o => {
-          const defaultJson = JSON.stringify(JSON.stringify(o.default));
-          return `    if ${o.name} is _SUBMIT_MISSING:\n        ${o.name} = _submit_json.loads(${defaultJson})`;
-        })
+      .filter((o) => o.has_default)
+      .map((o) => {
+        const defaultJson = JSON.stringify(JSON.stringify(o.default));
+        return `    if ${o.name} is _SUBMIT_MISSING:\n        ${o.name} = _submit_json.loads(${defaultJson})`;
+      })
     : [];
-  const dictParts = outputs.map(o => `"${o.name}": ${o.name}`);
+  const dictParts = outputs.map((o) => `"${o.name}": ${o.name}`);
 
   return `${serializerDef}
 _SUBMIT_MISSING = object()
-def SUBMIT(${sigParts.join(', ')}):
-${defaultLines.length ? defaultLines.join('\n') + '\n' : ''}    raise FinalOutput(_submit_to_jsonsafe({${dictParts.join(', ')}}))
+def SUBMIT(${sigParts.join(", ")}):
+${
+    defaultLines.length
+      ? defaultLines.join("\n") + "\n"
+      : ""
+  }    raise FinalOutput(_submit_to_jsonsafe({${dictParts.join(", ")}}))
 `;
 };
 
@@ -504,7 +508,7 @@ globalThis.addEventListener("unhandledrejection", (event) => {
   console.log(jsonrpcError(
     JSONRPC_APP_ERRORS.Unknown,
     `Unhandled async error: ${event.reason?.message || event.reason}`,
-    null
+    null,
   ));
 });
 
@@ -523,11 +527,11 @@ if (preinstall) {
   await pyodide.loadPackage("micropip");
 
   // Collect all packages to install: defaults + skill packages
-  const defaultPackages = ['pandas', 'pydantic'];
+  const defaultPackages = ["pandas", "pydantic"];
   const skillPackagesEnv = Deno.env.get("SKILL_PACKAGES") || "";
   const skillPackages = skillPackagesEnv
     .split(",")
-    .map(p => p.trim())
+    .map((p) => p.trim())
     .filter(Boolean);
   const allPackages = [...defaultPackages, ...skillPackages];
 
@@ -555,8 +559,8 @@ let requestIdCounter = 0;
 
 // Store registered tools so we can re-inject them before each execution
 // This protects against state corruption during long async executions
-let registeredTools = [];  // [{name, params}, ...]
-let registeredOutputs = null;  // output field definitions
+let registeredTools = []; // [{name, params}, ...]
+let registeredOutputs = null; // output field definitions
 
 // Pending tool calls waiting for responses
 const pendingToolCalls = new Map(); // requestId -> { resolve, reject }
@@ -586,7 +590,9 @@ async function toolCallBridge(name, argsJson) {
     name: name,
     args: parsedArgs.args || [],
     kwargs: parsedArgs.kwargs || {},
-    ...(parsedArgs.pydantic_schemas ? { pydantic_schemas: parsedArgs.pydantic_schemas } : {}),
+    ...(parsedArgs.pydantic_schemas
+      ? { pydantic_schemas: parsedArgs.pydantic_schemas }
+      : {}),
   }, requestId));
 
   // Wait for our specific response (dispatcher will route it)
@@ -598,7 +604,7 @@ function handleToolResponse(response) {
   const pending = pendingToolCalls.get(response.id);
   if (!pending) {
     console.error(JSON.stringify({
-      warning: `Received response for unknown request: ${response.id}`
+      warning: `Received response for unknown request: ${response.id}`,
     }));
     return false;
   }
@@ -616,7 +622,7 @@ function handleToolResponse(response) {
 
 // Helper to create a timeout promise
 function sleep(ms) {
-  return new Promise(resolve => setTimeout(resolve, ms));
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 // Background response reader - runs during code execution
@@ -626,7 +632,10 @@ async function responseReader() {
   // Track if we have an in-flight read that needs to be resolved
   let pendingRead = null;
 
-  while (!responseReaderCancelled && (codeExecutionInProgress || pendingToolCalls.size > 0)) {
+  while (
+    !responseReaderCancelled &&
+    (codeExecutionInProgress || pendingToolCalls.size > 0)
+  ) {
     // Check if we have pending requests to wait for
     if (pendingToolCalls.size === 0 && codeExecutionInProgress) {
       // No pending requests but code is still running, yield and check again
@@ -642,8 +651,8 @@ async function responseReader() {
     // Race between the read and a timeout
     // This allows us to check the cancellation flag periodically
     const result = await Promise.race([
-      pendingRead.then(r => ({ ...r, timeout: false })),
-      sleep(100).then(() => ({ timeout: true }))
+      pendingRead.then((r) => ({ ...r, timeout: false })),
+      sleep(100).then(() => ({ timeout: true })),
     ]);
 
     if (result.timeout) {
@@ -657,7 +666,9 @@ async function responseReader() {
     if (result.done) {
       // stdin closed, reject all pending
       for (const [id, pending] of pendingToolCalls) {
-        pending.reject(new Error("stdin closed while waiting for tool response"));
+        pending.reject(
+          new Error("stdin closed while waiting for tool response"),
+        );
       }
       pendingToolCalls.clear();
       break;
@@ -677,7 +688,8 @@ async function responseReader() {
         } catch (e) {
           console.log(jsonrpcError(
             JSONRPC_APP_ERRORS.RuntimeError,
-            `sync_file failed: ${e.message}`, response.id
+            `sync_file failed: ${e.message}`,
+            response.id,
           ));
         }
         continue;
@@ -686,34 +698,40 @@ async function responseReader() {
         try {
           const contents = await Deno.readFile(response.params.host_path);
           const vp = response.params.virtual_path;
-          const dirs = vp.split('/').slice(1, -1);
-          let cur = '';
+          const dirs = vp.split("/").slice(1, -1);
+          let cur = "";
           for (const d of dirs) {
-            cur += '/' + d;
-            try { pyodide.FS.mkdir(cur); } catch (_) { /* exists */ }
+            cur += "/" + d;
+            try {
+              pyodide.FS.mkdir(cur);
+            } catch (_) { /* exists */ }
           }
           pyodide.FS.writeFile(vp, contents);
           console.log(jsonrpcResult({ ok: true }, response.id));
         } catch (e) {
           console.log(jsonrpcError(
             JSONRPC_APP_ERRORS.RuntimeError,
-            `mount_file failed: ${e.message}`, response.id
+            `mount_file failed: ${e.message}`,
+            response.id,
           ));
         }
         continue;
       }
 
       // JSON-RPC response: has id and either result or error
-      if (response.id && (response.result !== undefined || response.error !== undefined)) {
+      if (
+        response.id &&
+        (response.result !== undefined || response.error !== undefined)
+      ) {
         handleToolResponse(response);
       } else {
         console.error(JSON.stringify({
-          warning: `Unexpected message during execution: ${result.value}`
+          warning: `Unexpected message during execution: ${result.value}`,
         }));
       }
     } catch (e) {
       console.error(JSON.stringify({
-        warning: `Failed to parse response: ${e.message}`
+        warning: `Failed to parse response: ${e.message}`,
       }));
     }
   }
@@ -753,16 +771,16 @@ while (true) {
     console.log(jsonrpcError(
       JSONRPC_PROTOCOL_ERRORS.ParseError,
       "Invalid JSON input: " + error.message,
-      null
+      null,
     ));
     continue;
   }
 
-  if (typeof input !== 'object' || input === null) {
+  if (typeof input !== "object" || input === null) {
     console.log(jsonrpcError(
       JSONRPC_PROTOCOL_ERRORS.InvalidRequest,
       "Input is not a JSON object",
-      null
+      null,
     ));
     continue;
   }
@@ -778,10 +796,12 @@ while (true) {
       try {
         await Deno.writeFile(
           params.host_path || params.virtual_path,
-          pyodide.FS.readFile(params.virtual_path)
+          pyodide.FS.readFile(params.virtual_path),
         );
       } catch (e) {
-        console.error(`sync_file failed for ${params.virtual_path}: ${e.message || e}`);
+        console.error(
+          `sync_file failed for ${params.virtual_path}: ${e.message || e}`,
+        );
       }
       continue;
     }
@@ -795,16 +815,16 @@ while (true) {
       const virtualPath = params.virtual_path || hostPath;
       try {
         const contents = await Deno.readFile(hostPath);
-        const dirs = virtualPath.split('/').slice(1, -1);
-        let cur = '';
+        const dirs = virtualPath.split("/").slice(1, -1);
+        let cur = "";
         for (const d of dirs) {
-          cur += '/' + d;
+          cur += "/" + d;
           try {
             pyodide.FS.mkdir(cur);
           } catch (e) {
-            const isExists = e.errno === 20
-              || e.code === 'EEXIST'
-              || (e.message && e.message.includes('File exists'));
+            const isExists = e.errno === 20 ||
+              e.code === "EEXIST" ||
+              (e.message && e.message.includes("File exists"));
             if (!isExists) {
               throw e;
             }
@@ -816,7 +836,7 @@ while (true) {
         console.log(jsonrpcError(
           JSONRPC_APP_ERRORS.RuntimeError,
           "Failed to mount file: " + e.message,
-          requestId
+          requestId,
         ));
       }
       continue;
@@ -826,17 +846,17 @@ while (true) {
     if (method === "mkdir_p") {
       const dirPath = params.path;
       try {
-        const parts = dirPath.split('/').filter(Boolean);
-        let cur = '';
+        const parts = dirPath.split("/").filter(Boolean);
+        let cur = "";
         for (const d of parts) {
-          cur += '/' + d;
+          cur += "/" + d;
           try {
             pyodide.FS.mkdir(cur);
           } catch (e) {
             // Pyodide FS throws ErrnoError with errno=20 (EEXIST) — ignore it
-            const isExists = e.errno === 20
-              || e.code === 'EEXIST'
-              || (e.message && e.message.includes('File exists'));
+            const isExists = e.errno === 20 ||
+              e.code === "EEXIST" ||
+              (e.message && e.message.includes("File exists"));
             if (!isExists) {
               throw e;
             }
@@ -847,7 +867,7 @@ while (true) {
         console.log(jsonrpcError(
           JSONRPC_APP_ERRORS.RuntimeError,
           "Failed to create directory: " + (e.message || String(e)),
-          requestId
+          requestId,
         ));
       }
       continue;
@@ -866,8 +886,8 @@ while (true) {
             return; // directory doesn't exist
           }
           for (const entry of entries) {
-            if (entry === '.' || entry === '..') continue;
-            const fullPath = dir + '/' + entry;
+            if (entry === "." || entry === "..") continue;
+            const fullPath = dir + "/" + entry;
             const stat = pyodide.FS.stat(fullPath);
             if (pyodide.FS.isFile(stat.mode)) {
               files.push(fullPath);
@@ -882,7 +902,7 @@ while (true) {
         console.log(jsonrpcError(
           JSONRPC_APP_ERRORS.RuntimeError,
           "Failed to list directory: " + e.message,
-          requestId
+          requestId,
         ));
       }
       continue;
@@ -892,18 +912,22 @@ while (true) {
     if (method === "inject_var") {
       const { name, value } = params;
       try {
-        try { pyodide.FS.mkdir('/tmp'); } catch (e) { /* exists */ }
-        try { pyodide.FS.mkdir('/tmp/dspy_vars'); } catch (e) { /* exists */ }
+        try {
+          pyodide.FS.mkdir("/tmp");
+        } catch (e) { /* exists */ }
+        try {
+          pyodide.FS.mkdir("/tmp/dspy_vars");
+        } catch (e) { /* exists */ }
         pyodide.FS.writeFile(
           `/tmp/dspy_vars/${name}.json`,
-          new TextEncoder().encode(value)
+          new TextEncoder().encode(value),
         );
         console.log(jsonrpcResult({ injected: name }, requestId));
       } catch (e) {
         console.log(jsonrpcError(
           JSONRPC_APP_ERRORS.RuntimeError,
           `Failed to inject var: ${e.message}`,
-          requestId
+          requestId,
         ));
       }
       continue;
@@ -916,8 +940,10 @@ while (true) {
       if (params.tools) {
         registeredTools = [];
         for (const tool of params.tools) {
-          const name = typeof tool === 'string' ? tool : tool.name;
-          const toolParams = typeof tool === 'string' ? [] : (tool.parameters || []);
+          const name = typeof tool === "string" ? tool : tool.name;
+          const toolParams = typeof tool === "string"
+            ? []
+            : (tool.parameters || []);
 
           registeredTools.push({ name, params: toolParams });
           pyodide.runPython(makeToolWrapper(name, toolParams));
@@ -932,7 +958,7 @@ while (true) {
 
       console.log(jsonrpcResult({
         tools: toolNames,
-        outputs: params.outputs ? params.outputs.map(o => o.name) : []
+        outputs: params.outputs ? params.outputs.map((o) => o.name) : [],
       }, requestId));
       continue;
     }
@@ -982,8 +1008,10 @@ while (true) {
         const capturedStdout = pyodide.runPython("buf_stdout.getvalue()");
         pyodide.runPython("sys.stdout, sys.stderr = old_stdout, old_stderr");
 
-        let output = (result === null || result === undefined) ? capturedStdout : (result.toJs?.() ?? result);
-        if (typeof output === 'string') output = filterBinary(output);
+        let output = (result === null || result === undefined)
+          ? capturedStdout
+          : (result.toJs?.() ?? result);
+        if (typeof output === "string") output = filterBinary(output);
         console.log(jsonrpcResult({ output }, requestId));
       } catch (error) {
         codeExecutionInProgress = false;
@@ -1002,7 +1030,9 @@ while (true) {
 
         // Cancel any pending tool calls (they won't get responses now)
         for (const [id, pending] of pendingToolCalls) {
-          pending.reject(new Error("Code execution failed, cancelling pending tool calls"));
+          pending.reject(
+            new Error("Code execution failed, cancelling pending tool calls"),
+          );
         }
         pendingToolCalls.clear();
 
@@ -1023,7 +1053,9 @@ while (true) {
         if (errorType === "FinalOutput") {
           let answer = null;
           try {
-            const last_exception_args = pyodide.globals.get("last_exception_args");
+            const last_exception_args = pyodide.globals.get(
+              "last_exception_args",
+            );
             const args = JSON.parse(last_exception_args());
             answer = args?.[0] ?? null;
           } catch (e) {
@@ -1033,8 +1065,8 @@ while (true) {
             // the submitted value.
             console.error(
               `[submit] Failed to capture FinalOutput args (${e}); ` +
-              `answer will be null. This indicates the SUBMIT serializer ` +
-              `couldn't make a value JSON-safe — please report.`,
+                `answer will be null. This indicates the SUBMIT serializer ` +
+                `couldn't make a value JSON-safe — please report.`,
             );
           }
           console.log(jsonrpcResult({ final: answer }, requestId));
@@ -1042,10 +1074,13 @@ while (true) {
         }
 
         // Map Python error type to JSON-RPC error code
-        const errorCode = JSONRPC_APP_ERRORS[errorType] ?? JSONRPC_APP_ERRORS.Unknown;
+        const errorCode = JSONRPC_APP_ERRORS[errorType] ??
+          JSONRPC_APP_ERRORS.Unknown;
         let errorArgs = [];
         try {
-          const last_exception_args = pyodide.globals.get("last_exception_args");
+          const last_exception_args = pyodide.globals.get(
+            "last_exception_args",
+          );
           errorArgs = JSON.parse(last_exception_args()) || [];
         } catch (e) {
           // Ignore errors getting exception args
@@ -1054,7 +1089,7 @@ while (true) {
           errorCode,
           errorMessage,
           requestId,
-          { type: errorType, args: errorArgs }
+          { type: errorType, args: errorArgs },
         ));
       }
       continue;
@@ -1064,7 +1099,7 @@ while (true) {
     console.log(jsonrpcError(
       JSONRPC_PROTOCOL_ERRORS.MethodNotFound,
       `Method not found: ${method}`,
-      requestId
+      requestId,
     ));
     continue;
   }
@@ -1079,6 +1114,6 @@ while (true) {
   console.log(jsonrpcError(
     JSONRPC_PROTOCOL_ERRORS.InvalidRequest,
     "Invalid Request: not a JSON-RPC 2.0 message",
-    null
+    null,
   ));
 }

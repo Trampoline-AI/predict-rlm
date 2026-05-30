@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+from collections.abc import Mapping
+from typing import Any
 
 from predict_rlm import Skill
 from predict_rlm.trace import RunTrace, extract_trace_from_exc
@@ -17,7 +19,7 @@ COMPONENT_SKILL = "skill_instructions"
 
 def score_runner_result(payload: str | dict[str, object]) -> tuple[float, str]:
     data = json.loads(payload) if isinstance(payload, str) else payload
-    score = max(0.0, min(1.0, float(data.get("score", 0.0) or 0.0)))
+    score = _appworld_soft_score(data)
     success = bool(data.get("success", score >= 1.0))
     feedback = str(data.get("feedback") or "")
     stderr = str(data.get("stderr") or "")
@@ -29,6 +31,24 @@ def score_runner_result(payload: str | dict[str, object]) -> tuple[float, str]:
     if stderr:
         parts.append(stderr)
     return score, "\n".join(parts)
+
+
+def _appworld_soft_score(data: Mapping[str, Any]) -> float:
+    result = data.get("result")
+    counted_score = _appworld_counted_score(data)
+    if counted_score is None and isinstance(result, Mapping):
+        counted_score = _appworld_counted_score(result)
+    if counted_score is not None:
+        return counted_score
+    return max(0.0, min(1.0, float(data.get("score", 0.0) or 0.0)))
+
+
+def _appworld_counted_score(data: Mapping[Any, Any]) -> float | None:
+    num_tests = data.get("num_tests")
+    passes = data.get("passes")
+    if not isinstance(num_tests, int | float) or num_tests <= 0 or not isinstance(passes, list):
+        return None
+    return max(0.0, min(1.0, len(passes) / float(num_tests)))
 
 
 class AppWorldGepaProject(RLMGepaProject):
