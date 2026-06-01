@@ -18,7 +18,6 @@ import pathlib
 import pickle
 import queue
 import re
-import select
 import shutil
 import signal
 import sys
@@ -41,6 +40,7 @@ TOOL_RESPONSE_LOCK = asyncio.Lock()
 PENDING_TOOL_RESPONSES: dict[int, dict[str, Any]] = {}
 RUNTIME_HOOK_ORIGINALS: dict[str, tuple[Any, str, Callable[..., Any]]] = {}
 RUNTIME_HOOK_SPECS: dict[str, set[str]] = {}
+RUNTIME_HOOKS_ENABLED = False
 _TRUE_VALUES = {"1", "true", "yes", "on"}
 _KERNEL_PROCESS: multiprocessing.Process | None = None
 _KERNEL_REQUEST_QUEUE: multiprocessing.Queue | None = None
@@ -291,6 +291,8 @@ def _emit_runtime_hook_event(
     error: BaseException | None = None,
     duration_ms: int | None = None,
 ) -> None:
+    if not RUNTIME_HOOKS_ENABLED:
+        return
     if phase not in RUNTIME_HOOK_SPECS.get(target, set()):
         return
     params = {
@@ -507,6 +509,8 @@ def _reconstruct_output_types(
     result: Any,
     globals_dict: dict[str, Any],
 ) -> Any:
+    if isinstance(result, _PredictResult):
+        result = result.to_dict()
     if not isinstance(result, dict):
         return result
 
@@ -876,6 +880,7 @@ def _persistent_kernel_runner(
     result_queue: multiprocessing.Queue,
     stdin_fd: int,
 ) -> None:
+    global RUNTIME_HOOKS_ENABLED
     with contextlib.suppress(OSError):
         os.setsid()
     global PROTOCOL_STDIN, PROTOCOL_STDOUT
@@ -884,7 +889,6 @@ def _persistent_kernel_runner(
     global PENDING_TOOL_RESPONSES, TOOL_RESPONSE_LOCK
     PENDING_TOOL_RESPONSES = {}
     TOOL_RESPONSE_LOCK = asyncio.Lock()
-
     while True:
         request = request_queue.get()
         if request is None:
@@ -896,16 +900,23 @@ def _persistent_kernel_runner(
                     "snapshot": _pickleable_globals_snapshot(globals_dict),
                 })
                 continue
+            if request.get("op") == "register_runtime_hooks":
+                result_queue.put({"ok": True, "result": _register_runtime_hooks(request["params"])})
+                continue
             if request.get("timeout_seconds") is not None:
                 signal.signal(signal.SIGINT, signal.default_int_handler)
-            result = _run_kernel_coroutine(
-                _execute_code_to_capture_files(
-                    request["code"],
-                    globals_dict,
-                    request["stdout_path"],
-                    request["stderr_path"],
+            RUNTIME_HOOKS_ENABLED = True
+            try:
+                result = _run_kernel_coroutine(
+                    _execute_code_to_capture_files(
+                        request["code"],
+                        globals_dict,
+                        request["stdout_path"],
+                        request["stderr_path"],
+                    )
                 )
-            )
+            finally:
+                RUNTIME_HOOKS_ENABLED = False
             result_queue.put({"ok": True, "result": result})
         except KeyboardInterrupt:
             timeout_seconds = request.get("timeout_seconds")
@@ -1042,6 +1053,26 @@ async def _kernel_pickle_snapshot(
             }
         _raise_runner_error(message.get("error") or {})
     return {"globals": {}, "restored_globals": [], "lost_globals": []}
+
+
+async def _register_runtime_hooks_in_runner(
+    params: dict[str, Any], globals_dict: dict[str, Any]
+) -> dict[str, Any]:
+    process = _ensure_kernel(globals_dict)
+    assert _KERNEL_REQUEST_QUEUE is not None
+    assert _KERNEL_RESULT_QUEUE is not None
+    _KERNEL_REQUEST_QUEUE.put({"op": "register_runtime_hooks", "params": params})
+    while process.is_alive():
+        try:
+            message = _KERNEL_RESULT_QUEUE.get_nowait()
+        except queue.Empty:
+            await asyncio.sleep(0.01)
+            continue
+        if message.get("ok"):
+            return message.get("result") or {}
+        _raise_runner_error(message.get("error") or {})
+    _discard_kernel()
+    raise RuntimeError("execution runner exited while registering runtime hooks")
 
 
 async def _execute_code_in_runner_with_timeout(
@@ -1304,7 +1335,9 @@ async def _handle_request(
         if method == "register_tools":
             return _response(request_id, _register_tools(params, globals_dict))
         if method == "register_runtime_hooks":
-            return _response(request_id, _register_runtime_hooks(params))
+            return _response(
+                request_id, await _register_runtime_hooks_in_runner(params, globals_dict)
+            )
         if method == "mount_file":
             return _response(request_id, _mount_file(params))
         if method == "mkdir_p":
