@@ -163,6 +163,119 @@ class TestPythonRunnerProtocol:
 
         assert result["result"]["final"] == {"answer": "done"}
 
+    def test_predict_rejects_oversized_individual_payload_before_host_tool_call(
+        self, runner: LocalRunner
+    ):
+        runner.request("register_tools", {"tools": ["predict"]})
+
+        result = runner.request(
+            "execute",
+            {
+                "code": (
+                    "payload = 'x' * 1_000_001\n"
+                    "await predict('text: str -> answer: str', text=payload)\n"
+                )
+            },
+        )
+
+        assert result["error"]["data"]["type"] == "ValueError"
+        assert "predict() input is too large to send through the sbx tool bridge" in result[
+            "error"
+        ]["message"]
+        assert "text" in result["error"]["message"]
+        assert "raw=1000001 bytes" in result["error"]["message"]
+        assert "limit=1000000 bytes" in result["error"]["message"]
+
+    def test_predict_rejects_payload_when_serialized_value_exceeds_limit(
+        self, runner: LocalRunner
+    ):
+        runner.request("register_tools", {"tools": ["predict"]})
+
+        result = runner.request(
+            "execute",
+            {
+                "code": (
+                    "payload = '\\\\' * 600_000\n"
+                    "await predict('text: str -> answer: str', text=payload)\n"
+                )
+            },
+        )
+
+        assert result["error"]["data"]["type"] == "ValueError"
+        assert "argument text is raw=600000 bytes" in result["error"]["message"]
+        assert "serialized=1200002 bytes" in result["error"]["message"]
+        assert "limit=1000000 bytes" in result["error"]["message"]
+
+    def test_predict_rejects_aggregate_payload_budget_within_one_execute(
+        self, runner: LocalRunner
+    ):
+        runner.request("register_tools", {"tools": ["predict"]})
+
+        runner._request_id += 1
+        execute_id = runner._request_id
+        assert runner.proc.stdin is not None
+        assert runner.proc.stdout is not None
+        runner.proc.stdin.write(
+            json.dumps(
+                {
+                    "jsonrpc": "2.0",
+                    "method": "execute",
+                    "params": {
+                        "code": (
+                            "payload = 'x' * 400_000\n"
+                            "for _ in range(3):\n"
+                            "    await predict('text: str -> answer: str', text=payload)\n"
+                        )
+                    },
+                    "id": execute_id,
+                }
+            )
+            + "\n"
+        )
+        runner.proc.stdin.flush()
+
+        for expected_tool_call_id in (1, 2):
+            tool_call = json.loads(runner.proc.stdout.readline())
+            assert tool_call["method"] == "tool_call"
+            assert tool_call["id"] == expected_tool_call_id
+            runner.proc.stdin.write(
+                json.dumps(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": tool_call["id"],
+                        "result": {"type": "json", "value": '{"answer": "ok"}'},
+                    }
+                )
+                + "\n"
+            )
+            runner.proc.stdin.flush()
+
+        result = json.loads(runner.proc.stdout.readline())
+        if result.get("method") == "tool_call":
+            runner.proc.stdin.write(
+                json.dumps(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": result["id"],
+                        "result": {"type": "json", "value": '{"answer": "ok"}'},
+                    }
+                )
+                + "\n"
+            )
+            runner.proc.stdin.flush()
+            json.loads(runner.proc.stdout.readline())
+
+        assert result["id"] == execute_id
+        assert result["error"]["data"]["type"] == "ValueError"
+        assert "predict() payload budget exceeded for this sandbox execution" in result[
+            "error"
+        ]["message"]
+        assert "next argument text is serialized=400002 bytes" in result["error"][
+            "message"
+        ]
+        assert "current=" in result["error"]["message"]
+        assert "limit=1000000 bytes" in result["error"]["message"]
+
     def test_predict_image_data_url_round_trips_to_host_tool(self, runner: LocalRunner):
         png_bytes = b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR"
         runner.request("register_tools", {"tools": ["predict"]})
