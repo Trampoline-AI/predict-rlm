@@ -100,6 +100,13 @@ Expected aggregate: `0.9411` soft / `0.8925` hard.
 
 For a cheap smoke check, add `--limit 5 --concurrency 5`.
 
+For RLM observability during evals, add:
+
+- `--verbose-rlm` to print human-readable RLM reasoning, code, output, tool
+  calls, errors, and submit blocks to stderr.
+- `--debug-rlm` to print timestamped RLM and sandbox lifecycle diagnostics to
+  stderr.
+
 ## Re-run other release evals
 
 Use the same candidate and swap executor settings:
@@ -157,6 +164,9 @@ Before spending model calls, run:
 ```bash
 uv run rlm-gepa optimize --check
 ```
+
+For optimizer evaluations, `uv run rlm-gepa optimize` also accepts
+`--verbose-rlm` and `--debug-rlm` with the same meanings as the eval command.
 
 Resume a stopped run by increasing the total metric-call cap:
 

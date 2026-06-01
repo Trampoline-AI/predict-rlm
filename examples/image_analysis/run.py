@@ -4,6 +4,7 @@ Pass image files (PNG, JPG, WEBP) and a query:
 
     uv run examples/image_analysis/run.py --query "What do you see?" photo1.png photo2.jpg
     uv run examples/image_analysis/run.py --query "Compare these images" images/
+    uv run examples/image_analysis/run.py --verbose --query "Describe each image" *.png
     uv run examples/image_analysis/run.py --debug --query "Describe each image" *.png
 
 Environment:
@@ -67,7 +68,12 @@ def parse_args():
     parser.add_argument(
         "--debug",
         action="store_true",
-        help="Print REPL code, output, errors, and tool calls to stderr",
+        help="Print timestamped RLM and sandbox lifecycle diagnostics to stderr",
+    )
+    parser.add_argument(
+        "--verbose",
+        action="store_true",
+        help="Print RLM reasoning, code, output, tool calls, errors, and submit blocks to stderr",
     )
     parser.add_argument(
         "--query",
@@ -145,7 +151,7 @@ async def main():
     analyzer = ImageAnalyzer(
         sub_lm=sub_lm,
         max_iterations=args.max_iterations,
-        verbose=True,
+        verbose=args.verbose,
         debug=args.debug,
     )
     start_time = time.perf_counter()

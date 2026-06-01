@@ -13,6 +13,23 @@ Each iteration is a REPL turn: the LLM sees the output of its previous code,
 decides what to do next, and writes more code. State persists between
 iterations, so it can accumulate findings across many steps.
 
+## Observability
+
+`PredictRLM` exposes three complementary views into a run:
+
+- `prediction.trace` is the structured artifact. It records iterations, code,
+  output, tool calls, `predict()` calls, token usage, timings, and errors.
+- `verbose=True` prints the same kind of execution story for humans as colored
+  stderr blocks: reasoning, generated code, output, tool calls, errors, and
+  `SUBMIT`.
+- `debug=True` prints timestamped lifecycle diagnostics for the RLM and sandbox:
+  process startup, requests, timeouts, shutdown, and captured partial output
+  before failures. Error-like debug records are colored red.
+
+If sandbox code prints output and then raises, the printed output is preserved
+before the formatted `[Error] ...` line in both the verbose stream and the
+structured run trace.
+
 ## Signatures and file I/O
 
 The DSPy signature defines the **inputs**, **outputs**, and **strategy** (via

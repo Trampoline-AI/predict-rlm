@@ -24,7 +24,10 @@ uv run examples/document_redaction/run.py /path/to/docs/
 # Custom redaction criteria
 uv run examples/document_redaction/run.py --criteria "Redact all financial amounts and account numbers"
 
-# With debug output (prints REPL code and tool calls)
+# With verbose RLM trace blocks
+uv run examples/document_redaction/run.py --verbose
+
+# With timestamped lifecycle diagnostics
 uv run examples/document_redaction/run.py --debug
 ```
 
@@ -36,7 +39,8 @@ uv run examples/document_redaction/run.py --debug
 | `--sub-lm-model`   | `openai/gpt-5.1` | Sub-LM for `predict()` calls  |
 | `--max-iterations` | `30`             | Max REPL iterations           |
 | `--criteria`       | PII redaction    | What to redact                |
-| `--debug`          | off              | Print REPL activity to stderr |
+| `--verbose`        | off              | Print RLM reasoning, code, output, tool calls, errors, and submit blocks to stderr |
+| `--debug`          | off              | Print timestamped RLM and sandbox lifecycle diagnostics to stderr |
 
 Outputs (redacted PDFs + report) are saved to `output/{timestamp}/` inside this
 directory.

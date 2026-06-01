@@ -43,7 +43,7 @@ GEPA_COMPONENT_SKILL = "skill_instructions"
 # Backwards-compat alias used by older code that only knew about sig.
 GEPA_COMPONENT = GEPA_COMPONENT_SIGNATURE
 
-RLM_LOGGER_NAME = "dspy.predict.rlm"
+RLM_LOGGER_NAME = "predict_rlm.trace"
 
 _current_log_file: contextvars.ContextVar[Path | None] = contextvars.ContextVar(
     "spreadbench_eval_log_file", default=None
@@ -51,7 +51,7 @@ _current_log_file: contextvars.ContextVar[Path | None] = contextvars.ContextVar(
 
 
 class _TaskFileHandler(logging.Handler):
-    """Routes ``dspy.predict.rlm`` records to each async task's own log file.
+    """Routes ``predict_rlm.trace`` records to each async task's own log file.
 
     Every coroutine running concurrently under :func:`run_evaluation`
     lives in its own asyncio context, so the :class:`ContextVar` set by
@@ -73,7 +73,7 @@ class _TaskFileHandler(logging.Handler):
 
 
 def _install_log_handler() -> _TaskFileHandler:
-    """Attach the per-task file handler to ``dspy.predict.rlm``, idempotently.
+    """Attach the per-task file handler to ``predict_rlm.trace``, idempotently.
 
     Clears any previously installed ``_TaskFileHandler`` first so that
     repeated :func:`run_evaluation` calls (from a notebook, say) don't
@@ -643,8 +643,8 @@ async def _run_case(
                 sub_lm=sub_lm,
                 skills=[skill],
                 max_iterations=config.max_iterations,
-                verbose=config.log_dir is not None,
-                debug=False,
+                verbose=config.verbose_rlm or config.log_dir is not None,
+                debug=config.debug_rlm,
                 **_predict_rlm_sandbox_kwargs(config, sbx_pool),
             )
             result = await asyncio.wait_for(

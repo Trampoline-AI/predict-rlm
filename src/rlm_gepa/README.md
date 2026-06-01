@@ -124,12 +124,16 @@ def build_rlm(
     lm=None,
     sub_lm=None,
     max_iterations: int = 30,
+    verbose: bool = False,
+    debug: bool = False,
 ):
     return PredictRLM(
         AnalyzeDocuments,
         lm=lm,
         sub_lm=sub_lm,
         max_iterations=max_iterations,
+        verbose=verbose,
+        debug=debug,
         skills=[Skill(name="document-analysis", instructions=skill_instructions)],
     )
 
@@ -176,6 +180,8 @@ class MyProject(RLMGepaProject):
             lm=context.lm,
             sub_lm=context.sub_lm,
             max_iterations=context.max_iterations,
+            verbose=context.verbose_rlm,
+            debug=context.debug_rlm,
         )
         # 2. Run it on the concrete example shape for this project, then score it.
         # `rlm_kwargs` should match the DSPy signature fields passed to build_rlm(...).
@@ -251,6 +257,10 @@ The `eval` subcommand is project-specific because datasets and metrics are
 project-specific. Agent-only or optimization-only projects do not need a
 held-out `eval` command unless the user asks for one.
 
+Use `--verbose-rlm` to print human-readable RLM trace blocks during eval:
+reasoning, generated code, output, tool calls, errors, and `SUBMIT` payloads.
+Use `--debug-rlm` for timestamped RLM and sandbox lifecycle diagnostics.
+
 ### Optimize
 
 Use `optimize --check` before a real run. It validates that the project can load
@@ -294,6 +304,10 @@ uv run rlm-gepa optimize "${optimize_args[@]}"
 Use `AgentSpec`, seed instructions, evaluator feedback, and `component_focus()`
 to steer _what kinds of behaviors_ GEPA explores. Use CLI/runtime args to steer
 _how much search_ is performed.
+
+`optimize` accepts `--verbose-rlm` and `--debug-rlm` with the same meanings as
+the eval command. The flags are forwarded into executor rollouts, instruction
+proposer RLMs, and patch-merge proposer RLMs.
 
 The CLI calls the same Python API, so embedding is still available when you need
 it:

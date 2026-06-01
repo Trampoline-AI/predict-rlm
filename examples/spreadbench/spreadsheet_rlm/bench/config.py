@@ -31,6 +31,8 @@ class EvalConfig:
     sbx_pool_size: int | None = None
     sbx_template: str | None = None
     sbx_preinstall_packages: bool = True
+    verbose_rlm: bool = False
+    debug_rlm: bool = False
 
     def __post_init__(self) -> None:
         self.sandbox_backend = str(self.sandbox_backend).lower()

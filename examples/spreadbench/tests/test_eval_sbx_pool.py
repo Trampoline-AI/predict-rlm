@@ -51,6 +51,16 @@ def test_eval_config_parses_sbx_pool_flags() -> None:
     assert config.sbx_preinstall_packages is False
 
 
+def test_eval_config_parses_rlm_logging_flags() -> None:
+    parser = eval_cli.build_eval_parser()
+    args = parser.parse_args(["--verbose-rlm", "--debug-rlm"])
+
+    config = eval_cli.build_eval_config(args, log_dir=None)
+
+    assert config.verbose_rlm is True
+    assert config.debug_rlm is True
+
+
 def test_sbx_pool_size_requires_sbx_backend() -> None:
     with pytest.raises(ValueError, match="sbx_pool_size.*sandbox_backend"):
         EvalConfig(sandbox_backend="jspi", sbx_pool_size=5)
@@ -194,6 +204,8 @@ def test_run_case_passes_predict_rlm_sandbox_kwargs(
     )
 
     assert result.passed is True
+    assert calls[0]["verbose"] is config.verbose_rlm
+    assert calls[0]["debug"] is config.debug_rlm
     for key, value in expected.items():
         assert calls[0][key] == value
     for absent_key in {"sandbox_backend", "sbx_pool"} - set(expected):

@@ -3,9 +3,7 @@ from __future__ import annotations
 import argparse
 import importlib.util
 import json
-import logging
 import os
-import sys
 from datetime import datetime
 from pathlib import Path
 
@@ -46,19 +44,6 @@ def run_eval_args(args: argparse.Namespace) -> int:
     log_dir = None if args.no_logs else Path(args.log_dir) if args.log_dir else output_dir
 
     install_codex_lm(args)
-
-    if args.verbose_rlm:
-        rlm_logger = logging.getLogger("dspy.predict.rlm")
-        rlm_logger.setLevel(logging.INFO)
-        if not any(
-            isinstance(handler, logging.StreamHandler)
-            and getattr(handler, "stream", None) is sys.stdout
-            for handler in rlm_logger.handlers
-        ):
-            handler = logging.StreamHandler(sys.stdout)
-            handler.setLevel(logging.INFO)
-            handler.setFormatter(logging.Formatter("%(asctime)s %(message)s"))
-            rlm_logger.addHandler(handler)
 
     config = build_eval_config(args, log_dir=log_dir)
     report = run_evaluation(config)
@@ -138,6 +123,8 @@ def build_eval_config(args: argparse.Namespace, log_dir: Path | None) -> EvalCon
         sbx_pool_size=args.sbx_pool_size,
         sbx_template=args.sbx_template,
         sbx_preinstall_packages=args.sbx_preinstall_packages,
+        verbose_rlm=args.verbose_rlm,
+        debug_rlm=args.debug_rlm,
     )
 
 
@@ -272,7 +259,20 @@ def add_eval_args(parser: argparse.ArgumentParser) -> None:
         action="store_true",
         help="disable per-case logs",
     )
-    parser.add_argument("--verbose-rlm", "--verbose_rlm", dest="verbose_rlm", action="store_true")
+    parser.add_argument(
+        "--verbose-rlm",
+        "--verbose_rlm",
+        dest="verbose_rlm",
+        action="store_true",
+        help="print RLM reasoning, code, output, tool calls, errors, and submit blocks to stderr",
+    )
+    parser.add_argument(
+        "--debug-rlm",
+        "--debug_rlm",
+        dest="debug_rlm",
+        action="store_true",
+        help="print timestamped RLM and sandbox lifecycle diagnostics to stderr",
+    )
     codex_group = parser.add_mutually_exclusive_group()
     codex_group.add_argument(
         "--codex-lm",

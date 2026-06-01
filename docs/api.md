@@ -15,31 +15,54 @@ rlm = PredictRLM(
     max_iterations=30,        # Max REPL iterations
     max_llm_calls=50,         # Max LM calls per execution
     max_output_chars=100_000, # Max chars from REPL output
-    verbose=False,            # Log detailed execution info
+    verbose=False,            # Print human-readable iteration trace blocks
     tools=None,               # Additional tool functions
     skills=None,              # List of Skill instances
     allowed_domains=None,     # Domains the sandbox can access
-    debug=False,              # Print REPL activity to stderr
+    debug=False,              # Print timestamped lifecycle diagnostics
     output_dir=None,          # Host directory for output files
 )
 ```
 
 ### Parameters
 
-| Parameter          | Type                                            | Default   | Description                                                                                                                                                                                                       |
-| ------------------ | ----------------------------------------------- | --------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `signature`        | `type[Signature] \| str`                        | —         | Defines inputs and outputs. A string like `"images, query -> answer"` or a `dspy.Signature` class.                                                                                                                |
-| `lm`               | `dspy.LM \| str \| None`                        | `None`    | Main LM that drives the RLM (writes and executes code). Accepts a `dspy.LM` instance or a model string like `"openai/gpt-5.4"`. If `None`, uses the current context LM from `dspy.settings.lm` or `dspy.context`. |
-| `sub_lm`           | `dspy.LM \| str \| None`                        | `None`    | LM for the `predict()` tool. Accepts a `dspy.LM` instance or a model string like `"openai/gpt-5.1"`. If `None`, uses the current context LM.                                                                      |
-| `max_iterations`   | `int`                                           | `30`      | Maximum REPL interaction iterations. Each iteration is one code → output → reasoning turn.                                                                                                                        |
-| `max_llm_calls`    | `int`                                           | `50`      | Maximum LM calls per execution (both outer LM and sub-LM calls count).                                                                                                                                            |
-| `max_output_chars` | `int`                                           | `100_000` | Maximum characters to include from REPL output per iteration.                                                                                                                                                     |
-| `verbose`          | `bool`                                          | `False`   | Log detailed execution info.                                                                                                                                                                                      |
-| `tools`            | `dict[str, Callable] \| list[Callable] \| None` | `None`    | Additional tool functions callable from the sandbox. Accepts a dict mapping names to callables, or a list of callables (names inferred from `__name__`). `predict` is added automatically.                        |
-| `skills`           | `list[Skill] \| None`                           | `None`    | [Skills](skills.md) providing domain-specific instructions, packages, and tools. Merged automatically.                                                                                                            |
-| `allowed_domains`  | `list[str] \| None`                             | `None`    | Domains/IPs the sandbox can access via network. By default, no network access. Example: `["api.example.com", "192.168.1.100:8080"]`                                                                               |
-| `debug`            | `bool`                                          | `False`   | Print REPL code, output, errors, and tool calls to stderr in real-time.                                                                                                                                           |
-| `output_dir`       | `str \| Path \| None`                           | `None`    | Host directory for output files. When set, `File` output fields without an explicit path are written here. If `None`, a temp directory is used.                                                                   |
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `signature` | `type[Signature] \| str` | — | Defines inputs and outputs. A string like `"images, query -> answer"` or a `dspy.Signature` class. |
+| `lm` | `dspy.LM \| str \| None` | `None` | Main LM that drives the RLM (writes and executes code). Accepts a `dspy.LM` instance or a model string like `"openai/gpt-5.4"`. If `None`, uses the current context LM from `dspy.settings.lm` or `dspy.context`. |
+| `sub_lm` | `dspy.LM \| str \| None` | `None` | LM for the `predict()` tool. Accepts a `dspy.LM` instance or a model string like `"openai/gpt-5.1"`. If `None`, uses the current context LM. |
+| `max_iterations` | `int` | `30` | Maximum REPL interaction iterations. Each iteration is one code → output → reasoning turn. |
+| `max_llm_calls` | `int` | `50` | Maximum LM calls per execution (both outer LM and sub-LM calls count). |
+| `max_output_chars` | `int` | `100_000` | Maximum characters to include from REPL output per iteration. |
+| `verbose` | `bool` | `False` | Print human-readable RLM iteration blocks to stderr: reasoning, generated code, output, tool calls, errors, and `SUBMIT` payloads. |
+| `tools` | `dict[str, Callable] \| list[Callable] \| None` | `None` | Additional tool functions callable from the sandbox. Accepts a dict mapping names to callables, or a list of callables (names inferred from `__name__`). `predict` is added automatically. |
+| `skills` | `list[Skill] \| None` | `None` | [Skills](skills.md) providing domain-specific instructions, packages, and tools. Merged automatically. |
+| `allowed_domains` | `list[str] \| None` | `None` | Domains/IPs the sandbox can access via network. By default, no network access. Example: `["api.example.com", "192.168.1.100:8080"]` |
+| `debug` | `bool` | `False` | Print timestamped RLM and sandbox lifecycle diagnostics to stderr. Error-like debug records are colored red when the terminal supports ANSI colors. |
+| `output_dir` | `str \| Path \| None` | `None` | Host directory for output files. When set, `File` output fields without an explicit path are written here. If `None`, a temp directory is used. |
+
+### Verbose, debug, and trace output
+
+`verbose=True` is for understanding the RLM's work product. It prints colored
+iteration blocks to stderr: reasoning, generated code, sandbox output, tool
+calls, errors, and `SUBMIT` payloads. The verbose stream is intentionally
+plain text without logging prefixes.
+
+`debug=True` is for diagnosing runtime behavior. It prints timestamped
+`logging` records for RLM and sandbox lifecycle events such as process startup,
+requests, timeouts, shutdown, and partial output captured before an error.
+Debug error records are colored red.
+
+These flags are independent and can be enabled together:
+
+```python
+rlm = PredictRLM(MySignature, verbose=True, debug=True)
+```
+
+Every run also attaches a structured `RunTrace` to the returned prediction as
+`prediction.trace`. If sandbox code prints output and then fails, the output
+printed before the exception is preserved in the failed iteration's trace output
+before the formatted `[Error] ...` line.
 
 ### Usage
 

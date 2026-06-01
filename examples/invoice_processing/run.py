@@ -3,6 +3,7 @@
 Drop PDF invoices into the `sample/input/` directory next to this script, then run:
 
     uv run examples/invoice_processing/run.py
+    uv run examples/invoice_processing/run.py --verbose
     uv run examples/invoice_processing/run.py --debug
 
 Requires:
@@ -56,12 +57,12 @@ def parse_args():
     parser.add_argument(
         "--debug",
         action="store_true",
-        help="Print REPL code, output, errors, and tool calls to stderr",
+        help="Print timestamped RLM and sandbox lifecycle diagnostics to stderr",
     )
     parser.add_argument(
         "--verbose",
         action="store_true",
-        help="Print RLM iteration trace logs to stderr",
+        help="Print RLM reasoning, code, output, tool calls, errors, and submit blocks to stderr",
     )
     parser.add_argument(
         "--model",

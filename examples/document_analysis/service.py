@@ -19,7 +19,6 @@ from predict_rlm import File, PredictRLM
 from predict_rlm.skills import docx as docx_skill
 from predict_rlm.skills import pdf as pdf_skill
 
-from .schema import DocumentAnalysis
 from .signature import AnalyzeDocuments
 
 
@@ -49,5 +48,6 @@ class DocumentAnalyzer(dspy.Module):
             max_iterations=self.max_iterations,
             verbose=self.verbose,
             debug=self.debug,
+            sandbox_backend="sbx",
         )
         return await predictor.acall(documents=documents)
