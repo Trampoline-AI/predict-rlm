@@ -62,6 +62,9 @@ PREDICT_SCHEMA_BUILTINS = {
     "Tuple",
     "Union",
 }
+MAX_HOST_TOOL_PAYLOAD_BYTES = 1_000_000
+MAX_HOST_TOOL_EXECUTION_PAYLOAD_BYTES = 1_000_000
+HOST_TOOL_EXECUTION_PAYLOAD_BYTES = 0
 
 
 def _debug_enabled() -> bool:
@@ -236,6 +239,65 @@ class _SandboxPath(REAL_PATH):
 
 def _submit(**kwargs: Any) -> None:
     raise _FinalOutputError(_to_jsonable(kwargs))
+
+
+def _payload_raw_size(value: Any) -> int | None:
+    if isinstance(value, str):
+        return len(value.encode("utf-8"))
+    if isinstance(value, bytes):
+        return len(value)
+    return None
+
+
+def _payload_serialized_size(value: Any) -> int:
+    return len(json.dumps(value, default=str).encode("utf-8"))
+
+
+def _host_tool_payload_items(
+    args: list[Any], kwargs: dict[str, Any]
+) -> list[tuple[str, Any, int]]:
+    items = [(str(index), arg, _payload_serialized_size(arg)) for index, arg in enumerate(args)]
+    items.extend((key, value, _payload_serialized_size(value)) for key, value in kwargs.items())
+    return items
+
+
+def _host_tool_payload_error(name: str, label: str, value: Any) -> ValueError:
+    raw_size = _payload_raw_size(value)
+    serialized_size = _payload_serialized_size(value)
+    raw_detail = f"raw={raw_size} bytes, " if raw_size is not None else ""
+    return ValueError(
+        f"{name}() input is too large to send through the sbx tool bridge: "
+        f"argument {label} is {raw_detail}serialized={serialized_size} bytes, "
+        f"limit={MAX_HOST_TOOL_PAYLOAD_BYTES} bytes. "
+        "Pass a file path, chunk the document, or use retrieval/excerpts instead "
+        "of passing the full file as a value."
+    )
+
+
+def _host_tool_execution_payload_error(name: str, label: str, size: int) -> ValueError:
+    return ValueError(
+        f"{name}() payload budget exceeded for this sandbox execution: "
+        f"next argument {label} is serialized={size} bytes, "
+        f"current={HOST_TOOL_EXECUTION_PAYLOAD_BYTES} bytes, "
+        f"limit={MAX_HOST_TOOL_EXECUTION_PAYLOAD_BYTES} bytes. "
+        "Pass file paths, chunk documents, or reduce the number of full-text "
+        "tool calls in one execution."
+    )
+
+
+def _validate_host_tool_payload_bytes(name: str, args: list[Any], kwargs: dict[str, Any]) -> None:
+    global HOST_TOOL_EXECUTION_PAYLOAD_BYTES
+    items = _host_tool_payload_items(args, kwargs)
+    for label, value, size in items:
+        if size > MAX_HOST_TOOL_PAYLOAD_BYTES:
+            raise _host_tool_payload_error(name, label, value)
+
+    execution_payload_bytes = HOST_TOOL_EXECUTION_PAYLOAD_BYTES
+    for label, _value, size in items:
+        if execution_payload_bytes + size > MAX_HOST_TOOL_EXECUTION_PAYLOAD_BYTES:
+            raise _host_tool_execution_payload_error(name, label, size)
+        execution_payload_bytes += size
+    HOST_TOOL_EXECUTION_PAYLOAD_BYTES = execution_payload_bytes
 
 
 def _send_protocol(message: dict[str, Any]) -> None:
@@ -439,13 +501,15 @@ async def _read_protocol_response(request_id: int) -> dict[str, Any]:
 
 
 async def _call_host_tool(name: str, *args: Any, **kwargs: Any) -> Any:
+    safe_args = list(args)
+    _validate_host_tool_payload_bytes(name, safe_args, kwargs)
     global TOOL_REQUEST_ID
     TOOL_REQUEST_ID += 1
     request_id = TOOL_REQUEST_ID
     _send_protocol({
         "jsonrpc": "2.0",
         "method": "tool_call",
-        "params": {"name": name, "args": list(args), "kwargs": kwargs},
+        "params": {"name": name, "args": safe_args, "kwargs": kwargs},
         "id": request_id,
     })
     response = await _read_protocol_response(request_id)
@@ -649,6 +713,8 @@ async def _execute_code(
     globals_dict: dict[str, Any],
     capture: _ExecutionCapture | None = None,
 ) -> dict[str, Any]:
+    global HOST_TOOL_EXECUTION_PAYLOAD_BYTES
+    HOST_TOOL_EXECUTION_PAYLOAD_BYTES = 0
     capture = capture or _ExecutionCapture()
     baseline_tasks = set(asyncio.all_tasks())
     try:
