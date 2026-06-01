@@ -318,7 +318,8 @@ class SbxInterpreter(PersistentJsonRpcRunnerClient, PredictRLMInterpreter):
                 self._send_request("register_output_fields", {"fields": self.output_fields})
             if self.tools:
                 self._send_request("register_tools", {"tools": list(self.tools)})
-            self._register_runtime_hooks()
+            if runtime_hooks is not None or self.runtime_hooks:
+                self._register_runtime_hooks()
 
     def _register_runtime_hooks(self) -> None:
         self._send_request(
@@ -427,7 +428,8 @@ class SbxInterpreter(PersistentJsonRpcRunnerClient, PredictRLMInterpreter):
                 self._send_request("register_output_fields", {"fields": self.output_fields})
             if self.tools:
                 self._send_request("register_tools", {"tools": list(self.tools)})
-            self._register_runtime_hooks()
+            if self.runtime_hooks:
+                self._register_runtime_hooks()
         except BaseException as exc:
             debug_event(
                 "predict_rlm.sandbox.process.end",

@@ -40,6 +40,7 @@ TOOL_RESPONSE_LOCK = asyncio.Lock()
 PENDING_TOOL_RESPONSES: dict[int, dict[str, Any]] = {}
 RUNTIME_HOOK_ORIGINALS: dict[str, tuple[Any, str, Callable[..., Any]]] = {}
 RUNTIME_HOOK_SPECS: dict[str, set[str]] = {}
+RUNTIME_HOOKS_ENABLED = False
 PREDICT_SCHEMA_BUILTINS = {
     "Any",
     "BaseModel",
@@ -254,6 +255,8 @@ def _emit_runtime_hook_event(
     error: BaseException | None = None,
     duration_ms: int | None = None,
 ) -> None:
+    if not RUNTIME_HOOKS_ENABLED:
+        return
     if phase not in RUNTIME_HOOK_SPECS.get(target, set()):
         return
     params = {
@@ -470,6 +473,8 @@ def _reconstruct_output_types(
     result: Any,
     globals_dict: dict[str, Any],
 ) -> Any:
+    if isinstance(result, _PredictResult):
+        result = result.to_dict()
     if not isinstance(result, dict):
         return result
 
@@ -655,6 +660,7 @@ def _execute_code_runner(
     stdout_fd: int,
     stderr_fd: int,
 ) -> None:
+    global RUNTIME_HOOKS_ENABLED
     with contextlib.suppress(OSError):
         os.setsid()
     global PROTOCOL_STDIN, PROTOCOL_STDOUT
@@ -673,13 +679,17 @@ def _execute_code_runner(
         stderr=_FdTextStream(stderr_fd),
     )
     try:
+        RUNTIME_HOOKS_ENABLED = True
         result = asyncio.run(_execute_code(code, globals_dict, capture))
+        RUNTIME_HOOKS_ENABLED = False
         result_queue.put({
             "ok": True,
             "result": result,
             "globals": _pickleable_globals(globals_dict),
+            "sys_path": list(sys.path),
         })
     except BaseException as exc:
+        RUNTIME_HOOKS_ENABLED = False
         result_queue.put({"ok": False, "error": _exception_payload(exc)})
     finally:
         with contextlib.suppress(OSError):
@@ -844,6 +854,7 @@ async def _execute_code_in_runner_with_timeout(
     if not runner_message.get("ok"):
         _raise_runner_error(runner_message.get("error") or {})
     globals_dict.update(runner_message.get("globals") or {})
+    sys.path[:] = runner_message["sys_path"]
     result = runner_message.get("result") or {}
     if isinstance(result, dict) and "output" in result:
         result = dict(result)
