@@ -56,6 +56,13 @@ def _build_executor():
     return executor
 
 
+def _lm_with_history() -> dspy.LM:
+    lm = MagicMock(spec=dspy.LM)
+    lm.history = []
+    lm.kwargs = {"max_tokens": None}
+    return lm
+
+
 def test_none_code_prediction_fails_loudly_in_rlm_loop():
     """A malformed direct Prediction means the validating adapter was bypassed."""
     executor = _build_executor()
@@ -66,14 +73,15 @@ def test_none_code_prediction_fails_loudly_in_rlm_loop():
     repl = _FakeRepl()
 
     async def _run():
-        return await executor._aexecute_iteration(
-            repl,
-            variables=[],
-            history=MagicMock(),
-            iteration=0,
-            input_args={},
-            output_field_names=["answer"],
-        )
+        with dspy.context(lm=_lm_with_history()):
+            return await executor._aexecute_iteration(
+                repl,
+                variables=[],
+                history=MagicMock(),
+                iteration=0,
+                input_args={},
+                output_field_names=["answer"],
+            )
 
     with pytest.raises(RuntimeError, match="invalid reasoning"):
         asyncio.run(_run())
@@ -89,14 +97,15 @@ def test_empty_string_code_prediction_fails_loudly_in_rlm_loop():
     repl = _FakeRepl()
 
     async def _run():
-        return await executor._aexecute_iteration(
-            repl,
-            variables=[],
-            history=MagicMock(),
-            iteration=0,
-            input_args={},
-            output_field_names=["answer"],
-        )
+        with dspy.context(lm=_lm_with_history()):
+            return await executor._aexecute_iteration(
+                repl,
+                variables=[],
+                history=MagicMock(),
+                iteration=0,
+                input_args={},
+                output_field_names=["answer"],
+            )
 
     with pytest.raises(RuntimeError, match="invalid code"):
         asyncio.run(_run())
@@ -109,8 +118,6 @@ def test_code_field_has_min_length_validator():
     If someone removes the constraint, we go back to accepting empty
     responses silently.
     """
-    import dspy
-
     from predict_rlm._shared import build_rlm_signatures
 
     class _Base(dspy.Signature):

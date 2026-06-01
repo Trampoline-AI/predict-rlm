@@ -68,18 +68,26 @@ from .trace import (
     IterationStep,
     LMUsage,
     RunTrace,
+    TokenUsage,
     _RawPredictCall,
+    aggregate_usage_objects,
     drain_predict_calls,
     drain_tool_calls,
     init_predict_call_collector,
     init_tool_call_collector,
+    iteration_cost_from_accounting,
+    iteration_usage_from_accounting,
     lm_completion_metadata_since,
     lm_finish_since,
+    lm_history_since,
     ms_since,
+    predict_calls_usage,
+    raw_usage_since,
     record_predict_call,
     reset_predict_call_collector,
     reset_tool_call_collector,
     snapshot_lm_history_len,
+    subtract_usage,
     usage_since,
 )
 
@@ -959,6 +967,10 @@ class PredictRLM(dspy.RLM):
         self._partial_history = None
         self._partial_pending_entry = None
         self._partial_pending_start = None
+        self._partial_pending_lm_metadata = None
+        self._partial_pending_lm_history = None
+        self._last_action_lm_metadata = None
+        self._last_action_lm_history = None
 
         # Store allowed_domains, debug, and output_dir for interpreter creation
         self._allowed_domains = allowed_domains
@@ -1325,6 +1337,9 @@ class PredictRLM(dspy.RLM):
                         model=str(getattr(lm, "model", lm)),
                         duration_ms=ms_since(_call_start),
                         usage=usage_since(lm, _hist_len_before),
+                        raw_usage=aggregate_usage_objects(
+                            raw_usage_since(lm, _hist_len_before)
+                        ),
                         input=kwargs,
                         output=result,
                         error=str(exc),
@@ -1340,6 +1355,9 @@ class PredictRLM(dspy.RLM):
                         model=str(getattr(lm, "model", lm)),
                         duration_ms=ms_since(_call_start),
                         usage=usage_since(lm, _hist_len_before),
+                        raw_usage=aggregate_usage_objects(
+                            raw_usage_since(lm, _hist_len_before)
+                        ),
                         input=kwargs,
                         output=result,
                         lm=lm_finish_since(lm, _hist_len_before),
@@ -2025,6 +2043,8 @@ class PredictRLM(dspy.RLM):
         if status == "error" and pending_entry is not None:
             trace_steps = list(steps)
             pending_start = getattr(self, "_partial_pending_start", None)
+            pending_lm_history = getattr(self, "_partial_pending_lm_history", None) or []
+            pending_predict_calls = drain_predict_calls()
             trace_steps.append(
                 IterationStep(
                     iteration=len(steps) + 1,
@@ -2034,8 +2054,15 @@ class PredictRLM(dspy.RLM):
                     untruncated_output=pending_entry.output,
                     error=True,
                     duration_ms=ms_since(pending_start) if pending_start else 0,
+                    usage=iteration_usage_from_accounting(
+                        pending_lm_history, pending_predict_calls
+                    ),
+                    cost=iteration_cost_from_accounting(
+                        pending_lm_history, pending_predict_calls
+                    ),
                     tool_calls=drain_tool_calls(),
-                    predict_calls=drain_predict_calls(),
+                    predict_calls=pending_predict_calls,
+                    lm=getattr(self, "_partial_pending_lm_metadata", None),
                 )
             )
         # Per-RLM instance ``lm`` has its own history (isolated via
@@ -2046,16 +2073,24 @@ class PredictRLM(dspy.RLM):
         # ``_hidden_params["response_cost"]`` — LiteLLM's authoritative
         # number with cache/batch discounts baked in.
         main_usage = usage_since(lm, lm_hist_start)
-        sub_usage = (
-            usage_since(sub_lm, sub_hist_start)
-            if sub_lm is not None and sub_lm is not lm
-            else None
-        )
+        predict_usage = TokenUsage()
+        for step in trace_steps:
+            predict_usage += predict_calls_usage(step.predict_calls)
+
+        if sub_lm is not None and sub_lm is not lm:
+            sub_usage = usage_since(sub_lm, sub_hist_start)
+        else:
+            sub_usage = predict_usage
+            main_usage = subtract_usage(main_usage, predict_usage)
 
         return RunTrace(
             status=status,
             model=str(getattr(lm, "model", lm)),
-            sub_model=str(getattr(sub_lm, "model", sub_lm)) if sub_lm is not lm else None,
+            sub_model=(
+                str(getattr(sub_lm, "model", sub_lm))
+                if sub_lm is not None and sub_lm is not lm
+                else None
+            ),
             iterations=len(trace_steps),
             max_iterations=self.max_iterations,
             duration_ms=ms_since(run_start),
@@ -2140,8 +2175,9 @@ class PredictRLM(dspy.RLM):
         action_start_ns: int,
         lm_hist_before_action: int,
         execution_timeout: float | None = None,
-    ) -> Any:
+    ) -> tuple[Any, list[dict[str, Any]]]:
         lm_metadata = lm_completion_metadata_since(dspy.settings.lm, lm_hist_before_action)
+        lm_history = lm_history_since(dspy.settings.lm, lm_hist_before_action)
         self._write_telemetry_span(
             "rlm.action_generation.ok",
             iteration=iteration + 1,
@@ -2176,9 +2212,16 @@ class PredictRLM(dspy.RLM):
                 f"Execution timeout: {timeout_label}\n"
                 f"Reasoning: {pred.reasoning}\nCode:\n{pred.code}"
             )
-        return lm_metadata
+        return lm_metadata, lm_history
 
-    def _prepare_iteration_execution(self, pred: Any, iteration: int) -> tuple[str, bool]:
+    def _prepare_iteration_execution(
+        self,
+        pred: Any,
+        iteration: int,
+        *,
+        lm_metadata: Any,
+        lm_history: list[dict[str, Any]],
+    ) -> tuple[str, bool]:
         code = pred.code or ""
         code = strip_code_fences(code)
         self._write_generated_code_event(iteration=iteration, pred=pred, code=code)
@@ -2196,6 +2239,8 @@ class PredictRLM(dspy.RLM):
             output="",
         )
         self._partial_pending_start = time.perf_counter()
+        self._partial_pending_lm_metadata = lm_metadata
+        self._partial_pending_lm_history = lm_history
         return code, iteration_log_open
 
     def _log_iteration_execute_start(self, repl: Any, *, iteration: int, code: str) -> float:
@@ -2382,6 +2427,7 @@ class PredictRLM(dspy.RLM):
         history: Any,
         output_field_names: list[str],
         lm_metadata: Any,
+        lm_history: list[dict[str, Any]],
     ) -> Any:
         if not isinstance(result, FinalOutput):
             self._emit_iteration_output_log(result)
@@ -2400,7 +2446,10 @@ class PredictRLM(dspy.RLM):
             self._partial_history = step_result
         self._partial_pending_entry = None
         self._partial_pending_start = None
+        self._partial_pending_lm_metadata = None
+        self._partial_pending_lm_history = None
         self._last_action_lm_metadata = lm_metadata
+        self._last_action_lm_history = lm_history
         return step_result
 
     def _execute_iteration(
@@ -2435,14 +2484,19 @@ class PredictRLM(dspy.RLM):
                 lm_metadata=lm_metadata,
             )
             raise
-        lm_metadata = self._record_action_generation_ok(
+        lm_metadata, lm_history = self._record_action_generation_ok(
             pred,
             iteration=iteration,
             action_start_ns=action_start_ns,
             lm_hist_before_action=lm_hist_before_action,
             execution_timeout=execution_timeout,
         )
-        code, iteration_log_open = self._prepare_iteration_execution(pred, iteration)
+        code, iteration_log_open = self._prepare_iteration_execution(
+            pred,
+            iteration,
+            lm_metadata=lm_metadata,
+            lm_history=lm_history,
+        )
 
         try:
             result = self._execute_iteration_code(
@@ -2460,6 +2514,7 @@ class PredictRLM(dspy.RLM):
                 history=history,
                 output_field_names=output_field_names,
                 lm_metadata=lm_metadata,
+                lm_history=lm_history,
             )
         finally:
             self._finish_iteration_log(iteration_log_open)
@@ -2502,14 +2557,19 @@ class PredictRLM(dspy.RLM):
                 lm_metadata=lm_metadata,
             )
             raise
-        lm_metadata = self._record_action_generation_ok(
+        lm_metadata, lm_history = self._record_action_generation_ok(
             pred,
             iteration=iteration,
             action_start_ns=action_start_ns,
             lm_hist_before_action=lm_hist_before_action,
             execution_timeout=execution_timeout,
         )
-        code, iteration_log_open = self._prepare_iteration_execution(pred, iteration)
+        code, iteration_log_open = self._prepare_iteration_execution(
+            pred,
+            iteration,
+            lm_metadata=lm_metadata,
+            lm_history=lm_history,
+        )
 
         try:
             result = await self._aexecute_iteration_code(
@@ -2527,6 +2587,7 @@ class PredictRLM(dspy.RLM):
                 history=history,
                 output_field_names=output_field_names,
                 lm_metadata=lm_metadata,
+                lm_history=lm_history,
             )
         finally:
             self._finish_iteration_log(iteration_log_open)
@@ -2818,6 +2879,7 @@ class PredictRLM(dspy.RLM):
         iteration: int,
         iter_start: float,
         action_lm_metadata: Any | None,
+        action_lm_history: list[dict[str, Any]],
     ) -> tuple[IterationStep, bool]:
         """Build trace/callback payload for a completed RLM iteration."""
         from dspy.primitives.repl_types import REPLEntry, REPLHistory
@@ -2844,6 +2906,7 @@ class PredictRLM(dspy.RLM):
         else:
             prompt_output = full_output
 
+        predict_calls = drain_predict_calls()
         return (
             IterationStep(
                 iteration=iteration + 1,
@@ -2853,8 +2916,10 @@ class PredictRLM(dspy.RLM):
                 untruncated_output=full_output,
                 error=_output_indicates_error(full_output),
                 duration_ms=ms_since(iter_start),
+                usage=iteration_usage_from_accounting(action_lm_history, predict_calls),
+                cost=iteration_cost_from_accounting(action_lm_history, predict_calls),
                 tool_calls=drain_tool_calls(),
-                predict_calls=drain_predict_calls(),
+                predict_calls=predict_calls,
                 lm=action_lm_metadata,
             ),
             isinstance(result, dspy.Prediction),
@@ -2919,6 +2984,10 @@ class PredictRLM(dspy.RLM):
                     self._partial_history = history
                     self._partial_pending_entry = None
                     self._partial_pending_start = None
+                    self._partial_pending_lm_metadata = None
+                    self._partial_pending_lm_history = None
+                    self._last_action_lm_metadata = None
+                    self._last_action_lm_history = None
                     call_id = ACTIVE_CALL_ID.get()
 
                     for iteration in range(self.max_iterations):
@@ -2933,13 +3002,16 @@ class PredictRLM(dspy.RLM):
                                 output_field_names,
                             )
                             action_lm_metadata = getattr(self, "_last_action_lm_metadata", None)
+                            action_lm_history = getattr(self, "_last_action_lm_history", None) or []
                             self._last_action_lm_metadata = None
+                            self._last_action_lm_history = None
                             state.step, state.is_final = self._build_iteration_outcome(
                                 result,
                                 history,
                                 iteration,
                                 iter_start,
                                 action_lm_metadata,
+                                action_lm_history,
                             )
                             steps.append(state.step)
 
@@ -3052,6 +3124,10 @@ class PredictRLM(dspy.RLM):
                     self._partial_history = history
                     self._partial_pending_entry = None
                     self._partial_pending_start = None
+                    self._partial_pending_lm_metadata = None
+                    self._partial_pending_lm_history = None
+                    self._last_action_lm_metadata = None
+                    self._last_action_lm_history = None
                     call_id = ACTIVE_CALL_ID.get()
 
                     for iteration in range(self.max_iterations):
@@ -3066,13 +3142,16 @@ class PredictRLM(dspy.RLM):
                                 output_field_names,
                             )
                             action_lm_metadata = getattr(self, "_last_action_lm_metadata", None)
+                            action_lm_history = getattr(self, "_last_action_lm_history", None) or []
                             self._last_action_lm_metadata = None
+                            self._last_action_lm_history = None
                             state.step, state.is_final = self._build_iteration_outcome(
                                 result,
                                 history,
                                 iteration,
                                 iter_start,
                                 action_lm_metadata,
+                                action_lm_history,
                             )
                             steps.append(state.step)
 

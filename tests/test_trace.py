@@ -2,12 +2,16 @@
 
 import contextvars
 import time
+from typing import Any, cast
 from unittest.mock import MagicMock
 
+import dspy
 import pytest
 
 from predict_rlm.trace import (
+    IterationCost,
     IterationStep,
+    IterationUsage,
     LMFinishMetadata,
     LMUsage,
     PredictCallDetail,
@@ -22,8 +26,11 @@ from predict_rlm.trace import (
     drain_tool_calls,
     init_predict_call_collector,
     init_tool_call_collector,
+    iteration_cost_from_accounting,
+    iteration_usage_from_accounting,
     lm_completion_metadata_since,
     lm_finish_since,
+    lm_history_since,
     ms_since,
     record_predict_call,
     record_tool_call,
@@ -32,6 +39,13 @@ from predict_rlm.trace import (
     snapshot_lm_history_len,
     usage_since,
 )
+
+
+def _lm_with_history(history: list[dict[str, Any]]) -> dspy.LM:
+    lm = MagicMock(spec=dspy.LM)
+    lm.history = history
+    lm.kwargs = {"max_tokens": None}
+    return cast(dspy.LM, lm)
 
 
 class TestTokenUsage:
@@ -78,6 +92,8 @@ class TestIterationStep:
         )
         assert step.iteration == 1
         assert step.predict_calls == []
+        assert step.usage == IterationUsage()
+        assert step.cost == IterationCost()
 
     def test_output_vs_untruncated(self):
         long_output = "x" * 10000
@@ -200,13 +216,11 @@ class TestRunTrace:
             "input_tokens": 100,
             "output_tokens": 50,
             "cost": 0.01,
-            "cache_hits": 0,
         }
         assert data["usage"]["sub"] == {
             "input_tokens": 20,
             "output_tokens": 10,
             "cost": 0.002,
-            "cache_hits": 0,
         }
         assert data["steps"][0]["lm"] == {"finish_reason": "length"}
         call = data["steps"][0]["predict_calls"][0]["calls"][0]
@@ -316,7 +330,6 @@ class TestRunTrace:
                                 input_tokens=20,
                                 output_tokens=10,
                                 cost=0.002,
-                                cache_hits=1,
                             ),
                             calls=[
                                 PredictCallDetail(
@@ -325,7 +338,6 @@ class TestRunTrace:
                                         input_tokens=20,
                                         output_tokens=10,
                                         cost=0.002,
-                                        cache_hits=1,
                                     ),
                                     input={"q": "question"},
                                     output={"a": "answer"},
@@ -369,7 +381,7 @@ class TestRunTrace:
         assert predict_call["lm"] == {"finish_reason": "length"}
 
         serialized = trace.to_proposer_json()
-        forbidden = ("usage", "duration_ms", "cost", "cache_hits", "total_usage")
+        forbidden = ("usage", "duration_ms", "cost", "total_usage")
         for field in forbidden:
             assert f'"{field}"' not in serialized
 
@@ -436,11 +448,11 @@ class TestPredictCallCollector:
         init_predict_call_collector()
         record_predict_call(_RawPredictCall(
             signature="a -> b", instructions=None, model="openai/gpt-4o",
-            duration_ms=50, usage=TokenUsage(), input={"a": "1"}, output={"b": "x"},
+            duration_ms=50, usage=TokenUsage(), raw_usage={}, input={"a": "1"}, output={"b": "x"},
         ))
         record_predict_call(_RawPredictCall(
             signature="c -> d", instructions=None, model="openai/gpt-4o",
-            duration_ms=30, usage=TokenUsage(), input={"c": "2"}, output={"d": "y"},
+            duration_ms=30, usage=TokenUsage(), raw_usage={}, input={"c": "2"}, output={"d": "y"},
         ))
         groups = drain_predict_calls()
         assert len(groups) == 2
@@ -459,6 +471,7 @@ class TestPredictCallCollector:
             model="openai/gpt-4o",
             duration_ms=100,
             usage=TokenUsage(input_tokens=50, output_tokens=20, cost=0.01),
+            raw_usage={"prompt_tokens": 50, "completion_tokens": 20},
             input={"page": "url1"}, output={"items": ["a"]},
         ))
         record_predict_call(_RawPredictCall(
@@ -467,6 +480,7 @@ class TestPredictCallCollector:
             model="openai/gpt-4o",
             duration_ms=150,
             usage=TokenUsage(input_tokens=60, output_tokens=30, cost=0.02),
+            raw_usage={"prompt_tokens": 60, "completion_tokens": 30},
             input={"page": "url2"}, output={"items": ["b", "c"]},
         ))
         record_predict_call(_RawPredictCall(
@@ -475,6 +489,7 @@ class TestPredictCallCollector:
             model="openai/gpt-4o",
             duration_ms=120,
             usage=TokenUsage(input_tokens=55, output_tokens=25, cost=0.015),
+            raw_usage={"prompt_tokens": 55, "completion_tokens": 25},
             input={"page": "url3"}, output={"items": []},
         ))
         groups = drain_predict_calls()
@@ -490,11 +505,11 @@ class TestPredictCallCollector:
         init_predict_call_collector()
         record_predict_call(_RawPredictCall(
             signature="q -> a", instructions="Task A", model="m",
-            duration_ms=10, usage=TokenUsage(), input={"q": "x"}, output={"a": "1"},
+            duration_ms=10, usage=TokenUsage(), raw_usage={}, input={"q": "x"}, output={"a": "1"},
         ))
         record_predict_call(_RawPredictCall(
             signature="q -> a", instructions="Task B", model="m",
-            duration_ms=10, usage=TokenUsage(), input={"q": "y"}, output={"a": "2"},
+            duration_ms=10, usage=TokenUsage(), raw_usage={}, input={"q": "y"}, output={"a": "2"},
         ))
         groups = drain_predict_calls()
         assert len(groups) == 2
@@ -503,20 +518,20 @@ class TestPredictCallCollector:
         outer_token = init_predict_call_collector()
         record_predict_call(_RawPredictCall(
             signature="outer-before", instructions=None, model="m",
-            duration_ms=10, usage=TokenUsage(), input={}, output={},
+            duration_ms=10, usage=TokenUsage(), raw_usage={}, input={}, output={},
         ))
 
         inner_token = init_predict_call_collector()
         record_predict_call(_RawPredictCall(
             signature="inner", instructions=None, model="m",
-            duration_ms=10, usage=TokenUsage(), input={}, output={},
+            duration_ms=10, usage=TokenUsage(), raw_usage={}, input={}, output={},
         ))
         inner_groups = drain_predict_calls()
         reset_predict_call_collector(inner_token)
 
         record_predict_call(_RawPredictCall(
             signature="outer-after", instructions=None, model="m",
-            duration_ms=10, usage=TokenUsage(), input={}, output={},
+            duration_ms=10, usage=TokenUsage(), raw_usage={}, input={}, output={},
         ))
         outer_groups = drain_predict_calls()
         reset_predict_call_collector(outer_token)
@@ -532,7 +547,7 @@ class TestPredictCallCollector:
         try:
             record_predict_call(_RawPredictCall(
                 signature="orphan", instructions=None, model="m",
-                duration_ms=1, usage=TokenUsage(), input={}, output={},
+                duration_ms=1, usage=TokenUsage(), raw_usage={}, input={}, output={},
             ))
             assert drain_predict_calls() == []
         finally:
@@ -634,125 +649,96 @@ class TestToolCallCollector:
 
 class TestSnapshotLmHistoryLen:
     def test_with_history(self):
-        lm = MagicMock()
-        lm.history = [{"usage": {}}, {"usage": {}}]
+        lm = _lm_with_history([{"usage": {}}, {"usage": {}}])
         assert snapshot_lm_history_len(lm) == 2
 
-    def test_without_history(self):
+    def test_missing_history_fails_loudly(self):
         lm = MagicMock(spec=[])
-        assert snapshot_lm_history_len(lm) == 0
+        with pytest.raises(AttributeError):
+            snapshot_lm_history_len(lm)
 
     def test_empty_history(self):
-        lm = MagicMock()
-        lm.history = []
+        lm = _lm_with_history([])
         assert snapshot_lm_history_len(lm) == 0
 
 
 class TestUsageSince:
     def test_sums_new_entries(self):
-        lm = MagicMock()
-        lm.history = [
-            {"usage": {"prompt_tokens": 100, "completion_tokens": 50}, "cost": 0.01},
-            {"usage": {"prompt_tokens": 200, "completion_tokens": 100}, "cost": 0.02},
-            {"usage": {"prompt_tokens": 300, "completion_tokens": 150}, "cost": 0.03},
-        ]
+        lm = _lm_with_history(
+            [
+                {"usage": {"prompt_tokens": 100, "completion_tokens": 50}, "cost": 0.01},
+                {"usage": {"prompt_tokens": 200, "completion_tokens": 100}, "cost": 0.02},
+                {"usage": {"prompt_tokens": 300, "completion_tokens": 150}, "cost": 0.03},
+            ]
+        )
         usage = usage_since(lm, 1)
         assert usage.input_tokens == 500
         assert usage.output_tokens == 250
         assert usage.cost == pytest.approx(0.05)
 
     def test_since_zero_sums_all(self):
-        lm = MagicMock()
-        lm.history = [
-            {"usage": {"prompt_tokens": 100, "completion_tokens": 50}, "cost": 0.01},
-        ]
+        lm = _lm_with_history(
+            [
+                {"usage": {"prompt_tokens": 100, "completion_tokens": 50}, "cost": 0.01},
+            ]
+        )
         usage = usage_since(lm, 0)
         assert usage.input_tokens == 100
         assert usage.output_tokens == 50
 
     def test_since_beyond_length_returns_zero(self):
-        lm = MagicMock()
-        lm.history = [{"usage": {"prompt_tokens": 100, "completion_tokens": 50}, "cost": 0.01}]
+        lm = _lm_with_history(
+            [
+                {"usage": {"prompt_tokens": 100, "completion_tokens": 50}, "cost": 0.01}
+            ]
+        )
         usage = usage_since(lm, 5)
         assert usage.input_tokens == 0
 
-    def test_no_history_returns_zero(self):
+    def test_missing_history_fails_loudly(self):
         lm = MagicMock(spec=[])
-        usage = usage_since(lm, 0)
-        assert usage.input_tokens == 0
+        with pytest.raises(AttributeError):
+            usage_since(lm, 0)
 
-    def test_cache_hit_via_response_flag_excluded_from_cost(self):
-        """DSPy's Cache.get() zeros response.usage but keeps response._hidden_params
-        on a cache hit. Without care, usage_since double-counts: 0 tokens yet
-        phantom cost. We detect cache hits via response.cache_hit and drop them
-        from the billed aggregate, surfacing the count via TokenUsage.cache_hits.
-        """
-        fresh_resp = MagicMock()
-        fresh_resp.cache_hit = False
-        cached_resp = MagicMock()
-        cached_resp.cache_hit = True
-
-        lm = MagicMock()
-        lm.history = [
-            {
-                "usage": {"prompt_tokens": 1000, "completion_tokens": 50},
-                "cost": 0.001,
-                "response": fresh_resp,
-            },
-            {
-                "usage": {},  # DSPy clears usage on cache hit
-                "cost": 0.001,  # but leaves cost
-                "response": cached_resp,
-            },
-        ]
-        usage = usage_since(lm, 0)
-        # Only the fresh call counts toward tokens and cost.
-        assert usage.input_tokens == 1000
-        assert usage.output_tokens == 50
-        assert usage.cost == pytest.approx(0.001)
-        # The cache hit is surfaced for observability.
-        assert usage.cache_hits == 1
-
-    def test_cache_hit_via_empty_usage_heuristic(self):
-        """When the response object isn't accessible (e.g. synthetic history or
-        the response was dropped), an empty usage dict paired with non-zero
-        cost is an unambiguous cache-hit signature: a real call always
-        populates prompt_tokens/completion_tokens.
-        """
-        lm = MagicMock()
-        lm.history = [
-            {"usage": {"prompt_tokens": 1000, "completion_tokens": 50}, "cost": 0.001},
-            {"usage": {}, "cost": 0.001},  # no response key, usage empty, cost > 0
-        ]
+    def test_sums_cost_from_history_entries_without_cache_heuristics(self):
+        lm = _lm_with_history(
+            [
+                {
+                    "usage": {"prompt_tokens": 1000, "completion_tokens": 50},
+                    "cost": 0.001,
+                },
+                {
+                    "usage": {},
+                    "cost": 0.001,
+                },
+            ]
+        )
         usage = usage_since(lm, 0)
         assert usage.input_tokens == 1000
         assert usage.output_tokens == 50
-        assert usage.cost == pytest.approx(0.001)
-        assert usage.cache_hits == 1
+        assert usage.cost == pytest.approx(0.002)
 
-    def test_legitimate_zero_usage_entry_not_flagged(self):
-        """An entry with zero usage AND zero cost is a legitimate no-op, not a
-        cache hit. Don't surface it as one.
-        """
-        lm = MagicMock()
-        lm.history = [
-            {"usage": {"prompt_tokens": 0, "completion_tokens": 0}, "cost": 0},
-        ]
+    def test_zero_usage_zero_cost_entry_sums_to_zero(self):
+        lm = _lm_with_history(
+            [
+                {"usage": {"prompt_tokens": 0, "completion_tokens": 0}, "cost": 0},
+            ]
+        )
         usage = usage_since(lm, 0)
         assert usage.input_tokens == 0
         assert usage.output_tokens == 0
         assert usage.cost == 0
-        assert usage.cache_hits == 0
 
     def test_usage_since_keeps_token_usage_free_of_truncation_metadata(self):
-        lm = MagicMock()
-        lm.history = [
-            {
-                "usage": {"prompt_tokens": 100, "completion_tokens": 50000},
-                "kwargs": {"max_tokens": 50000},
-                "response": {"choices": [{"finish_reason": "length"}]},
-            }
-        ]
+        lm = _lm_with_history(
+            [
+                {
+                    "usage": {"prompt_tokens": 100, "completion_tokens": 50000},
+                    "kwargs": {"max_tokens": 50000},
+                    "response": {"choices": [{"finish_reason": "length"}]},
+                }
+            ]
+        )
 
         usage = usage_since(lm, 0)
 
@@ -761,14 +747,15 @@ class TestUsageSince:
         assert not hasattr(usage, "truncation")
 
     def test_lm_finish_since_extracts_finish_reason_only(self):
-        lm = MagicMock()
-        lm.history = [
-            {
-                "usage": {"prompt_tokens": 100, "completion_tokens": 49100},
-                "kwargs": {"max_tokens": 50000},
-                "response": {"choices": [{"finish_reason": "stop"}]},
-            }
-        ]
+        lm = _lm_with_history(
+            [
+                {
+                    "usage": {"prompt_tokens": 100, "completion_tokens": 49100},
+                    "kwargs": {"max_tokens": 50000},
+                    "response": {"choices": [{"finish_reason": "stop"}]},
+                }
+            ]
+        )
 
         metadata = lm_finish_since(lm, 0)
 
@@ -802,6 +789,128 @@ class TestUsageSince:
         assert metadata.cached_input_tokens == 850
         assert metadata.cache_read_ratio == pytest.approx(850 / 1500)
 
+    def test_lm_history_since_preserves_raw_usage_and_accounting(self):
+        lm = _lm_with_history(
+            [
+                {
+                    "usage": {
+                        "prompt_tokens": 100,
+                        "completion_tokens": 20,
+                        "total_tokens": 120,
+                        "completion_tokens_details": {"reasoning_tokens": 5},
+                    },
+                    "cost": 0.01,
+                },
+                {
+                    "usage": {},
+                    "cost": 0.01,
+                },
+            ]
+        )
+
+        raw_history = lm_history_since(lm, 0)
+
+        assert raw_history == [
+            {
+                "usage": {
+                    "prompt_tokens": 100,
+                    "completion_tokens": 20,
+                    "total_tokens": 120,
+                    "completion_tokens_details": {"reasoning_tokens": 5},
+                },
+                "cost": 0.01,
+            },
+            {
+                "usage": {},
+                "cost": 0.01,
+            },
+        ]
+
+
+class TestIterationAccounting:
+    def test_iteration_usage_uses_raw_main_usage_and_aggregates_sub_lm_usage(self):
+        group = PredictCallGroup(
+            signature="q -> a",
+            model="sub/model",
+            total_usage=TokenUsage(input_tokens=15, output_tokens=6, cost=0.03),
+            calls=[],
+        )
+        group._raw_usage_objects = [
+            {
+                "prompt_tokens": 10,
+                "completion_tokens": 4,
+                "completion_tokens_details": {"reasoning_tokens": 2},
+            },
+            {
+                "prompt_tokens": 5,
+                "completion_tokens": 2,
+                "completion_tokens_details": {"reasoning_tokens": 1},
+            },
+        ]
+
+        usage = iteration_usage_from_accounting(
+            [
+                {
+                    "usage": {
+                        "prompt_tokens": 34,
+                        "completion_tokens": 13,
+                        "total_tokens": 47,
+                    },
+                    "cost": 0.02,
+                }
+            ],
+            [group],
+        )
+
+        assert usage.main_lm == {
+            "prompt_tokens": 34,
+            "completion_tokens": 13,
+            "total_tokens": 47,
+        }
+        assert usage.sub_lm == {
+            "prompt_tokens": 15,
+            "completion_tokens": 6,
+            "completion_tokens_details": {"reasoning_tokens": 3},
+        }
+
+    def test_iteration_cost_splits_main_and_sub_lm_cost(self):
+        group = PredictCallGroup(
+            signature="q -> a",
+            model="sub/model",
+            total_usage=TokenUsage(input_tokens=15, output_tokens=6, cost=0.03),
+            calls=[],
+        )
+
+        cost = iteration_cost_from_accounting(
+            [{"usage": {"prompt_tokens": 34}, "cost": 0.02}],
+            [group],
+        )
+
+        assert cost == IterationCost(main_lm=0.02, sub_lm=0.03)
+
+    def test_iteration_usage_requires_exactly_one_main_lm_usage_object(self):
+        with pytest.raises(RuntimeError, match="Expected exactly one main LM history"):
+            iteration_usage_from_accounting([], [])
+
+        with pytest.raises(RuntimeError, match="Expected exactly one main LM history"):
+            iteration_usage_from_accounting(
+                [
+                    {"usage": {"prompt_tokens": 1}, "cost": 0.1},
+                    {"usage": {"prompt_tokens": 2}, "cost": 0.2},
+                ],
+                [],
+            )
+
+    def test_iteration_cost_requires_cost_field(self):
+        with pytest.raises(KeyError):
+            iteration_cost_from_accounting([{"usage": {"prompt_tokens": 34}}], [])
+
+    def test_iteration_cost_requires_numeric_cost(self):
+        with pytest.raises(TypeError, match="LM history cost must be numeric"):
+            iteration_cost_from_accounting(
+                [{"usage": {"prompt_tokens": 34}, "cost": None}], []
+            )
+
 
 class TestConcurrentUsageAccounting:
     """Regression test for the concurrency overcount bug.
@@ -823,11 +932,7 @@ class TestConcurrentUsageAccounting:
         both see the full delta; sum is 2x the real tokens. This is why
         PredictRLM copies the lm in __init__.
         """
-        class SharedLM:
-            def __init__(self):
-                self.history = []
-
-        lm = SharedLM()
+        lm = _lm_with_history([])
         snap_A = snapshot_lm_history_len(lm)
         snap_B = snapshot_lm_history_len(lm)
         lm.history.append({"usage": {"prompt_tokens": 100, "completion_tokens": 10}, "cost": 0.001})
@@ -849,8 +954,6 @@ class TestConcurrentUsageAccounting:
         other's history — so two concurrent PredictRLM instances sharing
         an 'original' LM still see only their own calls via usage_since.
         """
-        import dspy
-
         original = dspy.LM(model="openai/gpt-4o", cache=False)
         # PredictRLM.__init__ does this internally:
         lm_a = original.copy()

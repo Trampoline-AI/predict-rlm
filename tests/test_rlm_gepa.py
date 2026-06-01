@@ -3863,7 +3863,7 @@ def test_patch_merge_prompt_contains_compact_grounding_invariants():
     assert "cannot state the trigger and boundary concretely" in instructions
     assert "ProposerRunTrace" not in instructions
     assert "archival" not in instructions
-    assert "token cost/cache accounting" not in instructions
+    assert "token cost accounting" not in instructions
     assert "durations" not in instructions
     assert "candidate_hash" not in instructions
     assert "outer proposer" not in instructions
@@ -3881,7 +3881,7 @@ def test_generic_proposer_prompt_contains_surgical_compression_invariants():
     )
     assert "ProposerRunTrace" not in instructions
     assert "archival" not in instructions
-    assert "token cost/cache accounting" not in instructions
+    assert "token cost accounting" not in instructions
     assert "durations" not in instructions
     assert "candidate_hash" not in instructions
     assert "outer proposer" not in instructions
@@ -4005,7 +4005,6 @@ def test_rlm_instruction_proposer_serializes_proposer_trace_records(
     assert "usage" not in serialized_text
     assert "duration_ms" not in serialized_text
     assert "cost" not in serialized_text
-    assert "cache_hits" not in serialized_text
     assert serialized[0]["Failure Metadata"]["failure_class"] == "host_tool_timeout_or_leak"
     assert "candidate_hash" not in serialized_text
     assert "telemetry_ref" not in serialized_text
