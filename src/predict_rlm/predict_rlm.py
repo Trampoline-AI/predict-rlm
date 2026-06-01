@@ -50,7 +50,7 @@ from ._logging import (
     live_tool_call_logging,
     suppress_interpreter_result_logging,
 )
-from ._shared import build_rlm_signatures, format_tool_docs_full
+from ._shared import build_rlm_signatures, format_tool_docs_full, strip_code_fences
 from .execution_timeout import validate_execution_timeout
 from .files import File, build_file_plan, scan_file_fields
 from .interpreter import JspiInterpreter, SandboxFatalError
@@ -145,16 +145,6 @@ class DebugLoggingConfigurable(Protocol):
 @runtime_checkable
 class VerboseLoggingConfigurable(Protocol):
     def configure_verbose(self, enabled: bool) -> Any: ...
-
-
-def _strip_code_fences(code: str) -> str:
-    """Extract code from markdown fences, accepting python/py/repl tags."""
-    matches = re.findall(
-        r"```(?:python|py|repl)?\s*\n(.*?)^```\s*$", code, re.DOTALL | re.MULTILINE
-    )
-    if matches:
-        return "\n\n".join(block.rstrip() for block in matches)
-    return code
 
 
 def _format_execution_error(code: str, exc: Exception) -> str:
@@ -2117,7 +2107,7 @@ class PredictRLM(dspy.RLM):
 
     def _prepare_iteration_execution(self, pred: Any, iteration: int) -> tuple[str, bool]:
         code = pred.code or ""
-        code = _strip_code_fences(code)
+        code = strip_code_fences(code)
         self._write_generated_code_event(iteration=iteration, pred=pred, code=code)
         iteration_log_open = self._begin_iteration_log(
             iteration=iteration,

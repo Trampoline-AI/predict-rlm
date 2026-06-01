@@ -29,6 +29,7 @@ from predict_rlm._logging import (
     interpreter_result_logging_enabled,
     live_tool_call_logging_enabled,
 )
+from predict_rlm._shared import strip_code_fences
 from predict_rlm.execution_timeout import (
     ITERATION_TIMEOUT_FAILURE_CLASS,
     recoverable_timeout_host_deadline_seconds,
@@ -159,6 +160,7 @@ class SbxInterpreter(PersistentJsonRpcRunnerClient, PredictRLMInterpreter):
         *,
         timeout: float | None = None,
     ) -> Any:
+        code = strip_code_fences(code)
         if variables:
             mapped_variables = {
                 name: self._map_variable_value(value) for name, value in variables.items()
