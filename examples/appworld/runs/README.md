@@ -42,12 +42,17 @@ tar \
 Download the hosted bundle if it is not already present:
 
 ```bash
-hf download Trampoline-AI/predict-rlm-appworld-runs runs.bundle \
-  --repo-type dataset \
-  --local-dir examples/appworld/runs
+make -C examples/appworld download-runs
 ```
 
 Then unpack from the repository root:
+
+```bash
+export RUNS_BUNDLE_PASSWORD='<password>'
+make -C examples/appworld unpack-runs
+```
+
+Equivalent direct command:
 
 ```bash
 export RUNS_BUNDLE_PASSWORD='<password>'

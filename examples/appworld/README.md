@@ -28,6 +28,42 @@ AppWorld's bundled runtime files, and downloads the dataset under `data/`. The
 AppWorld environment and dataset are intentionally gitignored, so a fresh clone
 must run setup before live AppWorld evals.
 
+## Protected run artifacts
+
+Raw run artifacts live under `runs/` and are intentionally gitignored. They
+include task traces, proposer traces, candidate policies, evaluator outputs,
+configs, and cost logs. Treat the complete contents as protected
+benchmark-derived data.
+
+The encrypted hosted archive is published at:
+
+```text
+https://huggingface.co/datasets/Trampoline-AI/predict-rlm-appworld-runs
+```
+
+Download it into `runs/`:
+
+```bash
+make download-runs
+```
+
+Unpack it after setting the bundle password:
+
+```bash
+export RUNS_BUNDLE_PASSWORD='<password>'
+make unpack-runs
+```
+
+Recreate the encrypted bundle from the local `runs/` directory:
+
+```bash
+export RUNS_BUNDLE_PASSWORD='<password>'
+make bundle-runs
+```
+
+Do not publish extracted run contents in plain text. Share only the encrypted
+bundle or sanitized aggregate metrics/manifests.
+
 ## Dataset semantics
 
 - `train`: official AppWorld train split, minus the groups held out for
