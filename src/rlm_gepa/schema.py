@@ -232,6 +232,7 @@ class EvaluationContext:
     debug_rlm: bool = False
     concurrency: int | None = None
     telemetry_context: TelemetryContext | None = None
+    task_resources: Mapping[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -266,6 +267,12 @@ class RLMGepaProject(ABC):
         example: Any,
         context: EvaluationContext,
     ) -> RLMGepaExampleResult: ...
+
+    def task_timeout_for_example(self, example: Any, default_timeout: int) -> int:
+        return default_timeout
+
+    def task_resources_for_example(self, example: Any) -> Mapping[str, Any]:
+        return {}
 
     def component_focus(self, component_name: str) -> str:
         return ""

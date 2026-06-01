@@ -204,8 +204,11 @@ class RLMGepaAdapter:
         progress_label = self._progress_label(eval_kind, eval_idx, capture_traces)
 
         async def run_one(index: int, example: Any) -> tuple[int, RLMGepaExampleResult]:
+            example_timeout = self.project.task_timeout_for_example(example, self.task_timeout)
             example_context = replace(
                 context,
+                task_timeout=example_timeout,
+                task_resources=self.project.task_resources_for_example(example),
                 telemetry_context=self._example_telemetry_context(
                     eval_telemetry_context,
                     example=example,
@@ -230,16 +233,16 @@ class RLMGepaAdapter:
                     try:
                         result = await asyncio.wait_for(
                             self.project.evaluate_example(candidate, example, example_context),
-                            timeout=self.task_timeout,
+                            timeout=example_timeout,
                         )
                     except asyncio.TimeoutError:
                         self._write_outer_timeout_event(example_context, example, index)
                         result = RLMGepaExampleResult(
                             score=0.0,
-                            feedback=f"evaluation timeout at {self.task_timeout}s",
+                            feedback=f"evaluation timeout at {example_timeout}s",
                             traces=[],
                             example_id=example_id,
-                            error=f"timeout at {self.task_timeout}s",
+                            error=f"timeout at {example_timeout}s",
                         )
                     except Exception as exc:
                         trace = extract_trace_from_exc(exc)
@@ -464,11 +467,11 @@ class RLMGepaAdapter:
                 event_domain="spreadbench",
                 status={
                     "code": "ERROR",
-                    "message": f"outer task timeout at {self.task_timeout}s",
+                    "message": f"outer task timeout at {context.task_timeout}s",
                 },
                 attributes={
                     "rlm.phase": context.kind,
-                    "rlm.configured_timeout_sec": self.task_timeout,
+                    "rlm.configured_timeout_sec": context.task_timeout,
                     "rlm.concurrency": self.concurrency,
                     "spreadbench.case_idx": index,
                     "spreadbench.example_id": telemetry_context.example_id
