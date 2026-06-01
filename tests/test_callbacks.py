@@ -1,8 +1,8 @@
 """Tests for PredictRLM lifecycle callbacks.
 
 Covers ``on_rlm_iteration_start`` and ``on_rlm_iteration_end`` handlers
-dispatched from both the sync (``forward``) and async (``aforward``)
-iteration loops. Uses a mocked interpreter and patched iteration helper
+dispatched from both the sync (``__call__``) and async (``acall``)
+DSPy module paths. Uses a mocked interpreter and patched iteration helper
 so no Deno sandbox is required — these tests run as pure unit tests.
 """
 
@@ -73,14 +73,14 @@ def _build_rlm(**kwargs) -> PredictRLM:
 
 
 def _drive_sync(rlm: PredictRLM, iteration_returns: list, fallback: dspy.Prediction | None = None):
-    """Run rlm.forward() with patched _execute_iteration returning the
+    """Run rlm(...) with patched _execute_iteration returning the
     given sequence of values. ``fallback`` is used by _extract_fallback if
     we exhaust max_iterations without a final Prediction."""
     fallback = fallback or _final_prediction(answer="fallback")
     with patch.object(rlm, "_execute_iteration", side_effect=iteration_returns), \
          patch.object(rlm, "_extract_fallback", return_value=fallback), \
          dspy.context(lm=_make_lm()):
-        return rlm.forward(query="hi")
+        return rlm(query="hi")
 
 
 async def _drive_async(rlm: PredictRLM, iteration_returns: list, fallback: dspy.Prediction | None = None):
@@ -90,7 +90,7 @@ async def _drive_async(rlm: PredictRLM, iteration_returns: list, fallback: dspy.
     with patch.object(rlm, "_aexecute_iteration", aexec), \
          patch.object(rlm, "_aextract_fallback", aextract), \
          dspy.context(lm=_make_lm()):
-        return await rlm.aforward(query="hi")
+        return await rlm.acall(query="hi")
 
 
 # --- Recording callback ----------------------------------------------------
@@ -130,11 +130,20 @@ class AsyncRecordingCallback(BaseCallback):
     async def on_rlm_iteration_start(self, *, call_id, instance, iteration, max_iterations):
         # await something to prove we're really async
         await asyncio.sleep(0)
-        self.events.append(("start", {"iteration": iteration}))
+        self.events.append(("start", {"call_id": call_id, "iteration": iteration}))
 
     async def on_rlm_iteration_end(self, *, call_id, instance, iteration, step, is_final, exception):
         await asyncio.sleep(0)
-        self.events.append(("end", {"iteration": iteration, "is_final": is_final}))
+        self.events.append((
+            "end",
+            {"call_id": call_id, "iteration": iteration, "is_final": is_final},
+        ))
+
+
+def _assert_shared_call_id(events: list[tuple[str, dict]]) -> None:
+    call_ids = [payload["call_id"] for _, payload in events]
+    assert all(call_ids)
+    assert len(set(call_ids)) == 1
 
 
 # --- Sync path tests -------------------------------------------------------
@@ -155,6 +164,7 @@ class TestSyncCallbacks:
         assert [name for name, _ in cb.events] == [
             "start", "end", "start", "end", "start", "end",
         ]
+        _assert_shared_call_id(cb.events)
         ends = [payload for name, payload in cb.events if name == "end"]
         assert [e["iteration"] for e in ends] == [1, 2, 3]
         assert [e["is_final"] for e in ends] == [False, False, True]
@@ -170,6 +180,7 @@ class TestSyncCallbacks:
         with dspy.context(callbacks=[cb]):
             _drive_sync(rlm, [_final_prediction()])
         assert [name for name, _ in cb.events] == ["start", "end"]
+        _assert_shared_call_id(cb.events)
 
     def test_instance_callback(self):
         cb = RecordingCallback()
@@ -177,6 +188,7 @@ class TestSyncCallbacks:
         rlm.callbacks = [cb]
         _drive_sync(rlm, [_final_prediction()])
         assert [name for name, _ in cb.events] == ["start", "end"]
+        _assert_shared_call_id(cb.events)
 
     def test_no_callbacks_runs_clean(self):
         rlm = _build_rlm()
@@ -205,6 +217,7 @@ class TestSyncCallbacks:
         with pytest.raises(RuntimeError, match="kaboom"):
             _drive_sync(rlm, [RuntimeError("kaboom")])
         assert [name for name, _ in cb.events] == ["start", "end"]
+        _assert_shared_call_id(cb.events)
         end_payload = cb.events[-1][1]
         assert end_payload["step"] is None
         assert end_payload["is_final"] is False
@@ -218,6 +231,7 @@ class TestSyncCallbacks:
         h = _history_with(_entry())
         _drive_sync(rlm, [h, _history_with(_entry(), _entry())])
         ends = [p for n, p in cb.events if n == "end"]
+        _assert_shared_call_id(cb.events)
         assert all(e["is_final"] is False for e in ends)
         assert len(ends) == 2
 
@@ -253,6 +267,7 @@ class TestAsyncCallbacks:
         rlm.callbacks = [cb]
         await _drive_async(rlm, [_final_prediction(answer="ok")])
         assert [name for name, _ in cb.events] == ["start", "end"]
+        _assert_shared_call_id(cb.events)
 
     @pytest.mark.asyncio
     async def test_async_handler_is_awaited(self):
@@ -262,6 +277,7 @@ class TestAsyncCallbacks:
         h = _history_with(_entry())
         await _drive_async(rlm, [h, _final_prediction()])
         assert [name for name, _ in cb.events] == ["start", "end", "start", "end"]
+        _assert_shared_call_id(cb.events)
         assert cb.events[-1][1]["is_final"] is True
 
     @pytest.mark.asyncio
@@ -285,6 +301,7 @@ class TestAsyncCallbacks:
         with pytest.raises(RuntimeError, match="async kaboom"):
             await _drive_async(rlm, [RuntimeError("async kaboom")])
         assert [name for name, _ in cb.events] == ["start", "end"]
+        _assert_shared_call_id(cb.events)
         assert isinstance(cb.events[-1][1]["exception"], RuntimeError)
 
 
@@ -302,6 +319,9 @@ class TestMultipleCallbacks:
         # Both receive both events.
         assert [n for n, _ in global_cb.events] == ["start", "end"]
         assert [n for n, _ in instance_cb.events] == ["start", "end"]
+        _assert_shared_call_id(global_cb.events)
+        _assert_shared_call_id(instance_cb.events)
+        assert global_cb.events[0][1]["call_id"] == instance_cb.events[0][1]["call_id"]
 
     def test_one_handler_failing_does_not_block_others(self):
         good = RecordingCallback()
@@ -350,7 +370,7 @@ class TestCallbacksIntegration:
             rlm.generate_action = MagicMock(side_effect=scripted)
 
             with dspy.context(lm=_make_lm()):
-                result = rlm.forward(query="anything")
+                result = rlm(query="anything")
 
             assert result.answer == "42"
             ends = [p for n, p in cb.events if n == "end"]

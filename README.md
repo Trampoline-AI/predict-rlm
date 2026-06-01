@@ -217,14 +217,15 @@ with two RLM-specific handlers:
 | `on_rlm_iteration_end` | After iteration N finishes (code executed, `IterationStep` built — or an error was raised) | `call_id`, `instance`, `iteration`, `step: IterationStep \| None`, `is_final: bool`, `exception: Exception \| None` |
 
 `call_id` matches the parent module's `on_module_start/end` ID, so events
-correlate cleanly with DSPy's own callback events. Existing
-`BaseCallback` subclasses keep working unchanged — handlers we call are
-opt-in via `getattr`.
+correlate cleanly with DSPy's own callback events when you invoke the RLM
+through DSPy's public module call path (`rlm(...)` or `await rlm.acall(...)`).
+Existing `BaseCallback` subclasses keep working unchanged — handlers we
+call are opt-in via `getattr`.
 
-**Async-aware.** If you use `aforward()` your handlers may be coroutines
-and they will be awaited. Sync `forward()` calls sync handlers; if it
-encounters an async handler the coroutine is closed and a warning is
-logged.
+**Async-aware.** If you use `await rlm.acall(...)` your handlers may be
+coroutines and they will be awaited. Sync `rlm(...)` calls sync handlers;
+if it encounters an async handler the coroutine is closed and a warning
+is logged.
 
 **Failure-isolated.** Handler exceptions are logged and swallowed — a
 broken callback can never break the run.
@@ -260,7 +261,7 @@ class ProgressBroadcaster(BaseCallback):
 
 rlm = PredictRLM("query -> answer")
 rlm.callbacks = [ProgressBroadcaster(ws)]
-result = await rlm.aforward(query="…")
+result = await rlm.acall(query="...")
 ```
 
 Register globally instead with `dspy.configure(callbacks=[...])` and the
