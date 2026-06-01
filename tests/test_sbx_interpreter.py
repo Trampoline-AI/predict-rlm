@@ -1648,6 +1648,41 @@ while True:
         assert output.strip() == "[1, 2]"
         assert elapsed < 0.6
 
+    def test_failed_concurrent_host_tool_calls_leave_runner_reusable(
+        self,
+        tmp_path: Path,
+    ):
+        async def predict(_signature: str, value: int) -> dict[str, int]:
+            if value == 0:
+                await asyncio.sleep(0.05)
+                raise RuntimeError("boom")
+            await asyncio.sleep(0.25)
+            return {"value": value}
+
+        interpreter = SbxInterpreter(
+            config=SbxConfig(name="local-test", exec_timeout=3),
+            tools={"predict": predict},
+            preinstall_packages=False,
+            _runner_command=[sys.executable, "-u", str(RUNNER_PATH)],
+            _staging_root=tmp_path / "staging",
+        )
+        try:
+            with pytest.raises(CodeInterpreterError, match="boom"):
+                interpreter.execute("""
+import asyncio
+results = await asyncio.gather(*[
+    predict("value: int -> value: int", value=i)
+    for i in range(8)
+])
+print(results)
+""")
+
+            output = interpreter.execute("print('still alive')")
+        finally:
+            interpreter.shutdown()
+
+        assert output.strip() == "still alive"
+
     def test_same_interpreter_tool_reentry_raises_runtimeerror(self, tmp_path: Path):
         observed_errors: list[str] = []
 

@@ -567,6 +567,17 @@ async def _call_predict_tool(
     return _reconstruct_output_types(signature, result, globals_dict)
 
 
+async def _drain_execution_tasks(baseline_tasks: set[asyncio.Task]) -> None:
+    current_task = asyncio.current_task()
+    pending_tasks = [
+        task
+        for task in asyncio.all_tasks()
+        if task is not current_task and task not in baseline_tasks and not task.done()
+    ]
+    if pending_tasks:
+        await asyncio.gather(*pending_tasks, return_exceptions=True)
+
+
 def _register_tools(params: dict[str, Any], globals_dict: dict[str, Any]) -> dict[str, Any]:
     tool_names = globals_dict.setdefault("__predict_rlm_tool_names__", set())
     for name in params.get("tools", []):
@@ -639,6 +650,7 @@ async def _execute_code(
     capture: _ExecutionCapture | None = None,
 ) -> dict[str, Any]:
     capture = capture or _ExecutionCapture()
+    baseline_tasks = set(asyncio.all_tasks())
     try:
         compiled = compile(
             code,
@@ -657,6 +669,7 @@ async def _execute_code(
         return {"final": final.payload}
     except BaseException as exc:
         setattr(exc, "_predict_rlm_output", capture.stdout.getvalue() + capture.stderr.getvalue())
+        await _drain_execution_tasks(baseline_tasks)
         raise
     return {"output": capture.stdout.getvalue() + capture.stderr.getvalue()}
 
