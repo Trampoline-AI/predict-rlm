@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import re
 import sys
 from pathlib import Path
@@ -17,7 +18,7 @@ from terminal_bench_rlm.skills import (  # noqa: E402
     DEFAULT_TERMINAL_BENCH_SKILL_INSTRUCTIONS,
     TERMINAL_BENCH_SKILL_NAME,
 )
-from terminal_bench_rlm.tools import tbench_agent  # noqa: E402
+from terminal_bench_rlm.tools import remote_controller, tbench_agent  # noqa: E402
 
 
 def _assert_task_instruction_signature(signature, task_instruction: str) -> None:
@@ -155,6 +156,36 @@ def _assert_terminal_bench_skill_semantics(instructions: str) -> None:
     assert "read_terminal" not in instructions
 
 
+class FakeDaytonaRemoteEnvironment:
+    def __init__(self, *, answer: str = "remote answer") -> None:
+        self.commands: list[str] = []
+        self.uploads: list[tuple[str, str]] = []
+        self.upload_dirs: list[tuple[str, str]] = []
+        self.payloads: list[dict[str, object]] = []
+        self.command_timeouts: list[int | None] = []
+        self.answer = answer
+
+    def exec(self, *, command: str, timeout_sec: int | None = None):
+        self.command_timeouts.append(timeout_sec)
+        self.commands.append(command)
+        if "terminal_bench_rlm.tools.remote_controller" in command:
+            stdout = (
+                "controller log\n"
+                f"{tbench_agent.DAYTONA_REMOTE_RESULT_SENTINEL}"
+                f"{json.dumps({'ok': True, 'answer': self.answer})}\n"
+            )
+            return SimpleNamespace(returncode=0, stdout=stdout, stderr="")
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    def upload_file(self, host_path: str, remote_path: str) -> None:
+        self.uploads.append((host_path, remote_path))
+        if remote_path.endswith(".json"):
+            self.payloads.append(json.loads(Path(host_path).read_text(encoding="utf-8")))
+
+    def upload_dir(self, host_path: str, remote_path: str) -> None:
+        self.upload_dirs.append((host_path, remote_path))
+
+
 def test_harbor_agent_runs_predict_rlm_async_against_harbor_environment(
     monkeypatch,
     tmp_path: Path,
@@ -202,6 +233,116 @@ def test_harbor_agent_runs_predict_rlm_async_against_harbor_environment(
     assert captured["kwargs"]["skills"][0].name == "terminal-bench"
     assert captured["kwargs"]["skills"][0].instructions == "Use shell commands and verify outputs."
     assert captured["acall_kwargs"] == {}
+    assert captured["shutdown"] is True
+
+
+def test_harbor_agent_local_process_mode_does_not_use_environment_exec(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    captured: dict[str, object] = {}
+
+    class FakePredictRLM:
+        def __init__(self, _signature, **kwargs) -> None:
+            captured["kwargs"] = kwargs
+
+        async def acall(self, **_kwargs):
+            return SimpleNamespace(answer="done", trace=None)
+
+    class ForbiddenHarborInterpreter:
+        def __init__(self, *_args, **_kwargs) -> None:
+            raise AssertionError("local-process mode must not build HarborEnvironmentInterpreter")
+
+    class FakeLocalProcessInterpreter:
+        def __init__(self, **kwargs) -> None:
+            captured["local_process_kwargs"] = kwargs
+
+        def shutdown(self) -> None:
+            captured["shutdown"] = True
+
+    class EnvironmentWithoutExec:
+        def start_exec(self, *_args, **_kwargs):
+            raise AssertionError("local-process mode must not call environment.start_exec")
+
+        def exec_stream(self, *_args, **_kwargs):
+            raise AssertionError("local-process mode must not call environment.exec_stream")
+
+    monkeypatch.setattr(tbench_agent, "PredictRLM", FakePredictRLM)
+    monkeypatch.setattr(tbench_agent, "HarborEnvironmentInterpreter", ForbiddenHarborInterpreter)
+    monkeypatch.setattr(tbench_agent, "LocalProcessRunnerInterpreter", FakeLocalProcessInterpreter)
+
+    agent = tbench_agent.HarborPredictRLMAgent(
+        logs_dir=tmp_path,
+        interpreter_mode="local-process",
+        max_iterations="3",
+    )
+
+    asyncio.run(agent.run("solve", EnvironmentWithoutExec(), SimpleNamespace()))
+
+    interpreter = captured["kwargs"]["interpreter"]
+    assert isinstance(interpreter, FakeLocalProcessInterpreter)
+    assert captured["local_process_kwargs"]["exec_timeout"] == 900.0
+    assert captured["shutdown"] is True
+
+
+def test_harbor_agent_local_process_mode_uses_daytona_session_environment(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    captured: dict[str, object] = {}
+
+    class FakePredictRLM:
+        def __init__(self, _signature, **kwargs) -> None:
+            captured["kwargs"] = kwargs
+
+        async def acall(self, **_kwargs):
+            return SimpleNamespace(answer="done", trace=None)
+
+    class FakeHarborInterpreter:
+        def __init__(self, environment, *, loop, **kwargs) -> None:
+            captured["environment"] = environment
+            captured["loop"] = loop
+            captured["interpreter_kwargs"] = kwargs
+
+        def shutdown(self) -> None:
+            captured["shutdown"] = True
+
+    class ForbiddenLocalProcessInterpreter:
+        def __init__(self, **_kwargs) -> None:
+            raise AssertionError("Daytona local-process mode must execute inside the task environment")
+
+    class FakeDaytonaProcess:
+        def create_session(self):
+            pass
+
+        def execute_session_command(self):
+            pass
+
+        def get_session_command(self):
+            pass
+
+        def get_session_command_logs(self):
+            pass
+
+        def send_session_command_input(self):
+            pass
+
+    environment = SimpleNamespace(_sandbox=SimpleNamespace(process=FakeDaytonaProcess()))
+
+    monkeypatch.setattr(tbench_agent, "PredictRLM", FakePredictRLM)
+    monkeypatch.setattr(tbench_agent, "HarborEnvironmentInterpreter", FakeHarborInterpreter)
+    monkeypatch.setattr(tbench_agent, "LocalProcessRunnerInterpreter", ForbiddenLocalProcessInterpreter)
+
+    agent = tbench_agent.HarborPredictRLMAgent(
+        logs_dir=tmp_path,
+        interpreter_mode="local-process",
+        max_iterations="3",
+    )
+
+    asyncio.run(agent.run("solve", environment, SimpleNamespace()))
+
+    assert captured["environment"] is environment
+    assert captured["interpreter_kwargs"]["exec_timeout"] == 900.0
     assert captured["shutdown"] is True
 
 
@@ -316,6 +457,157 @@ def test_harbor_agent_does_not_forward_harbor_extra_env_to_predict_rlm(
     assert isinstance(kwargs, dict)
     assert "extra_env" not in kwargs
     assert context.answer == "done"
+
+
+def test_daytona_remote_agent_payload_is_non_secret_and_uses_remote_home(tmp_path: Path) -> None:
+    env = FakeDaytonaRemoteEnvironment(answer="remote done")
+    context = SimpleNamespace()
+    agent = tbench_agent.DaytonaRemotePredictRLMAgent(
+        logs_dir=tmp_path,
+        extra_env={"OPENAI_API_KEY": "super-secret-token"},
+        exec_timeout="123",
+        interpreter_kwargs={"cwd": "/tmp/task"},
+        lm="openai/gpt-5-mini",
+        max_iterations="2",
+    )
+
+    asyncio.run(agent.setup(env))
+    asyncio.run(agent.run("solve remotely", env, context))
+
+    assert context.answer == "remote done"
+    assert env.payloads
+    payload_text = json.dumps(env.payloads[-1], sort_keys=True)
+    assert "super-secret-token" not in payload_text
+    assert "OPENAI_API_KEY" not in payload_text
+    assert env.payloads[-1]["interpreter_kwargs"] == {"cwd": "/tmp/task"}
+    remote_command = next(
+        command
+        for command in env.commands
+        if "terminal_bench_rlm.tools.remote_controller" in command
+    )
+    remote_command_index = env.commands.index(remote_command)
+    assert "HOME=/tmp/predict_rlm_home" in remote_command
+    assert "PYTHONPATH=" in remote_command
+    assert env.command_timeouts[remote_command_index] is None
+
+
+def test_daytona_remote_agent_sentinel_parsing_sets_answer(tmp_path: Path) -> None:
+    env = FakeDaytonaRemoteEnvironment(answer="sentinel answer")
+    context = SimpleNamespace()
+    agent = tbench_agent.DaytonaRemotePredictRLMAgent(logs_dir=tmp_path)
+
+    asyncio.run(agent.run("solve remotely", env, context))
+
+    assert context.answer == "sentinel answer"
+
+
+def test_remote_controller_verbose_streams_rlm_iteration_logs(monkeypatch, tmp_path: Path) -> None:
+    class FakeInterpreter:
+        def shutdown(self) -> None:
+            pass
+
+    class FakePredictRLM:
+        def __init__(self, _signature, **kwargs) -> None:
+            self.verbose = kwargs["verbose"]
+
+        def __call__(self):
+            logging.getLogger("dspy.predict.rlm").info("RLM iteration 1/2\nCode:\nprint(1)")
+            return SimpleNamespace(answer="done", trace=None)
+
+    log_path = tmp_path / "predict_rlm_debug.jsonl"
+    monkeypatch.setenv("PREDICT_RLM_DEBUG_LOG", str(log_path))
+    monkeypatch.setattr(remote_controller, "_local_process_interpreter_class", lambda: FakeInterpreter)
+    monkeypatch.setattr(remote_controller, "_predict_rlm_class", lambda: FakePredictRLM)
+
+    answer = remote_controller._run_predict_rlm(
+        {
+            "instruction": "solve",
+            "predict_rlm_kwargs": {"verbose": True},
+        }
+    )
+
+    assert answer == "done"
+    assert "RLM iteration 1/2" in log_path.read_text()
+
+
+def test_daytona_remote_agent_streams_remote_debug_logs(tmp_path: Path, capsys) -> None:
+    class StreamingRemoteEnvironment(FakeDaytonaRemoteEnvironment):
+        def __init__(self) -> None:
+            super().__init__(answer="streamed answer")
+            self.polls = 0
+
+        async def exec(self, *, command: str, timeout_sec: int | None = None):
+            self.command_timeouts.append(timeout_sec)
+            self.commands.append(command)
+            if "terminal_bench_rlm.tools.remote_controller" in command:
+                await asyncio.sleep(0.05)
+                stdout = (
+                    f"{tbench_agent.DAYTONA_REMOTE_RESULT_SENTINEL}"
+                    f"{json.dumps({'ok': True, 'answer': self.answer})}\n"
+                )
+                return SimpleNamespace(returncode=0, stdout=stdout, stderr="")
+            if "PREDICT_RLM_REMOTE_LOG_OFFSET" in command:
+                self.polls += 1
+                stdout = "remote debug line\nPREDICT_RLM_REMOTE_LOG_OFFSET=18\n"
+                return SimpleNamespace(returncode=0, stdout=stdout, stderr="")
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    env = StreamingRemoteEnvironment()
+    context = SimpleNamespace()
+    agent = tbench_agent.DaytonaRemotePredictRLMAgent(
+        logs_dir=tmp_path,
+        predict_rlm_debug=True,
+        remote_log_poll_interval=0.01,
+    )
+
+    asyncio.run(agent.run("solve remotely", env, context))
+
+    assert context.answer == "streamed answer"
+    assert env.payloads[-1]["predict_rlm_debug_log"] == "/tmp/predict_rlm_controller/predict_rlm_debug.jsonl"
+    assert env.polls > 0
+    assert "remote debug line" in capsys.readouterr().out
+
+
+def test_daytona_remote_agent_bootstrap_installs_python_before_uv(tmp_path: Path) -> None:
+    env = FakeDaytonaRemoteEnvironment(answer="remote done")
+    agent = tbench_agent.DaytonaRemotePredictRLMAgent(logs_dir=tmp_path)
+
+    asyncio.run(agent.setup(env))
+
+    setup_command = next(command for command in env.commands if "$UV_COMMAND venv" in command)
+    assert "apt-get install -y python3 python3-pip python3-venv" in setup_command
+    assert "apk add --no-cache python3 py3-pip" in setup_command
+    assert "python3 -m venv /tmp/predict_rlm_controller/uv-bootstrap" in setup_command
+    assert "/tmp/predict_rlm_controller/uv-bootstrap/bin/python -m pip install" in setup_command
+    assert setup_command.index("command -v python3") < setup_command.index("python3 -m venv")
+
+
+def test_daytona_remote_agent_codex_lm_uploads_opaque_auth_dir(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / "home"
+    credentials_dir = home / ".codex-lm"
+    credentials_dir.mkdir(parents=True)
+    (credentials_dir / "auth.json").write_text('{"token": "do-not-copy-into-payload"}')
+    monkeypatch.setenv("HOME", str(home))
+    env = FakeDaytonaRemoteEnvironment(answer="codex answer")
+    context = SimpleNamespace()
+    agent = tbench_agent.DaytonaRemotePredictRLMAgent(
+        logs_dir=tmp_path,
+        codex_lm=True,
+    )
+
+    asyncio.run(agent.setup(env))
+    asyncio.run(agent.run("solve remotely", env, context))
+
+    assert context.answer == "codex answer"
+    assert env.upload_dirs == [
+        (str(credentials_dir), "/tmp/predict_rlm_home/.codex-lm"),
+    ]
+    payload_text = json.dumps(env.payloads[-1], sort_keys=True)
+    assert "do-not-copy-into-payload" not in payload_text
+    assert any("rm -rf /tmp/predict_rlm_home/.codex-lm" in command for command in env.commands)
 
 
 

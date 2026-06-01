@@ -6,6 +6,7 @@ import ast
 import asyncio
 import builtins
 import contextlib
+import hashlib
 import inspect
 import io
 import json
@@ -36,6 +37,34 @@ SANDBOX_DIR.mkdir(parents=True, exist_ok=True)
 TOOL_REQUEST_ID = 0
 TOOL_RESPONSE_LOCK = asyncio.Lock()
 PENDING_TOOL_RESPONSES: dict[int, dict[str, Any]] = {}
+_TRUE_VALUES = {"1", "true", "yes", "on"}
+
+
+def _debug_enabled() -> bool:
+    return os.environ.get("PREDICT_RLM_DEBUG", "").strip().lower() in _TRUE_VALUES
+
+
+def _debug_event(event: str, **metadata: Any) -> None:
+    if not _debug_enabled():
+        return
+    log_path = os.environ.get("PREDICT_RLM_DEBUG_LOG")
+    if not log_path:
+        return
+    payload = {
+        "ts": time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime()),
+        "event": event,
+        **metadata,
+    }
+    try:
+        pathlib.Path(log_path).parent.mkdir(parents=True, exist_ok=True)
+        with REAL_OPEN(log_path, "a", encoding="utf-8") as log_file:
+            log_file.write(json.dumps(payload, sort_keys=True, default=str) + "\n")
+    except Exception:
+        return
+
+
+def _code_hash(code: str) -> str:
+    return hashlib.sha256(code.encode("utf-8", errors="replace")).hexdigest()[:16]
 
 
 class _FinalOutputError(Exception):
@@ -449,6 +478,7 @@ async def _execute_code_in_runner_with_timeout(
     globals_dict: dict[str, Any],
     timeout_seconds: float | None,
 ) -> dict[str, Any]:
+    code_digest = _code_hash(code)
     ctx = _runner_context()
     stdout_read_fd, stdout_write_fd = os.pipe()
     stderr_read_fd, stderr_write_fd = os.pipe()
@@ -495,10 +525,24 @@ async def _execute_code_in_runner_with_timeout(
                     _terminate_runner(process)
                     for fd, parts in list(active_fds.items()):
                         _drain_fd(fd, parts)
+                    stdout = "".join(stdout_parts)
+                    stderr = "".join(stderr_parts)
+                    _debug_event(
+                        "sbx.python_runner.execute",
+                        code_hash=code_digest,
+                        code_len=len(code),
+                        timeout=True,
+                        timeout_seconds=timeout_seconds,
+                        stdout_len=len(stdout),
+                        stderr_len=len(stderr),
+                        child_pid=process.pid,
+                        child_exitcode=process.exitcode,
+                        active_fd_count=len(active_fds),
+                    )
                     return {
                         "timeout": {"seconds": timeout_seconds},
-                        "stdout": "".join(stdout_parts),
-                        "stderr": "".join(stderr_parts),
+                        "stdout": stdout,
+                        "stderr": stderr,
                     }
                 select_timeout = min(0.01, remaining)
             else:
@@ -535,18 +579,65 @@ async def _execute_code_in_runner_with_timeout(
 
     if runner_message is None:
         exitcode = process.exitcode
+        _debug_event(
+            "sbx.python_runner.execute",
+            code_hash=code_digest,
+            code_len=len(code),
+            timeout=False,
+            error=True,
+            error_type="RuntimeError",
+            stdout_len=len("".join(stdout_parts)),
+            stderr_len=len("".join(stderr_parts)),
+            child_pid=process.pid,
+            child_exitcode=exitcode,
+            active_fd_count=len(active_fds),
+        )
         if exitcode is None:
             raise RuntimeError("execution runner exited without a result")
         raise RuntimeError(
             f"execution runner exited without a result (exitcode={exitcode})"
         )
     if not runner_message.get("ok"):
+        _debug_event(
+            "sbx.python_runner.execute",
+            code_hash=code_digest,
+            code_len=len(code),
+            timeout=False,
+            error=True,
+            error_type=(runner_message.get("error") or {}).get("type"),
+            error_message=(runner_message.get("error") or {}).get("message"),
+            stdout_len=len("".join(stdout_parts)),
+            stderr_len=len("".join(stderr_parts)),
+            child_pid=process.pid,
+            child_exitcode=process.exitcode,
+            active_fd_count=len(active_fds),
+        )
         _raise_runner_error(runner_message.get("error") or {})
     globals_dict.update(runner_message.get("globals") or {})
     result = runner_message.get("result") or {}
     if isinstance(result, dict) and "output" in result:
         result = dict(result)
         result["output"] = "".join(stdout_parts) + "".join(stderr_parts)
+    _debug_event(
+        "sbx.python_runner.execute",
+        code_hash=code_digest,
+        code_len=len(code),
+        timeout=False,
+        error=False,
+        result_kind=(
+            "timeout"
+            if isinstance(result, dict) and "timeout" in result
+            else "final"
+            if isinstance(result, dict) and "final" in result
+            else "output"
+        ),
+        output_len=len(result.get("output", "")) if isinstance(result, dict) else None,
+        stdout_len=len("".join(stdout_parts)),
+        stderr_len=len("".join(stderr_parts)),
+        child_pid=process.pid,
+        child_exitcode=process.exitcode,
+        active_fd_count=len(active_fds),
+    )
     return result
 
 

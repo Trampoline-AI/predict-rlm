@@ -1,15 +1,21 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
+import os
 import shlex
+import shutil
 import subprocess
+import tarfile
+import tempfile
 import time
 import tomllib
 import uuid
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime
+from enum import StrEnum
 from pathlib import Path
 from typing import Any, Protocol
 from urllib.parse import unquote, urlparse
@@ -46,6 +52,7 @@ class TerminalBenchTaskRunRequest:
     output_dir: Path
     run_id: str
     config: TerminalBenchGepaConfig
+    task_resources: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True)
@@ -69,6 +76,245 @@ class HarborTaskTimeouts:
         return self.environment_setup + self.agent + self.verifier + self.cleanup
 
 
+class HarborControllerLocality(StrEnum):
+    AUTO = "auto"
+    LOCAL_CONTROLLER = "local-controller"
+    REMOTE_CONTROLLER = "remote-controller"
+
+
+@dataclass(frozen=True)
+class HarborControllerSelection:
+    locality: HarborControllerLocality
+    reason: str
+
+
+@dataclass(frozen=True)
+class RemoteCommandResult:
+    """Portable result returned by remote-controller environment adapters."""
+
+    returncode: int = 0
+    stdout: str = ""
+    stderr: str = ""
+
+    @property
+    def return_code(self) -> int:
+        return self.returncode
+
+
+class RemoteControllerEnvironment(Protocol):
+    """Boundary required by HarborRemoteControllerHarnessRunner.
+
+    Implementations run shell commands in the controller environment and move
+    files between the host and controller filesystem. The shared runner owns
+    packaging, command composition, artifact download, and result parsing.
+    """
+
+    def exec(self, *, command: str, timeout_sec: int) -> Any: ...
+
+    def upload_file(self, host_path: str, remote_path: str) -> Any: ...
+
+    def download_file(self, remote_path: str, host_path: str) -> Any: ...
+
+
+class LocalShellRemoteControllerEnvironment:
+    """Remote-controller adapter that runs against the local shell/filesystem."""
+
+    def __init__(self, *, cwd: Path | None = None) -> None:
+        self.cwd = cwd
+
+    def exec(self, *, command: str, timeout_sec: int) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            command,
+            cwd=self.cwd,
+            shell=True,
+            check=False,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=timeout_sec,
+        )
+
+    def upload_file(self, host_path: str, remote_path: str) -> None:
+        destination = Path(remote_path)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(host_path, destination)
+
+    def download_file(self, remote_path: str, host_path: str) -> None:
+        destination = Path(host_path)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(remote_path, destination)
+
+
+class SshGcpRemoteControllerEnvironment:
+    """Remote-controller adapter for GCP VMs reachable through SSH/SCP."""
+
+    def __init__(
+        self,
+        host: str,
+        *,
+        ssh_executable: str = "ssh",
+        scp_executable: str = "scp",
+        ssh_args: Sequence[str] = (),
+        scp_args: Sequence[str] = (),
+    ) -> None:
+        self.host = host
+        self.ssh_executable = ssh_executable
+        self.scp_executable = scp_executable
+        self.ssh_args = tuple(ssh_args)
+        self.scp_args = tuple(scp_args)
+
+    def exec(self, *, command: str, timeout_sec: int) -> subprocess.CompletedProcess[str]:
+        return _run_controller_subprocess(
+            [self.ssh_executable, *self.ssh_args, self.host, command],
+            timeout=timeout_sec,
+            check=False,
+        )
+
+    def upload_file(self, host_path: str, remote_path: str) -> None:
+        _run_controller_subprocess(
+            [self.scp_executable, *self.scp_args, host_path, f"{self.host}:{remote_path}"],
+            timeout=None,
+        )
+
+    def download_file(self, remote_path: str, host_path: str) -> None:
+        _run_controller_subprocess(
+            [self.scp_executable, *self.scp_args, f"{self.host}:{remote_path}", host_path],
+            timeout=None,
+        )
+
+
+class GcpSshRemoteControllerEnvironment(SshGcpRemoteControllerEnvironment):
+    """Alias with GCP-first naming for remote-controller call sites."""
+
+
+class SbxRemoteControllerEnvironment:
+    """Remote-controller adapter for Docker SBX sandboxes."""
+
+    def __init__(
+        self,
+        *,
+        sandbox_id: str | None = None,
+        sbx_executable: str = "sbx",
+        workspace: str | Path | None = None,
+        create_args: Sequence[str] = (),
+        remove_on_close: bool = True,
+    ) -> None:
+        self.sandbox_id = sandbox_id
+        self.sbx_executable = sbx_executable
+        self.workspace = Path(workspace) if workspace is not None else None
+        self.create_args = tuple(create_args)
+        self.remove_on_close = remove_on_close
+        self._owns_sandbox = sandbox_id is None
+
+    def create(self) -> str:
+        if self.sandbox_id is not None:
+            return self.sandbox_id
+        workspace = self.workspace or Path(tempfile.mkdtemp(prefix="predict-rlm-sbx-controller-"))
+        workspace.mkdir(parents=True, exist_ok=True)
+        completed = _run_controller_subprocess(
+            [self.sbx_executable, "create", "shell", str(workspace), *self.create_args],
+            timeout=None,
+        )
+        sandbox_id = completed.stdout.strip().splitlines()[-1] if completed.stdout.strip() else ""
+        if not sandbox_id:
+            raise RuntimeError("sbx create did not return a sandbox id on stdout")
+        self.workspace = workspace
+        self.sandbox_id = sandbox_id
+        return sandbox_id
+
+    def close(self) -> None:
+        if self.sandbox_id is None or not self._owns_sandbox or not self.remove_on_close:
+            return
+        _run_controller_subprocess([self.sbx_executable, "rm", self.sandbox_id], timeout=None)
+        self.sandbox_id = None
+
+    def exec(self, *, command: str, timeout_sec: int) -> subprocess.CompletedProcess[str]:
+        sandbox_id = self.create()
+        return _run_controller_subprocess(
+            [self.sbx_executable, "exec", sandbox_id, "sh", "-lc", command],
+            timeout=timeout_sec,
+            check=False,
+        )
+
+    def upload_file(self, host_path: str, remote_path: str) -> None:
+        sandbox_id = self.create()
+        _run_controller_subprocess(
+            [self.sbx_executable, "cp", host_path, f"{sandbox_id}:{remote_path}"],
+            timeout=None,
+        )
+
+    def download_file(self, remote_path: str, host_path: str) -> None:
+        sandbox_id = self.create()
+        Path(host_path).parent.mkdir(parents=True, exist_ok=True)
+        _run_controller_subprocess(
+            [self.sbx_executable, "cp", f"{sandbox_id}:{remote_path}", host_path],
+            timeout=None,
+        )
+
+    def __enter__(self) -> SbxRemoteControllerEnvironment:
+        self.create()
+        return self
+
+    def __exit__(self, *_exc_info: object) -> None:
+        self.close()
+
+
+class DockerSbxRemoteControllerEnvironment(SbxRemoteControllerEnvironment):
+    """Alias with Docker SBX naming for remote-controller call sites."""
+
+
+class DaytonaRemoteControllerEnvironment:
+    """Adapter that treats a Daytona sandbox as the Harbor controller host."""
+
+    def __init__(self, sandbox: Any) -> None:
+        self.sandbox = sandbox
+
+    def exec(self, *, command: str, timeout_sec: int) -> Any:
+        process = getattr(self.sandbox, "process", None)
+        if process is not None:
+            return _call_controller_method(
+                process,
+                ("exec", "run"),
+                (
+                    ((command,), {"timeout": timeout_sec}),
+                    (((), {"command": command, "timeout_sec": timeout_sec})),
+                ),
+            )
+        return _call_controller_method(
+            self.sandbox,
+            ("exec", "run"),
+            (((), {"command": command, "timeout_sec": timeout_sec}), ((command,), {"timeout": timeout_sec})),
+        )
+
+    def upload_file(self, host_path: str, remote_path: str) -> Any:
+        filesystem = getattr(self.sandbox, "fs", None) or getattr(self.sandbox, "filesystem", None)
+        if filesystem is not None:
+            return _call_controller_method(
+                filesystem,
+                ("upload_file", "copy_to", "put_file"),
+                (((host_path, remote_path), {}),),
+            )
+        return _call_controller_method(
+            self.sandbox,
+            ("upload_file", "copy_to", "put_file"),
+            (((host_path, remote_path), {}),),
+        )
+
+    def download_file(self, remote_path: str, host_path: str) -> Any:
+        filesystem = getattr(self.sandbox, "fs", None) or getattr(self.sandbox, "filesystem", None)
+        if filesystem is not None:
+            return _call_controller_method(
+                filesystem,
+                ("download_file", "copy_from", "get_file"),
+                (((remote_path, host_path), {}),),
+            )
+        return _call_controller_method(
+            self.sandbox,
+            ("download_file", "copy_from", "get_file"),
+            (((remote_path, host_path), {}),),
+        )
+
+
 class TerminalBenchHarnessRunner(Protocol):
     async def run(self, request: TerminalBenchTaskRunRequest) -> TerminalBenchTaskRunResult: ...
 
@@ -84,35 +330,10 @@ class HarborSubprocessHarnessRunner:
         return await asyncio.to_thread(self._run_sync, request)
 
     def _run_sync(self, request: TerminalBenchTaskRunRequest) -> TerminalBenchTaskRunResult:
-        config = request.config
         output_dir = _resolve_output_dir(request)
         output_dir.mkdir(parents=True, exist_ok=True)
         phase_log_path = _phase_log_path(request, output_dir=output_dir)
-        cmd = [
-            *shlex.split(config.harbor_executable),
-            "run",
-            "-d",
-            config.harbor_dataset,
-            "--include-task-name",
-            request.task_id,
-            "--agent-import-path",
-            "terminal_bench_rlm.tools.tbench_agent:HarborPredictRLMAgent",
-            "--n-attempts",
-            str(config.n_attempts),
-            "--n-concurrent",
-            str(config.n_concurrent_trials),
-            "--jobs-dir",
-            str(output_dir),
-            "--job-name",
-            request.run_id,
-        ]
-        for key, value in _agent_kwargs(request).items():
-            cmd.extend(["--agent-kwarg", f"{key}={value}"])
-        if config.no_rebuild:
-            cmd.append("--no-force-build")
-        else:
-            cmd.append("--force-build")
-        cmd.append("--delete" if config.cleanup else "--no-delete")
+        cmd = _build_harbor_run_command(request, output_dir=output_dir)
         max_attempts = self._result_retry_limit + 1
         for attempt in range(1, max_attempts + 1):
             started = time.monotonic()
@@ -199,6 +420,100 @@ class HarborSubprocessHarnessRunner:
         run_dir: Path,
     ) -> TerminalBenchTaskRunResult:
         return _load_task_run_result(request, run_dir)
+
+
+class HarborRemoteControllerHarnessRunner:
+    """Runs the existing Harbor task command inside a Harbor/Daytona machine."""
+
+    def __init__(
+        self,
+        controller_environment: Any | None = None,
+        *,
+        cwd: Path | None = None,
+    ) -> None:
+        self.controller_environment = controller_environment
+        self.cwd = cwd or Path(__file__).resolve().parents[2]
+
+    async def run(self, request: TerminalBenchTaskRunRequest) -> TerminalBenchTaskRunResult:
+        return await asyncio.to_thread(self._run_sync, request)
+
+    def _run_sync(self, request: TerminalBenchTaskRunRequest) -> TerminalBenchTaskRunResult:
+        environment = self._require_controller_environment()
+        if not _supports_remote_controller(environment):
+            raise RuntimeError(
+                "Harbor remote-controller requires one-shot remote command execution "
+                "plus upload and download file APIs."
+            )
+
+        output_dir = _resolve_output_dir(request)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        run_dir = output_dir / request.run_id
+        remote_root = _remote_run_root(request)
+        remote_repo_dir = f"{remote_root}/repo"
+        remote_output_dir = f"{remote_root}/harbor-runs"
+        remote_archive_path = f"{remote_root}/repo.tar.gz"
+        remote_artifact_path = f"{remote_root}/artifacts.tar.gz"
+        repo_root = _repo_root_for_cwd(self.cwd)
+        remote_cwd = _remote_cwd(repo_root, self.cwd, remote_repo_dir)
+        remote_cmd = _build_harbor_run_command(request, output_dir=remote_output_dir)
+
+        with tempfile.TemporaryDirectory(prefix="terminal-bench-remote-controller-") as tmp_dir:
+            local_archive_path = Path(tmp_dir) / "repo.tar.gz"
+            local_artifact_path = Path(tmp_dir) / "artifacts.tar.gz"
+            _create_repo_archive(repo_root, local_archive_path)
+
+            _remote_preflight_new_run_root(
+                environment,
+                remote_root,
+                timeout=request.task_timeout,
+            )
+            _remote_exec_checked(
+                environment,
+                f"mkdir -p {shlex.quote(remote_root)} {shlex.quote(remote_output_dir)}",
+                timeout=request.task_timeout,
+                operation="creating remote controller workdir",
+            )
+            _remote_upload_file(environment, str(local_archive_path), remote_archive_path)
+            _remote_exec_checked(
+                environment,
+                (
+                    f"rm -rf {shlex.quote(remote_repo_dir)} && "
+                    f"mkdir -p {shlex.quote(remote_repo_dir)} && "
+                    f"tar -xzf {shlex.quote(remote_archive_path)} "
+                    f"-C {shlex.quote(remote_repo_dir)} --strip-components=1"
+                ),
+                timeout=request.task_timeout,
+                operation="unpacking remote controller package",
+            )
+            _remote_exec_checked(
+                environment,
+                f"cd {shlex.quote(remote_cwd)} && {shlex.join(remote_cmd)}",
+                timeout=_subprocess_timeout(request),
+                operation="running remote Harbor controller",
+            )
+            _remote_exec_checked(
+                environment,
+                (
+                    f"tar -czf {shlex.quote(remote_artifact_path)} "
+                    f"-C {shlex.quote(remote_output_dir)} {shlex.quote(request.run_id)}"
+                ),
+                timeout=request.task_timeout,
+                operation="packing remote Harbor artifacts",
+            )
+            _remote_download_file(environment, remote_artifact_path, str(local_artifact_path))
+            _extract_tarball(local_artifact_path, output_dir)
+
+        return _load_task_run_result(request, run_dir)
+
+    def _require_controller_environment(self) -> Any:
+        if self.controller_environment is None:
+            raise RuntimeError(
+                "Harbor remote-controller was selected, but no Harbor/Daytona "
+                "controller environment was provided. Remote runs are opt-in; "
+                "provide an environment with exec/upload/download capabilities and "
+                "download artifacts before rerunning a reused job name."
+            )
+        return self.controller_environment
 
 
 class TerminalBenchSubprocessHarnessRunner:
@@ -341,12 +656,24 @@ class TerminalBenchGepaProject(RLMGepaProject):
     def load_valset(self) -> Sequence[TerminalBenchExample]:
         return _examples(self.config.val_task_ids, limit=self.config.val_limit)
 
+    def task_timeout_for_example(self, example: TerminalBenchExample, default_timeout: int) -> int:
+        return _terminal_bench_task_timeouts(
+            self.config,
+            example.task_id,
+            fallback=default_timeout,
+        ).outer
+
+    def task_resources_for_example(self, example: TerminalBenchExample) -> dict[str, Any]:
+        return _terminal_bench_task_resources(self.config, example.task_id)
+
     async def evaluate_example(
         self,
         candidate: dict[str, str],
         example: TerminalBenchExample,
         context: EvaluationContext,
     ) -> RLMGepaExampleResult:
+        task_timeout = self.task_timeout_for_example(example, context.task_timeout)
+        task_resources = dict(context.task_resources) or self.task_resources_for_example(example)
         request = TerminalBenchTaskRunRequest(
             task_id=example.task_id,
             instruction=example.instruction,
@@ -354,11 +681,12 @@ class TerminalBenchGepaProject(RLMGepaProject):
             lm=context.lm,
             sub_lm=context.sub_lm,
             max_iterations=context.max_iterations,
-            task_timeout=context.task_timeout,
+            task_timeout=task_timeout,
             verbose_rlm=context.verbose_rlm,
             output_dir=context.output_dir,
             run_id=_run_id(context.kind, example.task_id),
             config=self.config,
+            task_resources=task_resources,
         )
         run_result = await self.harness_runner.run(request)
         result = to_gepa_example_result(
@@ -385,7 +713,7 @@ def build_project(config: TerminalBenchGepaConfig | None = None) -> RLMGepaProje
 
 def _build_harness_runner(config: TerminalBenchGepaConfig) -> TerminalBenchHarnessRunner:
     if config.harness_backend == "harbor":
-        return HarborSubprocessHarnessRunner()
+        return _build_harbor_harness_runner(config)
     if config.harness_backend == "python":
         return TerminalBenchInProcessHarnessRunner()
     if config.harness_backend == "cli":
@@ -393,11 +721,95 @@ def _build_harness_runner(config: TerminalBenchGepaConfig) -> TerminalBenchHarne
     raise ValueError(f"Unsupported Terminal-Bench harness backend: {config.harness_backend}")
 
 
+def _build_harbor_harness_runner(
+    config: TerminalBenchGepaConfig,
+    *,
+    controller_environment: Any | None = None,
+) -> TerminalBenchHarnessRunner:
+    selection = select_harbor_controller_locality(
+        config.harbor_controller_locality,
+        controller_environment,
+        harbor_environment=config.harbor_environment,
+    )
+    if selection.locality is HarborControllerLocality.REMOTE_CONTROLLER:
+        return HarborRemoteControllerHarnessRunner(controller_environment)
+    return HarborSubprocessHarnessRunner()
+
+
+def select_harbor_controller_locality(
+    requested: str | HarborControllerLocality,
+    controller_environment: Any | None,
+    *,
+    harbor_environment: str | None = None,
+) -> HarborControllerSelection:
+    locality = HarborControllerLocality(str(requested))
+    if _is_daytona_environment(harbor_environment) and controller_environment is None:
+        if locality is HarborControllerLocality.REMOTE_CONTROLLER:
+            raise RuntimeError(
+                "Harbor remote-controller with Daytona requires an explicit Daytona "
+                "controller environment; build_project(config) cannot create it."
+            )
+        return HarborControllerSelection(
+            HarborControllerLocality.LOCAL_CONTROLLER,
+            "Daytona uses the local Harbor launcher when no controller environment is supplied",
+        )
+    if controller_environment is None:
+        if locality is HarborControllerLocality.REMOTE_CONTROLLER:
+            raise RuntimeError(
+                "Harbor remote-controller requires a Harbor/Daytona environment "
+                "object with remote exec, upload, and download APIs. "
+                "build_project(config) cannot construct that environment; callers "
+                "must supply it to the lower-level Harbor runner."
+            )
+        return HarborControllerSelection(
+            HarborControllerLocality.LOCAL_CONTROLLER,
+            "no explicit remote controller environment was provided; using local Harbor launcher",
+        )
+    if locality is HarborControllerLocality.LOCAL_CONTROLLER:
+        if not _supports_interactive_exec(controller_environment):
+            raise RuntimeError(
+                "Harbor local-controller requires persistent interactive exec "
+                "(start_exec/exec_stream/popen or docker exec -i)."
+            )
+        return HarborControllerSelection(
+            HarborControllerLocality.LOCAL_CONTROLLER,
+            "remote environment exposes persistent interactive exec",
+        )
+    if locality is HarborControllerLocality.REMOTE_CONTROLLER:
+        if not _supports_remote_controller(controller_environment):
+            raise RuntimeError(
+                "Harbor remote-controller requires one-shot remote exec plus "
+                "upload/download file APIs."
+            )
+        return HarborControllerSelection(
+            HarborControllerLocality.REMOTE_CONTROLLER,
+            "remote environment exposes one-shot exec and artifact file sync",
+        )
+    if _supports_interactive_exec(controller_environment):
+        return HarborControllerSelection(
+            HarborControllerLocality.LOCAL_CONTROLLER,
+            "auto selected local-controller because persistent interactive exec is available",
+        )
+    if _supports_remote_controller(controller_environment):
+        return HarborControllerSelection(
+            HarborControllerLocality.REMOTE_CONTROLLER,
+            "auto selected remote-controller because only one-shot exec plus file sync are available",
+        )
+    raise RuntimeError(
+        "Harbor controller locality auto-detection failed: environment exposes neither "
+        "persistent interactive exec nor remote exec/upload/download capabilities."
+    )
+
+
+def _is_daytona_environment(harbor_environment: str | None) -> bool:
+    return str(harbor_environment or "").strip().lower() == "daytona"
+
+
 def _resolve_output_dir(request: TerminalBenchTaskRunRequest) -> Path:
     output_dir = request.config.terminal_bench_output_dir
     if output_dir.is_absolute():
         return output_dir
-    return request.output_dir / output_dir
+    return (request.output_dir / output_dir).resolve()
 
 
 
@@ -457,6 +869,22 @@ def _phase_log_path(request: TerminalBenchTaskRunRequest, *, output_dir: Path) -
     return output_dir / request.run_id / "task_phase_events.jsonl"
 
 
+def _phase_log_path_text(
+    request: TerminalBenchTaskRunRequest,
+    *,
+    output_dir: Path | str,
+) -> str:
+    if isinstance(output_dir, Path):
+        return str(_phase_log_path(request, output_dir=output_dir))
+    return "/".join(
+        [
+            output_dir.rstrip("/"),
+            request.run_id,
+            "task_phase_events.jsonl",
+        ]
+    )
+
+
 def _write_phase_event(
     path: Path,
     *,
@@ -487,9 +915,55 @@ def _write_phase_event(
         flush=True,
     )
 
-def _agent_kwargs(request: TerminalBenchTaskRunRequest) -> dict[str, str]:
+
+def _build_harbor_run_command(
+    request: TerminalBenchTaskRunRequest,
+    *,
+    output_dir: Path | str,
+) -> list[str]:
     config = request.config
-    output_dir = _resolve_output_dir(request)
+    cmd = [
+        *shlex.split(config.harbor_executable),
+        "run",
+        "-d",
+        config.harbor_dataset,
+        "-e",
+        config.harbor_environment,
+        "--include-task-name",
+        request.task_id,
+        "--agent-import-path",
+        "terminal_bench_rlm.tools.tbench_agent:HarborPredictRLMAgent",
+        "--n-attempts",
+        str(config.n_attempts),
+        "--n-concurrent",
+        str(config.n_concurrent_trials),
+        "--cpus",
+        config.harbor_cpus,
+        "--memory",
+        config.harbor_memory,
+        "--jobs-dir",
+        str(output_dir),
+        "--job-name",
+        request.run_id,
+    ]
+    for key, value in _agent_kwargs(request, output_dir=output_dir).items():
+        cmd.extend(["--agent-kwarg", f"{key}={value}"])
+    if config.no_rebuild:
+        cmd.append("--no-force-build")
+    else:
+        cmd.append("--force-build")
+    cmd.append("--delete" if config.cleanup else "--no-delete")
+    return cmd
+
+
+def _agent_kwargs(
+    request: TerminalBenchTaskRunRequest,
+    *,
+    output_dir: Path | str | None = None,
+) -> dict[str, str]:
+    config = request.config
+    if output_dir is None:
+        output_dir = _resolve_output_dir(request)
     kwargs = {
         "lm": _model_name(request.lm),
         "sub_lm": _model_name(request.sub_lm),
@@ -497,7 +971,7 @@ def _agent_kwargs(request: TerminalBenchTaskRunRequest) -> dict[str, str]:
         "exec_timeout": str(_agent_timeout_with_cleanup_grace(request)),
         "skill_instructions": request.skill_instructions,
         "task_id": request.task_id,
-        "phase_log_path": str(_phase_log_path(request, output_dir=output_dir)),
+        "phase_log_path": _phase_log_path_text(request, output_dir=output_dir),
     }
     lm_reasoning_effort = _reasoning_effort(request.lm)
     if lm_reasoning_effort is not None:
@@ -515,9 +989,34 @@ def _agent_kwargs(request: TerminalBenchTaskRunRequest) -> dict[str, str]:
         kwargs["verbose"] = "true"
     if config.codex_lm:
         kwargs["codex_lm"] = "true"
+        if os.environ.get("CODEX_LM_DEBUG"):
+            kwargs["codex_lm_debug"] = os.environ["CODEX_LM_DEBUG"]
+        if os.environ.get("CODEX_LM_DEBUG_LOG"):
+            kwargs["codex_lm_debug_log"] = os.environ["CODEX_LM_DEBUG_LOG"]
+        if os.environ.get("PREDICT_RLM_DEBUG"):
+            kwargs["predict_rlm_debug"] = os.environ["PREDICT_RLM_DEBUG"]
+        if os.environ.get("PREDICT_RLM_DEBUG_JSON"):
+            kwargs["predict_rlm_debug_json"] = os.environ["PREDICT_RLM_DEBUG_JSON"]
+        if os.environ.get("PREDICT_RLM_DEBUG_LOG"):
+            kwargs["predict_rlm_debug_log"] = os.environ["PREDICT_RLM_DEBUG_LOG"]
         if config.codex_lm_exclude:
             kwargs["codex_lm_exclude"] = ",".join(config.codex_lm_exclude)
+    interpreter_mode = _harbor_agent_interpreter_mode(config)
+    if interpreter_mode != "environment":
+        kwargs["interpreter_mode"] = interpreter_mode
     return kwargs
+
+
+def _harbor_agent_interpreter_mode(config: TerminalBenchGepaConfig) -> str:
+    mode = str(getattr(config, "harbor_agent_interpreter_mode", "auto") or "auto").strip().lower()
+    if mode == "auto":
+        return "environment"
+    if mode in {"environment", "local-process"}:
+        return mode
+    raise ValueError(
+        "Unsupported harbor_agent_interpreter_mode: "
+        f"{mode!r}. Expected 'auto', 'environment', or 'local-process'."
+    )
 
 
 def _agent_timeout(request: TerminalBenchTaskRunRequest) -> int:
@@ -537,13 +1036,25 @@ def _subprocess_timeout(request: TerminalBenchTaskRunRequest) -> int:
 
 
 def _harbor_task_timeouts(request: TerminalBenchTaskRunRequest) -> HarborTaskTimeouts:
-    cleanup = max(0, int(request.config.timeout_cleanup_grace_sec))
-    fallback = max(1, int(request.task_timeout))
-    payload = _load_harbor_task_toml(request)
+    return _terminal_bench_task_timeouts(
+        request.config,
+        request.task_id,
+        fallback=max(1, int(request.task_timeout)),
+    )
+
+
+def _terminal_bench_task_timeouts(
+    config: TerminalBenchGepaConfig,
+    task_id: str,
+    *,
+    fallback: int,
+) -> HarborTaskTimeouts:
+    cleanup = max(0, int(config.timeout_cleanup_grace_sec))
+    payload = _load_terminal_bench_task_toml(config, task_id)
     if payload is None:
-        if request.task_id.startswith("terminal-bench/"):
+        if task_id.startswith("terminal-bench/"):
             raise RuntimeError(
-                f"Cannot determine official Harbor timeouts for {request.task_id}: "
+                f"Cannot determine official Harbor timeouts for {task_id}: "
                 "task.toml is missing from the configured task cache and the global Harbor cache."
             )
         return HarborTaskTimeouts(
@@ -560,8 +1071,29 @@ def _harbor_task_timeouts(request: TerminalBenchTaskRunRequest) -> HarborTaskTim
     )
 
 
+def _terminal_bench_task_resources(config: TerminalBenchGepaConfig, task_id: str) -> dict[str, Any]:
+    payload = _load_terminal_bench_task_toml(config, task_id)
+    if payload is None:
+        return {}
+    environment = payload.get("environment")
+    if not isinstance(environment, dict):
+        return {}
+    resources: dict[str, Any] = {}
+    for key in ("cpus", "memory_mb", "storage_mb", "gpus"):
+        if key in environment:
+            resources[key] = environment[key]
+    return resources
+
+
 def _load_harbor_task_toml(request: TerminalBenchTaskRunRequest) -> dict[str, Any] | None:
-    task_toml = _harbor_task_toml_path(request)
+    return _load_terminal_bench_task_toml(request.config, request.task_id)
+
+
+def _load_terminal_bench_task_toml(
+    config: TerminalBenchGepaConfig,
+    task_id: str,
+) -> dict[str, Any] | None:
+    task_toml = _terminal_bench_task_toml_path(config, task_id)
     if task_toml is None:
         return None
     try:
@@ -571,14 +1103,18 @@ def _load_harbor_task_toml(request: TerminalBenchTaskRunRequest) -> dict[str, An
 
 
 def _harbor_task_toml_path(request: TerminalBenchTaskRunRequest) -> Path | None:
+    return _terminal_bench_task_toml_path(request.config, request.task_id)
+
+
+def _terminal_bench_task_toml_path(config: TerminalBenchGepaConfig, task_id: str) -> Path | None:
     roots = []
-    if request.config.harbor_task_cache_dir is not None:
-        roots.append(request.config.harbor_task_cache_dir)
+    if config.harbor_task_cache_dir is not None:
+        roots.append(config.harbor_task_cache_dir)
     global_cache_root = Path.home() / ".cache" / "harbor" / "tasks" / "packages"
     if global_cache_root not in roots:
         roots.append(global_cache_root)
 
-    task_parts = [part for part in request.task_id.split("/") if part]
+    task_parts = [part for part in task_id.split("/") if part]
     candidates = []
     for cache_root in roots:
         task_dir = cache_root.joinpath(*task_parts)
@@ -607,6 +1143,7 @@ def _subprocess_run_kwargs(request: TerminalBenchTaskRunRequest, *, cwd: Path) -
     kwargs: dict[str, Any] = {
         "cwd": cwd,
         "check": False,
+        "env": _subprocess_env(cwd),
         "text": True,
         "timeout": _subprocess_timeout(request),
     }
@@ -614,6 +1151,348 @@ def _subprocess_run_kwargs(request: TerminalBenchTaskRunRequest, *, cwd: Path) -
         kwargs["stdout"] = subprocess.PIPE
         kwargs["stderr"] = subprocess.PIPE
     return kwargs
+
+
+def _supports_interactive_exec(environment: Any) -> bool:
+    if _has_any_callable(environment, ("start_exec", "exec_stream", "popen")):
+        return True
+    container = getattr(environment, "container", None)
+    if container is None:
+        return False
+    if _has_any_callable(container, ("start_exec", "exec_stream", "popen")):
+        return True
+    if getattr(container, "id", None):
+        return True
+    attrs = getattr(container, "attrs", None)
+    return isinstance(attrs, dict) and bool(attrs.get("Id"))
+
+
+def _supports_remote_controller(environment: Any) -> bool:
+    return (
+        _has_any_callable(environment, ("exec", "run"))
+        and _has_any_callable(environment, ("upload_file", "copy_to", "put_file"))
+        and _has_any_callable(environment, ("download_file", "copy_from", "get_file"))
+    )
+
+
+def _has_any_callable(obj: Any, names: tuple[str, ...]) -> bool:
+    return any(callable(getattr(obj, name, None)) for name in names)
+
+
+def _run_controller_subprocess(
+    cmd: Sequence[str],
+    *,
+    timeout: int | None,
+    check: bool = True,
+) -> subprocess.CompletedProcess[str]:
+    completed = subprocess.run(
+        list(cmd),
+        check=False,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=timeout,
+    )
+    if check and completed.returncode != 0:
+        raise RuntimeError(
+            "remote-controller command failed: "
+            f"{shlex.join(list(cmd))}; exit code {completed.returncode}; "
+            f"stdout: {completed.stdout}; stderr: {completed.stderr}"
+        )
+    return completed
+
+
+def _call_controller_method(
+    obj: Any,
+    names: tuple[str, ...],
+    attempts: Sequence[tuple[tuple[Any, ...], dict[str, Any]]],
+) -> Any:
+    type_errors: list[TypeError] = []
+    for name in names:
+        method = getattr(obj, name, None)
+        if method is None:
+            continue
+        for args, kwargs in attempts:
+            try:
+                return _resolve_remote_call(method(*args, **kwargs))
+            except TypeError as exc:
+                type_errors.append(exc)
+    if type_errors:
+        raise type_errors[0]
+    raise TypeError(f"Remote-controller object does not expose any of: {', '.join(names)}")
+
+
+def _remote_run_root(request: TerminalBenchTaskRunRequest) -> str:
+    root = request.config.harbor_remote_workdir.rstrip("/") or "/tmp/predict_rlm_terminal_bench"
+    return f"{root}/{request.run_id}"
+
+
+def _repo_root_for_cwd(cwd: Path) -> Path:
+    cwd = cwd.resolve()
+    for directory in (cwd, *cwd.parents):
+        if (directory / "pyproject.toml").is_file() and (
+            directory / "examples" / "terminal_bench"
+        ).is_dir():
+            return directory
+    return cwd
+
+
+def _remote_cwd(repo_root: Path, cwd: Path, remote_repo_dir: str) -> str:
+    try:
+        rel_cwd = cwd.resolve().relative_to(repo_root)
+    except ValueError:
+        return remote_repo_dir
+    if str(rel_cwd) == ".":
+        return remote_repo_dir
+    return "/".join([remote_repo_dir.rstrip("/"), rel_cwd.as_posix()])
+
+
+def _create_repo_archive(repo_root: Path, archive_path: Path) -> None:
+    with tarfile.open(archive_path, "w:gz") as archive:
+        for path in _iter_repo_archive_paths(repo_root):
+            archive.add(path, arcname=str(Path("repo") / path.relative_to(repo_root)), recursive=False)
+
+
+def _iter_repo_archive_paths(repo_root: Path) -> list[Path]:
+    tracked_paths = _git_tracked_repo_paths(repo_root)
+    if tracked_paths is not None:
+        return tracked_paths
+    return _fallback_repo_archive_paths(repo_root)
+
+
+def _git_tracked_repo_paths(repo_root: Path) -> list[Path] | None:
+    try:
+        completed = subprocess.run(
+            ["git", "ls-files", "-z"],
+            cwd=repo_root,
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    paths: list[Path] = []
+    for raw_relpath in completed.stdout.split(b"\0"):
+        if not raw_relpath:
+            continue
+        relpath = Path(os.fsdecode(raw_relpath))
+        if relpath.is_absolute() or ".." in relpath.parts:
+            continue
+        path = repo_root / relpath
+        if path.is_file() or path.is_symlink():
+            paths.append(path)
+    return sorted(paths)
+
+
+def _fallback_repo_archive_paths(repo_root: Path) -> list[Path]:
+    paths: list[Path] = []
+    for root, dirnames, filenames in os.walk(repo_root):
+        root_path = Path(root)
+        dirnames[:] = [
+            dirname
+            for dirname in sorted(dirnames)
+            if not _exclude_from_remote_package(root_path / dirname, repo_root)
+        ]
+        for filename in sorted(filenames):
+            path = root_path / filename
+            if not _exclude_from_remote_package(path, repo_root):
+                paths.append(path)
+    return paths
+
+
+def _exclude_from_remote_package(path: Path, repo_root: Path) -> bool:
+    rel = path.relative_to(repo_root)
+    parts = set(rel.parts)
+    if parts & {
+        ".git",
+        ".hermes",
+        ".mypy_cache",
+        ".pytest_cache",
+        ".ruff_cache",
+        ".terminal-bench-venv",
+        ".venv",
+        "__pycache__",
+        "bug_reports",
+        "downloaded-gcp-artifacts",
+        "ops",
+        "runs",
+        "run_artifacts",
+    }:
+        return True
+    if path.suffix in {".pyc", ".pyo"}:
+        return True
+    return rel.as_posix() in {
+        "early_failures.txt",
+        "failing-short.txt",
+        "old-skill-bits.txt",
+    }
+
+
+def _remote_exec_checked(
+    environment: Any,
+    command: str,
+    *,
+    timeout: int,
+    operation: str,
+) -> Any:
+    result = _remote_exec(environment, command, timeout=timeout)
+    returncode = _remote_returncode(result)
+    if returncode not in (0, None):
+        stdout = _remote_stdout(result)
+        stderr = _remote_stderr(result)
+        raise RuntimeError(
+            f"Harbor remote-controller failed while {operation}: "
+            f"exit code {returncode}; stdout: {stdout}; stderr: {stderr}"
+        )
+    return result
+
+
+def _remote_preflight_new_run_root(environment: Any, remote_root: str, *, timeout: int) -> None:
+    result = _remote_exec(
+        environment,
+        f"test ! -e {shlex.quote(remote_root)}",
+        timeout=timeout,
+    )
+    returncode = _remote_returncode(result)
+    if returncode not in (0, None):
+        stdout = _remote_stdout(result)
+        stderr = _remote_stderr(result)
+        raise RuntimeError(
+            "Harbor remote-controller remote root already exists: "
+            f"{remote_root}. Refusing to delete or overwrite it. "
+            "Download/preserve artifacts or use a unique run id before rerunning. "
+            f"stdout: {stdout}; stderr: {stderr}"
+        )
+
+
+def _remote_exec(environment: Any, command: str, *, timeout: int) -> Any:
+    for name in ("exec", "run"):
+        method = getattr(environment, name, None)
+        if method is None:
+            continue
+        try:
+            return _resolve_remote_call(method(command=command, timeout_sec=int(timeout)))
+        except TypeError as keyword_exc:
+            try:
+                return _resolve_remote_call(method(command, timeout=timeout))
+            except TypeError:
+                raise keyword_exc
+    raise TypeError("Harbor remote-controller environment does not expose exec/run")
+
+
+def _remote_upload_file(environment: Any, host_path: str, remote_path: str) -> None:
+    for name in ("upload_file", "copy_to", "put_file"):
+        method = getattr(environment, name, None)
+        if method is not None:
+            _resolve_remote_call(method(host_path, remote_path))
+            return
+    raise TypeError("Harbor remote-controller environment does not expose upload_file/copy_to")
+
+
+def _remote_download_file(environment: Any, remote_path: str, host_path: str) -> None:
+    for name in ("download_file", "copy_from", "get_file"):
+        method = getattr(environment, name, None)
+        if method is not None:
+            Path(host_path).parent.mkdir(parents=True, exist_ok=True)
+            _resolve_remote_call(method(remote_path, host_path))
+            return
+    raise TypeError("Harbor remote-controller environment does not expose download_file/copy_from")
+
+
+def _resolve_remote_call(value: Any) -> Any:
+    if inspect.isawaitable(value):
+        return asyncio.run(value)
+    return value
+
+
+def _remote_returncode(result: Any) -> int | None:
+    value = getattr(result, "return_code", None)
+    if value is None:
+        value = getattr(result, "returncode", None)
+    if value is None:
+        value = getattr(result, "exit_code", None)
+    return value
+
+
+def _remote_stdout(result: Any) -> str:
+    stdout = getattr(result, "stdout", None)
+    if stdout is not None:
+        return str(stdout)
+    artifacts = getattr(result, "artifacts", None)
+    artifact_stdout = getattr(artifacts, "stdout", None)
+    if artifact_stdout is not None:
+        return str(artifact_stdout)
+    payload = getattr(result, "result", None)
+    return "" if payload is None else str(payload)
+
+
+def _remote_stderr(result: Any) -> str:
+    stderr = getattr(result, "stderr", None)
+    return "" if stderr is None else str(stderr)
+
+
+def _extract_tarball(archive_path: Path, output_dir: Path) -> None:
+    output_dir = output_dir.resolve()
+    with tarfile.open(archive_path, "r:gz") as archive:
+        for member in archive.getmembers():
+            _extract_tar_member(archive, member, output_dir)
+
+
+def _extract_tar_member(archive: tarfile.TarFile, member: tarfile.TarInfo, output_dir: Path) -> None:
+    target = (output_dir / member.name).resolve()
+    if output_dir != target and output_dir not in target.parents:
+        raise RuntimeError(f"Refusing to extract remote artifact outside {output_dir}: {member.name}")
+    if member.isdir():
+        target.mkdir(parents=True, exist_ok=True)
+        return
+    if not member.isfile():
+        raise RuntimeError(f"Refusing to extract unsupported remote artifact member: {member.name}")
+    target.parent.mkdir(parents=True, exist_ok=True)
+    source = archive.extractfile(member)
+    if source is None:
+        raise RuntimeError(f"Remote artifact member could not be read: {member.name}")
+    with source, target.open("wb") as destination:
+        shutil.copyfileobj(source, destination)
+
+
+def _subprocess_env(cwd: Path) -> dict[str, str]:
+    env = os.environ.copy()
+    env_file = _find_env_development(cwd)
+    if env_file is None:
+        return env
+    for line in env_file.read_text(encoding="utf-8").splitlines():
+        key_value = _parse_env_line(line)
+        if key_value is None:
+            continue
+        key, value = key_value
+        env.setdefault(key, value)
+    return env
+
+
+def _find_env_development(cwd: Path) -> Path | None:
+    cwd = cwd.resolve()
+    for directory in (cwd, *cwd.parents):
+        candidate = directory / ".env.development"
+        if candidate.is_file():
+            return candidate
+    return None
+
+
+def _parse_env_line(line: str) -> tuple[str, str] | None:
+    line = line.strip()
+    if not line or line.startswith("#"):
+        return None
+    if line.startswith("export "):
+        line = line[len("export ") :].lstrip()
+    key, separator, value = line.partition("=")
+    key = key.strip()
+    if not separator or not key:
+        return None
+    value = value.strip()
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in {'\"', "'"}:
+        value = value[1:-1]
+    return key, value
 
 
 def _timeout_trial_result(exc: subprocess.TimeoutExpired) -> dict[str, Any]:
