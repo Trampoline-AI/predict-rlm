@@ -68,6 +68,7 @@ class RLMGepaAdapter:
         proposer_timeout: int = 600,
         heartbeat_interval_seconds: float = 30.0,
         verbose_rlm: bool = False,
+        debug_rlm: bool = False,
         display_progress_bar: bool = False,
         valset_size: int | None = None,
         telemetry_context: TelemetryContext | None = None,
@@ -81,6 +82,7 @@ class RLMGepaAdapter:
         self.output_dir = Path(output_dir)
         self.run_id = run_id
         self.verbose_rlm = verbose_rlm
+        self.debug_rlm = debug_rlm
         self.task_trace_dir = self.output_dir / "task_traces"
         self.proposer_trace_dir = self.output_dir / "proposer_traces"
         self.cost_log_path = self.output_dir / "cost_log.jsonl"
@@ -113,6 +115,7 @@ class RLMGepaAdapter:
                 heartbeat_interval_seconds=heartbeat_interval_seconds,
                 run_id=run_id,
                 component_focus=project.component_focus,
+                debug_rlm=debug_rlm,
             )
             self.propose_new_texts = proposer.propose_new_texts
 
@@ -190,6 +193,7 @@ class RLMGepaAdapter:
             output_dir=self.output_dir,
             kind=eval_kind,
             verbose_rlm=self.verbose_rlm,
+            debug_rlm=self.debug_rlm,
             concurrency=self.concurrency,
             telemetry_context=eval_telemetry_context,
         )
@@ -520,7 +524,7 @@ class RLMGepaAdapter:
             skills=[],
             max_iterations=self.proposer_max_iterations,
             verbose=True,
-            debug=False,
+            debug=self.debug_rlm,
         )
         progress_write("\n" + "=" * 80)
         progress_write(f"RLM PATCH MERGE PROPOSER STARTING (call {call_idx})")

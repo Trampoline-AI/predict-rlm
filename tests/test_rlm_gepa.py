@@ -2835,6 +2835,7 @@ def test_apply_optimize_args_does_not_mutate_default_config():
         resume=False,
         cache=False,
         verbose_rlm=False,
+        debug_rlm=False,
         merge_proposer=True,
     )
 
@@ -3057,9 +3058,11 @@ def test_adapter_progress_bar_uses_reflective_context(tmp_path: Path, monkeypatc
 class _ContextProject(_Project):
     def __init__(self):
         self.verbose_values: list[bool] = []
+        self.debug_values: list[bool] = []
 
     async def evaluate_example(self, candidate, example, context):
         self.verbose_values.append(context.verbose_rlm)
+        self.debug_values.append(context.debug_rlm)
         return RLMGepaExampleResult(
             score=1.0,
             feedback="",
@@ -3068,7 +3071,7 @@ class _ContextProject(_Project):
         )
 
 
-def test_adapter_propagates_verbose_rlm_to_every_example(tmp_path: Path):
+def test_adapter_propagates_rlm_logging_flags_to_every_example(tmp_path: Path):
     project = _ContextProject()
     adapter = RLMGepaAdapter(
         project=project,
@@ -3080,11 +3083,13 @@ def test_adapter_propagates_verbose_rlm_to_every_example(tmp_path: Path):
         output_dir=tmp_path,
         run_id="run_test",
         verbose_rlm=True,
+        debug_rlm=True,
     )
 
     adapter.evaluate(["a", "b"], {"skill_instructions": "seed"}, capture_traces=False)
 
     assert project.verbose_values == [True, True]
+    assert project.debug_values == [True, True]
 
 
 class _TelemetryProject(_Project):

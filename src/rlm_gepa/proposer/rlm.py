@@ -391,6 +391,7 @@ class RLMInstructionProposer:
         heartbeat_interval_seconds: float = 30.0,
         run_id: str = "run",
         component_focus: Callable[[str], str] | None = None,
+        debug_rlm: bool = False,
     ):
         self.spec = spec
         self.lm = lm
@@ -403,6 +404,7 @@ class RLMInstructionProposer:
         self.heartbeat_interval_seconds = heartbeat_interval_seconds
         self.run_id = run_id
         self.component_focus = component_focus or (lambda _component: "")
+        self.debug_rlm = debug_rlm
         self._call_count = 0
 
     def propose_new_texts(
@@ -465,7 +467,7 @@ class RLMInstructionProposer:
                 skills=[],
                 max_iterations=self.max_iterations,
                 verbose=True,
-                debug=False,
+                debug=self.debug_rlm,
             )
             kwargs: dict[str, Any] = {
                 "current_instructions": current_text,

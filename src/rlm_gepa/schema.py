@@ -151,6 +151,7 @@ class OptimizeConfig:
 
     cache: bool = False
     verbose_rlm: bool = False
+    debug_rlm: bool = False
     display_progress_bar: bool = True
     telemetry_enabled: bool = True
     telemetry_level: str = "minimal"
@@ -228,6 +229,7 @@ class EvaluationContext:
     output_dir: Path
     kind: str
     verbose_rlm: bool = False
+    debug_rlm: bool = False
     concurrency: int | None = None
     telemetry_context: TelemetryContext | None = None
 

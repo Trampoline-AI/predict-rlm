@@ -101,6 +101,7 @@ def run_optimization(
         proposer_timeout=config.proposer_timeout,
         heartbeat_interval_seconds=config.heartbeat_interval_seconds,
         verbose_rlm=config.verbose_rlm,
+        debug_rlm=config.debug_rlm,
         display_progress_bar=config.display_progress_bar,
         valset_size=len(validation.valset),
         telemetry_context=telemetry_context,

@@ -97,7 +97,16 @@ def build_parser(
     optimize.add_argument("--run-dir", type=Path)
     optimize.add_argument("--resume", action="store_true")
     optimize.add_argument("--cache", action="store_true")
-    optimize.add_argument("--verbose-rlm", action="store_true")
+    optimize.add_argument(
+        "--verbose-rlm",
+        action="store_true",
+        help="print RLM reasoning, code, output, tool calls, errors, and submit blocks to stderr",
+    )
+    optimize.add_argument(
+        "--debug-rlm",
+        action="store_true",
+        help="print timestamped RLM and sandbox lifecycle diagnostics to stderr",
+    )
     optimize.add_argument("--telemetry-level", choices=["off", "minimal", "debug"])
     optimize.add_argument("--merge-proposer", action="store_true")
     optimize.add_argument("--max-merge-attempts", type=int)
@@ -156,6 +165,8 @@ def apply_optimize_args(config: OptimizeConfig, args: argparse.Namespace) -> Opt
         config.cache = True
     if args.verbose_rlm:
         config.verbose_rlm = True
+    if args.debug_rlm:
+        config.debug_rlm = True
     telemetry_level = getattr(args, "telemetry_level", None)
     if telemetry_level is not None:
         config.telemetry_level = telemetry_level

@@ -7,7 +7,7 @@ try:
 except ImportError:  # pragma: no cover - exercised only when optional dep is missing
     tqdm = None
 
-RLM_LOGGER_NAME = "dspy.predict.rlm"
+RLM_LOGGER_NAME = "predict_rlm.trace"
 
 
 def progress_write(message: str) -> None:
