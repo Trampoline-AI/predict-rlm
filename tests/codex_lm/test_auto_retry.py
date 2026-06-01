@@ -12,11 +12,28 @@ Persistent failures (all retries exhausted) still raise CodexStreamError
 """
 
 import copy
+import json
+from pathlib import Path
 from unittest import mock
 
 import pytest
 from conftest import build_stream_events
 from dspy_codex_lm import CodexStreamError
+
+
+def _write_auth(path: Path, *, access_token: str, account_id: str) -> Path:
+    path.write_text(
+        json.dumps(
+            {
+                "tokens": {
+                    "access_token": access_token,
+                    "account_id": account_id,
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    return path
 
 
 def _failed_events(code: str = "rate_limit_exceeded", msg: str = "slow down"):
@@ -57,6 +74,52 @@ def test_retries_on_transient_stream_failure_and_succeeds(lm, monkeypatch):
     assert call_sequence == []
 
 
+def test_retry_uses_alternate_rotation_profile_after_stream_stall(tmp_path, monkeypatch):
+    from dspy_codex_lm import CodexLM
+    from dspy_codex_lm.auth import import_auth_profile
+    from dspy_codex_lm.cli import main
+
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
+    monkeypatch.setattr("dspy_codex_lm.lm.CODEX_STREAM_MAX_ATTEMPTS", 2)
+    import_auth_profile(
+        "alpha",
+        _write_auth(tmp_path / "alpha.json", access_token="alpha-token", account_id="acct-alpha"),
+    )
+    import_auth_profile(
+        "beta",
+        _write_auth(tmp_path / "beta.json", access_token="beta-token", account_id="acct-beta"),
+    )
+    assert main(["codex-lm", "rotation", "on"]) == 0
+
+    selected_accounts = iter(["acct-beta", "acct-beta"])
+
+    def choose_credentials(credentials):
+        credentials = tuple(credentials)
+        selected = next(selected_accounts)
+        return next(
+            credential for credential in credentials if credential.account_id == selected
+        )
+
+    seen_headers = []
+    seen_api_keys = []
+    good_events = build_stream_events("ok", input_tokens=5, output_tokens=1)
+
+    def fake_responses(*, headers, api_key, **_):
+        seen_headers.append(headers["ChatGPT-Account-Id"])
+        seen_api_keys.append(api_key)
+        if len(seen_headers) == 1:
+            raise CodexStreamError("Codex stream stalled")
+        return iter(copy.deepcopy(good_events))
+
+    monkeypatch.setattr("dspy_codex_lm.lm.random.choice", choose_credentials)
+    with mock.patch("dspy_codex_lm.lm.litellm.responses", side_effect=fake_responses):
+        response = CodexLM(model="gpt-5.3-codex").forward(prompt="hi")
+
+    assert response.output[0].content[0].text == "ok"
+    assert seen_headers == ["acct-beta", "acct-alpha"]
+    assert seen_api_keys == ["beta-token", "alpha-token"]
+
+
 def test_retries_exhausted_raises_codex_stream_error(lm, monkeypatch):
     """After all configured retries fail, the last CodexStreamError
     propagates with the real upstream error message.
@@ -77,6 +140,59 @@ def test_retries_exhausted_raises_codex_stream_error(lm, monkeypatch):
     from dspy_codex_lm.lm import CODEX_STREAM_MAX_ATTEMPTS
 
     assert attempts["n"] == CODEX_STREAM_MAX_ATTEMPTS
+
+
+async def test_aforward_retry_uses_alternate_rotation_profile_after_stream_stall(
+    tmp_path,
+    monkeypatch,
+):
+    from dspy_codex_lm import CodexLM
+    from dspy_codex_lm.auth import import_auth_profile
+    from dspy_codex_lm.cli import main
+
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
+    monkeypatch.setattr("dspy_codex_lm.lm.CODEX_STREAM_MAX_ATTEMPTS", 2)
+    import_auth_profile(
+        "alpha",
+        _write_auth(tmp_path / "alpha.json", access_token="alpha-token", account_id="acct-alpha"),
+    )
+    import_auth_profile(
+        "beta",
+        _write_auth(tmp_path / "beta.json", access_token="beta-token", account_id="acct-beta"),
+    )
+    assert main(["codex-lm", "rotation", "on"]) == 0
+
+    selected_accounts = iter(["acct-beta", "acct-beta"])
+
+    def choose_credentials(credentials):
+        credentials = tuple(credentials)
+        selected = next(selected_accounts)
+        return next(
+            credential for credential in credentials if credential.account_id == selected
+        )
+
+    seen_headers = []
+    seen_api_keys = []
+    good_events = build_stream_events("ok", input_tokens=5, output_tokens=1)
+
+    async def good_stream():
+        for event in copy.deepcopy(good_events):
+            yield event
+
+    async def fake_aresponses(*, headers, api_key, **_):
+        seen_headers.append(headers["ChatGPT-Account-Id"])
+        seen_api_keys.append(api_key)
+        if len(seen_headers) == 1:
+            raise CodexStreamError("Codex stream stalled")
+        return good_stream()
+
+    monkeypatch.setattr("dspy_codex_lm.lm.random.choice", choose_credentials)
+    with mock.patch("dspy_codex_lm.lm.litellm.aresponses", side_effect=fake_aresponses):
+        response = await CodexLM(model="gpt-5.3-codex").aforward(prompt="hi")
+
+    assert response.output[0].content[0].text == "ok"
+    assert seen_headers == ["acct-beta", "acct-alpha"]
+    assert seen_api_keys == ["beta-token", "alpha-token"]
 
 
 async def test_aforward_retries_on_transient_failure(lm, monkeypatch):
