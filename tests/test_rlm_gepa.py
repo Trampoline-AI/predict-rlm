@@ -2861,6 +2861,31 @@ class _TimeoutProject(_Project):
         return RLMGepaExampleResult(score=1.0, feedback="ok", traces=[])
 
 
+class _ExampleTimeoutProject(_Project):
+    def task_timeout_for_example(self, example, default_timeout):
+        return 1
+
+    def task_resources_for_example(self, example):
+        return {"cpus": 2, "memory_mb": 4096}
+
+    async def evaluate_example(self, candidate, example, context):
+        await asyncio.sleep(0.02)
+        return RLMGepaExampleResult(
+            score=1.0,
+            feedback=f"timeout={context.task_timeout} resources={dict(context.task_resources)}",
+            traces=[
+                RunTrace(
+                    status="completed",
+                    model="test",
+                    iterations=1,
+                    max_iterations=1,
+                    duration_ms=1,
+                )
+            ],
+            example_id=str(example),
+        )
+
+
 class _ImmediateProject(_Project):
     async def evaluate_example(self, candidate, example, context):
         return RLMGepaExampleResult(
@@ -3493,6 +3518,26 @@ def test_adapter_enforces_per_example_timeout(tmp_path: Path):
 
     assert batch.scores == [0.0]
     assert batch.trajectories[0]["record"]["Feedback"] == "evaluation timeout at 0.01s"
+
+
+def test_adapter_uses_project_timeout_and_resources_for_each_example(tmp_path: Path):
+    adapter = RLMGepaAdapter(
+        project=_ExampleTimeoutProject(),
+        lm=_DummyLM(),
+        sub_lm=_DummyLM(),
+        max_iterations=1,
+        concurrency=1,
+        task_timeout=0.01,
+        output_dir=tmp_path,
+        run_id="run_test",
+    )
+
+    batch = adapter.evaluate(["example"], {"skill_instructions": "seed"}, capture_traces=True)
+
+    assert batch.scores == [1.0]
+    assert batch.trajectories[0]["record"]["Feedback"] == (
+        "timeout=1 resources={'cpus': 2, 'memory_mb': 4096}"
+    )
 
 
 def test_adapter_prints_big_warning_for_evaluation_errors(tmp_path: Path, monkeypatch):
