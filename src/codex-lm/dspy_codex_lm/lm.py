@@ -1,9 +1,12 @@
 import asyncio
+import json
 import logging
+import os
 import random
 import uuid
 import warnings
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from time import monotonic
 from typing import Any
@@ -64,10 +67,221 @@ CODEX_STREAM_WAIT_MAX: float = 8.0
 # socket read that never hits an await point, and TCP keepalive is 2
 # hours by default on macOS. 30s comfortably covers slow first-token
 # latency and normal inter-token gaps while keeping stalls observable.
-CODEX_STREAM_HEARTBEAT_SEC: float = 30.0
+CODEX_STREAM_HEARTBEAT_SEC: float = float(
+    os.environ.get("CODEX_STREAM_HEARTBEAT_SEC", "30.0")
+)
 DEFAULT_CODEX_MODEL = "gpt-5.5"
 
 logger = logging.getLogger(__name__)
+
+_DEBUG_TRUE_VALUES = {"1", "true", "yes", "on"}
+
+
+def _debug_env_enabled() -> bool:
+    return any(
+        os.environ.get(name, "").strip().lower() in _DEBUG_TRUE_VALUES
+        for name in (
+            "PREDICT_RLM_DEBUG",
+            "RLM_DEBUG",
+            "CODEX_LM_DEBUG",
+            "DSPY_CODEX_LM_DEBUG",
+        )
+    )
+
+
+def _codex_debug_event(event: str, **metadata: Any) -> None:
+    if not _debug_env_enabled():
+        return
+
+    try:
+        from predict_rlm.debug import debug_event, sanitize_metadata
+    except Exception:
+        sanitize_metadata = None
+    else:
+        if os.environ.get("PREDICT_RLM_DEBUG") or os.environ.get("RLM_DEBUG"):
+            debug_event(event, **metadata)
+            return
+
+    payload = {
+        "ts": datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
+        "event": event,
+        **(sanitize_metadata(metadata) if sanitize_metadata is not None else metadata),
+    }
+    line = json.dumps(payload, sort_keys=True, default=str)
+    log_path = os.environ.get("CODEX_LM_DEBUG_LOG") or os.environ.get("PREDICT_RLM_DEBUG_LOG")
+    if log_path:
+        try:
+            path = Path(log_path)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with path.open("a", encoding="utf-8") as handle:
+                handle.write(line + "\n")
+            return
+        except Exception:
+            pass
+    logger.debug(line)
+
+
+def _elapsed_ms(start: float, end: float | None) -> float | None:
+    if end is None:
+        return None
+    return round((end - start) * 1000.0, 3)
+
+
+def _prompt_cache_stats(usage: Any) -> dict[str, Any]:
+    prompt_tokens = _coerce_int(_g(usage, "prompt_tokens"))
+    if prompt_tokens is None:
+        prompt_tokens = _coerce_int(_g(usage, "input_tokens"))
+    details = _g(usage, "prompt_tokens_details") or _g(usage, "input_tokens_details")
+    cached_prompt_tokens = _coerce_int(_g(details, "cached_tokens"))
+    stats: dict[str, Any] = {}
+    if prompt_tokens is not None:
+        stats["prompt_tokens"] = prompt_tokens
+    if cached_prompt_tokens is not None:
+        stats["cached_prompt_tokens"] = cached_prompt_tokens
+        stats["prompt_cache_read_ratio"] = (
+            cached_prompt_tokens / prompt_tokens if prompt_tokens else 0.0
+        )
+    return stats
+
+
+def _coerce_int(value: Any) -> int | None:
+    if isinstance(value, bool) or value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+@dataclass
+class _StreamTiming:
+    model: str
+    attempt_number: int | None
+    start_at: float
+    auth_metadata: dict[str, Any] | None = None
+    first_event_at: float | None = None
+    first_text_delta_at: float | None = None
+    stream_end_at: float | None = None
+    output_text_chars: int = 0
+    events_before_first_text: int = 0
+    max_inter_event_gap_ms: float | None = None
+    last_event_type: str | None = None
+    last_event_at: float | None = None
+    non_text_event_counts: dict[str, int] | None = None
+
+    def emit_start(self) -> None:
+        _codex_debug_event(
+            "codex_lm.stream.start",
+            model=self.model,
+            attempt_number=self.attempt_number,
+            **(self.auth_metadata or {}),
+        )
+
+    def observe_event(self, event: Any) -> None:
+        now = monotonic()
+        etype = str(_g(event, "type") or "unknown")
+        self._record_event_gap(now)
+        self.last_event_type = etype
+        self.last_event_at = now
+        if self.first_event_at is None:
+            self.first_event_at = now
+            _codex_debug_event(
+                "codex_lm.stream.first_event",
+                model=self.model,
+                attempt_number=self.attempt_number,
+                first_event_type=etype,
+                tt_first_event_ms=_elapsed_ms(self.start_at, now),
+                **(self.auth_metadata or {}),
+            )
+        if etype == "response.output_text.delta":
+            delta = _g(event, "delta")
+            if delta:
+                self.output_text_chars += len(delta)
+                if self.first_text_delta_at is None:
+                    self.first_text_delta_at = now
+                    _codex_debug_event(
+                        "codex_lm.stream.first_text_delta",
+                        model=self.model,
+                        attempt_number=self.attempt_number,
+                        tt_first_event_ms=_elapsed_ms(
+                            self.start_at,
+                            self.first_event_at,
+                        ),
+                        ttft_ms=_elapsed_ms(self.start_at, now),
+                        first_delta_chars=len(delta),
+                        **(self.auth_metadata or {}),
+                    )
+            elif self.first_text_delta_at is None:
+                self.events_before_first_text += 1
+        else:
+            if self.non_text_event_counts is None:
+                self.non_text_event_counts = {}
+            self.non_text_event_counts[etype] = self.non_text_event_counts.get(etype, 0) + 1
+            if self.first_text_delta_at is None:
+                self.events_before_first_text += 1
+
+    def _record_event_gap(self, now: float) -> None:
+        if self.last_event_at is None:
+            return
+        gap_ms = _elapsed_ms(self.last_event_at, now)
+        if gap_ms is None:
+            return
+        if self.max_inter_event_gap_ms is None or gap_ms > self.max_inter_event_gap_ms:
+            self.max_inter_event_gap_ms = gap_ms
+
+    def _event_gap_metadata(self, now: float | None = None) -> dict[str, Any]:
+        metadata: dict[str, Any] = {
+            "events_before_first_text": self.events_before_first_text,
+            "max_inter_event_gap_ms": self.max_inter_event_gap_ms,
+            "last_event_type": self.last_event_type,
+            "non_text_event_counts": self.non_text_event_counts or {},
+        }
+        if now is not None and self.last_event_at is not None:
+            metadata["last_event_age_ms"] = _elapsed_ms(self.last_event_at, now)
+        else:
+            metadata["last_event_age_ms"] = None
+        return metadata
+
+    def mark_stream_end(self) -> None:
+        self.stream_end_at = monotonic()
+
+    def emit_end(self, state: dict[str, Any], *, finished_at: float) -> None:
+        _codex_debug_event(
+            "codex_lm.stream.end",
+            model=self.model,
+            attempt_number=self.attempt_number,
+            tt_first_event_ms=_elapsed_ms(self.start_at, self.first_event_at),
+            ttft_ms=_elapsed_ms(self.start_at, self.first_text_delta_at),
+            stream_total_ms=_elapsed_ms(self.start_at, self.stream_end_at),
+            parse_overhead_ms=_elapsed_ms(self.stream_end_at, finished_at)
+            if self.stream_end_at is not None
+            else None,
+            output_text_chars=self.output_text_chars,
+            completed=bool(state.get("completed")),
+            **(self.auth_metadata or {}),
+            **self._event_gap_metadata(finished_at),
+            **_prompt_cache_stats(state.get("usage_raw")),
+        )
+
+    def emit_error(self, state: dict[str, Any], exc: BaseException) -> None:
+        if self.stream_end_at is None:
+            self.mark_stream_end()
+        failure = state.get("failure") or {}
+        _codex_debug_event(
+            "codex_lm.stream.error",
+            model=self.model,
+            attempt_number=self.attempt_number,
+            tt_first_event_ms=_elapsed_ms(self.start_at, self.first_event_at),
+            ttft_ms=_elapsed_ms(self.start_at, self.first_text_delta_at),
+            stream_total_ms=_elapsed_ms(self.start_at, self.stream_end_at),
+            output_text_chars=self.output_text_chars,
+            completed=bool(state.get("completed")),
+            failure_kind=failure.get("kind") or type(exc).__name__,
+            failure_code=failure.get("code"),
+            exception_type=type(exc).__name__,
+            **(self.auth_metadata or {}),
+            **self._event_gap_metadata(self.stream_end_at),
+        )
 
 
 def _codex_retry_kwargs() -> dict[str, Any]:
@@ -220,6 +434,8 @@ def _g(obj: Any, key: str, default: Any = None) -> Any:
 class _AuthCredentials:
     access_token: str
     account_id: str
+    profile: str | None = None
+    source: str | None = None
 
 
 @dataclass(frozen=True)
@@ -307,34 +523,74 @@ class CodexLM(dspy.LM):
         if request["model"].startswith("openai/"):
             request["model"] = request["model"].split("/", 1)[1]
 
-        access_token, account_id = self._request_auth()
-        request["api_key"] = access_token
-
         request["store"] = False
         request["stream"] = True
         request["custom_llm_provider"] = "openai"
         request.setdefault("instructions", self._instructions)
 
         headers = dict(request.pop("headers", None) or {})
-        headers["ChatGPT-Account-Id"] = account_id
+        self._apply_request_auth(request, headers)
         headers["originator"] = "opencode"
         headers["session_id"] = str(uuid.uuid4())
         return request, headers
 
-    def _request_auth(self) -> tuple[str, str]:
+    def _request_auth(
+        self,
+        *,
+        exclude_profile: str | None = None,
+        exclude_account_id: str | None = None,
+    ) -> _AuthCredentials:
         if self._pinned_access_token is not None and self._pinned_account_id is not None:
-            return self._pinned_access_token, self._pinned_account_id
+            return _AuthCredentials(
+                self._pinned_access_token,
+                self._pinned_account_id,
+                profile=self._auth_profile,
+                source="profile" if self._auth_profile is not None else "pinned",
+            )
         snapshot = self._cached_auth_config_snapshot()
         if snapshot.error is not None:
             raise snapshot.error
         if not snapshot.credentials:
             raise FileNotFoundError("no codex-lm auth credentials available")
-        credentials = (
-            random.choice(snapshot.credentials)
-            if snapshot.rotating
-            else snapshot.credentials[0]
+        credentials = snapshot.credentials
+        if not snapshot.rotating:
+            return credentials[0]
+        if len(credentials) > 1 and (exclude_profile is not None or exclude_account_id is not None):
+            alternates = tuple(
+                credential
+                for credential in credentials
+                if credential.profile != exclude_profile
+                and credential.account_id != exclude_account_id
+            )
+            if len(alternates) == 1:
+                return alternates[0]
+            if alternates:
+                credentials = alternates
+        return random.choice(credentials)
+
+    def _apply_request_auth(
+        self,
+        request: dict[str, Any],
+        headers: dict[str, str],
+        *,
+        exclude_profile: str | None = None,
+        exclude_account_id: str | None = None,
+    ) -> dict[str, Any]:
+        credentials = self._request_auth(
+            exclude_profile=exclude_profile,
+            exclude_account_id=exclude_account_id,
         )
-        return credentials.access_token, credentials.account_id
+        request["api_key"] = credentials.access_token
+        headers["ChatGPT-Account-Id"] = credentials.account_id
+        metadata = self._auth_debug_metadata(credentials)
+        request["_codex_lm_auth_metadata"] = metadata
+        return metadata
+
+    def _auth_debug_metadata(self, credentials: _AuthCredentials) -> dict[str, Any]:
+        metadata: dict[str, Any] = {"auth_source": credentials.source}
+        if credentials.profile is not None:
+            metadata["auth_profile"] = credentials.profile
+        return metadata
 
     def _cached_auth_config_snapshot(self) -> _AuthConfigSnapshot:
         now = monotonic()
@@ -365,13 +621,27 @@ class CodexLM(dspy.LM):
         if source.source != "rotation":
             access_token, account_id = load_codex_auth(source.path)
             return _AuthConfigSnapshot(
-                credentials=(_AuthCredentials(access_token, account_id),),
+                credentials=(
+                    _AuthCredentials(
+                        access_token,
+                        account_id,
+                        profile=source.profile,
+                        source=source.source,
+                    ),
+                ),
             )
 
         credentials = []
         for profile in list_enabled_auth_profiles():
             access_token, account_id = load_codex_auth(profile_auth_path(profile))
-            credentials.append(_AuthCredentials(access_token, account_id))
+            credentials.append(
+                _AuthCredentials(
+                    access_token,
+                    account_id,
+                    profile=profile,
+                    source="rotation",
+                )
+            )
         if not credentials:
             raise ValueError(
                 "auth profile rotation is enabled but no enabled auth profiles "
@@ -508,27 +778,51 @@ class CodexLM(dspy.LM):
 
     def forward(self, prompt=None, messages=None, **kwargs):
         request, headers = self._build_request(prompt, messages, kwargs)
+        auth_metadata = request.pop("_codex_lm_auth_metadata", {})
         cache = kwargs.pop("cache", self.cache)
 
         def _completion(request, num_retries, cache):
+            nonlocal auth_metadata
             for attempt in Retrying(**_codex_retry_kwargs()):
                 with attempt:
-                    stream = litellm.responses(
-                        headers=headers,
-                        num_retries=num_retries,
-                        **request,
+                    if attempt.retry_state.attempt_number > 1:
+                        auth_metadata = self._apply_request_auth(
+                            request,
+                            headers,
+                            exclude_profile=auth_metadata.get("auth_profile"),
+                        )
+                        request.pop("_codex_lm_auth_metadata", None)
+                    timing = _StreamTiming(
+                        model=str(request.get("model") or self.model),
+                        attempt_number=attempt.retry_state.attempt_number,
+                        start_at=monotonic(),
+                        auth_metadata=auth_metadata,
                     )
-                    stream = _disable_litellm_stream_logging(stream)
                     state = self._fresh_state()
-                    for event in _iter_stream_with_heartbeat(stream):
-                        self._handle_event(event, state)
-                    self._raise_if_failed(state)
-                    return self._assemble(
-                        text_parts=state["text_parts"],
-                        usage_raw=state["usage_raw"],
-                        response_id=state["response_id"],
-                        model_name=state["model_name"],
-                    )
+                    timing.emit_start()
+                    try:
+                        stream = litellm.responses(
+                            headers=headers,
+                            num_retries=num_retries,
+                            **request,
+                        )
+                        stream = _disable_litellm_stream_logging(stream)
+                        for event in _iter_stream_with_heartbeat(stream):
+                            timing.observe_event(event)
+                            self._handle_event(event, state)
+                        timing.mark_stream_end()
+                        self._raise_if_failed(state)
+                        result = self._assemble(
+                            text_parts=state["text_parts"],
+                            usage_raw=state["usage_raw"],
+                            response_id=state["response_id"],
+                            model_name=state["model_name"],
+                        )
+                        timing.emit_end(state, finished_at=monotonic())
+                        return result
+                    except Exception as exc:
+                        timing.emit_error(state, exc)
+                        raise
 
         completion_fn, litellm_cache_args = self._get_cached_completion_fn(_completion, cache)
         results = completion_fn(
@@ -543,27 +837,51 @@ class CodexLM(dspy.LM):
 
     async def aforward(self, prompt=None, messages=None, **kwargs):
         request, headers = self._build_request(prompt, messages, kwargs)
+        auth_metadata = request.pop("_codex_lm_auth_metadata", {})
         cache = kwargs.pop("cache", self.cache)
 
         async def _acompletion(request, num_retries, cache):
+            nonlocal auth_metadata
             async for attempt in AsyncRetrying(**_codex_retry_kwargs()):
                 with attempt:
-                    stream = await litellm.aresponses(
-                        headers=headers,
-                        num_retries=num_retries,
-                        **request,
+                    if attempt.retry_state.attempt_number > 1:
+                        auth_metadata = self._apply_request_auth(
+                            request,
+                            headers,
+                            exclude_profile=auth_metadata.get("auth_profile"),
+                        )
+                        request.pop("_codex_lm_auth_metadata", None)
+                    timing = _StreamTiming(
+                        model=str(request.get("model") or self.model),
+                        attempt_number=attempt.retry_state.attempt_number,
+                        start_at=monotonic(),
+                        auth_metadata=auth_metadata,
                     )
-                    stream = _disable_litellm_stream_logging(stream)
                     state = self._fresh_state()
-                    async for event in _aiter_stream_with_heartbeat(stream):
-                        self._handle_event(event, state)
-                    self._raise_if_failed(state)
-                    return self._assemble(
-                        text_parts=state["text_parts"],
-                        usage_raw=state["usage_raw"],
-                        response_id=state["response_id"],
-                        model_name=state["model_name"],
-                    )
+                    timing.emit_start()
+                    try:
+                        stream = await litellm.aresponses(
+                            headers=headers,
+                            num_retries=num_retries,
+                            **request,
+                        )
+                        stream = _disable_litellm_stream_logging(stream)
+                        async for event in _aiter_stream_with_heartbeat(stream):
+                            timing.observe_event(event)
+                            self._handle_event(event, state)
+                        timing.mark_stream_end()
+                        self._raise_if_failed(state)
+                        result = self._assemble(
+                            text_parts=state["text_parts"],
+                            usage_raw=state["usage_raw"],
+                            response_id=state["response_id"],
+                            model_name=state["model_name"],
+                        )
+                        timing.emit_end(state, finished_at=monotonic())
+                        return result
+                    except Exception as exc:
+                        timing.emit_error(state, exc)
+                        raise
 
         completion_fn, litellm_cache_args = self._get_cached_completion_fn(_acompletion, cache)
         results = await completion_fn(
