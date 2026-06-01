@@ -117,6 +117,16 @@ Each example follows: `schema.py` (Pydantic models) -> `signature.py` (DSPy Sign
 - **No dead code** - When creating a new component that replaces an existing one, delete the old file. Check for unused exports before committing.
 - **No code duplication** - If two components share the same logic, extract the shared logic into a single source of truth. Before adding a new component, check if a near-identical one already exists.
 
+### Type Discipline and Failure Behavior
+- **Prefer maintainability over implementation speed** - Take the time to model the code correctly instead of shipping loose or defensive shortcuts. Reusable, typed, simple code is better than fast glue code.
+- **Avoid defensive programming by default** - Do not add guards, fallbacks, permissive coercions, or compatibility branches unless the boundary explicitly requires them and the behavior is documented by tests.
+- **Type the contract you depend on** - If code needs a particular object shape, annotate that exact type. If the shape is not already named, introduce the smallest appropriate type, protocol, dataclass, or Pydantic model instead of using `Any` or guessing fields dynamically.
+- **Use Pydantic for structured boundaries** - When accepting or reconstructing structured external data, use a Pydantic model when validation, coercion, or field documentation is useful. Let Pydantic raise validation errors instead of hand-rolling partial checks.
+- **Avoid defensive attribute access** - Do not use `getattr(obj, "field", None)` or similar probes to hide missing attributes on objects whose shape is expected. Prefer direct attribute access on typed objects so incorrect shape fails loudly.
+- **No blanket exception handling** - Avoid broad `try`/`except`, especially `except Exception` or empty handlers. Catch the specific exception only when recovery is intentional; otherwise let failures bubble up.
+- **No shape normalization** - Do not "normalize" variable names, aliases, object shapes, or payload variants to hide contract mismatches. If a caller provides the wrong field name or shape, fail loudly so the mismatch is fixed at the source.
+- **Fail loudly** - Missing dependencies, impossible states, invalid payloads, and unexpected response shapes should raise clear errors rather than degrade silently.
+
 ### Pydantic Models
 - **Use Field descriptions** - All non-obvious fields should use `Field(description=...)` for self-documentation
 - **Separate LLM vs internal models** - Models for LLM I/O should be lean (avoid context rot). Internal models can have richer fields.
