@@ -25,6 +25,8 @@ from unittest.mock import MagicMock
 import pytest
 from dspy.primitives.repl_types import REPLEntry
 
+from predict_rlm.trace import LMFinishMetadata
+
 
 def _patch_build_run_trace(predictor, sentinel):
     """Make _build_run_trace return a sentinel object we can recognise."""
@@ -152,6 +154,13 @@ class TestAsyncForwardTracedCancellationPath:
             output="",
         )
         predictor._partial_pending_start = time.perf_counter()
+        predictor._partial_pending_lm_metadata = LMFinishMetadata(finish_reason="stop")
+        predictor._partial_pending_lm_history = [
+            {
+                "usage": {"prompt_tokens": 10, "completion_tokens": 4},
+                "cost": 0.001,
+            }
+        ]
         lm = SimpleNamespace(model="fake-main", history=[])
 
         trace = predictor._build_run_trace(
@@ -168,6 +177,11 @@ class TestAsyncForwardTracedCancellationPath:
         assert trace.steps[0].reasoning == "about to call a slow tool"
         assert trace.steps[0].code == "await slow_tool()"
         assert trace.steps[0].error is True
+        assert trace.steps[0].lm == LMFinishMetadata(finish_reason="stop")
+        assert trace.steps[0].usage.main_lm == {"prompt_tokens": 10, "completion_tokens": 4}
+        assert trace.steps[0].usage.sub_lm == {}
+        assert trace.steps[0].cost.main_lm == 0.001
+        assert trace.steps[0].cost.sub_lm == 0.0
 
 
 class TestHandlerWideningIsAnchored:

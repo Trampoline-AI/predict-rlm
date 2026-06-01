@@ -589,7 +589,7 @@ class RLMGepaAdapter:
             sub_role = "sub_lm"
 
         rows: list[CostRow] = []
-        if main_usage is not None and (main_usage.input_tokens or main_usage.output_tokens or main_usage.cache_hits):
+        if main_usage is not None and (main_usage.input_tokens or main_usage.output_tokens):
             rows.append(
                 CostRow(
                     event_id=event_id,
@@ -602,11 +602,10 @@ class RLMGepaAdapter:
                     input_tokens=main_usage.input_tokens,
                     output_tokens=main_usage.output_tokens,
                     cost_usd=main_usage.cost,
-                    cache_hits=main_usage.cache_hits,
                 )
             )
         if sub_usage is not None and sub_model and (
-            sub_usage.input_tokens or sub_usage.output_tokens or sub_usage.cache_hits
+            sub_usage.input_tokens or sub_usage.output_tokens
         ):
             rows.append(
                 CostRow(
@@ -620,7 +619,6 @@ class RLMGepaAdapter:
                     input_tokens=sub_usage.input_tokens,
                     output_tokens=sub_usage.output_tokens,
                     cost_usd=sub_usage.cost,
-                    cache_hits=sub_usage.cache_hits,
                 )
             )
         if rows:

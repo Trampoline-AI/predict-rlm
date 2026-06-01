@@ -96,7 +96,6 @@ class CostRow:
     input_tokens: int
     output_tokens: int
     cost_usd: float
-    cache_hits: int = 0
     ts: str | None = None
     schema_version: int = SCHEMA_VERSION
 
@@ -114,7 +113,6 @@ class CostRow:
             "input_tokens": self.input_tokens,
             "output_tokens": self.output_tokens,
             "cost_usd": self.cost_usd,
-            "cache_hits": self.cache_hits,
         }
 
 

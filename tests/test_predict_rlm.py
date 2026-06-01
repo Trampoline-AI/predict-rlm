@@ -14,6 +14,7 @@ from dspy.primitives.repl_types import REPLEntry, REPLHistory
 from pydantic import BaseModel
 
 from predict_rlm import PredictRLM, RuntimeHook, SbxConfig, SbxInterpreter, SbxPool
+from predict_rlm.interpreter import FinalOutput
 from predict_rlm.predict_rlm import _models_from_schema
 from predict_rlm.rlm_skills import Skill
 from predict_rlm.telemetry import TelemetryContext, classify_failure
@@ -67,6 +68,20 @@ class ListTelemetrySink:
 
     def write(self, record: dict[str, Any]) -> None:
         self.records.append(record)
+
+
+def _lm_with_history() -> dspy.LM:
+    lm = MagicMock(spec=dspy.LM)
+    lm.history = []
+    lm.kwargs = {"max_tokens": None}
+    return lm
+
+
+class _TraceTestLM:
+    def __init__(self, model: str):
+        self.model = model
+        self.history: list[dict[str, Any]] = []
+        self.kwargs = {"max_tokens": None}
 
 
 class TestSandboxBackendSelection:
@@ -1024,6 +1039,7 @@ class TestTracedErrorHandling:
         context.__exit__.return_value = False
 
         with (
+            dspy.context(lm=_lm_with_history()),
             patch.object(PredictRLM, "_interpreter_context", return_value=context),
             patch.object(PredictRLM, "_prepare_execution_tools", return_value={}),
             patch.object(PredictRLM, "_build_variables", return_value={}),
@@ -1048,6 +1064,12 @@ class TestTracedErrorHandling:
 
         def side_effect(repl_obj, _variables, _history, iteration, _input_args, _output_fields):
             if iteration == 0:
+                rlm._last_action_lm_history = [
+                    {
+                        "usage": {"prompt_tokens": 12, "completion_tokens": 3},
+                        "cost": 0.001,
+                    }
+                ]
                 return REPLHistory(
                     entries=[
                         REPLEntry(reasoning="first", code="print('ok')", output="ok"),
@@ -1056,6 +1078,7 @@ class TestTracedErrorHandling:
             raise RuntimeError("boom")
 
         with (
+            dspy.context(lm=_lm_with_history()),
             patch.object(PredictRLM, "_interpreter_context", return_value=context),
             patch.object(PredictRLM, "_prepare_execution_tools", return_value={}),
             patch.object(PredictRLM, "_build_variables", return_value={}),
@@ -1071,6 +1094,129 @@ class TestTracedErrorHandling:
         assert exc.trace.steps[0].iteration == 1
         assert exc.trace.steps[0].reasoning == "first"
 
+    def test_forward_traced_stores_action_lm_history_on_iteration_step(self):
+        mock_lm = MagicMock()
+        mock_lm.history = []
+        rlm = PredictRLM(ImageAnalysisSignature, lm=mock_lm, max_iterations=1)
+
+        repl = MagicMock()
+        context = MagicMock()
+        context.__enter__.return_value = repl
+        context.__exit__.return_value = False
+
+        def execute_iteration(*_args, **_kwargs):
+            rlm._last_action_lm_history = [
+                {
+                    "usage": {"prompt_tokens": 34, "completion_tokens": 13, "total_tokens": 47},
+                    "cost": 0.02,
+                }
+            ]
+            return dspy.Prediction(
+                answer="ok",
+                trajectory=[
+                    {
+                        "reasoning": "submit",
+                        "code": "SUBMIT(answer='ok')",
+                        "output": "FINAL: {'answer': 'ok'}",
+                    }
+                ],
+            )
+
+        with (
+            dspy.context(lm=mock_lm),
+            patch.object(PredictRLM, "_interpreter_context", return_value=context),
+            patch.object(PredictRLM, "_prepare_execution_tools", return_value={}),
+            patch.object(PredictRLM, "_build_variables", return_value={}),
+            patch.object(rlm, "_execute_iteration", side_effect=execute_iteration),
+        ):
+            prediction = rlm._forward_traced(None, images=["img"], query="q")
+
+        step = prediction.trace.steps[0]
+        assert step.usage.main_lm == {
+            "prompt_tokens": 34,
+            "completion_tokens": 13,
+            "total_tokens": 47,
+        }
+        assert step.usage.sub_lm == {}
+        assert step.cost.main_lm == 0.02
+        assert step.cost.sub_lm == 0.0
+
+    def test_forward_traced_splits_root_predict_usage_when_sub_lm_uses_main_lm(self):
+        main_lm = _TraceTestLM("main-model")
+
+        class FakeRepl:
+            def configure_runtime(self, *, tools, output_fields):
+                self.tools = tools
+
+            def reset(self):
+                pass
+
+            def execute(self, _code, variables=None):
+                result = asyncio.get_event_loop().run_until_complete(
+                    self.tools["predict"](
+                        "question -> answer",
+                        question=variables["query"],
+                    )
+                )
+                return FinalOutput({"answer": result["answer"]})
+
+        class FakePredictor:
+            async def acall(self, **_kwargs):
+                dspy.settings.lm.history.append(
+                    {
+                        "usage": {
+                            "prompt_tokens": 7,
+                            "completion_tokens": 3,
+                            "total_tokens": 10,
+                        },
+                        "cost": 0.004,
+                    }
+                )
+                return dspy.Prediction(answer="sub answer")
+
+        rlm = PredictRLM(
+            ImageAnalysisSignature,
+            lm=main_lm,
+            sub_lm=None,
+            max_iterations=1,
+            interpreter=FakeRepl(),
+        )
+
+        def generate_action(**_kwargs):
+            dspy.settings.lm.history.append(
+                {
+                    "usage": {
+                        "prompt_tokens": 11,
+                        "completion_tokens": 5,
+                        "total_tokens": 16,
+                    },
+                    "cost": 0.02,
+                }
+            )
+            return dspy.Prediction(reasoning="call predict", code="result = await predict(...)")
+
+        rlm.generate_action = generate_action
+
+        with patch("predict_rlm.predict_rlm.dspy.Predict", return_value=FakePredictor()):
+            prediction = rlm.forward(images=["img"], query="q")
+
+        trace = prediction.trace
+        step = trace.steps[0]
+        assert trace.sub_model is None
+        assert trace.usage.main.input_tokens == 11
+        assert trace.usage.main.output_tokens == 5
+        assert trace.usage.main.cost == 0.02
+        assert trace.usage.sub.input_tokens == 7
+        assert trace.usage.sub.output_tokens == 3
+        assert trace.usage.sub.cost == 0.004
+        assert step.usage.sub_lm == {
+            "prompt_tokens": 7,
+            "completion_tokens": 3,
+            "total_tokens": 10,
+        }
+        assert step.cost.sub_lm == 0.004
+        assert step.predict_calls[0].total_usage.input_tokens == 7
+
     @pytest.mark.asyncio
     async def test_aforward_traced_error_attaches_error_trace(self):
         mock_lm = MagicMock()
@@ -1082,6 +1228,7 @@ class TestTracedErrorHandling:
         context.__exit__.return_value = False
 
         with (
+            dspy.context(lm=_lm_with_history()),
             patch.object(PredictRLM, "_interpreter_context", return_value=context),
             patch.object(PredictRLM, "_prepare_execution_tools", return_value={}),
             patch.object(PredictRLM, "_build_variables", return_value={}),
@@ -1678,7 +1825,10 @@ class TestExecuteIteration:
         rlm.generate_action = MagicMock(return_value=mock_pred)
 
         mock_result = MagicMock()
-        with patch.object(rlm, "_process_execution_result", return_value=mock_result):
+        with (
+            dspy.context(lm=_lm_with_history()),
+            patch.object(rlm, "_process_execution_result", return_value=mock_result),
+        ):
             result = rlm._execute_iteration(
                 repl=mock_repl,
                 variables=[],
@@ -1690,6 +1840,54 @@ class TestExecuteIteration:
 
         mock_repl.execute.assert_called_once_with("print('hello')", variables={})
         assert result is mock_result
+
+    def test_sync_path_captures_action_lm_history(self):
+        mock_lm = MagicMock()
+        mock_lm.history = []
+        rlm = PredictRLM(ImageAnalysisSignature, lm=mock_lm, max_iterations=5)
+
+        mock_repl = MagicMock()
+        mock_repl.execute = MagicMock(return_value="output from execute")
+
+        mock_pred = MagicMock()
+        mock_pred.reasoning = "thinking"
+        mock_pred.code = "print('hello')"
+
+        def generate_action(**_kwargs):
+            mock_lm.history.append(
+                {
+                    "messages": [{"role": "user", "content": "generate the next action"}],
+                    "kwargs": {"temperature": 0.0},
+                    "outputs": ["Reasoning: thinking\nCode: print('hello')"],
+                    "usage": {"prompt_tokens": 21, "completion_tokens": 8},
+                    "cost": 0.004,
+                    "response": {"choices": [{"finish_reason": "stop"}]},
+                }
+            )
+            return mock_pred
+
+        rlm.generate_action = MagicMock(side_effect=generate_action)
+        mock_result = MagicMock()
+
+        with dspy.context(lm=mock_lm):
+            with patch.object(rlm, "_process_execution_result", return_value=mock_result):
+                result = rlm._execute_iteration(
+                    repl=mock_repl,
+                    variables=[],
+                    history=[],
+                    iteration=0,
+                    input_args={},
+                    output_field_names=["answer"],
+                )
+
+        assert result is mock_result
+        assert rlm._last_action_lm_history == [
+            {
+                "usage": {"prompt_tokens": 21, "completion_tokens": 8},
+                "cost": 0.004,
+            }
+        ]
+        assert rlm._last_action_lm_metadata.finish_reason == "stop"
 
     def test_sync_sandbox_fatal_error_propagates(self):
         from predict_rlm.interpreter import SandboxFatalError
@@ -1705,7 +1903,9 @@ class TestExecuteIteration:
         mock_pred.code = "print('hello')"
         rlm.generate_action = MagicMock(return_value=mock_pred)
 
-        with pytest.raises(SandboxFatalError, match="fatal"):
+        with dspy.context(lm=_lm_with_history()), pytest.raises(
+            SandboxFatalError, match="fatal"
+        ):
             rlm._execute_iteration(
                 repl=mock_repl,
                 variables=[],
@@ -1764,7 +1964,10 @@ class TestPredictRLMTelemetry:
         mock_pred.code = "```python\nsecret_code = 41 + 1\nprint(secret_code)\n```"
         rlm.generate_action = MagicMock(return_value=mock_pred)
 
-        with patch.object(rlm, "_process_execution_result", return_value=MagicMock()):
+        with (
+            dspy.context(lm=_lm_with_history()),
+            patch.object(rlm, "_process_execution_result", return_value=MagicMock()),
+        ):
             rlm._begin_telemetry_execution()
             try:
                 rlm._execute_iteration(
@@ -1818,19 +2021,20 @@ class TestPredictRLMTelemetry:
         mock_pred.code = ""
         rlm.generate_action = MagicMock(return_value=mock_pred)
 
-        rlm._begin_telemetry_execution()
-        try:
-            with pytest.raises(RuntimeError, match="invalid code"):
-                rlm._execute_iteration(
-                    repl=MagicMock(),
-                    variables=[],
-                    history=[],
-                    iteration=0,
-                    input_args={},
-                    output_field_names=["answer"],
-                )
-        finally:
-            rlm._clear_telemetry_execution()
+        with dspy.context(lm=_lm_with_history()):
+            rlm._begin_telemetry_execution()
+            try:
+                with pytest.raises(RuntimeError, match="invalid code"):
+                    rlm._execute_iteration(
+                        repl=MagicMock(),
+                        variables=[],
+                        history=[],
+                        iteration=0,
+                        input_args={},
+                        output_field_names=["answer"],
+                    )
+            finally:
+                rlm._clear_telemetry_execution()
 
         event = next(
             record
@@ -1855,19 +2059,20 @@ class TestPredictRLMTelemetry:
         )
         rlm.generate_action = MagicMock(side_effect=ConnectionError("lm unavailable"))
 
-        rlm._begin_telemetry_execution()
-        try:
-            with pytest.raises(ConnectionError, match="lm unavailable"):
-                rlm._execute_iteration(
-                    repl=MagicMock(),
-                    variables=[],
-                    history=[],
-                    iteration=0,
-                    input_args={},
-                    output_field_names=["answer"],
-                )
-        finally:
-            rlm._clear_telemetry_execution()
+        with dspy.context(lm=_lm_with_history()):
+            rlm._begin_telemetry_execution()
+            try:
+                with pytest.raises(ConnectionError, match="lm unavailable"):
+                    rlm._execute_iteration(
+                        repl=MagicMock(),
+                        variables=[],
+                        history=[],
+                        iteration=0,
+                        input_args={},
+                        output_field_names=["answer"],
+                    )
+            finally:
+                rlm._clear_telemetry_execution()
 
         event = next(
             record
@@ -1895,6 +2100,7 @@ class TestPredictRLMTelemetry:
         context.__exit__.return_value = False
 
         with (
+            dspy.context(lm=_lm_with_history()),
             patch.object(PredictRLM, "_interpreter_context", return_value=context),
             patch.object(PredictRLM, "_prepare_execution_tools", return_value={}),
             patch.object(PredictRLM, "_build_variables", return_value={}),
@@ -1928,9 +2134,10 @@ class TestAexecuteIteration:
         rlm.generate_action.acall = AsyncMock(return_value=mock_pred)
 
         mock_result = MagicMock()
-        with patch.object(
-            rlm, "_process_execution_result", return_value=mock_result
-        ) as mock_process:
+        with (
+            dspy.context(lm=_lm_with_history()),
+            patch.object(rlm, "_process_execution_result", return_value=mock_result) as mock_process,
+        ):
             with patch(
                 "predict_rlm.predict_rlm._strip_code_fences", return_value="print('hello')"
             ):
@@ -1973,7 +2180,10 @@ class TestAexecuteIteration:
         rlm.generate_action.acall = AsyncMock(return_value=mock_pred)
 
         mock_result = MagicMock()
-        with patch.object(rlm, "_process_execution_result", return_value=mock_result):
+        with (
+            dspy.context(lm=_lm_with_history()),
+            patch.object(rlm, "_process_execution_result", return_value=mock_result),
+        ):
             with patch(
                 "predict_rlm.predict_rlm._strip_code_fences", return_value="print('hi')"
             ):
@@ -2006,9 +2216,10 @@ class TestAexecuteIteration:
         rlm.generate_action.acall = AsyncMock(return_value=mock_pred)
 
         mock_result = MagicMock()
-        with patch.object(
-            rlm, "_process_execution_result", return_value=mock_result
-        ) as mock_process:
+        with (
+            dspy.context(lm=_lm_with_history()),
+            patch.object(rlm, "_process_execution_result", return_value=mock_result) as mock_process,
+        ):
             with patch("predict_rlm.predict_rlm._strip_code_fences", return_value="bad_code()"):
                 await rlm._aexecute_iteration(
                     repl=mock_repl,
@@ -2041,7 +2252,9 @@ class TestAexecuteIteration:
         rlm.generate_action = MagicMock()
         rlm.generate_action.acall = AsyncMock(return_value=mock_pred)
 
-        with pytest.raises(SandboxFatalError, match="fatal"):
+        with dspy.context(lm=_lm_with_history()), pytest.raises(
+            SandboxFatalError, match="fatal"
+        ):
             await rlm._aexecute_iteration(
                 repl=mock_repl,
                 variables=[],

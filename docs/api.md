@@ -234,6 +234,8 @@ data = trace.model_dump()
 | `untruncated_output` | `str` | Full sandbox output before prompt truncation. |
 | `error` | `bool` | `true` if code execution raised an error. |
 | `duration_ms` | `int` | Wall-clock duration of this iteration. |
+| `usage` | `IterationUsage` | Per-iteration provider usage: raw `main_lm` object and aggregated `sub_lm` object. |
+| `cost` | `IterationCost` | Per-iteration cost split into `main_lm` and `sub_lm`. |
 | `tool_calls` | `list[ToolCall]` | Tool calls made during this iteration (excluding predict). |
 | `predict_calls` | `list[PredictCallGroup]` | predict() subcalls, grouped by signature. |
 

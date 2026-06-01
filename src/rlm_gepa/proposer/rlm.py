@@ -662,7 +662,7 @@ def sum_traces(traces: Sequence[Any]) -> tuple[Any, Any, str, str | None, int, i
         for step in steps:
             for group in getattr(step, "predict_calls", None) or []:
                 sub_calls += len(getattr(group, "calls", None) or [])
-    sub_usage = sub if sub.input_tokens or sub.output_tokens or sub.cache_hits else None
+    sub_usage = sub if sub.input_tokens or sub.output_tokens else None
     return main, sub_usage, main_model, sub_model, main_calls, sub_calls
 
 

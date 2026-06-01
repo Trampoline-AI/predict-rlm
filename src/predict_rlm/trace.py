@@ -15,31 +15,21 @@ from contextvars import ContextVar, Token
 from pathlib import Path
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field
+import dspy
+from pydantic import BaseModel, Field, PrivateAttr
 
 
 class TokenUsage(BaseModel):
-    """Aggregated token counts and cost for a set of LM calls.
-
-    Cache hits are excluded from ``input_tokens``, ``output_tokens``, and
-    ``cost`` (no new tokens were consumed and no new spend was incurred);
-    they are surfaced separately via ``cache_hits`` for observability.
-    """
+    """Aggregated token counts and cost for a set of LM calls."""
 
     input_tokens: int = Field(default=0, description="Total input/prompt tokens")
     output_tokens: int = Field(default=0, description="Total output/completion tokens")
-    cost: float = Field(
-        default=0.0, description="Total billed cost in USD (excludes cache hits)"
-    )
-    cache_hits: int = Field(
-        default=0, description="Number of LM calls served from DSPy's cache"
-    )
+    cost: float = Field(default=0.0, description="Total billed cost in USD")
 
     def __iadd__(self, other: TokenUsage) -> TokenUsage:
         self.input_tokens += other.input_tokens
         self.output_tokens += other.output_tokens
         self.cost += other.cost
-        self.cache_hits += other.cache_hits
         return self
 
 
@@ -106,6 +96,7 @@ class PredictCallGroup(BaseModel):
         default_factory=TokenUsage, description="Sum of token usage across all calls"
     )
     calls: list[PredictCallDetail] = Field(description="Per-call duration and usage")
+    _raw_usage_objects: list[dict[str, Any]] = PrivateAttr(default_factory=list)
 
 
 class ToolCall(BaseModel):
@@ -165,16 +156,12 @@ class ProposerIterationStep(BaseModel):
     """Proposer-facing RLM iteration evidence."""
 
     iteration: int = Field(description="1-indexed iteration number")
-    reasoning: str = Field(
-        description="Model reasoning before writing this iteration's code"
-    )
+    reasoning: str = Field(description="Model reasoning before writing this iteration's code")
     code: str = Field(description="Python code executed for this iteration")
     output: str = Field(
         description="Sandbox output visible in later model context, shortened to 5K chars"
     )
-    untruncated_output: str = Field(
-        description="Full sandbox output before context shortening"
-    )
+    untruncated_output: str = Field(description="Full sandbox output before context shortening")
     error: bool = Field(default=False, description="True if code execution raised an error")
     tool_calls: list[ProposerToolCall] = Field(
         default_factory=list,
@@ -194,8 +181,8 @@ class ProposerRunTrace(BaseModel):
     """Subset of RunTrace intended for instruction proposer inputs.
 
     This view preserves the behavioral evidence proposers need while excluding
-    archival accounting and timing fields such as usage, cost/cache counters,
-    and durations.
+    archival accounting and timing fields such as usage, cost counters, and
+    durations.
     """
 
     status: Literal["completed", "max_iterations", "error"] = Field(
@@ -206,30 +193,59 @@ class ProposerRunTrace(BaseModel):
         default=None, description="Sub-LM model identifier, if different from main LM"
     )
     iterations: int = Field(description="Total iterations executed")
-    max_iterations: int | None = Field(
-        default=None, description="Maximum iterations allowed"
-    )
+    max_iterations: int | None = Field(default=None, description="Maximum iterations allowed")
     steps: list[ProposerIterationStep] = Field(
         default_factory=list, description="Per-iteration execution steps"
     )
+
+
+class LMUsage(BaseModel):
+    """Token usage split by main LM and sub-LM."""
+
+    main: TokenUsage = Field(default_factory=TokenUsage, description="Main LM token usage")
+    sub: TokenUsage = Field(default_factory=TokenUsage, description="Sub-LM token usage")
+
+
+class IterationUsage(BaseModel):
+    """Provider usage objects for one RLM iteration."""
+
+    main_lm: dict[str, Any] = Field(
+        default_factory=dict,
+        description="Raw provider usage object from the main LM action call",
+    )
+    sub_lm: dict[str, Any] = Field(
+        default_factory=dict,
+        description="Aggregated provider usage object across predict() sub-LM calls",
+    )
+
+
+class IterationCost(BaseModel):
+    """Billed cost for one RLM iteration."""
+
+    main_lm: float = Field(default=0.0, description="Main LM action-call cost")
+    sub_lm: float = Field(default=0.0, description="Total predict() sub-LM cost")
 
 
 class IterationStep(BaseModel):
     """One iteration of the RLM code-generation loop."""
 
     iteration: int = Field(description="1-indexed iteration number")
-    reasoning: str = Field(
-        description="Model reasoning before writing this iteration's code"
-    )
+    reasoning: str = Field(description="Model reasoning before writing this iteration's code")
     code: str = Field(description="Python code executed for this iteration")
     output: str = Field(
         description="Sandbox output visible in later model context, shortened to 5K chars"
     )
-    untruncated_output: str = Field(
-        description="Full sandbox output before context shortening"
-    )
+    untruncated_output: str = Field(description="Full sandbox output before context shortening")
     error: bool = Field(default=False, description="True if code execution raised an error")
     duration_ms: int = Field(description="Wall-clock duration of this iteration")
+    usage: IterationUsage = Field(
+        default_factory=IterationUsage,
+        description="Provider usage objects for this iteration",
+    )
+    cost: IterationCost = Field(
+        default_factory=IterationCost,
+        description="Billed cost for this iteration",
+    )
     tool_calls: list[ToolCall] = Field(
         default_factory=list,
         description="Tool calls made during this iteration (excluding predict)",
@@ -242,13 +258,6 @@ class IterationStep(BaseModel):
         default=None,
         description="Why the main LM stopped while generating this iteration's code",
     )
-
-
-class LMUsage(BaseModel):
-    """Token usage split by main LM and sub-LM."""
-
-    main: TokenUsage = Field(default_factory=TokenUsage, description="Main LM token usage")
-    sub: TokenUsage = Field(default_factory=TokenUsage, description="Sub-LM token usage")
 
 
 class RunTrace(BaseModel):
@@ -412,6 +421,7 @@ class _RawPredictCall:
         "model",
         "duration_ms",
         "usage",
+        "raw_usage",
         "input",
         "output",
         "error",
@@ -425,6 +435,7 @@ class _RawPredictCall:
         model: str,
         duration_ms: int,
         usage: TokenUsage,
+        raw_usage: dict[str, Any],
         input: dict[str, Any],
         output: dict[str, Any],
         error: str | None = None,
@@ -435,6 +446,7 @@ class _RawPredictCall:
         self.model = model
         self.duration_ms = duration_ms
         self.usage = usage
+        self.raw_usage = raw_usage
         self.input = input
         self.output = output
         self.error = error
@@ -476,25 +488,25 @@ def drain_predict_calls() -> list[PredictCallGroup]:
         total_usage = TokenUsage()
         for c in group_calls:
             total_usage += c.usage
-        result.append(
-            PredictCallGroup(
-                signature=sig,
-                instructions=instr,
-                model=model,
-                total_usage=total_usage,
-                calls=[
-                    PredictCallDetail(
-                        duration_ms=c.duration_ms,
-                        usage=c.usage,
-                        input=c.input,
-                        output=c.output,
-                        error=c.error,
-                        lm=c.lm,
-                    )
-                    for c in group_calls
-                ],
-            )
+        group = PredictCallGroup(
+            signature=sig,
+            instructions=instr,
+            model=model,
+            total_usage=total_usage,
+            calls=[
+                PredictCallDetail(
+                    duration_ms=c.duration_ms,
+                    usage=c.usage,
+                    input=c.input,
+                    output=c.output,
+                    error=c.error,
+                    lm=c.lm,
+                )
+                for c in group_calls
+            ],
         )
+        group._raw_usage_objects = [dict(c.raw_usage) for c in group_calls]
+        result.append(group)
 
     calls.clear()
     return result
@@ -544,46 +556,161 @@ def reset_tool_call_collector(token: Token) -> None:
     _tool_calls.reset(token)
 
 
-def snapshot_lm_history_len(lm: Any) -> int:
+def snapshot_lm_history_len(lm: dspy.LM) -> int:
     """Return the current length of an LM's history list."""
-    history = getattr(lm, "history", None)
-    return len(history) if history is not None else 0
+    return len(lm.history)
 
 
-def usage_since(lm: Any, since: int) -> TokenUsage:
-    """Sum token usage from LM history entries added after index ``since``.
-
-    Cache hits are detected and excluded from ``input_tokens`` / ``output_tokens``
-    / ``cost`` — DSPy's ``Cache.get()`` zeros ``response.usage`` on a hit but
-    leaves ``response._hidden_params["response_cost"]`` intact, so a naïve sum
-    would mis-report phantom cost with no matching tokens. The hit count is
-    surfaced via ``TokenUsage.cache_hits``.
-    """
-    history = getattr(lm, "history", None)
+def usage_since(lm: dspy.LM, since: int) -> TokenUsage:
+    """Sum token usage from LM history entries added after index ``since``."""
+    history = lm.history
     if not history or len(history) <= since:
         return TokenUsage()
     input_tok = 0
     output_tok = 0
     cost = 0.0
-    cache_hits = 0
     for entry in history[since:]:
         usage = entry.get("usage", {}) or {}
         entry_cost = entry.get("cost", 0) or 0
-        if _is_cache_hit(entry, usage, entry_cost):
-            cache_hits += 1
-            continue
         input_tok += usage.get("prompt_tokens", 0) or 0
         output_tok += usage.get("completion_tokens", 0) or 0
         cost += entry_cost
-    return TokenUsage(
-        input_tokens=input_tok,
-        output_tokens=output_tok,
-        cost=cost,
-        cache_hits=cache_hits,
+    return TokenUsage(input_tokens=input_tok, output_tokens=output_tok, cost=cost)
+
+
+def raw_usage_since(lm: dspy.LM, since: int) -> list[dict[str, Any]]:
+    """Return raw provider usage objects from LM history entries after ``since``."""
+
+    history = lm.history
+    if not history or len(history) <= since:
+        return []
+
+    usage_objects: list[dict[str, Any]] = []
+    for entry in history[since:]:
+        usage = entry["usage"]
+        if not isinstance(usage, dict):
+            raise TypeError(f"LM history usage must be a dict, got {type(usage).__name__}")
+        usage_objects.append(dict(usage))
+    return usage_objects
+
+
+def aggregate_usage_objects(usages: list[dict[str, Any]]) -> dict[str, Any]:
+    """Deep-sum numeric provider usage fields."""
+
+    aggregate: dict[str, Any] = {}
+    for usage in usages:
+        _merge_numeric_usage(aggregate, usage)
+    return aggregate
+
+
+def predict_calls_usage(predict_calls: list[PredictCallGroup]) -> TokenUsage:
+    """Sum token usage across grouped predict() calls."""
+
+    usage = TokenUsage()
+    for group in predict_calls:
+        usage += group.total_usage
+    return usage
+
+
+def subtract_usage(left: TokenUsage, right: TokenUsage) -> TokenUsage:
+    """Subtract one usage aggregate from another, failing on impossible results."""
+
+    result = TokenUsage(
+        input_tokens=left.input_tokens - right.input_tokens,
+        output_tokens=left.output_tokens - right.output_tokens,
+        cost=left.cost - right.cost,
+    )
+    if result.input_tokens < 0 or result.output_tokens < 0 or result.cost < 0:
+        raise ValueError("Usage subtraction produced negative tokens or cost")
+    return result
+
+
+def iteration_usage_from_accounting(
+    main_lm_history: list[dict[str, Any]],
+    predict_calls: list[PredictCallGroup],
+) -> IterationUsage:
+    """Build per-iteration usage from main-LM records and sub-LM calls."""
+
+    if len(main_lm_history) != 1:
+        raise RuntimeError(
+            "Expected exactly one main LM history usage object per iteration; "
+            f"got {len(main_lm_history)}"
+        )
+    main_usage = main_lm_history[0]["usage"]
+    if not isinstance(main_usage, dict):
+        raise TypeError(
+            f"Main LM history usage must be a dict, got {type(main_usage).__name__}"
+        )
+
+    sub_usage_objects: list[dict[str, Any]] = []
+    for group in predict_calls:
+        sub_usage_objects.extend(group._raw_usage_objects)
+
+    return IterationUsage(
+        main_lm=dict(main_usage),
+        sub_lm=aggregate_usage_objects(sub_usage_objects),
     )
 
 
-def lm_finish_since(lm: Any, since: int) -> LMFinishMetadata | None:
+def iteration_cost_from_accounting(
+    main_lm_history: list[dict[str, Any]],
+    predict_calls: list[PredictCallGroup],
+) -> IterationCost:
+    """Build per-iteration cost from main-LM records and sub-LM calls."""
+
+    if len(main_lm_history) != 1:
+        raise RuntimeError(
+            "Expected exactly one main LM history cost record per iteration; "
+            f"got {len(main_lm_history)}"
+        )
+    main_cost = main_lm_history[0]["cost"]
+    return IterationCost(
+        main_lm=_numeric_cost(main_cost),
+        sub_lm=sum(group.total_usage.cost for group in predict_calls),
+    )
+
+
+def lm_history_since(lm: dspy.LM, since: int) -> list[dict[str, Any]]:
+    """Return raw usage objects and per-call accounting records after ``since``."""
+
+    history = lm.history
+    if not history or len(history) <= since:
+        return []
+
+    raw_history: list[dict[str, Any]] = []
+    for entry in history[since:]:
+        if not isinstance(entry, dict):
+            continue
+        usage = dict(entry.get("usage", {}) or {})
+        raw_history.append(
+            {
+                "usage": usage,
+                "cost": entry.get("cost"),
+            }
+        )
+
+    return raw_history
+
+
+def _merge_numeric_usage(target: dict[str, Any], source: dict[str, Any]) -> None:
+    for key, value in source.items():
+        if isinstance(value, dict):
+            child = target.setdefault(key, {})
+            if not isinstance(child, dict):
+                raise TypeError(f"Cannot merge nested usage object into scalar key {key!r}")
+            _merge_numeric_usage(child, value)
+            continue
+        if isinstance(value, int | float) and not isinstance(value, bool):
+            target[key] = target.get(key, 0) + value
+
+
+def _numeric_cost(value: Any) -> float:
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        raise TypeError(f"LM history cost must be numeric, got {type(value).__name__}")
+    return float(value)
+
+
+def lm_finish_since(lm: dspy.LM, since: int) -> LMFinishMetadata | None:
     """Extract compact finish metadata from LM history entries."""
 
     metadata = lm_completion_metadata_since(lm, since)
@@ -593,24 +720,20 @@ def lm_finish_since(lm: Any, since: int) -> LMFinishMetadata | None:
 
 
 def lm_completion_metadata_since(
-    lm: Any,
+    lm: dspy.LM,
     since: int,
     *,
     output_tokens: int | None = None,
 ) -> _LMCompletionMetadata | None:
     """Extract rich completion metadata from LM history entries."""
 
-    history = getattr(lm, "history", None)
+    history = lm.history
     if not history or len(history) <= since:
         return None
 
     aggregate: _LMCompletionMetadata | None = None
     for entry in history[since:]:
         if not isinstance(entry, dict):
-            continue
-        usage = entry.get("usage", {}) or {}
-        entry_cost = entry.get("cost", 0) or 0
-        if _is_cache_hit(entry, usage, entry_cost):
             continue
         metadata = lm_truncation_from_history_entry(entry, lm=lm)
         aggregate = merge_lm_truncation(aggregate, metadata)
@@ -646,7 +769,7 @@ def merge_lm_truncation(
 def lm_truncation_from_history_entry(
     entry: dict[str, Any],
     *,
-    lm: Any = None,
+    lm: dspy.LM | None = None,
 ) -> _LMCompletionMetadata | None:
     """Extract finish/max-token metadata from one DSPy LM history entry."""
 
@@ -715,7 +838,7 @@ def _extract_output_tokens(entry: dict[str, Any]) -> int | None:
     return None
 
 
-def _extract_max_tokens(entry: dict[str, Any], *, lm: Any = None) -> int | None:
+def _extract_max_tokens(entry: dict[str, Any], *, lm: dspy.LM | None = None) -> int | None:
     candidates: list[Any] = [
         entry.get("max_tokens"),
         entry.get("max_output_tokens"),
@@ -729,12 +852,11 @@ def _extract_max_tokens(entry: dict[str, Any], *, lm: Any = None) -> int | None:
             ]
         )
     if lm is not None:
+        lm_kwargs = lm.kwargs
         candidates.extend(
             [
-                _get_value(lm, "max_tokens"),
-                _get_value(lm, "max_output_tokens"),
-                _get_value(_get_value(lm, "kwargs"), "max_tokens"),
-                _get_value(_get_value(lm, "kwargs"), "max_output_tokens"),
+                _get_value(lm_kwargs, "max_tokens"),
+                _get_value(lm_kwargs, "max_output_tokens"),
             ]
         )
     for candidate in candidates:
@@ -759,23 +881,6 @@ def _coerce_int(value: Any) -> int | None:
         return int(value)
     except (TypeError, ValueError):
         return None
-
-
-def _is_cache_hit(entry: dict, usage: dict, cost: float) -> bool:
-    """Return True if ``entry`` is a DSPy cache-hit artifact.
-
-    Two signals, checked in order of reliability:
-      1. ``response.cache_hit`` flag set by ``dspy.clients.cache.Cache.get``.
-      2. Empty usage dict paired with non-zero cost — a real LM call always
-         populates prompt_tokens / completion_tokens, so this combination is
-         unambiguous even when the response object is missing.
-    """
-    response = entry.get("response")
-    if response is not None and getattr(response, "cache_hit", False):
-        return True
-    if not usage and cost:
-        return True
-    return False
 
 
 def ms_since(start: float) -> int:
