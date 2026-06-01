@@ -4,7 +4,19 @@ from unittest.mock import MagicMock, patch
 
 import dspy
 
-from predict_rlm._shared import build_rlm_signatures, format_tool_docs_full
+from predict_rlm._shared import (
+    build_rlm_signatures,
+    format_tool_docs_full,
+    strip_code_fences,
+)
+
+
+def test_strip_code_fences_accepts_supported_fences_and_bare_code():
+    assert strip_code_fences("```python\nprint('python')\n```") == "print('python')"
+    assert strip_code_fences("```py\nprint('py')\n```") == "print('py')"
+    assert strip_code_fences("```repl\nprint('repl')\n```") == "print('repl')"
+    assert strip_code_fences("```\nprint('bare fence')\n```") == "print('bare fence')"
+    assert strip_code_fences("print('bare code')") == "print('bare code')"
 
 
 class TestFormatToolDocsFull:
@@ -114,6 +126,17 @@ class TestBuildRlmSignatures:
         assert "tests/subprocesses" in desc
         assert "stdout/stderr" in desc
         assert "next iteration can continue" in desc
+
+    def test_action_signature_keeps_code_field_description_narrow(self):
+        sig = dspy.Signature("question -> answer")
+        action, _ = build_rlm_signatures(
+            sig, self.ACTION_TEMPLATE, {}, format_tool_docs_full
+        )
+
+        assert (
+            action.output_fields["code"].json_schema_extra["desc"]
+            == "Python code wrapped in ```repl blocks."
+        )
 
     def test_tool_docs_in_action_instructions(self):
         def my_tool(x: str) -> str:

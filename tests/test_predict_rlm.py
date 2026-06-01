@@ -2121,7 +2121,7 @@ class TestAexecuteIteration:
             rlm, "_process_execution_result", return_value=mock_result
         ) as mock_process:
             with patch(
-                "predict_rlm.predict_rlm._strip_code_fences", return_value="print('hello')"
+                "predict_rlm.predict_rlm.strip_code_fences", return_value="print('hello')"
             ):
                 result = await rlm._aexecute_iteration(
                     repl=mock_repl,
@@ -2215,7 +2215,7 @@ class TestAexecuteIteration:
         mock_result = MagicMock()
         with patch.object(rlm, "_process_execution_result", return_value=mock_result):
             with patch(
-                "predict_rlm.predict_rlm._strip_code_fences", return_value="print('hi')"
+                "predict_rlm.predict_rlm.strip_code_fences", return_value="print('hi')"
             ):
                 result = await rlm._aexecute_iteration(
                     repl=mock_repl,
@@ -2249,7 +2249,7 @@ class TestAexecuteIteration:
         with patch.object(
             rlm, "_process_execution_result", return_value=mock_result
         ) as mock_process:
-            with patch("predict_rlm.predict_rlm._strip_code_fences", return_value="bad_code()"):
+            with patch("predict_rlm.predict_rlm.strip_code_fences", return_value="bad_code()"):
                 await rlm._aexecute_iteration(
                     repl=mock_repl,
                     variables=[],

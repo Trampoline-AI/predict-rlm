@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import inspect
+import re
 import textwrap
 import typing
 from pathlib import Path
@@ -14,6 +15,17 @@ from dspy.adapters.utils import translate_field_type
 if TYPE_CHECKING:
     from dspy.signatures.signature import Signature
 
+
+def strip_code_fences(code: str) -> str:
+    """Extract code from markdown fences, accepting python/py/repl tags."""
+    matches = re.findall(
+        r"```(?:python|py|repl)?\s*\n(.*?)^```\s*$",
+        code,
+        re.DOTALL | re.MULTILINE,
+    )
+    if matches:
+        return "\n\n".join(block.rstrip() for block in matches)
+    return code
 
 
 def format_tool_docs_full(tools: dict[str, Callable]) -> str:
