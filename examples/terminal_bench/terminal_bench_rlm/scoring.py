@@ -140,9 +140,7 @@ def to_gepa_example_result(
         "total": details["total"],
         "is_resolved": 1.0 if details["is_resolved"] is True else 0.0,
     }
-    if "failure_class" in details:
-        objective_scores["failure_class"] = details["failure_class"]
-    objective_scores.update(_diagnostic_metadata(result_or_parser_results))
+    objective_scores.update(_numeric_diagnostic_metadata(_diagnostic_metadata(result_or_parser_results)))
     return RLMGepaExampleResult(
         score=details["soft_score"],
         feedback=feedback(result_or_parser_results),
@@ -151,6 +149,16 @@ def to_gepa_example_result(
         example_id=example_id,
         objective_scores=objective_scores,
     )
+
+
+def _numeric_diagnostic_metadata(metadata: Mapping[str, Any]) -> dict[str, float]:
+    numeric: dict[str, float] = {}
+    if "timed_out" in metadata:
+        numeric["timed_out"] = 1.0 if metadata["timed_out"] else 0.0
+    timeout_seconds = metadata.get("timeout_seconds")
+    if isinstance(timeout_seconds, (int, float)):
+        numeric["timeout_seconds"] = float(timeout_seconds)
+    return numeric
 
 
 def _pass_counts(parser_results: Mapping[Any, Any]) -> tuple[int, int]:
