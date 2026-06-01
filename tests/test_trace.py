@@ -22,6 +22,7 @@ from predict_rlm.trace import (
     drain_tool_calls,
     init_predict_call_collector,
     init_tool_call_collector,
+    lm_completion_metadata_since,
     lm_finish_since,
     ms_since,
     record_predict_call,
@@ -772,6 +773,34 @@ class TestUsageSince:
         metadata = lm_finish_since(lm, 0)
 
         assert metadata == LMFinishMetadata(finish_reason="stop")
+
+    def test_lm_completion_metadata_includes_prompt_cache_stats(self):
+        lm = MagicMock()
+        lm.history = [
+            {
+                "usage": {
+                    "prompt_tokens": 1000,
+                    "completion_tokens": 50,
+                    "prompt_tokens_details": {"cached_tokens": 750},
+                },
+                "response": {"choices": [{"finish_reason": "stop"}]},
+            },
+            {
+                "usage": {
+                    "input_tokens": 500,
+                    "output_tokens": 20,
+                    "input_tokens_details": {"cached_tokens": 100},
+                },
+                "response": {"choices": [{"finish_reason": "stop"}]},
+            },
+        ]
+
+        metadata = lm_completion_metadata_since(lm, 0)
+
+        assert metadata is not None
+        assert metadata.input_tokens == 1500
+        assert metadata.cached_input_tokens == 850
+        assert metadata.cache_read_ratio == pytest.approx(850 / 1500)
 
 
 class TestConcurrentUsageAccounting:

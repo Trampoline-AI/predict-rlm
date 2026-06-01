@@ -1515,6 +1515,27 @@ class PredictRLM(dspy.RLM):
         """
         return {name: tool.func for name, tool in self._user_tools.items()}
 
+    def _debug_lm_metadata(self, metadata: Any | None) -> dict[str, Any]:
+        if metadata is None:
+            return {}
+        attrs: dict[str, Any] = {}
+        for source_name, target_name in (
+            ("finish_reason", "lm_finish_reason"),
+            ("truncation_reason", "lm_truncation_reason"),
+            ("max_tokens", "lm_max_tokens"),
+            ("input_tokens", "lm_prompt_tokens"),
+            ("cached_input_tokens", "lm_cached_prompt_tokens"),
+            ("cache_read_ratio", "lm_prompt_cache_read_ratio"),
+            ("output_tokens", "lm_output_tokens"),
+        ):
+            value = getattr(metadata, source_name, None)
+            if value is not None:
+                attrs[target_name] = value
+        truncated = getattr(metadata, "truncated", None)
+        if truncated is not None:
+            attrs["lm_truncated"] = truncated
+        return attrs
+
     @contextmanager
     def _lm_context(self):
         """Set the configured LM as active context and capture it for predict() calls."""
@@ -2080,7 +2101,7 @@ class PredictRLM(dspy.RLM):
         lm_hist_before_action: int,
         execution_timeout: float | None,
     ) -> Any:
-        lm_metadata = lm_finish_since(dspy.settings.lm, lm_hist_before_action)
+        lm_metadata = lm_completion_metadata_since(dspy.settings.lm, lm_hist_before_action)
         self._write_telemetry_span(
             "rlm.action_generation.ok",
             iteration=iteration + 1,
@@ -2327,7 +2348,9 @@ class PredictRLM(dspy.RLM):
             self._partial_history = step_result
         self._partial_pending_entry = None
         self._partial_pending_start = None
-        self._last_action_lm_metadata = lm_metadata
+        self._last_action_lm_metadata = lm_finish_since(
+            dspy.settings.lm, lm_hist_before_action
+        )
         return step_result
 
     def _execute_iteration(
