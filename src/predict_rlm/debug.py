@@ -53,6 +53,8 @@ def debug_event(event: str, **metadata: Any) -> None:
 def sanitize_metadata(value: Any, *, key: str | None = None) -> Any:
     """Return a small log-safe value with obvious secrets redacted."""
     if key and _SECRET_KEY_RE.search(key):
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            return value
         return "[REDACTED]"
     if isinstance(value, Mapping):
         return {str(k): sanitize_metadata(v, key=str(k)) for k, v in value.items()}

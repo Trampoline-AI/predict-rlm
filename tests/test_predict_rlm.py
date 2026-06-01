@@ -17,8 +17,10 @@ from predict_rlm.predict_rlm import _models_from_schema
 from predict_rlm.rlm_skills import Skill
 from predict_rlm.telemetry import TelemetryContext, classify_failure
 from predict_rlm.trace import (
+    LMFinishMetadata,
     drain_predict_calls,
     init_predict_call_collector,
+    lm_completion_metadata_since,
 )
 
 
@@ -1769,6 +1771,46 @@ class TestUnresolvedTypesFallback:
 class TestExecuteIteration:
     """Tests for _execute_iteration sync-path behavior."""
 
+    def test_action_lm_trace_metadata_stays_compact_with_prompt_cache_stats(self):
+        mock_lm = MagicMock()
+        mock_lm.history = []
+        rlm = PredictRLM(ImageAnalysisSignature, sub_lm=mock_lm, max_iterations=5)
+
+        mock_repl = MagicMock()
+        mock_repl.execute = MagicMock(return_value="output from execute")
+
+        mock_pred = MagicMock()
+        mock_pred.reasoning = "thinking"
+        mock_pred.code = "print('hello')"
+
+        def generate_action(**_kwargs):
+            mock_lm.history.append(
+                {
+                    "usage": {
+                        "prompt_tokens": 2000,
+                        "completion_tokens": 100,
+                        "prompt_tokens_details": {"cached_tokens": 1536},
+                    },
+                    "response": {"choices": [{"finish_reason": "stop"}]},
+                }
+            )
+            return mock_pred
+
+        rlm.generate_action = MagicMock(side_effect=generate_action)
+
+        with dspy.context(lm=mock_lm):
+            with patch.object(rlm, "_process_execution_result", return_value=MagicMock()):
+                rlm._execute_iteration(
+                    repl=mock_repl,
+                    variables=[],
+                    history=[],
+                    iteration=0,
+                    input_args={},
+                    output_field_names=["answer"],
+                )
+
+        assert rlm._last_action_lm_metadata == LMFinishMetadata(finish_reason="stop")
+
     def test_accepts_repl_fence_in_sync_path(self):
         mock_lm = MagicMock()
         rlm = PredictRLM(ImageAnalysisSignature, sub_lm=mock_lm, max_iterations=5)
@@ -2101,6 +2143,48 @@ class TestAexecuteIteration:
     """Tests for _aexecute_iteration: async vs sync interpreter dispatch."""
 
     @pytest.mark.asyncio
+    async def test_async_action_lm_trace_metadata_stays_compact_with_prompt_cache_stats(self):
+        mock_lm = MagicMock()
+        mock_lm.history = []
+        rlm = PredictRLM(ImageAnalysisSignature, sub_lm=mock_lm, max_iterations=5)
+
+        mock_repl = MagicMock()
+        mock_repl.aexecute = AsyncMock(return_value="output from aexecute")
+
+        mock_pred = MagicMock()
+        mock_pred.reasoning = "thinking"
+        mock_pred.code = "print('hello')"
+
+        async def generate_action(**_kwargs):
+            mock_lm.history.append(
+                {
+                    "usage": {
+                        "prompt_tokens": 2000,
+                        "completion_tokens": 100,
+                        "prompt_tokens_details": {"cached_tokens": 1536},
+                    },
+                    "response": {"choices": [{"finish_reason": "stop"}]},
+                }
+            )
+            return mock_pred
+
+        rlm.generate_action = MagicMock()
+        rlm.generate_action.acall = AsyncMock(side_effect=generate_action)
+
+        with dspy.context(lm=mock_lm):
+            with patch.object(rlm, "_process_execution_result", return_value=MagicMock()):
+                await rlm._aexecute_iteration(
+                    repl=mock_repl,
+                    variables=[],
+                    history=[],
+                    iteration=0,
+                    input_args={},
+                    output_field_names=["answer"],
+                )
+
+        assert rlm._last_action_lm_metadata == LMFinishMetadata(finish_reason="stop")
+
+    @pytest.mark.asyncio
     async def test_uses_aexecute_when_available(self):
         """_aexecute_iteration calls repl.aexecute() when it has the method."""
         mock_lm = MagicMock()
@@ -2323,6 +2407,28 @@ class TestAforwardTracedUsage:
         assert u.input_tokens == 290
         assert u.output_tokens == 85
         assert u.cost == pytest.approx(0.0031)
+
+    def test_debug_lm_metadata_reports_openai_prompt_cache_hits(self):
+        mock_lm = MagicMock()
+        mock_lm.history = [
+            {
+                "usage": {
+                    "prompt_tokens": 2000,
+                    "completion_tokens": 100,
+                    "prompt_tokens_details": {"cached_tokens": 1536},
+                },
+                "response": {"choices": [{"finish_reason": "stop"}]},
+            }
+        ]
+        metadata = lm_completion_metadata_since(mock_lm, 0)
+        rlm = PredictRLM.__new__(PredictRLM)
+
+        attrs = rlm._debug_lm_metadata(metadata)
+
+        assert attrs["lm_prompt_tokens"] == 2000
+        assert attrs["lm_cached_prompt_tokens"] == 1536
+        assert attrs["lm_prompt_cache_read_ratio"] == pytest.approx(1536 / 2000)
+        assert attrs["lm_output_tokens"] == 100
 
 
 class TestSkillsMergeIntoInit:

@@ -62,6 +62,18 @@ class _LMCompletionMetadata(BaseModel):
         default=None,
         description="Configured/requested output token cap if discoverable",
     )
+    input_tokens: int | None = Field(
+        default=None,
+        description="Input/prompt tokens reported for the LM call(s)",
+    )
+    cached_input_tokens: int | None = Field(
+        default=None,
+        description="OpenAI prompt-cache read tokens reported for the LM call(s)",
+    )
+    cache_read_ratio: float | None = Field(
+        default=None,
+        description="Cached input tokens divided by total input tokens, if known",
+    )
     output_tokens: int | None = Field(
         default=None,
         description="Output/completion tokens reported for the LM call(s)",
@@ -640,6 +652,18 @@ def merge_lm_truncation(
         left.output_tokens = right.output_tokens
     elif right.output_tokens is not None:
         left.output_tokens += right.output_tokens
+    if left.input_tokens is None:
+        left.input_tokens = right.input_tokens
+    elif right.input_tokens is not None:
+        left.input_tokens += right.input_tokens
+    if left.cached_input_tokens is None:
+        left.cached_input_tokens = right.cached_input_tokens
+    elif right.cached_input_tokens is not None:
+        left.cached_input_tokens += right.cached_input_tokens
+    if left.input_tokens:
+        left.cache_read_ratio = (left.cached_input_tokens or 0) / left.input_tokens
+    elif left.cached_input_tokens is not None:
+        left.cache_read_ratio = 0.0
     return left
 
 
@@ -652,19 +676,35 @@ def lm_truncation_from_history_entry(
 
     finish_reason = _extract_finish_reason(entry.get("response"))
     max_tokens = _extract_max_tokens(entry, lm=lm)
+    input_tokens = _extract_input_tokens(entry)
+    cached_input_tokens = _extract_cached_input_tokens(entry)
     output_tokens = _extract_output_tokens(entry)
     truncated, reason = _classify_truncation(
         finish_reason=finish_reason,
         max_tokens=max_tokens,
         output_tokens=output_tokens,
     )
-    if finish_reason is None and max_tokens is None and output_tokens is None:
+    if (
+        finish_reason is None
+        and max_tokens is None
+        and input_tokens is None
+        and cached_input_tokens is None
+        and output_tokens is None
+    ):
         return None
+    cache_read_ratio = None
+    if input_tokens:
+        cache_read_ratio = (cached_input_tokens or 0) / input_tokens
+    elif cached_input_tokens is not None:
+        cache_read_ratio = 0.0
     return _LMCompletionMetadata(
         truncated=truncated,
         truncation_reason=reason,
         finish_reason=finish_reason,
         max_tokens=max_tokens,
+        input_tokens=input_tokens,
+        cached_input_tokens=cached_input_tokens,
+        cache_read_ratio=cache_read_ratio,
         output_tokens=output_tokens,
     )
 
@@ -698,6 +738,38 @@ def _extract_finish_reason(response: Any) -> str | None:
         finish_reason = _get_value(choice, "finish_reason")
         if finish_reason is not None:
             return str(finish_reason)
+    return None
+
+
+def _extract_input_tokens(entry: dict[str, Any]) -> int | None:
+    usage = entry.get("usage", {}) or {}
+    for key in ("prompt_tokens", "input_tokens"):
+        value = _coerce_int(_get_value(usage, key))
+        if value is not None:
+            return value
+    response_usage = _get_value(entry.get("response"), "usage")
+    for key in ("prompt_tokens", "input_tokens"):
+        value = _coerce_int(_get_value(response_usage, key))
+        if value is not None:
+            return value
+    return None
+
+
+def _extract_cached_input_tokens(entry: dict[str, Any]) -> int | None:
+    usage = entry.get("usage", {}) or {}
+    value = _extract_cached_tokens_from_usage(usage)
+    if value is not None:
+        return value
+    response_usage = _get_value(entry.get("response"), "usage")
+    return _extract_cached_tokens_from_usage(response_usage)
+
+
+def _extract_cached_tokens_from_usage(usage: Any) -> int | None:
+    for details_key in ("prompt_tokens_details", "input_tokens_details"):
+        details = _get_value(usage, details_key)
+        value = _coerce_int(_get_value(details, "cached_tokens"))
+        if value is not None:
+            return value
     return None
 
 
