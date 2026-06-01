@@ -23,6 +23,7 @@ class TerminalBenchGepaConfig(OptimizeConfig):
     dataset_name: str = "terminal-bench-core"
     dataset_version: str = "0.1.1"
     harbor_dataset: str = "terminal-bench/terminal-bench-2-1"
+    harbor_environment: str = "docker"
     train_task_ids: tuple[str, ...] = DEFAULT_TRAIN_TASK_IDS
     val_task_ids: tuple[str, ...] = DEFAULT_VAL_TASK_IDS
     train_limit: int | None = None
@@ -31,6 +32,11 @@ class TerminalBenchGepaConfig(OptimizeConfig):
     terminal_bench_executable: str = ".terminal-bench-venv/bin/tb"
     harbor_executable: str = "harbor"
     harness_backend: str = "harbor"
+    harbor_controller_locality: str = "auto"
+    harbor_agent_interpreter_mode: str = "auto"
+    harbor_remote_workdir: str = "/tmp/predict_rlm_terminal_bench"
+    harbor_cpus: str = "auto"
+    harbor_memory: str = "auto"
     timeout_cleanup_grace_sec: int = 60
     harbor_task_cache_dir: Path | None = None
     n_attempts: int = 1
@@ -47,6 +53,12 @@ class TerminalBenchGepaConfig(OptimizeConfig):
         payload["harness_backend"] = self.harness_backend
         payload["harbor_executable"] = self.harbor_executable
         payload["harbor_dataset"] = self.harbor_dataset
+        payload["harbor_environment"] = self.harbor_environment
+        payload["harbor_controller_locality"] = self.harbor_controller_locality
+        payload["harbor_agent_interpreter_mode"] = self.harbor_agent_interpreter_mode
+        payload["harbor_remote_workdir"] = self.harbor_remote_workdir
+        payload["harbor_cpus"] = self.harbor_cpus
+        payload["harbor_memory"] = self.harbor_memory
         payload["train_task_ids"] = list(self.train_task_ids)
         payload["val_task_ids"] = list(self.val_task_ids)
         payload["codex_lm_exclude"] = list(self.codex_lm_exclude)

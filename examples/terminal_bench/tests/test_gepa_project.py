@@ -7,6 +7,7 @@ import json
 import re
 import subprocess
 import sys
+import tarfile
 import types
 from pathlib import Path
 from types import SimpleNamespace
@@ -18,16 +19,31 @@ if str(_EXAMPLE_DIR) not in sys.path:
     sys.path.insert(0, str(_EXAMPLE_DIR))
 
 from terminal_bench_rlm.gepa import cli as gepa_cli  # noqa: E402
+from terminal_bench_rlm.gepa import project as gepa_project  # noqa: E402
 from terminal_bench_rlm.gepa.config import COMPONENT_SKILL, default_config  # noqa: E402
 from terminal_bench_rlm.gepa.project import (  # noqa: E402
+    DaytonaRemoteControllerEnvironment,
+    HarborControllerLocality,
+    HarborRemoteControllerHarnessRunner,
     HarborSubprocessHarnessRunner,
+    LocalShellRemoteControllerEnvironment,
+    RemoteCommandResult,
+    SbxRemoteControllerEnvironment,
+    SshGcpRemoteControllerEnvironment,
+    TerminalBenchExample,
     TerminalBenchGepaProject,
     TerminalBenchInProcessHarnessRunner,
     TerminalBenchSubprocessHarnessRunner,
     TerminalBenchTaskRunRequest,
     TerminalBenchTaskRunResult,
+    _agent_kwargs,
+    _build_harbor_harness_runner,
+    _build_harbor_run_command,
+    _extract_tarball,
     _seed_skill_instructions,
+    _subprocess_env,
     phase_duration_summary,
+    select_harbor_controller_locality,
 )
 from terminal_bench_rlm.skills import DEFAULT_TERMINAL_BENCH_SKILL_INSTRUCTIONS  # noqa: E402
 from terminal_bench_rlm.tools import tbench_agent  # noqa: E402
@@ -47,6 +63,138 @@ class FakeHarnessRunner:
         return self.result
 
 
+class RecordingHarnessRunner:
+    def __init__(self) -> None:
+        self.calls: list[TerminalBenchTaskRunRequest] = []
+
+    async def run(self, request):
+        self.calls.append(request)
+        return TerminalBenchTaskRunResult(
+            task_id=request.task_id,
+            trial_result={"verifier_result": {"rewards": {"reward": 1.0}}},
+            traces=[],
+            run_dir=None,
+        )
+
+
+class FakeInteractiveHarborEnvironment:
+    def start_exec(self, command, *, workdir=None, timeout=None):
+        return None
+
+
+class FakeOneShotHarborEnvironment:
+    def __init__(self, *, run_id: str = "gepa-val-task", remote_root_exists: bool = False) -> None:
+        self.run_id = run_id
+        self.remote_root_exists = remote_root_exists
+        self.commands: list[str] = []
+        self.uploads: list[tuple[str, str]] = []
+        self.downloads: list[tuple[str, str]] = []
+        self.upload_archive_members: list[str] = []
+        self.upload_archive_contents: dict[str, bytes] = {}
+
+    def exec(self, *, command: str, timeout_sec: int):
+        self.commands.append(command)
+        if self.remote_root_exists and command.startswith("test ! -e "):
+            return SimpleNamespace(return_code=1, stdout="", stderr="exists")
+        return SimpleNamespace(return_code=0, stdout="", stderr="")
+
+    def upload_file(self, host_path: str, remote_path: str) -> None:
+        self.uploads.append((host_path, remote_path))
+        if host_path.endswith(".tar.gz"):
+            with tarfile.open(host_path, "r:gz") as archive:
+                self.upload_archive_members = archive.getnames()
+                self.upload_archive_contents = {}
+                for member in archive.getmembers():
+                    if not member.isfile():
+                        continue
+                    source = archive.extractfile(member)
+                    if source is not None:
+                        with source:
+                            self.upload_archive_contents[member.name] = source.read()
+
+    def download_file(self, remote_path: str, host_path: str) -> None:
+        self.downloads.append((remote_path, host_path))
+        with tarfile.open(host_path, "w:gz") as archive:
+            result_path = Path(host_path).parent / "result.json"
+            result_path.write_text(
+                json.dumps(
+                    {
+                        "trial_results": [
+                            {
+                                "task_name": "task",
+                                "verifier_result": {"rewards": {"reward": 1.0}},
+                            }
+                        ]
+                    }
+                ),
+                encoding="utf-8",
+            )
+            archive.add(result_path, arcname=f"{self.run_id}/result.json")
+
+
+class FakeDaytonaSyncSandbox:
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, tuple[object, ...], dict[str, object]]] = []
+
+    def run(self, command, *, timeout=None):
+        self.calls.append(("run", (command,), {"timeout": timeout}))
+        return RemoteCommandResult(stdout="sync")
+
+    def copy_to(self, host_path, remote_path):
+        self.calls.append(("copy_to", (host_path, remote_path), {}))
+
+    def get_file(self, remote_path, host_path):
+        self.calls.append(("get_file", (remote_path, host_path), {}))
+
+
+class FakeDaytonaAsyncSandbox:
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, tuple[object, ...], dict[str, object]]] = []
+
+    async def exec(self, *, command, timeout_sec):
+        self.calls.append(("exec", (), {"command": command, "timeout_sec": timeout_sec}))
+        return RemoteCommandResult(stdout="async")
+
+    async def put_file(self, host_path, remote_path):
+        self.calls.append(("put_file", (host_path, remote_path), {}))
+
+    async def copy_from(self, remote_path, host_path):
+        self.calls.append(("copy_from", (remote_path, host_path), {}))
+
+
+class FakeDaytonaSdkSandbox:
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, tuple[object, ...], dict[str, object]]] = []
+        self.process = SimpleNamespace(exec=self._exec)
+        self.fs = SimpleNamespace(upload_file=self._upload_file, download_file=self._download_file)
+
+    def _exec(self, command, *, timeout=None):
+        self.calls.append(("process.exec", (command,), {"timeout": timeout}))
+        return RemoteCommandResult(stdout="sdk")
+
+    def _upload_file(self, host_path, remote_path):
+        self.calls.append(("fs.upload_file", (host_path, remote_path), {}))
+
+    def _download_file(self, remote_path, host_path):
+        self.calls.append(("fs.download_file", (remote_path, host_path), {}))
+
+
+def _task_request(config, tmp_path: Path, *, run_id: str = "gepa-val-task"):
+    return TerminalBenchTaskRunRequest(
+        task_id="task",
+        instruction="",
+        skill_instructions="skill",
+        lm="main",
+        sub_lm="sub",
+        max_iterations=3,
+        task_timeout=30,
+        verbose_rlm=False,
+        output_dir=tmp_path,
+        run_id=run_id,
+        config=config,
+    )
+
+
 def test_project_validation_check_has_non_empty_train_and_val_examples() -> None:
     project = TerminalBenchGepaProject(default_config())
 
@@ -57,6 +205,55 @@ def test_project_validation_check_has_non_empty_train_and_val_examples() -> None
     assert len(validation.valset) >= 1
 
 
+@pytest.mark.asyncio
+async def test_project_loads_task_timeout_and_resources_before_launch(tmp_path: Path) -> None:
+    config = default_config()
+    config.harbor_task_cache_dir = tmp_path / "harbor-cache"
+    task_dir = config.harbor_task_cache_dir / "terminal-bench" / "task" / "sha"
+    task_dir.mkdir(parents=True)
+    (task_dir / "task.toml").write_text(
+        """
+[agent]
+timeout_sec = 90.0
+
+[verifier]
+timeout_sec = 45.0
+
+[environment]
+build_timeout_sec = 15.0
+cpus = 2
+memory_mb = 4096
+storage_mb = 10240
+gpus = 1
+""".strip(),
+        encoding="utf-8",
+    )
+    harness_runner = RecordingHarnessRunner()
+    project = TerminalBenchGepaProject(config, harness_runner=harness_runner)
+
+    await project.evaluate_example(
+        {COMPONENT_SKILL: "skill"},
+        TerminalBenchExample("terminal-bench/task"),
+        EvaluationContext(
+            lm="main",
+            sub_lm="sub",
+            max_iterations=3,
+            task_timeout=1800,
+            output_dir=tmp_path,
+            kind="valset",
+        ),
+    )
+
+    request = harness_runner.calls[0]
+    assert request.task_timeout == 210
+    assert request.task_resources == {
+        "cpus": 2,
+        "memory_mb": 4096,
+        "storage_mb": 10240,
+        "gpus": 1,
+    }
+
+
 
 def test_config_serializes_terminal_bench_fields_for_run_metadata() -> None:
     payload = default_config().to_dict()
@@ -64,6 +261,9 @@ def test_config_serializes_terminal_bench_fields_for_run_metadata() -> None:
     json.dumps(payload)
     assert payload["harness_backend"] == "harbor"
     assert payload["harbor_dataset"] == "terminal-bench/terminal-bench-2-1"
+    assert payload["harbor_environment"] == "docker"
+    assert payload["harbor_controller_locality"] == "auto"
+    assert payload["harbor_remote_workdir"] == "/tmp/predict_rlm_terminal_bench"
     assert payload["terminal_bench_output_dir"] == "runs/gepa-terminal-bench"
     assert payload["train_task_ids"] == ["configure-git-webserver", "extract-moves-from-video"]
     assert payload["val_task_ids"] == ["super-benchmark-upet"]
@@ -81,6 +281,12 @@ def test_cli_accepts_harbor_backend_and_executable_args() -> None:
             "uvx harbor",
             "--harbor-dataset",
             "terminal-bench/terminal-bench-2",
+            "--harbor-environment",
+            "daytona",
+            "--harbor-controller-locality",
+            "local-controller",
+            "--harbor-remote-workdir",
+            "/remote/tb",
         ]
     )
 
@@ -89,6 +295,19 @@ def test_cli_accepts_harbor_backend_and_executable_args() -> None:
     assert config.harness_backend == "harbor"
     assert config.harbor_executable == "uvx harbor"
     assert config.harbor_dataset == "terminal-bench/terminal-bench-2"
+    assert config.harbor_environment == "daytona"
+    assert config.harbor_controller_locality == "local-controller"
+    assert config.harbor_remote_workdir == "/remote/tb"
+
+
+def test_cli_help_advertises_remote_controller_as_supplied_machine() -> None:
+    parser = argparse.ArgumentParser()
+    gepa_cli._add_project_args(parser)
+
+    help_text = parser.format_help()
+
+    assert "the Harbor host process inside a supplied controller" in help_text
+    assert "unsupported for Daytona" not in help_text
 
 
 def test_cli_codex_lm_missing_dependency_points_to_local_extra(monkeypatch) -> None:
@@ -127,6 +346,252 @@ def test_build_project_can_still_use_cli_harness() -> None:
     assert isinstance(project.harness_runner, TerminalBenchSubprocessHarnessRunner)
 
 
+def test_build_project_explicit_remote_controller_requires_supplied_environment() -> None:
+    config = default_config()
+    config.harbor_controller_locality = "remote-controller"
+
+    with pytest.raises(RuntimeError) as exc_info:
+        gepa_project.build_project(config)
+
+    message = str(exc_info.value)
+    assert "Harbor remote-controller requires a Harbor/Daytona environment object" in message
+    assert "build_project(config) cannot construct that environment" in message
+    assert "must supply it to the lower-level Harbor runner" in message
+
+
+def test_harbor_controller_auto_chooses_local_controller_for_interactive_exec() -> None:
+    selection = select_harbor_controller_locality(
+        "auto",
+        FakeInteractiveHarborEnvironment(),
+    )
+
+    assert selection.locality is HarborControllerLocality.LOCAL_CONTROLLER
+    assert "interactive exec" in selection.reason
+
+
+def test_harbor_controller_auto_chooses_remote_controller_for_one_shot_file_sync() -> None:
+    selection = select_harbor_controller_locality(
+        "auto",
+        FakeOneShotHarborEnvironment(),
+    )
+
+    assert selection.locality is HarborControllerLocality.REMOTE_CONTROLLER
+    assert "one-shot exec" in selection.reason
+
+
+def test_harbor_controller_auto_recognizes_remote_controller_adapters() -> None:
+    adapters = [
+        LocalShellRemoteControllerEnvironment(),
+        SshGcpRemoteControllerEnvironment("gcp-vm"),
+        SbxRemoteControllerEnvironment(sandbox_id="sandbox-123"),
+        DaytonaRemoteControllerEnvironment(FakeDaytonaSyncSandbox()),
+    ]
+
+    selections = [select_harbor_controller_locality("auto", adapter) for adapter in adapters]
+
+    assert [selection.locality for selection in selections] == [
+        HarborControllerLocality.REMOTE_CONTROLLER,
+        HarborControllerLocality.REMOTE_CONTROLLER,
+        HarborControllerLocality.REMOTE_CONTROLLER,
+        HarborControllerLocality.REMOTE_CONTROLLER,
+    ]
+
+
+def test_harbor_controller_local_controller_fails_without_interactive_exec() -> None:
+    env = FakeOneShotHarborEnvironment()
+
+    with pytest.raises(RuntimeError, match="persistent interactive exec"):
+        select_harbor_controller_locality("local-controller", env)
+
+    assert env.commands == []
+
+
+def test_build_harbor_harness_runner_uses_remote_controller_for_auto_one_shot_env() -> None:
+    config = default_config()
+    runner = _build_harbor_harness_runner(
+        config,
+        controller_environment=FakeOneShotHarborEnvironment(),
+    )
+
+    assert isinstance(runner, HarborRemoteControllerHarnessRunner)
+
+
+def test_daytona_harbor_config_uses_local_subprocess_runner_without_controller_environment() -> None:
+    config = default_config()
+    config.harbor_environment = "daytona"
+
+    runner = _build_harbor_harness_runner(config)
+
+    assert isinstance(runner, HarborSubprocessHarnessRunner)
+
+
+def test_daytona_harbor_config_can_use_supplied_remote_controller_environment() -> None:
+    config = default_config()
+    config.harbor_environment = "daytona"
+
+    runner = _build_harbor_harness_runner(
+        config,
+        controller_environment=FakeOneShotHarborEnvironment(),
+    )
+
+    assert isinstance(runner, HarborRemoteControllerHarnessRunner)
+
+
+def test_daytona_agent_kwargs_keep_environment_interpreter_for_session_exec(tmp_path: Path) -> None:
+    config = default_config()
+    config.harbor_environment = "daytona"
+    request = _task_request(config, tmp_path)
+
+    kwargs = _agent_kwargs(request)
+    cmd = _build_harbor_run_command(request, output_dir=tmp_path / "harbor-runs")
+
+    assert "interpreter_mode" not in kwargs
+    assert "interpreter_mode=local-process" not in cmd
+    assert "remote-controller" not in cmd
+
+
+def test_docker_agent_kwargs_keep_environment_interpreter_default(tmp_path: Path) -> None:
+    config = default_config()
+    config.harbor_environment = "docker"
+
+    kwargs = _agent_kwargs(_task_request(config, tmp_path))
+
+    assert "interpreter_mode" not in kwargs
+
+
+def test_daytona_explicit_remote_controller_requires_supplied_environment() -> None:
+    config = default_config()
+    config.harbor_environment = "daytona"
+    config.harbor_controller_locality = "remote-controller"
+
+    with pytest.raises(RuntimeError) as exc_info:
+        _build_harbor_harness_runner(config)
+
+    message = str(exc_info.value)
+    assert "requires an explicit Daytona controller environment" in message
+
+
+def test_local_shell_remote_controller_runs_and_syncs_files(tmp_path: Path) -> None:
+    env = LocalShellRemoteControllerEnvironment()
+    source = tmp_path / "source.txt"
+    source.write_text("artifact\n", encoding="utf-8")
+    remote_source = tmp_path / "remote" / "source.txt"
+    remote_output = tmp_path / "remote" / "output.txt"
+    downloaded = tmp_path / "downloaded.txt"
+
+    env.upload_file(str(source), str(remote_source))
+    result = env.exec(
+        command=f"cp {remote_source} {remote_output}",
+        timeout_sec=10,
+    )
+    env.download_file(str(remote_output), str(downloaded))
+
+    assert result.returncode == 0
+    assert remote_source.read_text(encoding="utf-8") == "artifact\n"
+    assert downloaded.read_text(encoding="utf-8") == "artifact\n"
+
+
+def test_ssh_gcp_remote_controller_builds_ssh_and_scp_commands(monkeypatch) -> None:
+    calls: list[tuple[list[str], dict[str, object]]] = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append((cmd, kwargs))
+        return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="ok\n", stderr="")
+
+    monkeypatch.setattr(gepa_project.subprocess, "run", fake_run)
+    env = SshGcpRemoteControllerEnvironment(
+        "gcp-vm",
+        ssh_args=("-i", "key.pem"),
+        scp_args=("-i", "key.pem"),
+    )
+
+    result = env.exec(command="echo ok", timeout_sec=12)
+    env.upload_file("/host/repo.tar.gz", "/remote/repo.tar.gz")
+    env.download_file("/remote/artifacts.tar.gz", "/host/artifacts.tar.gz")
+
+    assert result.returncode == 0
+    assert [call[0] for call in calls] == [
+        ["ssh", "-i", "key.pem", "gcp-vm", "echo ok"],
+        ["scp", "-i", "key.pem", "/host/repo.tar.gz", "gcp-vm:/remote/repo.tar.gz"],
+        ["scp", "-i", "key.pem", "gcp-vm:/remote/artifacts.tar.gz", "/host/artifacts.tar.gz"],
+    ]
+    assert calls[0][1]["timeout"] == 12
+
+
+def test_sbx_remote_controller_builds_create_exec_cp_and_rm_commands(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    calls: list[list[str]] = []
+    host_artifacts = tmp_path / "artifacts.tar.gz"
+
+    def fake_run(cmd, **_kwargs):
+        calls.append(cmd)
+        stdout = "sandbox-123\n" if cmd[:2] == ["sbx", "create"] else ""
+        return subprocess.CompletedProcess(args=cmd, returncode=0, stdout=stdout, stderr="")
+
+    monkeypatch.setattr(gepa_project.subprocess, "run", fake_run)
+    env = SbxRemoteControllerEnvironment(
+        workspace=tmp_path / "sbx-workspace",
+        create_args=("--template", "ubuntu:22.04"),
+    )
+
+    result = env.exec(command="echo ok", timeout_sec=13)
+    env.upload_file("/host/repo.tar.gz", "/remote/repo.tar.gz")
+    env.download_file("/remote/artifacts.tar.gz", str(host_artifacts))
+    env.close()
+
+    assert result.returncode == 0
+    assert calls == [
+        ["sbx", "create", "shell", str(tmp_path / "sbx-workspace"), "--template", "ubuntu:22.04"],
+        ["sbx", "exec", "sandbox-123", "sh", "-lc", "echo ok"],
+        ["sbx", "cp", "/host/repo.tar.gz", "sandbox-123:/remote/repo.tar.gz"],
+        ["sbx", "cp", "sandbox-123:/remote/artifacts.tar.gz", str(host_artifacts)],
+        ["sbx", "rm", "sandbox-123"],
+    ]
+
+
+def test_daytona_remote_controller_wraps_sync_async_and_sdk_method_names() -> None:
+    sync_sandbox = FakeDaytonaSyncSandbox()
+    sync_env = DaytonaRemoteControllerEnvironment(sync_sandbox)
+
+    assert sync_env.exec(command="echo sync", timeout_sec=7).stdout == "sync"
+    sync_env.upload_file("/host/a", "/remote/a")
+    sync_env.download_file("/remote/a", "/host/a")
+
+    assert sync_sandbox.calls == [
+        ("run", ("echo sync",), {"timeout": 7}),
+        ("copy_to", ("/host/a", "/remote/a"), {}),
+        ("get_file", ("/remote/a", "/host/a"), {}),
+    ]
+
+    async_sandbox = FakeDaytonaAsyncSandbox()
+    async_env = DaytonaRemoteControllerEnvironment(async_sandbox)
+
+    assert async_env.exec(command="echo async", timeout_sec=8).stdout == "async"
+    async_env.upload_file("/host/a", "/remote/a")
+    async_env.download_file("/remote/a", "/host/a")
+
+    assert async_sandbox.calls == [
+        ("exec", (), {"command": "echo async", "timeout_sec": 8}),
+        ("put_file", ("/host/a", "/remote/a"), {}),
+        ("copy_from", ("/remote/a", "/host/a"), {}),
+    ]
+
+    sdk_sandbox = FakeDaytonaSdkSandbox()
+    sdk_env = DaytonaRemoteControllerEnvironment(sdk_sandbox)
+
+    assert sdk_env.exec(command="echo sdk", timeout_sec=9).stdout == "sdk"
+    sdk_env.upload_file("/host/a", "/remote/a")
+    sdk_env.download_file("/remote/a", "/host/a")
+
+    assert sdk_sandbox.calls == [
+        ("process.exec", ("echo sdk",), {"timeout": 9}),
+        ("fs.upload_file", ("/host/a", "/remote/a"), {}),
+        ("fs.download_file", ("/remote/a", "/host/a"), {}),
+    ]
+
+
 def test_harbor_agent_exposes_agent_info_without_harbor_dependency() -> None:
     agent = tbench_agent.HarborPredictRLMAgent(
         logs_dir=Path("/tmp/logs"),
@@ -146,6 +611,7 @@ def test_harbor_runner_builds_harbor_run_command(monkeypatch, tmp_path: Path) ->
     config = default_config()
     config.terminal_bench_output_dir = tmp_path / "harbor-runs"
     config.harbor_dataset = "terminal-bench/terminal-bench-2-1"
+    config.harbor_environment = "daytona"
     captured: dict[str, object] = {}
 
     def fake_run(cmd, **kwargs):
@@ -187,7 +653,14 @@ def test_harbor_runner_builds_harbor_run_command(monkeypatch, tmp_path: Path) ->
 
     cmd = captured["cmd"]
     assert isinstance(cmd, list)
-    assert cmd[:4] == ["harbor", "run", "-d", "terminal-bench/terminal-bench-2-1"]
+    assert cmd[:6] == [
+        "harbor",
+        "run",
+        "-d",
+        "terminal-bench/terminal-bench-2-1",
+        "-e",
+        "daytona",
+    ]
     assert "--include-task-name" in cmd
     assert cmd[cmd.index("--include-task-name") + 1] == "task"
     assert "--agent-import-path" in cmd
@@ -203,10 +676,16 @@ def test_harbor_runner_builds_harbor_run_command(monkeypatch, tmp_path: Path) ->
     assert cmd[cmd.index("--n-attempts") + 1] == "1"
     assert "--n-concurrent" in cmd
     assert cmd[cmd.index("--n-concurrent") + 1] == "1"
+    assert "--cpus" in cmd
+    assert cmd[cmd.index("--cpus") + 1] == "auto"
+    assert "--memory" in cmd
+    assert cmd[cmd.index("--memory") + 1] == "auto"
     assert "--agent-kwarg" in cmd
     assert "exec_timeout=900" in cmd
     assert "task_id=task" in cmd
     assert f"phase_log_path={config.terminal_bench_output_dir / 'gepa-val-task' / 'task_phase_events.jsonl'}" in cmd
+    assert "tar" not in cmd
+    assert "cd" not in cmd
     kwargs = captured["kwargs"]
     assert isinstance(kwargs, dict)
     assert kwargs["timeout"] == 2760
@@ -214,6 +693,207 @@ def test_harbor_runner_builds_harbor_run_command(monkeypatch, tmp_path: Path) ->
     assert "stderr" not in kwargs
     assert result.error is None
     assert result.trial_result["verifier_result"]["rewards"]["reward"] == 1.0
+
+
+def test_harbor_remote_controller_builds_remote_command_and_syncs_artifacts(
+    tmp_path: Path,
+) -> None:
+    repo = tmp_path / "repo"
+    cwd = repo / "examples" / "terminal_bench"
+    cwd.mkdir(parents=True)
+    (repo / "pyproject.toml").write_text("[project]\nname = 'predict-rlm'\n", encoding="utf-8")
+    (cwd / "pyproject.toml").write_text(
+        "[project]\nname = 'terminal-bench-rlm'\n",
+        encoding="utf-8",
+    )
+    config = default_config()
+    config.terminal_bench_output_dir = tmp_path / "local-runs"
+    config.harbor_environment = "docker"
+    config.harbor_remote_workdir = "/remote/tb"
+    env = FakeOneShotHarborEnvironment()
+
+    result = HarborRemoteControllerHarnessRunner(env, cwd=cwd)._run_sync(
+        _task_request(config, tmp_path)
+    )
+
+    assert result.error is None
+    assert result.trial_result["verifier_result"]["rewards"]["reward"] == 1.0
+    assert env.uploads
+    assert env.uploads[0][1] == "/remote/tb/gepa-val-task/repo.tar.gz"
+    assert env.downloads == [
+        (
+            "/remote/tb/gepa-val-task/artifacts.tar.gz",
+            env.downloads[0][1],
+        )
+    ]
+    joined_commands = "\n".join(env.commands)
+    assert "cd /remote/tb/gepa-val-task/repo/examples/terminal_bench" in joined_commands
+    assert "harbor run -d terminal-bench/terminal-bench-2-1 -e docker" in joined_commands
+    assert "--jobs-dir /remote/tb/gepa-val-task/harbor-runs" in joined_commands
+    assert "--job-name gepa-val-task" in joined_commands
+    assert "phase_log_path=/remote/tb/gepa-val-task/harbor-runs/gepa-val-task/task_phase_events.jsonl" in joined_commands
+    assert (config.terminal_bench_output_dir / "gepa-val-task" / "result.json").exists()
+
+
+def test_harbor_remote_controller_allows_daytona_when_controller_is_supplied(
+    tmp_path: Path,
+) -> None:
+    repo = tmp_path / "repo"
+    cwd = repo / "examples" / "terminal_bench"
+    cwd.mkdir(parents=True)
+    (repo / "pyproject.toml").write_text("[project]\nname = 'predict-rlm'\n", encoding="utf-8")
+    config = default_config()
+    config.terminal_bench_output_dir = tmp_path / "local-runs"
+    config.harbor_environment = "daytona"
+    env = FakeOneShotHarborEnvironment()
+
+    result = HarborRemoteControllerHarnessRunner(env, cwd=cwd)._run_sync(
+        _task_request(config, tmp_path)
+    )
+
+    assert result.error is None
+    joined_commands = "\n".join(env.commands)
+    assert "harbor run -d terminal-bench/terminal-bench-2-1 -e daytona" in joined_commands
+    assert env.uploads
+    assert env.downloads
+
+
+def test_harbor_remote_controller_refuses_existing_remote_root_before_unpack(
+    tmp_path: Path,
+) -> None:
+    repo = tmp_path / "repo"
+    cwd = repo / "examples" / "terminal_bench"
+    cwd.mkdir(parents=True)
+    (repo / "pyproject.toml").write_text("[project]\nname = 'predict-rlm'\n", encoding="utf-8")
+    config = default_config()
+    config.terminal_bench_output_dir = tmp_path / "local-runs"
+    config.harbor_remote_workdir = "/remote/tb"
+    env = FakeOneShotHarborEnvironment(remote_root_exists=True)
+
+    with pytest.raises(RuntimeError) as exc_info:
+        HarborRemoteControllerHarnessRunner(env, cwd=cwd)._run_sync(_task_request(config, tmp_path))
+
+    message = str(exc_info.value)
+    assert "remote root already exists: /remote/tb/gepa-val-task" in message
+    assert "Download/preserve artifacts or use a unique run id" in message
+    assert env.uploads == []
+    assert all("rm -rf" not in command for command in env.commands)
+
+
+def test_harbor_remote_controller_does_not_recreate_one_shot_json_rpc_shim(
+    tmp_path: Path,
+) -> None:
+    repo = tmp_path / "repo"
+    cwd = repo / "examples" / "terminal_bench"
+    cwd.mkdir(parents=True)
+    (repo / "pyproject.toml").write_text("[project]\nname = 'predict-rlm'\n", encoding="utf-8")
+    config = default_config()
+    config.terminal_bench_output_dir = tmp_path / "local-runs"
+    env = FakeOneShotHarborEnvironment()
+
+    HarborRemoteControllerHarnessRunner(env, cwd=cwd)._run_sync(_task_request(config, tmp_path))
+
+    remote_shell = "\n".join(env.commands)
+    assert "jsonrpc" not in remote_shell.lower()
+    assert "predict_rlm_runner.py" not in remote_shell
+    assert "heredoc" not in remote_shell.lower()
+    assert "python3 -u /tmp/predict_rlm_runner.py" not in remote_shell
+
+
+def test_harbor_remote_controller_package_uploads_only_tracked_files(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    repo = tmp_path / "repo"
+    cwd = repo / "examples" / "terminal_bench"
+    cwd.mkdir(parents=True)
+    (repo / "pyproject.toml").write_text("[project]\nname = 'predict-rlm'\n", encoding="utf-8")
+    (cwd / "pyproject.toml").write_text(
+        "[project]\nname = 'terminal-bench-rlm'\n",
+        encoding="utf-8",
+    )
+    (repo / "tracked.txt").write_text("working-tree tracked content\n", encoding="utf-8")
+    (repo / "early_failures.txt").write_text("untracked sentinel\n", encoding="utf-8")
+    (repo / "bug_reports").mkdir()
+    (repo / "bug_reports" / "stale.md").write_text("untracked report\n", encoding="utf-8")
+    (repo / ".hermes").mkdir()
+    (repo / ".hermes" / "checkpoint.json").write_text("checkpoint\n", encoding="utf-8")
+
+    def fake_git_ls_files(cmd, **kwargs):
+        assert cmd == ["git", "ls-files", "-z"]
+        assert kwargs["cwd"] == repo
+        return subprocess.CompletedProcess(
+            args=cmd,
+            returncode=0,
+            stdout=(
+                b"pyproject.toml\0"
+                b"examples/terminal_bench/pyproject.toml\0"
+                b"tracked.txt\0"
+            ),
+            stderr=b"",
+        )
+
+    monkeypatch.setattr(gepa_project.subprocess, "run", fake_git_ls_files)
+    config = default_config()
+    config.terminal_bench_output_dir = tmp_path / "local-runs"
+    env = FakeOneShotHarborEnvironment()
+
+    HarborRemoteControllerHarnessRunner(env, cwd=cwd)._run_sync(_task_request(config, tmp_path))
+
+    assert "repo/tracked.txt" in env.upload_archive_members
+    assert env.upload_archive_contents["repo/tracked.txt"] == b"working-tree tracked content\n"
+    assert "repo/early_failures.txt" not in env.upload_archive_members
+    assert "repo/bug_reports/stale.md" not in env.upload_archive_members
+    assert "repo/.hermes/checkpoint.json" not in env.upload_archive_members
+
+
+def test_extract_tarball_rejects_path_traversal_without_tar_filter(tmp_path: Path) -> None:
+    source = tmp_path / "source.txt"
+    source.write_text("artifact\n", encoding="utf-8")
+    safe_archive = tmp_path / "safe.tar.gz"
+    with tarfile.open(safe_archive, "w:gz") as archive:
+        archive.add(source, arcname="gepa-val-task/result.txt")
+
+    output_dir = tmp_path / "output"
+    _extract_tarball(safe_archive, output_dir)
+
+    assert (output_dir / "gepa-val-task" / "result.txt").read_text(encoding="utf-8") == "artifact\n"
+
+    evil_archive = tmp_path / "evil.tar.gz"
+    with tarfile.open(evil_archive, "w:gz") as archive:
+        archive.add(source, arcname="../escaped.txt")
+
+    with pytest.raises(RuntimeError, match="outside"):
+        _extract_tarball(evil_archive, output_dir)
+
+    assert not (tmp_path / "escaped.txt").exists()
+
+
+def test_harbor_subprocess_env_loads_repo_env_development_without_overrides(
+    monkeypatch, tmp_path: Path
+) -> None:
+    repo = tmp_path / "repo"
+    cwd = repo / "examples" / "terminal_bench"
+    cwd.mkdir(parents=True)
+    (repo / ".env.development").write_text(
+        "\n".join(
+            [
+                "# ignored",
+                "DAYTONA_API_KEY=from-file",
+                "export OPENAI_API_KEY='from-file-openai'",
+                "EMPTY_LINE_IGNORED",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("OPENAI_API_KEY", "from-shell-openai")
+    monkeypatch.delenv("DAYTONA_API_KEY", raising=False)
+
+    env = _subprocess_env(cwd)
+
+    assert env["DAYTONA_API_KEY"] == "from-file"
+    assert env["OPENAI_API_KEY"] == "from-shell-openai"
+    assert "EMPTY_LINE_IGNORED" not in env
 
 
 def test_harbor_subprocess_runner_retries_transient_registry_exception_result(
@@ -1272,6 +1952,11 @@ def test_agent_builds_low_effort_lms_from_agent_kwargs(monkeypatch) -> None:
             pass
 
     class FakeDspy:
+        class Signature:
+            def __init__(self, fields, instructions) -> None:
+                self.output_fields = {"answer": object()} if isinstance(fields, str) else dict(fields)
+                self.instructions = instructions
+
         class LM:
             def __init__(self, model, **kwargs) -> None:
                 self.model = model

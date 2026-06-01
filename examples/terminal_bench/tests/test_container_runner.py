@@ -12,6 +12,7 @@ from types import SimpleNamespace
 import pytest
 from dspy.primitives.code_interpreter import CodeInterpreterError
 
+from predict_rlm.debug import reset_debug_logger_for_tests
 from predict_rlm.interpreter import SandboxFatalError
 
 _EXAMPLE_DIR = Path(__file__).resolve().parent.parent
@@ -22,6 +23,7 @@ from terminal_bench_rlm.tools.container_runner import (  # noqa: E402
     TERMINAL_BENCH_RECOVERABLE_TIMEOUT_GRACE_SECONDS,
     HarborContainerAdapter,
     HarborEnvironmentInterpreter,
+    LocalProcessRunnerInterpreter,
     TerminalBenchRunnerInterpreter,
 )
 from terminal_bench_rlm.tools.runner import runner_source  # noqa: E402
@@ -136,6 +138,20 @@ class FakeAdapter:
         return process
 
 
+@pytest.fixture
+def local_runner_interpreter(tmp_path: Path) -> LocalProcessRunnerInterpreter:
+    interpreter = LocalProcessRunnerInterpreter(
+        runner_path=str(tmp_path / "predict_rlm_runner.py"),
+        workdir=str(tmp_path),
+        exec_timeout=10,
+        recoverable_timeout_grace=2.0,
+    )
+    try:
+        yield interpreter
+    finally:
+        interpreter.shutdown()
+
+
 def test_execute_reset_shutdown_requests_and_maps_success() -> None:
     process = FakeProcess(
         [
@@ -214,6 +230,154 @@ def test_execute_accepts_lm_selected_execution_timeout() -> None:
         "code": "print('bounded')",
         "execution_timeout_seconds": 2.5,
     }
+
+
+def test_execute_debug_logs_empty_output_diagnostic(monkeypatch, tmp_path: Path) -> None:
+    log_path = tmp_path / "predict_rlm_debug.jsonl"
+    monkeypatch.setenv("PREDICT_RLM_DEBUG", "1")
+    monkeypatch.setenv("PREDICT_RLM_DEBUG_JSON", "1")
+    monkeypatch.setenv("PREDICT_RLM_DEBUG_LOG", str(log_path))
+    reset_debug_logger_for_tests()
+    process = FakeProcess([{"id": 1, "ok": True, "result": {"output": ""}}])
+    interpreter = TerminalBenchRunnerInterpreter(
+        object(),
+        container_adapter=FakeAdapter(process),
+        runner_path="/tmp/predict_rlm_runner.py",
+    )
+
+    try:
+        assert interpreter.execute("print('expected output')") == ""
+    finally:
+        reset_debug_logger_for_tests()
+
+    records = [
+        json.loads(line)
+        for line in log_path.read_text(encoding="utf-8").splitlines()
+        if line.startswith("{")
+    ]
+    empty_events = [
+        record
+        for record in records
+        if record.get("event") == "terminal_bench.runner.empty_execute_output"
+    ]
+
+    assert empty_events
+    event = empty_events[0]
+    assert event["request_id"] == 1
+    assert event["code_len"] == len("print('expected output')")
+    assert event["code_hash"]
+    assert event["output_len"] == 0
+    assert event["code_preview"] == "print('expected output')"
+
+
+def test_execute_strips_python_and_repl_fences_before_runner_request() -> None:
+    process = FakeProcess(
+        [
+            {"id": 1, "ok": True, "result": {"output": "python\n"}},
+            {"id": 2, "ok": True, "result": {"output": "repl\n"}},
+        ]
+    )
+    interpreter = TerminalBenchRunnerInterpreter(
+        object(),
+        container_adapter=FakeAdapter(process),
+        runner_path="/tmp/predict_rlm_runner.py",
+    )
+
+    assert interpreter.execute("```python\nprint('python')\n```") == "python\n"
+    assert interpreter.execute("```repl\nprint('repl')\n```") == "repl\n"
+
+    assert process.requests[0]["params"] == {"code": "print('python')"}
+    assert process.requests[1]["params"] == {"code": "print('repl')"}
+
+
+def test_local_runner_preserves_stdout_from_repl_fenced_code(
+    local_runner_interpreter: LocalProcessRunnerInterpreter,
+) -> None:
+    result = local_runner_interpreter.execute(
+        "```repl\nprint('local stdout survives')\n```"
+    )
+
+    assert result == "local stdout survives\n"
+
+
+def test_local_runner_recoverable_timeout_preserves_streams_and_state(
+    local_runner_interpreter: LocalProcessRunnerInterpreter,
+) -> None:
+    assert local_runner_interpreter.execute("state = 'survived'\nprint('set')") == "set\n"
+
+    timeout_result = local_runner_interpreter.execute(
+        "import sys, time\n"
+        "print('before timeout')\n"
+        "print('stderr before timeout', file=sys.stderr)\n"
+        "sys.stdout.flush(); sys.stderr.flush()\n"
+        "time.sleep(30)\n",
+        timeout=0.2,
+    )
+    followup = local_runner_interpreter.execute("print(state)")
+
+    assert "[Timeout] Iteration execution timed out after 0.2s" in timeout_result
+    assert "[stdout]\nbefore timeout" in timeout_result
+    assert "[stderr]\nstderr before timeout" in timeout_result
+    assert timeout_result.timeout_seconds == 0.2
+    assert followup == "survived\n"
+
+
+def test_local_runner_surfaces_subprocess_failure_and_survives(
+    local_runner_interpreter: LocalProcessRunnerInterpreter,
+) -> None:
+    with pytest.raises(CodeInterpreterError) as exc_info:
+        local_runner_interpreter.execute(
+            "import subprocess, sys\n"
+            "subprocess.run(\n"
+            "    [sys.executable, '-c', 'import sys; print(\"child failed\", file=sys.stderr); sys.exit(7)'],\n"
+            "    capture_output=True,\n"
+            "    text=True,\n"
+            "    check=True,\n"
+            ")\n",
+            timeout=2,
+        )
+    followup = local_runner_interpreter.execute("print('after subprocess failure')")
+
+    message = str(exc_info.value)
+    assert "CalledProcessError" in message
+    assert "non-zero exit status 7" in message
+    assert followup == "after subprocess failure\n"
+
+
+def test_local_runner_unbounded_runner_exit_returns_error_and_supervisor_survives(
+    local_runner_interpreter: LocalProcessRunnerInterpreter,
+) -> None:
+    with pytest.raises(CodeInterpreterError) as exc_info:
+        local_runner_interpreter.execute("import os\nos._exit(7)")
+    followup = local_runner_interpreter.execute("print('after runner child exit')")
+
+    message = str(exc_info.value)
+    assert "RuntimeError" in message
+    assert "execution runner exited without a result" in message
+    assert "exitcode=7" in message
+    assert followup == "after runner child exit\n"
+
+
+def test_local_runner_protocol_stdin_is_isolated_from_user_subprocesses(
+    local_runner_interpreter: LocalProcessRunnerInterpreter,
+) -> None:
+    local_runner_interpreter.execute("sentinel = 123")
+
+    result = local_runner_interpreter.execute(
+        "import subprocess, sys\n"
+        "child = subprocess.run(\n"
+        "    [sys.executable, '-c', 'import os; print(os.read(0, 1))'],\n"
+        "    capture_output=True,\n"
+        "    text=True,\n"
+        "    timeout=0.5,\n"
+        ")\n"
+        "print(child.stdout.strip())\n",
+        timeout=2,
+    )
+    followup = local_runner_interpreter.execute("print(sentinel)")
+
+    assert result == "b''\n"
+    assert followup == "123\n"
 
 
 def test_execute_maps_structured_timeout_as_recoverable_observation() -> None:

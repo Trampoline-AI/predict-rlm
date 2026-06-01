@@ -5,6 +5,9 @@ import importlib
 import inspect
 import json
 import os
+import shlex
+import tarfile
+import tempfile
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -25,6 +28,28 @@ TERMINAL_WRAPPER_TOOL_NAMES = frozenset(
 PredictRLM: Any | None = None
 TerminalBenchRunnerInterpreter: Any | None = None
 HarborEnvironmentInterpreter: Any | None = None
+LocalProcessRunnerInterpreter: Any | None = None
+
+INTERPRETER_MODE_ENVIRONMENT = "environment"
+INTERPRETER_MODE_LOCAL_PROCESS = "local-process"
+DAYTONA_REMOTE_ROOT = "/tmp/predict_rlm_controller"
+DAYTONA_REMOTE_HOME = "/tmp/predict_rlm_home"
+DAYTONA_REMOTE_RESULT_SENTINEL = "PREDICT_RLM_REMOTE_RESULT_JSON="
+_SOURCE_BUNDLE_RELATIVE_PATHS = (
+    "pyproject.toml",
+    "README.md",
+    "src",
+    "examples/terminal_bench/pyproject.toml",
+    "examples/terminal_bench/terminal_bench_rlm",
+)
+_SECRET_PAYLOAD_KEY_PARTS = (
+    "api_key",
+    "authorization",
+    "credential",
+    "password",
+    "secret",
+    "token",
+)
 
 
 def _tool_name(tool: Callable[..., Any]) -> str:
@@ -186,6 +211,15 @@ def _write_phase_event(
     )
 
 
+def _set_context_answer(context: Any, answer: str) -> None:
+    if "metadata" in getattr(type(context), "model_fields", {}):
+        metadata = dict(context.metadata or {})
+        metadata["answer"] = answer
+        context.metadata = metadata
+    else:
+        setattr(context, "answer", answer)
+
+
 def _predict_rlm_class() -> Any:
     global PredictRLM
     if PredictRLM is None:
@@ -228,6 +262,48 @@ def _harbor_interpreter_class() -> Any:
             "HarborEnvironmentInterpreter",
         )
     return HarborEnvironmentInterpreter
+
+
+def _local_process_interpreter_class() -> Any:
+    global LocalProcessRunnerInterpreter
+    if LocalProcessRunnerInterpreter is None:
+        LocalProcessRunnerInterpreter = getattr(
+            importlib.import_module(".container_runner", __package__),
+            "LocalProcessRunnerInterpreter",
+        )
+    return LocalProcessRunnerInterpreter
+
+
+def _coerce_interpreter_mode(value: Any) -> str:
+    mode = str(value or INTERPRETER_MODE_ENVIRONMENT).strip().lower()
+    if mode in {"harbor", "harbor-environment"}:
+        return INTERPRETER_MODE_ENVIRONMENT
+    if mode in {"local", "local-process"}:
+        return INTERPRETER_MODE_LOCAL_PROCESS
+    if mode == INTERPRETER_MODE_ENVIRONMENT:
+        return mode
+    raise ValueError(
+        "Unsupported Terminal-Bench PredictRLM interpreter_mode: "
+        f"{value!r}. Expected 'environment' or 'local-process'."
+    )
+
+
+def _environment_has_daytona_session_process(environment: Any) -> bool:
+    process = getattr(getattr(environment, "_sandbox", None), "process", None)
+    return all(
+        callable(getattr(process, name, None))
+        for name in (
+            "create_session",
+            "execute_session_command",
+            "get_session_command",
+            "get_session_command_logs",
+            "send_session_command_input",
+        )
+    )
+
+
+def _use_environment_interpreter_for_local_process_mode(environment: Any) -> bool:
+    return _environment_has_daytona_session_process(environment)
 
 
 @dataclass
@@ -317,10 +393,16 @@ class _TerminalBenchRLMBaseAgentMixin:
         sub_lm_reasoning_effort: str | None = None,
         lm_service_tier: str | None = None,
         sub_lm_service_tier: str | None = None,
+        interpreter_mode: str = INTERPRETER_MODE_ENVIRONMENT,
         exec_timeout: float | str | None = None,
         no_rebuild: bool | None = None,
         phase_log_path: str | Path | None = None,
         task_id: str | None = None,
+        codex_lm_debug: bool | str = False,
+        codex_lm_debug_log: str | None = None,
+        predict_rlm_debug: bool | str = False,
+        predict_rlm_debug_json: bool | str = False,
+        predict_rlm_debug_log: str | None = None,
         **predict_rlm_kwargs: Any,
     ) -> None:
         _validate_tools(tools)
@@ -335,9 +417,25 @@ class _TerminalBenchRLMBaseAgentMixin:
         self.sub_lm_reasoning_effort = _coerce_optional_text(sub_lm_reasoning_effort)
         self.lm_service_tier = _coerce_optional_text(lm_service_tier)
         self.sub_lm_service_tier = _coerce_optional_text(sub_lm_service_tier)
+        self.interpreter_mode = _coerce_interpreter_mode(interpreter_mode)
         self.phase_log_path = Path(phase_log_path) if phase_log_path is not None else None
         self.task_id = task_id
         self.predict_rlm_kwargs = predict_rlm_kwargs
+        self.codex_lm_debug = _coerce_bool(codex_lm_debug)
+        self.codex_lm_debug_log = _coerce_optional_text(codex_lm_debug_log)
+        self.predict_rlm_debug = _coerce_bool(predict_rlm_debug)
+        self.predict_rlm_debug_json = _coerce_bool(predict_rlm_debug_json)
+        self.predict_rlm_debug_log = _coerce_optional_text(predict_rlm_debug_log)
+        if self.codex_lm_debug:
+            os.environ["CODEX_LM_DEBUG"] = "1"
+        if self.codex_lm_debug_log:
+            os.environ["CODEX_LM_DEBUG_LOG"] = self.codex_lm_debug_log
+        if self.predict_rlm_debug:
+            os.environ["PREDICT_RLM_DEBUG"] = "1"
+        if self.predict_rlm_debug_json:
+            os.environ["PREDICT_RLM_DEBUG_JSON"] = "1"
+        if self.predict_rlm_debug_log:
+            os.environ["PREDICT_RLM_DEBUG_LOG"] = self.predict_rlm_debug_log
 
     def perform_task(
         self,
@@ -359,10 +457,13 @@ class _TerminalBenchRLMBaseAgentMixin:
         runtime = _get_runtime(task=task, session=session, **kwargs)
         if self.codex_lm:
             _install_codex_lm_monkeypatch(self.codex_lm_exclude)
-        interpreter = _interpreter_class()(
-            runtime,
-            **self.interpreter_kwargs,
-        )
+        if self.interpreter_mode == INTERPRETER_MODE_LOCAL_PROCESS:
+            interpreter = _local_process_interpreter_class()(**self.interpreter_kwargs)
+        else:
+            interpreter = _interpreter_class()(
+                runtime,
+                **self.interpreter_kwargs,
+            )
         try:
             rlm_kwargs = dict(self.predict_rlm_kwargs)
             if "lm" in rlm_kwargs:
@@ -481,12 +582,7 @@ class HarborPredictRLMAgent(_TerminalBenchRLMBaseAgentMixin):
             duration_seconds=time.monotonic() - started,
         )
         answer = _coerce_answer(result)
-        if "metadata" in getattr(type(context), "model_fields", {}):
-            metadata = dict(context.metadata or {})
-            metadata["answer"] = answer
-            context.metadata = metadata
-        else:
-            setattr(context, "answer", answer)
+        _set_context_answer(context, answer)
 
     async def _run_async(
         self,
@@ -505,7 +601,21 @@ class HarborPredictRLMAgent(_TerminalBenchRLMBaseAgentMixin):
             status="started",
         )
         try:
-            interpreter = _harbor_interpreter_class()(environment, loop=loop, **self.interpreter_kwargs)
+            if self.interpreter_mode == INTERPRETER_MODE_LOCAL_PROCESS:
+                if _use_environment_interpreter_for_local_process_mode(environment):
+                    interpreter = _harbor_interpreter_class()(
+                        environment,
+                        loop=loop,
+                        **self.interpreter_kwargs,
+                    )
+                else:
+                    interpreter = _local_process_interpreter_class()(**self.interpreter_kwargs)
+            else:
+                interpreter = _harbor_interpreter_class()(
+                    environment,
+                    loop=loop,
+                    **self.interpreter_kwargs,
+                )
         except BaseException:
             _write_phase_event(
                 self.phase_log_path,
@@ -554,6 +664,503 @@ class HarborPredictRLMAgent(_TerminalBenchRLMBaseAgentMixin):
             raise
         finally:
             await asyncio.to_thread(interpreter.shutdown)
+
+
+def _repo_root() -> Path:
+    return Path(__file__).resolve().parents[4]
+
+
+def _source_bundle_filter(info: tarfile.TarInfo) -> tarfile.TarInfo | None:
+    parts = Path(info.name).parts
+    ignored = {
+        ".git",
+        ".mypy_cache",
+        ".pytest_cache",
+        ".ruff_cache",
+        "__pycache__",
+        "downloaded-gcp-artifacts",
+        "ops",
+    }
+    if any(part in ignored for part in parts):
+        return None
+    if info.name.endswith((".pyc", ".pyo")):
+        return None
+    return info
+
+
+def _create_source_bundle(destination: Path) -> None:
+    root = _repo_root()
+    with tarfile.open(destination, "w:gz") as archive:
+        for relative in _SOURCE_BUNDLE_RELATIVE_PATHS:
+            source = root / relative
+            if source.exists():
+                archive.add(source, arcname=str(Path("repo") / relative), filter=_source_bundle_filter)
+
+
+async def _resolve_remote_call(value: Any) -> Any:
+    if inspect.isawaitable(value):
+        return await value
+    return value
+
+
+async def _remote_exec(environment: Any, command: str, *, timeout: int | None = None) -> Any:
+    for name in ("exec", "run"):
+        method = getattr(environment, name, None)
+        if method is None:
+            continue
+        if timeout is None:
+            try:
+                return await _resolve_remote_call(method(command=command))
+            except TypeError as keyword_exc:
+                try:
+                    return await _resolve_remote_call(method(command))
+                except TypeError:
+                    raise keyword_exc
+        try:
+            return await _resolve_remote_call(method(command=command, timeout_sec=int(timeout)))
+        except TypeError as keyword_exc:
+            try:
+                return await _resolve_remote_call(method(command, timeout=timeout))
+            except TypeError:
+                raise keyword_exc
+    raise TypeError("Daytona remote PredictRLM environment does not expose exec/run")
+
+
+async def _remote_upload_file(environment: Any, host_path: str, remote_path: str) -> None:
+    for name in ("upload_file", "copy_to", "put_file"):
+        method = getattr(environment, name, None)
+        if method is not None:
+            await _resolve_remote_call(method(host_path, remote_path))
+            return
+    raise TypeError("Daytona remote PredictRLM environment does not expose upload_file/copy_to")
+
+
+async def _remote_upload_dir(environment: Any, host_path: str, remote_path: str) -> None:
+    method = getattr(environment, "upload_dir", None)
+    if method is None:
+        raise TypeError("Daytona remote PredictRLM CodexLM auth upload requires upload_dir")
+    await _resolve_remote_call(method(host_path, remote_path))
+
+
+def _remote_returncode(result: Any) -> int | None:
+    for attr in ("returncode", "return_code", "exit_code"):
+        value = getattr(result, attr, None)
+        if value is not None:
+            return int(value)
+    if isinstance(result, dict):
+        for key in ("returncode", "return_code", "exit_code"):
+            value = result.get(key)
+            if value is not None:
+                return int(value)
+    return None
+
+
+def _remote_stdout(result: Any) -> str:
+    if isinstance(result, str):
+        return result
+    if isinstance(result, dict):
+        return str(result.get("stdout", "") or "")
+    return str(getattr(result, "stdout", "") or "")
+
+
+def _remote_stderr(result: Any) -> str:
+    if isinstance(result, dict):
+        return str(result.get("stderr", "") or "")
+    return str(getattr(result, "stderr", "") or "")
+
+
+def _remote_output_tail(result: Any) -> str:
+    output = "\n".join(part for part in (_remote_stdout(result), _remote_stderr(result)) if part)
+    lines = output.splitlines()[-20:]
+    return "\n".join(lines)
+
+
+def _raise_for_remote_failure(result: Any, operation: str) -> None:
+    returncode = _remote_returncode(result)
+    if returncode not in (None, 0):
+        tail = _remote_output_tail(result)
+        details = f":\n{tail}" if tail else ""
+        raise RuntimeError(
+            f"Daytona remote PredictRLM failed while {operation}: exit code {returncode}{details}"
+        )
+
+
+def _reject_secret_payload_values(value: Any, path: tuple[str, ...] = ()) -> None:
+    if isinstance(value, dict):
+        for key, item in value.items():
+            key_text = str(key)
+            lowered = key_text.lower()
+            if any(part in lowered for part in _SECRET_PAYLOAD_KEY_PARTS) and item not in (
+                None,
+                "",
+                False,
+            ):
+                dotted = ".".join((*path, key_text))
+                raise ValueError(f"Refusing to put secret-like payload field in remote JSON: {dotted}")
+            _reject_secret_payload_values(item, (*path, key_text))
+    elif isinstance(value, list | tuple):
+        for index, item in enumerate(value):
+            _reject_secret_payload_values(item, (*path, str(index)))
+
+
+def _json_dumps_non_secret_payload(payload: dict[str, Any]) -> str:
+    _reject_secret_payload_values(payload)
+    try:
+        return json.dumps(payload, sort_keys=True)
+    except TypeError as exc:
+        raise TypeError(
+            "Daytona remote PredictRLM payload must be JSON-serializable; "
+            "custom Python objects such as callables must run through the local Harbor agent."
+        ) from exc
+
+
+def _parse_remote_result(result: Any) -> dict[str, Any]:
+    sentinel_payload = None
+    for line in _remote_stdout(result).splitlines():
+        if line.startswith(DAYTONA_REMOTE_RESULT_SENTINEL):
+            sentinel_payload = line[len(DAYTONA_REMOTE_RESULT_SENTINEL) :]
+    if sentinel_payload is None:
+        returncode = _remote_returncode(result)
+        raise RuntimeError(
+            "Daytona remote PredictRLM did not emit the result sentinel"
+            f" (exit code {returncode})"
+        )
+    parsed = json.loads(sentinel_payload)
+    if not isinstance(parsed, dict):
+        raise RuntimeError("Daytona remote PredictRLM result sentinel was not a JSON object")
+    return parsed
+
+
+class DaytonaRemotePredictRLMAgent(HarborPredictRLMAgent):
+    """Harbor adapter that runs the PredictRLM controller inside Daytona."""
+
+    def __init__(
+        self,
+        *args: Any,
+        remote_root: str = DAYTONA_REMOTE_ROOT,
+        remote_home: str = DAYTONA_REMOTE_HOME,
+        remote_log_stream: bool | str = True,
+        remote_log_poll_interval: float | str = 5.0,
+        **kwargs: Any,
+    ) -> None:
+        kwargs.pop("exec_timeout", None)
+        self.remote_root = remote_root.rstrip("/") or DAYTONA_REMOTE_ROOT
+        self.remote_home = remote_home.rstrip("/") or DAYTONA_REMOTE_HOME
+        self.remote_log_stream = _coerce_bool(remote_log_stream)
+        self.remote_log_poll_interval = float(remote_log_poll_interval)
+        self._remote_setup_complete = False
+        super().__init__(*args, **kwargs)
+        self.interpreter_kwargs.pop("exec_timeout", None)
+        if self.predict_rlm_debug and not self.predict_rlm_debug_log:
+            self.predict_rlm_debug_log = f"{self.remote_root}/predict_rlm_debug.jsonl"
+        if self.codex_lm_debug and not self.codex_lm_debug_log:
+            self.codex_lm_debug_log = f"{self.remote_root}/codex_lm_debug.jsonl"
+
+    async def setup(self, environment: Any) -> None:
+        started = time.monotonic()
+        _write_phase_event(
+            self.phase_log_path,
+            task_id=self.task_id,
+            event="agent_setup_start",
+            phase="agent_setup",
+            status="started",
+        )
+        try:
+            await self._bootstrap_remote_controller(environment)
+        except BaseException:
+            _write_phase_event(
+                self.phase_log_path,
+                task_id=self.task_id,
+                event="agent_setup_end",
+                phase="agent_setup",
+                status="failed",
+                duration_seconds=time.monotonic() - started,
+            )
+            raise
+        _write_phase_event(
+            self.phase_log_path,
+            task_id=self.task_id,
+            event="agent_setup_end",
+            phase="agent_setup",
+            status="completed",
+            duration_seconds=time.monotonic() - started,
+        )
+
+    async def run(self, instruction: str, environment: Any, context: Any) -> None:
+        if not self._remote_setup_complete:
+            await self.setup(environment)
+        started = time.monotonic()
+        _write_phase_event(
+            self.phase_log_path,
+            task_id=self.task_id,
+            event="agent_run_start",
+            phase="agent_eval",
+            status="started",
+        )
+        credentials_uploaded = False
+        try:
+            credentials_uploaded = await self._upload_codex_lm_credentials(environment)
+            payload_json = self._build_remote_payload_json(instruction)
+            stop_streaming = asyncio.Event()
+            stream_task = self._start_remote_log_stream(environment, stop_streaming)
+            try:
+                result = await self._run_remote_controller(environment, payload_json)
+            finally:
+                stop_streaming.set()
+                if stream_task is not None:
+                    await stream_task
+            parsed = _parse_remote_result(result)
+            if not parsed.get("ok"):
+                error_type = parsed.get("error_type") or "RemotePredictRLMError"
+                error = parsed.get("error") or "remote controller failed"
+                raise RuntimeError(f"Daytona remote PredictRLM failed: {error_type}: {error}")
+            answer = str(parsed.get("answer", ""))
+        except BaseException:
+            _write_phase_event(
+                self.phase_log_path,
+                task_id=self.task_id,
+                event="agent_run_end",
+                phase="agent_eval",
+                status="failed",
+                duration_seconds=time.monotonic() - started,
+            )
+            raise
+        finally:
+            if credentials_uploaded:
+                await self._cleanup_codex_lm_credentials(environment)
+        _write_phase_event(
+            self.phase_log_path,
+            task_id=self.task_id,
+            event="agent_run_end",
+            phase="agent_eval",
+            status="completed",
+            duration_seconds=time.monotonic() - started,
+        )
+        _set_context_answer(context, answer)
+
+    async def _bootstrap_remote_controller(self, environment: Any) -> None:
+        root = shlex.quote(self.remote_root)
+        home = shlex.quote(self.remote_home)
+        result = await _remote_exec(
+            environment,
+            f"rm -rf {root} && mkdir -p {root} {home}",
+            timeout=120,
+        )
+        _raise_for_remote_failure(result, "preparing the remote controller root")
+        with tempfile.TemporaryDirectory(prefix="predict-rlm-controller-") as tmpdir:
+            bundle_path = Path(tmpdir) / "repo.tar.gz"
+            await asyncio.to_thread(_create_source_bundle, bundle_path)
+            remote_bundle = f"{self.remote_root}/repo.tar.gz"
+            await _remote_upload_file(environment, str(bundle_path), remote_bundle)
+        result = await _remote_exec(
+            environment,
+            f"tar -xzf {shlex.quote(remote_bundle)} -C {root}",
+            timeout=120,
+        )
+        _raise_for_remote_failure(result, "unpacking the remote controller bundle")
+        extra = "[codex-lm]" if self.codex_lm else ""
+        install_target = shlex.quote(f"{self.remote_root}/repo{extra}")
+        venv_python = shlex.quote(f"{self.remote_root}/.venv/bin/python")
+        uv_bootstrap = shlex.quote(f"{self.remote_root}/uv-bootstrap")
+        setup_command = " ".join(
+            [
+                f"HOME={home}",
+                "PATH=\"$HOME/.local/bin:$PATH\"",
+                "sh",
+                "-lc",
+                shlex.quote(
+                    "if ! command -v python3 >/dev/null 2>&1; then "
+                    "if command -v apt-get >/dev/null 2>&1; then "
+                    "apt-get update && DEBIAN_FRONTEND=noninteractive "
+                    "apt-get install -y python3 python3-pip python3-venv; "
+                    "elif command -v apk >/dev/null 2>&1; then "
+                    "apk add --no-cache python3 py3-pip; "
+                    "else echo 'python3 not found and no supported package manager available' >&2; "
+                    "exit 127; fi; fi; "
+                    "if ! command -v uv >/dev/null 2>&1; then "
+                    f"python3 -m venv {uv_bootstrap} && "
+                    f"{uv_bootstrap}/bin/python -m pip install --disable-pip-version-check uv && "
+                    f"UV_COMMAND='{uv_bootstrap}/bin/python -m uv'; "
+                    "else UV_COMMAND='uv'; fi; "
+                    f"$UV_COMMAND venv --seed --python 3.12 {shlex.quote(f'{self.remote_root}/.venv')} && "
+                    f"{venv_python} -m pip install --disable-pip-version-check -e {install_target}"
+                ),
+            ]
+        )
+        result = await _remote_exec(environment, setup_command, timeout=900)
+        _raise_for_remote_failure(result, "installing the remote controller bundle")
+        self._remote_setup_complete = True
+
+    async def _upload_codex_lm_credentials(self, environment: Any) -> bool:
+        if not self.codex_lm:
+            return False
+        credentials_dir = Path.home() / ".codex-lm"
+        if not credentials_dir.is_dir():
+            raise RuntimeError(
+                "CodexLM was enabled, but local ~/.codex-lm is not available for opaque upload"
+            )
+        result = await _remote_exec(
+            environment,
+            f"mkdir -p {shlex.quote(self.remote_home)}",
+            timeout=60,
+        )
+        _raise_for_remote_failure(result, "preparing the remote CodexLM home")
+        try:
+            await _remote_upload_dir(
+                environment,
+                str(credentials_dir),
+                f"{self.remote_home}/.codex-lm",
+            )
+        except BaseException as exc:
+            raise RuntimeError(
+                "CodexLM credential upload failed; refusing to run without remote auth"
+            ) from exc
+        return True
+
+    async def _cleanup_codex_lm_credentials(self, environment: Any) -> None:
+        try:
+            await _remote_exec(
+                environment,
+                f"rm -rf {shlex.quote(f'{self.remote_home}/.codex-lm')}",
+                timeout=60,
+            )
+        except BaseException:
+            return
+
+    def _start_remote_log_stream(
+        self,
+        environment: Any,
+        stop_event: asyncio.Event,
+    ) -> asyncio.Task[None] | None:
+        paths = [path for path in (self.predict_rlm_debug_log, self.codex_lm_debug_log) if path]
+        if not self.remote_log_stream or not paths:
+            return None
+        return asyncio.create_task(self._stream_remote_logs(environment, paths, stop_event))
+
+    async def _stream_remote_logs(
+        self,
+        environment: Any,
+        paths: list[str],
+        stop_event: asyncio.Event,
+    ) -> None:
+        offsets = {path: 0 for path in paths}
+        while not stop_event.is_set():
+            for path in paths:
+                output, offset = await self._read_remote_log_delta(environment, path, offsets[path])
+                offsets[path] = offset
+                if output:
+                    print(output, end="" if output.endswith("\n") else "\n", flush=True)
+            try:
+                await asyncio.wait_for(stop_event.wait(), timeout=self.remote_log_poll_interval)
+            except TimeoutError:
+                pass
+        for path in paths:
+            output, offset = await self._read_remote_log_delta(environment, path, offsets[path])
+            offsets[path] = offset
+            if output:
+                print(output, end="" if output.endswith("\n") else "\n", flush=True)
+
+    async def _read_remote_log_delta(
+        self,
+        environment: Any,
+        remote_path: str,
+        offset: int,
+    ) -> tuple[str, int]:
+        quoted_path = shlex.quote(remote_path)
+        command = " ".join(
+            [
+                "sh",
+                "-lc",
+                shlex.quote(
+                    "path=$1; offset=$2; "
+                    "if [ ! -f \"$path\" ]; then "
+                    "printf 'PREDICT_RLM_REMOTE_LOG_OFFSET=%s\\n' \"$offset\"; exit 0; "
+                    "fi; "
+                    "size=$(wc -c < \"$path\" | tr -d ' '); "
+                    "if [ \"$size\" -gt \"$offset\" ]; then "
+                    "dd if=\"$path\" bs=1 skip=\"$offset\" count=$((size - offset)) 2>/dev/null; "
+                    "fi; "
+                    "printf '\\nPREDICT_RLM_REMOTE_LOG_OFFSET=%s\\n' \"$size\""
+                ),
+                "--",
+                quoted_path,
+                str(offset),
+            ]
+        )
+        result = await _remote_exec(environment, command, timeout=30)
+        stdout = _remote_stdout(result)
+        marker = "PREDICT_RLM_REMOTE_LOG_OFFSET="
+        next_offset = offset
+        lines = stdout.splitlines()
+        if lines and lines[-1].startswith(marker):
+            next_offset = int(lines[-1][len(marker) :])
+            output = "\n".join(lines[:-1])
+            if output:
+                output += "\n"
+            return output, next_offset
+        return stdout, next_offset
+
+    def _build_remote_payload_json(self, instruction: str) -> str:
+        if self.tools is not None:
+            raise TypeError(
+                "Daytona remote PredictRLM does not support shipping local Python tools"
+            )
+        payload = {
+            "codex_lm": self.codex_lm,
+            "codex_lm_debug": self.codex_lm_debug,
+            "codex_lm_debug_log": self.codex_lm_debug_log,
+            "codex_lm_exclude": list(self.codex_lm_exclude),
+            "instruction": instruction,
+            "interpreter_kwargs": self.interpreter_kwargs,
+            "lm_reasoning_effort": self.lm_reasoning_effort,
+            "lm_service_tier": self.lm_service_tier,
+            "logging_dir": f"{self.remote_root}/logs",
+            "predict_rlm_debug": self.predict_rlm_debug,
+            "predict_rlm_debug_json": self.predict_rlm_debug_json,
+            "predict_rlm_debug_log": self.predict_rlm_debug_log,
+            "predict_rlm_kwargs": self.predict_rlm_kwargs,
+            "signature": self.signature,
+            "skill_instructions": self.skill_instructions,
+            "sub_lm_reasoning_effort": self.sub_lm_reasoning_effort,
+            "sub_lm_service_tier": self.sub_lm_service_tier,
+        }
+        return _json_dumps_non_secret_payload(payload)
+
+    async def _run_remote_controller(self, environment: Any, payload_json: str) -> Any:
+        payload_remote_path = f"{self.remote_root}/payload-{uuid.uuid4().hex}.json"
+        with tempfile.NamedTemporaryFile("w", encoding="utf-8", suffix=".json", delete=False) as tmp:
+            tmp.write(payload_json)
+            payload_host_path = tmp.name
+        try:
+            await _remote_upload_file(environment, payload_host_path, payload_remote_path)
+        finally:
+            try:
+                os.unlink(payload_host_path)
+            except OSError:
+                pass
+        pythonpath = ":".join(
+            [
+                f"{self.remote_root}/repo/examples/terminal_bench",
+                f"{self.remote_root}/repo/src",
+                f"{self.remote_root}/repo/src/codex-lm",
+            ]
+        )
+        python = shlex.quote(f"{self.remote_root}/.venv/bin/python")
+        command = " ".join(
+            [
+                f"HOME={shlex.quote(self.remote_home)}",
+                "PYTHONUNBUFFERED=1",
+                f"PYTHONPATH={shlex.quote(pythonpath)}:${{PYTHONPATH:-}}",
+                python,
+                "-m",
+                "terminal_bench_rlm.tools.remote_controller",
+                shlex.quote(payload_remote_path),
+            ]
+        )
+        return await _remote_exec(
+            environment,
+            command,
+        )
 
 
 

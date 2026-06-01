@@ -36,6 +36,33 @@ def _add_project_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--terminal-bench-executable")
     parser.add_argument("--harbor-executable")
     parser.add_argument("--harbor-dataset")
+    parser.add_argument("--harbor-environment")
+    parser.add_argument(
+        "--harbor-controller-locality",
+        choices=("auto", "local-controller", "remote-controller"),
+        help=(
+            "Harbor controller placement. remote-controller runs the Harbor host "
+            "process inside a supplied controller machine such as Daytona."
+        ),
+    )
+    parser.add_argument(
+        "--harbor-agent-interpreter-mode",
+        choices=("auto", "environment", "local-process"),
+        help=(
+            "PredictRLM interpreter placement for the Harbor agent. Auto uses "
+            "environment execution; local-process is only for agents already running "
+            "inside the task machine."
+        ),
+    )
+    parser.add_argument(
+        "--harbor-remote-workdir",
+        help=(
+            "Deprecated remote-controller staging root. Ignored by the local Harbor "
+            "Daytona path."
+        ),
+    )
+    parser.add_argument("--harbor-cpus", choices=("auto", "limit", "request", "guarantee", "ignore"))
+    parser.add_argument("--harbor-memory", choices=("auto", "limit", "request", "guarantee", "ignore"))
     parser.add_argument("--harness-backend", choices=("harbor", "python", "cli"))
     parser.add_argument("--timeout-cleanup-grace-sec", type=int)
     parser.add_argument("--n-attempts", type=int)
@@ -90,6 +117,18 @@ def _apply_project_args(config: OptimizeConfig, args: Any) -> TerminalBenchGepaC
         config.harbor_executable = args.harbor_executable
     if args.harbor_dataset is not None:
         config.harbor_dataset = args.harbor_dataset
+    if args.harbor_environment is not None:
+        config.harbor_environment = args.harbor_environment
+    if args.harbor_controller_locality is not None:
+        config.harbor_controller_locality = args.harbor_controller_locality
+    if args.harbor_agent_interpreter_mode is not None:
+        config.harbor_agent_interpreter_mode = args.harbor_agent_interpreter_mode
+    if args.harbor_remote_workdir is not None:
+        config.harbor_remote_workdir = args.harbor_remote_workdir
+    if args.harbor_cpus is not None:
+        config.harbor_cpus = args.harbor_cpus
+    if args.harbor_memory is not None:
+        config.harbor_memory = args.harbor_memory
     if args.harness_backend is not None:
         config.harness_backend = args.harness_backend
     if args.timeout_cleanup_grace_sec is not None:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import inspect
 import json
 import math
@@ -9,15 +10,21 @@ import queue
 import re
 import select
 import shlex
+import shutil
 import subprocess
+import sys
 import tempfile
 import threading
 import time
 from pathlib import Path
 from typing import Any, Callable, Protocol
+from uuid import uuid4
 
 from dspy.primitives.code_interpreter import CodeInterpreterError
 
+from predict_rlm._shared import strip_code_fences
+from predict_rlm.debug import debug_event
+from predict_rlm.debug import is_enabled as predict_rlm_debug_enabled
 from predict_rlm.execution_timeout import (
     DEFAULT_RECOVERABLE_EXECUTION_TIMEOUT_GRACE_SECONDS,
     ITERATION_TIMEOUT_FAILURE_CLASS,
@@ -38,6 +45,39 @@ TERMINAL_BENCH_RECOVERABLE_TIMEOUT_GRACE_SECONDS = (
     DEFAULT_RECOVERABLE_EXECUTION_TIMEOUT_GRACE_SECONDS
 )
 HOST_TOOL_TIMEOUT_RESPONSE_MARGIN_SECONDS = 0.05
+_CODE_PREVIEW_CHARS = 500
+_SECRETISH_CODE_RE = re.compile(
+    r"(?i)\b(api[_-]?key|authorization|bearer|credential|password|secret|token)\b"
+)
+
+
+def _hash_text(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8", errors="replace")).hexdigest()[:16]
+
+
+def _code_preview(code: str) -> str:
+    preview = code[:_CODE_PREVIEW_CHARS]
+    lines = []
+    for line in preview.splitlines():
+        lines.append(
+            "[REDACTED secret-like code line]" if _SECRETISH_CODE_RE.search(line) else line
+        )
+    return "\n".join(lines)
+
+
+def _process_debug_metadata(process: Any) -> dict[str, Any]:
+    metadata: dict[str, Any] = {}
+    pid = getattr(process, "pid", None)
+    if pid is not None:
+        metadata["runner_pid"] = pid
+    returncode = getattr(process, "returncode", None)
+    if returncode is not None:
+        metadata["runner_returncode"] = returncode
+    for name in ("session_id", "command_id"):
+        value = getattr(process, name, None)
+        if value is not None:
+            metadata[f"runner_{name}"] = value
+    return metadata
 
 
 def _shell_python_command(python_executable: str, args: list[str]) -> str:
@@ -135,9 +175,21 @@ class _TimeoutLineReader:
         self.pipe = process.stdout
         self._queue: queue.Queue[str] = queue.Queue()
         self._thread: threading.Thread | None = None
+        self._closed = False
+
+    def close(self) -> None:
+        self._closed = True
+        close_pipe = getattr(self.pipe, "close", None)
+        if close_pipe is not None:
+            close_pipe()
+        if self._thread is not None:
+            self._thread.join(timeout=1)
 
     def readline(self, timeout: float) -> str | None:
         timeout = max(0.0, timeout)
+        read_with_timeout = getattr(self.pipe, "readline_timeout", None)
+        if read_with_timeout is not None:
+            return read_with_timeout(timeout)
         fd = self._fileno()
         if fd is not None:
             try:
@@ -175,12 +227,12 @@ class _TimeoutLineReader:
         self._thread.start()
 
     def _read_loop(self) -> None:
-        while True:
+        while not self._closed:
             line = self.pipe.readline()
             if line:
                 self._queue.put(line)
                 continue
-            if self.process.poll() is not None:
+            if self._closed or self.process.poll() is not None:
                 self._queue.put("")
                 return
             time.sleep(0.01)
@@ -344,6 +396,209 @@ class HarborContainerAdapter:
         )
 
 
+def _daytona_session_execute_request(command: str, *, run_async: bool) -> Any:
+    try:
+        from daytona.common.process import SessionExecuteRequest
+    except ImportError as exc:
+        raise SandboxFatalError("Daytona session execution requires the daytona SDK") from exc
+    return SessionExecuteRequest(command=command, run_async=run_async)
+
+
+class _DaytonaSessionInput:
+    def __init__(
+        self,
+        process: Any,
+        loop: asyncio.AbstractEventLoop,
+        session_id: str,
+        command_id: str,
+        echo_filter: "_DaytonaSessionEchoFilter",
+    ) -> None:
+        self.process = process
+        self.loop = loop
+        self.session_id = session_id
+        self.command_id = command_id
+        self.echo_filter = echo_filter
+        self._buffer = ""
+
+    def write(self, data: str) -> int:
+        self._buffer += data
+        return len(data)
+
+    def flush(self) -> None:
+        if not self._buffer:
+            return
+        data = self._buffer
+        self._buffer = ""
+        self.echo_filter.expect(data)
+        _run_coroutine_on_loop(
+            self.process.send_session_command_input(self.session_id, self.command_id, data),
+            self.loop,
+        )
+
+
+class _DaytonaSessionEchoFilter:
+    def __init__(self) -> None:
+        self._pending = ""
+
+    def expect(self, data: str) -> None:
+        self._pending += data
+
+    def strip(self, chunk: str) -> str:
+        while self._pending and chunk:
+            if chunk.startswith(self._pending):
+                chunk = chunk[len(self._pending) :]
+                self._pending = ""
+                break
+            if self._pending.startswith(chunk):
+                self._pending = self._pending[len(chunk) :]
+                return ""
+            break
+        return chunk
+
+
+class _DaytonaSessionOutput:
+    def __init__(
+        self,
+        process: Any,
+        loop: asyncio.AbstractEventLoop,
+        session_id: str,
+        command_id: str,
+        stream: str,
+        echo_filter: "_DaytonaSessionEchoFilter | None" = None,
+    ) -> None:
+        self.process = process
+        self.loop = loop
+        self.session_id = session_id
+        self.command_id = command_id
+        self.stream = stream
+        self.echo_filter = echo_filter
+        self._offset = 0
+        self._pending: list[str] = []
+        self._buffer = ""
+        self._closed = False
+
+    def close(self) -> None:
+        self._closed = True
+
+    def readline(self) -> str:
+        while not self._closed:
+            line = self._readline_once()
+            if line is not None:
+                return line
+            time.sleep(0.01)
+        return ""
+
+    def readline_timeout(self, timeout: float) -> str | None:
+        deadline = time.monotonic() + max(0.0, timeout)
+        while not self._closed:
+            line = self._readline_once()
+            if line is not None:
+                return line
+            if time.monotonic() >= deadline:
+                return None
+            time.sleep(min(0.01, max(0.0, deadline - time.monotonic())))
+        return ""
+
+    def _readline_once(self) -> str | None:
+        if self._pending:
+            return self._pending.pop(0)
+        logs = _run_coroutine_on_loop(
+            self.process.get_session_command_logs(self.session_id, self.command_id),
+            self.loop,
+        )
+        text = str(getattr(logs, self.stream, "") or "")
+        if len(text) > self._offset:
+            chunk = text[self._offset :]
+            self._offset = len(text)
+            self._buffer += chunk
+            self._queue_complete_lines()
+            if self._pending:
+                return self._pending.pop(0)
+        command = _run_coroutine_on_loop(
+            self.process.get_session_command(self.session_id, self.command_id),
+            self.loop,
+        )
+        if getattr(command, "exit_code", None) is not None:
+            if self._buffer:
+                self._queue_complete_lines(flush=True)
+            if self._pending:
+                return self._pending.pop(0)
+            return ""
+        return None
+
+    def _queue_complete_lines(self, *, flush: bool = False) -> None:
+        while "\n" in self._buffer:
+            index = self._buffer.find("\n") + 1
+            self._queue_line(self._buffer[:index])
+            self._buffer = self._buffer[index:]
+        if flush and self._buffer:
+            self._queue_line(self._buffer)
+            self._buffer = ""
+
+    def _queue_line(self, line: str) -> None:
+        if self.echo_filter is not None:
+            line = self.echo_filter.strip(line)
+        if line:
+            self._pending.append(line)
+
+
+class DaytonaSessionProcess:
+    def __init__(
+        self,
+        *,
+        process: Any,
+        loop: asyncio.AbstractEventLoop,
+        session_id: str,
+        command_id: str,
+    ) -> None:
+        self.process = process
+        self.loop = loop
+        self.session_id = session_id
+        self.command_id = command_id
+        stdout_echo_filter = _DaytonaSessionEchoFilter()
+        self.stdin = _DaytonaSessionInput(
+            process, loop, session_id, command_id, stdout_echo_filter
+        )
+        self.stdout = _DaytonaSessionOutput(
+            process,
+            loop,
+            session_id,
+            command_id,
+            "stdout",
+            stdout_echo_filter,
+        )
+        self.stderr = _DaytonaSessionOutput(process, loop, session_id, command_id, "stderr")
+
+    def poll(self) -> int | None:
+        command = _run_coroutine_on_loop(
+            self.process.get_session_command(self.session_id, self.command_id),
+            self.loop,
+        )
+        exit_code = getattr(command, "exit_code", None)
+        return None if exit_code is None else int(exit_code)
+
+    def wait(self, timeout: float | None = None) -> int:
+        deadline = None if timeout is None else time.monotonic() + timeout
+        while True:
+            return_code = self.poll()
+            if return_code is not None:
+                return return_code
+            if deadline is not None and time.monotonic() >= deadline:
+                raise subprocess.TimeoutExpired(self.command_id, timeout)
+            time.sleep(0.05)
+
+    def kill(self) -> None:
+        try:
+            _run_coroutine_on_loop(
+                self.process.send_session_command_input(
+                    self.session_id, self.command_id, "\x03"
+                ),
+                self.loop,
+            )
+        except Exception:
+            pass
+
+
 class HarborEnvironmentAdapter(HarborContainerAdapter):
     """Adapter that bridges Harbor's async environment APIs into the runner protocol."""
 
@@ -397,7 +652,9 @@ class HarborEnvironmentAdapter(HarborContainerAdapter):
         if self._is_docker_sdk_runtime or not hasattr(self.environment, "upload_file"):
             super().install_runner_script(source, runner_path, timeout=timeout)
             return
-        with tempfile.NamedTemporaryFile("w", encoding="utf-8", suffix=".py", delete=False) as tmp:
+        with tempfile.NamedTemporaryFile(
+            "w", encoding="utf-8", suffix=".py", delete=False
+        ) as tmp:
             tmp.write(source)
             tmp_path = tmp.name
         try:
@@ -417,6 +674,11 @@ class HarborEnvironmentAdapter(HarborContainerAdapter):
     ) -> ContainerProcess:
         if self._is_docker_sdk_runtime:
             return super().start_exec(command, workdir=workdir, timeout=timeout)
+        daytona_process = self._start_daytona_session_exec(
+            command, workdir=workdir, timeout=timeout
+        )
+        if daytona_process is not None:
+            return daytona_process
         for name in ("start_exec", "exec_stream", "popen"):
             method = getattr(self.environment, name, None)
             if method is None:
@@ -441,6 +703,50 @@ class HarborEnvironmentAdapter(HarborContainerAdapter):
             "Harbor environment does not expose an interactive exec method and "
             "no Docker SDK container id is available; persistent PredictRLM "
             "supervisor execution requires start_exec/exec_stream/popen or docker exec -i"
+        )
+
+    def _start_daytona_session_exec(
+        self,
+        command: list[str],
+        *,
+        workdir: str | None = None,
+        timeout: float | None = None,
+    ) -> ContainerProcess | None:
+        sandbox = getattr(self.environment, "_sandbox", None)
+        process = getattr(sandbox, "process", None)
+        if not all(
+            callable(getattr(process, name, None))
+            for name in (
+                "create_session",
+                "execute_session_command",
+                "get_session_command",
+                "get_session_command_logs",
+                "send_session_command_input",
+            )
+        ):
+            return None
+        session_id = f"predict-rlm-{uuid4().hex}"
+        self._resolve(process.create_session(session_id))
+        shell_command = " ".join(shlex.quote(str(part)) for part in command)
+        effective_workdir = workdir or self.workdir
+        if effective_workdir:
+            shell_command = f"cd {shlex.quote(effective_workdir)} && {shell_command}"
+        request = _daytona_session_execute_request(shell_command, run_async=True)
+        response = self._resolve(
+            process.execute_session_command(
+                session_id,
+                request,
+                timeout=int(timeout or self.exec_timeout),
+            )
+        )
+        command_id = getattr(response, "cmd_id", None)
+        if not command_id:
+            raise SandboxFatalError("Daytona session command did not return a command id")
+        return DaytonaSessionProcess(
+            process=process,
+            loop=self.loop,
+            session_id=session_id,
+            command_id=str(command_id),
         )
 
     def _start_docker_compose_exec(
@@ -485,6 +791,74 @@ class HarborEnvironmentAdapter(HarborContainerAdapter):
         )
 
 
+class LocalProcessRunnerAdapter:
+    """Runner adapter for an agent already executing inside the task machine."""
+
+    supports_file_sync = True
+
+    def __init__(self, *, workdir: str | None = None) -> None:
+        self.workdir = workdir
+
+    def _cwd(self, workdir: str | None = None) -> str | None:
+        return workdir or self.workdir
+
+    def copy_to(self, host_path: str, container_path: str) -> None:
+        source = Path(host_path)
+        destination = Path(container_path)
+        if source.resolve() == destination.resolve():
+            return
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source, destination)
+
+    def copy_from(self, container_path: str, host_path: str) -> None:
+        source = Path(container_path)
+        destination = Path(host_path)
+        if source.resolve() == destination.resolve():
+            return
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source, destination)
+
+    def exec(self, command: list[str], *, timeout: float | None = None) -> Any:
+        return subprocess.run(
+            command,
+            cwd=self._cwd(),
+            check=False,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=timeout,
+        )
+
+    def install_runner_script(
+        self,
+        source: str,
+        runner_path: str,
+        *,
+        timeout: float | None = None,
+    ) -> None:
+        del timeout
+        path = Path(runner_path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(source, encoding="utf-8")
+
+    def start_exec(
+        self,
+        command: list[str],
+        *,
+        workdir: str | None = None,
+        timeout: float | None = None,
+    ) -> ContainerProcess:
+        del timeout
+        return subprocess.Popen(
+            command,
+            cwd=self._cwd(workdir),
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+
+
 class TerminalBenchRunnerInterpreter(PersistentJsonRpcRunnerClient, PredictRLMInterpreter):
     _LIST_DIR_SCRIPT = (
         "import json, pathlib, sys; "
@@ -526,6 +900,7 @@ class TerminalBenchRunnerInterpreter(PersistentJsonRpcRunnerClient, PredictRLMIn
         self._output_fields_registered = False
         self._stdout_reader: _TimeoutLineReader | None = None
         self._execution_gate = InterpreterExecutionGate("Terminal-Bench supervisor")
+        self._debug_request_context: dict[int, dict[str, Any]] = {}
 
     def execute(
         self,
@@ -544,7 +919,11 @@ class TerminalBenchRunnerInterpreter(PersistentJsonRpcRunnerClient, PredictRLMIn
         *,
         timeout: float | None = None,
     ) -> Any:
-        return await asyncio.to_thread(self.execute, code, variables, timeout=timeout)
+        try:
+            return await asyncio.to_thread(self.execute, code, variables, timeout=timeout)
+        except asyncio.CancelledError:
+            self._abort_supervisor_after_cancellation()
+            raise
 
     def mount_file_at(self, host_path: str, virtual_path: str) -> None:
         self.adapter.copy_to(host_path, virtual_path)
@@ -586,7 +965,30 @@ class TerminalBenchRunnerInterpreter(PersistentJsonRpcRunnerClient, PredictRLMIn
                 process.wait(timeout=5)
             except Exception:
                 process.kill()
+        if self._stdout_reader is not None:
+            self._stdout_reader.close()
         self._process = None
+        self._stdout_reader = None
+
+    def _abort_supervisor_after_cancellation(self) -> None:
+        process = self._process
+        if process is not None:
+            self._debug_event(
+                "terminal_bench.runner.cancel_abort",
+                **_process_debug_metadata(process),
+            )
+            try:
+                process.kill()
+            except Exception:
+                pass
+            try:
+                process.wait(timeout=1)
+            except Exception:
+                pass
+        if self._stdout_reader is not None:
+            self._stdout_reader.close()
+        self._process = None
+        self._stdout_reader = None
 
     def configure_runtime(
         self,
@@ -610,6 +1012,7 @@ class TerminalBenchRunnerInterpreter(PersistentJsonRpcRunnerClient, PredictRLMIn
         *,
         timeout: float | None = None,
     ) -> Any:
+        code = strip_code_fences(code)
         if variables:
             assignments = "\n".join(f"{name} = {value!r}" for name, value in variables.items())
             code = f"{assignments}\n{code}"
@@ -647,9 +1050,12 @@ class TerminalBenchRunnerInterpreter(PersistentJsonRpcRunnerClient, PredictRLMIn
             return
         if self._process is not None and self._process.poll() is not None:
             stderr = self._read_stderr()
-            raise SandboxFatalError(
-                f"Terminal-Bench supervisor exited unexpectedly: {stderr}"
+            self._debug_event(
+                "terminal_bench.runner.dead_before_request",
+                stderr_len=len(stderr),
+                **_process_debug_metadata(self._process),
             )
+            raise SandboxFatalError(f"Terminal-Bench supervisor exited unexpectedly: {stderr}")
         self._copy_runner_script()
         self._process = self.adapter.start_exec(
             [self.python_executable, "-u", self.runner_path],
@@ -657,6 +1063,13 @@ class TerminalBenchRunnerInterpreter(PersistentJsonRpcRunnerClient, PredictRLMIn
             timeout=self.exec_timeout,
         )
         self._stdout_reader = None
+        self._debug_event(
+            "terminal_bench.runner.start",
+            runner_path=self.runner_path,
+            python_executable=self.python_executable,
+            workdir=self.workdir,
+            **_process_debug_metadata(self._process),
+        )
         self._register_runtime()
 
     def _copy_runner_script(self) -> None:
@@ -668,7 +1081,9 @@ class TerminalBenchRunnerInterpreter(PersistentJsonRpcRunnerClient, PredictRLMIn
                 timeout=self.exec_timeout,
             )
             return
-        with tempfile.NamedTemporaryFile("w", encoding="utf-8", suffix=".py", delete=False) as tmp:
+        with tempfile.NamedTemporaryFile(
+            "w", encoding="utf-8", suffix=".py", delete=False
+        ) as tmp:
             tmp.write(runner_source())
             tmp_path = tmp.name
         try:
@@ -728,12 +1143,161 @@ class TerminalBenchRunnerInterpreter(PersistentJsonRpcRunnerClient, PredictRLMIn
     ) -> float:
         return self.exec_timeout if timeout is None else timeout
 
+    def _debug_event(self, event: str, **metadata: Any) -> None:
+        debug_event(event, interpreter="terminal_bench", **metadata)
+
+    def _request_debug_context(
+        self,
+        method: str,
+        params: dict[str, Any],
+        *,
+        request_id: int,
+        request_timeout: float,
+    ) -> dict[str, Any]:
+        context: dict[str, Any] = {
+            "request_id": request_id,
+            "method": method,
+            "host_timeout_seconds": request_timeout,
+            "recoverable_timeout_grace_seconds": self.recoverable_timeout_grace,
+        }
+        process = self._get_supervisor_process()
+        if process is not None:
+            context.update(_process_debug_metadata(process))
+        code = params.get("code")
+        if isinstance(code, str):
+            context.update(
+                {
+                    "code_len": len(code),
+                    "code_hash": _hash_text(code),
+                    "code_nonempty": bool(code.strip()),
+                }
+            )
+            if "execution_timeout_seconds" in params:
+                context["execution_timeout_seconds"] = params.get("execution_timeout_seconds")
+        return context
+
+    def _on_supervisor_request_start(
+        self,
+        method: str,
+        params: dict[str, Any],
+        *,
+        request_id: int,
+        request_timeout: float,
+    ) -> None:
+        if not predict_rlm_debug_enabled():
+            return
+        context = self._request_debug_context(
+            method,
+            params,
+            request_id=request_id,
+            request_timeout=request_timeout,
+        )
+        self._debug_request_context[request_id] = context
+        self._debug_event("terminal_bench.runner.request", **context)
+
+    def _on_supervisor_request_response(
+        self,
+        method: str,
+        *,
+        request_id: int,
+        request_start: float,
+        response: dict[str, Any],
+    ) -> None:
+        if not predict_rlm_debug_enabled():
+            return
+        context = self._debug_request_context.pop(request_id, {})
+        context.update(
+            {
+                "request_id": request_id,
+                "method": method,
+                "elapsed_seconds": time.perf_counter() - request_start,
+                "response_id": response.get("id"),
+                "response_kind": self._response_debug_kind(response),
+            }
+        )
+        context.update(self._response_debug_lengths(response))
+        self._debug_event("terminal_bench.runner.response", **context)
+
+    def _record_supervisor_response(
+        self,
+        method: str,
+        params: dict[str, Any],
+        *,
+        request_id: int,
+        request_timeout: float,
+        response: dict[str, Any],
+    ) -> None:
+        super()._record_supervisor_response(
+            method,
+            params,
+            request_id=request_id,
+            request_timeout=request_timeout,
+            response=response,
+        )
+        if not predict_rlm_debug_enabled() or method != "execute":
+            return
+        result = response.get("result") if isinstance(response, dict) else None
+        output = result.get("output") if isinstance(result, dict) else None
+        code = params.get("code")
+        if isinstance(code, str) and code.strip() and output == "":
+            self._debug_event(
+                "terminal_bench.runner.empty_execute_output",
+                request_id=request_id,
+                code_len=len(code),
+                code_hash=_hash_text(code),
+                code_preview=_code_preview(code),
+                response_id=response.get("id"),
+                response_kind=self._response_debug_kind(response),
+                **self._response_debug_lengths(response),
+            )
+
+    def _response_debug_kind(self, response: dict[str, Any]) -> str:
+        if "error" in response:
+            error = response.get("error") or {}
+            data = error.get("data") if isinstance(error, dict) else {}
+            if isinstance(data, dict) and data.get("type"):
+                return f"error:{data.get('type')}"
+            return "error"
+        result = response.get("result") or {}
+        if isinstance(result, dict) and "timeout" in result:
+            return "timeout"
+        if isinstance(result, dict) and "final" in result:
+            return "final"
+        return "output"
+
+    def _response_debug_lengths(self, response: dict[str, Any]) -> dict[str, Any]:
+        metadata: dict[str, Any] = {}
+        if "error" in response:
+            error = response.get("error") or {}
+            if isinstance(error, dict):
+                metadata["error_type"] = (
+                    (error.get("data") or {}).get("type")
+                    if isinstance(error.get("data"), dict)
+                    else None
+                )
+                metadata["error_message"] = error.get("message")
+            return metadata
+        result = response.get("result") or {}
+        if not isinstance(result, dict):
+            return metadata
+        for key in ("output", "stdout", "stderr"):
+            value = result.get(key)
+            if isinstance(value, str):
+                metadata[f"{key}_len"] = len(value)
+        return metadata
+
     def _handle_supervisor_send_error(
         self,
         method: str,
         request_id: int,
         exc: BrokenPipeError,
     ) -> None:
+        self._debug_event(
+            "terminal_bench.runner.send_error",
+            method=method,
+            request_id=request_id,
+            error_type=type(exc).__name__,
+        )
         raise SandboxFatalError("Terminal-Bench supervisor pipe broke") from exc
 
     def _handle_supervisor_exit_during_request(
@@ -744,9 +1308,34 @@ class TerminalBenchRunnerInterpreter(PersistentJsonRpcRunnerClient, PredictRLMIn
         request_start: float,
         process: PersistentSupervisorProcess,
     ) -> None:
-        raise SandboxFatalError(
-            f"Terminal-Bench supervisor exited unexpectedly: "
-            f"{self._read_stderr_for_process(process)}"
+        stderr = self._read_stderr_for_process(process)
+        self._debug_request_context.pop(request_id, None)
+        self._debug_event(
+            "terminal_bench.runner.exit_during_request",
+            method=method,
+            request_id=request_id,
+            elapsed_seconds=time.perf_counter() - request_start,
+            stderr_len=len(stderr),
+            **_process_debug_metadata(process),
+        )
+        raise SandboxFatalError(f"Terminal-Bench supervisor exited unexpectedly: {stderr}")
+
+    def _on_supervisor_stale_response(
+        self,
+        method: str,
+        *,
+        expected_request_id: int,
+        stale_response: dict[str, Any],
+        stale_discards: int,
+    ) -> None:
+        self._debug_event(
+            "terminal_bench.runner.stale_response",
+            method=method,
+            expected_request_id=expected_request_id,
+            stale_response_id=stale_response.get("id"),
+            stale_discards=stale_discards,
+            response_kind=self._response_debug_kind(stale_response),
+            **self._response_debug_lengths(stale_response),
         )
 
     def _recoverable_execution_timeout_seconds(
@@ -775,6 +1364,33 @@ class TerminalBenchRunnerInterpreter(PersistentJsonRpcRunnerClient, PredictRLMIn
         )
         self._kill_process_after_timeout(process)
         stderr = self._read_stderr_for_process(process)
+        context = self._debug_request_context.pop(request_id, {})
+        context_metadata = {
+            key: value
+            for key, value in context.items()
+            if key
+            not in {
+                "method",
+                "request_id",
+                "host_timeout_seconds",
+                "runner_pid",
+                "runner_returncode",
+                "runner_session_id",
+                "runner_command_id",
+            }
+        }
+        self._debug_event(
+            "terminal_bench.runner.request_timeout",
+            method=method,
+            request_id=request_id,
+            elapsed_seconds=time.perf_counter() - request_start,
+            host_timeout_seconds=request_timeout,
+            recoverable_execution_timeout_seconds=recoverable_timeout_seconds,
+            stdout_tail_len=len(stdout_tail),
+            stderr_len=len(stderr),
+            **context_metadata,
+            **_process_debug_metadata(process),
+        )
         if recoverable_timeout_seconds is None:
             raise SandboxFatalError(
                 f"Terminal-Bench supervisor request timed out after {request_timeout:g}s"
@@ -832,12 +1448,14 @@ class TerminalBenchRunnerInterpreter(PersistentJsonRpcRunnerClient, PredictRLMIn
     ) -> bool:
         if message.get("method") != "tool_call":
             return False
-        self._write_tool_response(
-            self._build_tool_response(message, deadline=deadline)
-        )
+        self._write_tool_response(self._build_tool_response(message, deadline=deadline))
         return True
 
     def _kill_process_after_timeout(self, process: ContainerProcess) -> None:
+        self._debug_event(
+            "terminal_bench.runner.kill_after_timeout",
+            **_process_debug_metadata(process),
+        )
         process.kill()
         try:
             process.wait(timeout=1)
@@ -845,6 +1463,14 @@ class TerminalBenchRunnerInterpreter(PersistentJsonRpcRunnerClient, PredictRLMIn
             pass
 
     def _discard_supervisor_process(self) -> None:
+        process = self._process
+        if process is not None:
+            self._debug_event(
+                "terminal_bench.runner.discard",
+                **_process_debug_metadata(process),
+            )
+        if self._stdout_reader is not None:
+            self._stdout_reader.close()
         self._process = None
         self._stdout_reader = None
         self._tools_registered = False
@@ -866,9 +1492,7 @@ class TerminalBenchRunnerInterpreter(PersistentJsonRpcRunnerClient, PredictRLMIn
             f"[supervisor lifecycle] {self._format_supervisor_exit_evidence(returncode, context)}"
         )
         if stderr:
-            diagnostic = (
-                f"{diagnostic}\n[supervisor stderr before restart]\n{stderr.rstrip()}"
-            )
+            diagnostic = f"{diagnostic}\n[supervisor stderr before restart]\n{stderr.rstrip()}"
         return diagnostic
 
     def _build_tool_response(
@@ -993,9 +1617,16 @@ class TerminalBenchRunnerInterpreter(PersistentJsonRpcRunnerClient, PredictRLMIn
         if process.stderr is None:
             return ""
         try:
-            return process.stderr.read()
+            stderr = process.stderr.read()
         except Exception:
             return ""
+        if stderr:
+            self._debug_event(
+                "terminal_bench.runner.stderr_read",
+                stderr_len=len(stderr),
+                **_process_debug_metadata(process),
+            )
+        return stderr
 
     def _raise_for_exec_failure(self, result: Any, operation: str) -> None:
         returncode = getattr(result, "returncode", getattr(result, "return_code", 0))
@@ -1007,6 +1638,32 @@ class TerminalBenchRunnerInterpreter(PersistentJsonRpcRunnerClient, PredictRLMIn
                 f"exit code {returncode}; stdout: {stdout}; stderr: {stderr}"
             )
 
+
+class LocalProcessRunnerInterpreter(TerminalBenchRunnerInterpreter):
+    """PredictRLM interpreter that runs the persistent supervisor locally."""
+
+    def __init__(
+        self,
+        *,
+        tools: dict[str, Callable[..., Any]] | None = None,
+        output_fields: list[dict[str, Any]] | None = None,
+        runner_path: str = "/tmp/predict_rlm_runner.py",
+        python_executable: str | None = None,
+        workdir: str | None = None,
+        exec_timeout: float = 900.0,
+        recoverable_timeout_grace: float = TERMINAL_BENCH_RECOVERABLE_TIMEOUT_GRACE_SECONDS,
+    ) -> None:
+        super().__init__(
+            Path(workdir or os.getcwd()),
+            container_adapter=LocalProcessRunnerAdapter(workdir=workdir),
+            tools=tools,
+            output_fields=output_fields,
+            runner_path=runner_path,
+            python_executable=python_executable or sys.executable,
+            workdir=workdir,
+            exec_timeout=exec_timeout,
+            recoverable_timeout_grace=recoverable_timeout_grace,
+        )
 
 
 class HarborEnvironmentInterpreter(TerminalBenchRunnerInterpreter):

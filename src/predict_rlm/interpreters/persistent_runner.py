@@ -163,6 +163,12 @@ class PersistentJsonRpcRunnerClient(ABC):
                     response=message,
                 )
                 return message
+            self._on_supervisor_stale_response(
+                method,
+                expected_request_id=request_id,
+                stale_response=message,
+                stale_discards=stale_discards + 1,
+            )
             stale_discards += 1
             if stale_discards > self._stale_response_discard_limit:
                 self._handle_stale_response_limit(
@@ -325,6 +331,16 @@ class PersistentJsonRpcRunnerClient(ABC):
         request_id: int,
         request_start: float,
         response: dict[str, Any],
+    ) -> None:
+        return None
+
+    def _on_supervisor_stale_response(
+        self,
+        method: str,
+        *,
+        expected_request_id: int,
+        stale_response: dict[str, Any],
+        stale_discards: int,
     ) -> None:
         return None
 
