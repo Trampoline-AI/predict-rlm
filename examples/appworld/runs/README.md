@@ -14,8 +14,12 @@ examples/appworld/runs/runs.bundle
 ```
 
 `runs.bundle` is an encrypted `tar.gz` payload containing the run directories in
-this folder. It intentionally lives beside the runs so it can be regenerated or
-unpacked without changing the repository layout.
+this folder. The canonical hosted copy is published as a Hugging Face dataset
+artifact:
+
+```text
+https://huggingface.co/datasets/Trampoline-AI/predict-rlm-appworld-runs
+```
 
 ## Create the bundle
 
@@ -35,7 +39,15 @@ tar \
 
 ## Unpack the bundle
 
-From the repository root:
+Download the hosted bundle if it is not already present:
+
+```bash
+hf download Trampoline-AI/predict-rlm-appworld-runs runs.bundle \
+  --repo-type dataset \
+  --local-dir examples/appworld/runs
+```
+
+Then unpack from the repository root:
 
 ```bash
 export RUNS_BUNDLE_PASSWORD='<password>'
