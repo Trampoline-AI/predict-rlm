@@ -531,6 +531,17 @@ async def _call_predict_tool(
     return _reconstruct_output_types(signature, result, globals_dict)
 
 
+async def _drain_execution_tasks(baseline_tasks: set[asyncio.Task]) -> None:
+    current_task = asyncio.current_task()
+    pending_tasks = [
+        task
+        for task in asyncio.all_tasks()
+        if task is not current_task and task not in baseline_tasks and not task.done()
+    ]
+    if pending_tasks:
+        await asyncio.gather(*pending_tasks, return_exceptions=True)
+
+
 def _register_tools(params: dict[str, Any], globals_dict: dict[str, Any]) -> dict[str, Any]:
     for name in params.get("tools", []):
         if name == "predict":
@@ -593,6 +604,7 @@ async def _execute_code(
     capture: _ExecutionCapture | None = None,
 ) -> dict[str, Any]:
     capture = capture or _ExecutionCapture()
+    baseline_tasks = set(asyncio.all_tasks())
     try:
         compiled = compile(
             code,
@@ -609,6 +621,9 @@ async def _execute_code(
                 await result
     except _FinalOutputError as final:
         return {"final": final.payload}
+    except BaseException:
+        await _drain_execution_tasks(baseline_tasks)
+        raise
     return {"output": capture.stdout.getvalue() + capture.stderr.getvalue()}
 
 
