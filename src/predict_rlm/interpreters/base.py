@@ -9,6 +9,7 @@ from contextlib import asynccontextmanager, contextmanager
 from enum import Enum
 from typing import Any, Protocol
 
+from dspy.primitives.code_interpreter import CodeInterpreterError
 from pydantic import BaseModel, Field
 
 DEFAULT_SBX_TEMPLATE = "docker.io/docker/sandbox-templates:shell"
@@ -107,6 +108,20 @@ class SandboxBackend(str, Enum):
 
     JSPI = "jspi"
     SBX = "sbx"
+
+
+class SandboxExecutionError(CodeInterpreterError):
+    """Recoverable sandbox code error with captured output before failure."""
+
+    def __init__(self, message: str, *, partial_output: str = "") -> None:
+        super().__init__(message)
+        self.error_message = message
+        self.partial_output = partial_output
+
+    def __str__(self) -> str:
+        if not self.partial_output:
+            return self.error_message
+        return f"{self.partial_output.rstrip()}\n{self.error_message}"
 
 
 class SbxConfig(BaseModel):

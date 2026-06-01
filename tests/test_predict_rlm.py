@@ -1772,6 +1772,43 @@ class TestExecuteIteration:
                 output_field_names=["answer"],
             )
 
+    def test_failed_iteration_preserves_partial_output_before_error(self):
+        from predict_rlm.interpreters.base import SandboxExecutionError
+
+        mock_lm = MagicMock()
+        rlm = PredictRLM(ImageAnalysisSignature, sub_lm=mock_lm, max_iterations=5)
+
+        mock_repl = MagicMock()
+        mock_repl.execute = MagicMock(
+            side_effect=SandboxExecutionError(
+                "ValueError: bad",
+                partial_output="before failure\n",
+            )
+        )
+
+        mock_pred = MagicMock()
+        mock_pred.reasoning = "thinking"
+        mock_pred.code = "print('before failure')\nraise ValueError('bad')"
+        rlm.generate_action = MagicMock(return_value=mock_pred)
+
+        captured: dict[str, str] = {}
+
+        def process_result(*args):
+            captured["result"] = args[2] if len(args) == 5 else args[1]
+            return MagicMock()
+
+        with patch.object(rlm, "_process_execution_result", side_effect=process_result):
+            rlm._execute_iteration(
+                repl=mock_repl,
+                variables=[],
+                history=[],
+                iteration=0,
+                input_args={},
+                output_field_names=["answer"],
+            )
+
+        assert captured["result"] == "before failure\n[Error] ValueError: bad"
+
 
 class TestPredictRLMTelemetry:
     """Focused generated-code telemetry tests without real LM calls."""

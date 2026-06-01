@@ -135,11 +135,12 @@ def _strip_code_fences(code: str) -> str:
 
 
 def _format_execution_error(code: str, exc: Exception) -> str:
-    err = str(exc)
+    err = getattr(exc, "error_message", str(exc))
+    partial_output = getattr(exc, "partial_output", "")
     if code.count('"""') >= 3 and (
         "unterminated" in err.lower() or "invalid syntax" in err.lower()
     ):
-        return (
+        error = (
             f"[Error] {err}\n\n"
             'Hint: your code contains nested `"""` inside a '
             "triple-quoted string literal. Python cannot distinguish "
@@ -148,7 +149,22 @@ def _format_execution_error(code: str, exc: Exception) -> str:
             "single-quoted strings per line, or switch the outer "
             "delimiter to '''...'''."
         )
-    return f"[Error] {exc}"
+    else:
+        error = f"[Error] {err}"
+    return _prepend_partial_output(partial_output, error)
+
+
+def _prepend_partial_output(partial_output: str, error: str) -> str:
+    partial_output = partial_output.rstrip()
+    if not partial_output:
+        return error
+    return f"{partial_output}\n{error}"
+
+
+def _output_indicates_error(output: str) -> bool:
+    return any(
+        line.startswith(("[Error]", "[Type Error]")) for line in output.splitlines()
+    )
 
 
 def _sha256_text(value: str) -> str:
@@ -2534,7 +2550,7 @@ class PredictRLM(dspy.RLM):
                 code=entry.code if entry else "",
                 output=prompt_output,
                 untruncated_output=full_output,
-                error=full_output.startswith(("[Error]", "[Type Error]")),
+                error=_output_indicates_error(full_output),
                 duration_ms=ms_since(iter_start),
                 tool_calls=drain_tool_calls(),
                 predict_calls=drain_predict_calls(),

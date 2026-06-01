@@ -214,6 +214,31 @@ class TestSbxInterpreterLocalRunner:
         finally:
             interpreter.shutdown()
 
+    def test_execute_error_includes_partial_output(self, tmp_path: Path):
+        interpreter = self.make_interpreter(tmp_path)
+        try:
+            with pytest.raises(CodeInterpreterError) as exc_info:
+                interpreter.execute("print('before failure')\nraise ValueError('bad')")
+        finally:
+            interpreter.shutdown()
+
+        assert "before failure" in str(exc_info.value)
+        assert "ValueError" in str(exc_info.value)
+        assert getattr(exc_info.value, "partial_output") == "before failure\n"
+
+    def test_debug_logs_partial_output_on_error(self, tmp_path: Path, caplog):
+        caplog.set_level(logging.DEBUG, logger="predict_rlm")
+        interpreter = self.make_interpreter(tmp_path, debug=True)
+        try:
+            with pytest.raises(CodeInterpreterError):
+                interpreter.execute("print('before failure')\nraise ValueError('bad')")
+        finally:
+            interpreter.shutdown()
+
+        messages = "\n".join(record.getMessage() for record in caplog.records)
+        assert "sandbox.partial_output" in messages
+        assert "before failure" in messages
+
     def test_verbose_prints_output_tool_calls_and_errors(self, tmp_path: Path, capsys):
         async def add(a: int, b: int) -> dict:
             await asyncio.sleep(0)
@@ -239,6 +264,22 @@ class TestSbxInterpreterLocalRunner:
         assert '"args": [2, 3]' in stderr
         assert "── Output start ──" in stderr
         assert "5" in stderr
+        assert "── Output end ──" in stderr
+        assert "── Error (ValueError) start ──" in stderr
+        assert "bad" in stderr
+        assert "── Error (ValueError) end ──" in stderr
+
+    def test_verbose_prints_partial_output_before_error(self, tmp_path: Path, capsys):
+        interpreter = self.make_interpreter(tmp_path, verbose=True)
+        try:
+            with pytest.raises(CodeInterpreterError, match="ValueError"):
+                interpreter.execute("print('before failure')\nraise ValueError('bad')")
+        finally:
+            interpreter.shutdown()
+
+        stderr = capsys.readouterr().err
+        assert "── Output start ──" in stderr
+        assert "before failure" in stderr
         assert "── Output end ──" in stderr
         assert "── Error (ValueError) start ──" in stderr
         assert "bad" in stderr

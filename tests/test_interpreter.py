@@ -112,6 +112,34 @@ print(42)
         finally:
             interpreter.shutdown()
 
+    def test_prints_before_runtime_error_are_in_error(self):
+        interpreter = JspiInterpreter(preinstall_packages=False)
+        try:
+            with pytest.raises(CodeInterpreterError) as exc_info:
+                interpreter.execute("print('before failure')\nraise ValueError('bad')")
+        finally:
+            interpreter.shutdown()
+
+        assert "before failure" in str(exc_info.value)
+        assert "ValueError" in str(exc_info.value)
+        assert getattr(exc_info.value, "partial_output") == "before failure\n"
+
+    def test_verbose_prints_partial_output_before_error(self, capsys):
+        interpreter = JspiInterpreter(preinstall_packages=False, verbose=True)
+        try:
+            with pytest.raises(CodeInterpreterError):
+                interpreter.execute("print('before failure')\nraise ValueError('bad')")
+        finally:
+            interpreter.shutdown()
+
+        stderr = capsys.readouterr().err
+        assert "── Output start ──" in stderr
+        assert "before failure" in stderr
+        assert "── Output end ──" in stderr
+        assert "── Error (ValueError) start ──" in stderr
+        assert "bad" in stderr
+        assert "── Error (ValueError) end ──" in stderr
+
     def test_double_fence_handled(self):
         """Double fences (model outputs ```...```\\n```) are handled correctly."""
         interpreter = JspiInterpreter(preinstall_packages=False)

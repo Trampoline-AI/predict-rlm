@@ -1048,6 +1048,13 @@ while (true) {
 
         const errorType = error.type || "Error";
         const errorMessage = (error.message || "").trim();
+        let capturedOutput = "";
+        try {
+          capturedOutput = pyodide.runPython("buf_stdout.getvalue()");
+          if (typeof capturedOutput === 'string') capturedOutput = filterBinary(capturedOutput);
+        } catch (e) {
+          // Ignore errors reading captured output.
+        }
 
         // FinalOutput is a success — it's the SUBMIT signal, not an error
         if (errorType === "FinalOutput") {
@@ -1085,11 +1092,13 @@ while (true) {
         } catch (e) {
           // Ignore errors getting exception args
         }
+        const errorData = { type: errorType, args: errorArgs };
+        if (capturedOutput) errorData.output = capturedOutput;
         console.log(jsonrpcError(
           errorCode,
           errorMessage,
           requestId,
-          { type: errorType, args: errorArgs },
+          errorData
         ));
       }
       continue;

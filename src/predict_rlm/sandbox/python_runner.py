@@ -157,15 +157,19 @@ def _response(request_id: Any, result: dict[str, Any]) -> dict[str, Any]:
 
 
 def _error(request_id: Any, exc: BaseException) -> dict[str, Any]:
+    data = {
+        "type": type(exc).__name__,
+        "args": list(getattr(exc, "args", ())),
+    }
+    partial_output = getattr(exc, "_predict_rlm_output", "")
+    if partial_output:
+        data["output"] = partial_output
     return {
         "jsonrpc": "2.0",
         "error": {
             "code": -32000,
             "message": str(exc),
-            "data": {
-                "type": type(exc).__name__,
-                "args": list(getattr(exc, "args", ())),
-            },
+            "data": data,
         },
         "id": request_id,
     }
@@ -186,6 +190,9 @@ async def _execute_code(code: str, globals_dict: dict[str, Any]) -> dict[str, An
                 await result
     except _FinalOutputError as final:
         return {"final": final.payload}
+    except BaseException as exc:
+        setattr(exc, "_predict_rlm_output", output.getvalue())
+        raise
     return {"output": output.getvalue()}
 
 

@@ -39,6 +39,7 @@ from .base import (
     STALE_RESPONSE_DISCARD_LIMIT,
     InterpreterExecutionGate,
     PredictRLMInterpreter,
+    SandboxExecutionError,
     SbxConfig,
 )
 
@@ -127,6 +128,25 @@ class SbxInterpreter(PredictRLMInterpreter):
                     **fields,
                 }
             ),
+        )
+
+    def _log_partial_output(self, output: str, **fields: Any) -> None:
+        if not getattr(self, "debug", False) or not output:
+            return
+        process_pid = getattr(self._proc, "pid", None) if self._proc else None
+        logger.debug(
+            "sandbox.partial_output%s\n%s",
+            format_log_fields(
+                {
+                    "backend": "sbx",
+                    "sandbox_name": getattr(self, "_sandbox_name", None),
+                    "process_pid": process_pid,
+                    "staging_root": str(getattr(self, "_staging_root", "")) or None,
+                    "chars": len(output),
+                    **fields,
+                }
+            ),
+            output.rstrip(),
         )
 
     def execute(self, code: str, variables: dict[str, Any] | None = None) -> Any:
@@ -796,15 +816,21 @@ class SbxInterpreter(PredictRLMInterpreter):
             error = response["error"]
             error_data = error.get("data", {})
             error_type = error_data.get("type", "Sandbox Error")
+            partial_output = error_data.get("output") or ""
+            if partial_output:
+                self._log_partial_output(partial_output, error_type=error_type)
             if interpreter_result_logging_enabled(self.verbose):
+                if partial_output:
+                    emit_trace_result({"output": partial_output})
                 emit_trace_error(
                     error_type,
                     error.get("message") or error_data.get("args", []),
                 )
             if error_type == "SyntaxError":
                 raise SyntaxError(error.get("message", "Invalid Python syntax"))
-            raise CodeInterpreterError(
-                f"{error_type}: {error_data.get('args') or error.get('message', '')}"
+            raise SandboxExecutionError(
+                f"{error_type}: {error_data.get('args') or error.get('message', '')}",
+                partial_output=partial_output,
             )
 
         result = response.get("result", {})

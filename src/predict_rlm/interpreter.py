@@ -35,6 +35,7 @@ from pydantic import BaseModel
 from predict_rlm.interpreters.base import (
     STALE_RESPONSE_DISCARD_LIMIT,
     InterpreterExecutionGate,
+    SandboxExecutionError,
 )
 
 from ._logging import (
@@ -397,6 +398,23 @@ class JspiInterpreter(PythonInterpreter):
                     **fields,
                 }
             ),
+        )
+
+    def _log_partial_output(self, output: str, **fields: Any) -> None:
+        if not getattr(self, "_debug", False) or not output:
+            return
+        logger.debug(
+            "sandbox.partial_output%s\n%s",
+            format_log_fields(
+                {
+                    "backend": "jspi",
+                    "interpreter_id": getattr(self, "_interpreter_id", None),
+                    "process_pid": self._telemetry_process_pid(),
+                    "chars": len(output),
+                    **fields,
+                }
+            ),
+            output.rstrip(),
         )
 
     def _telemetry_process_pid(self) -> int | None:
@@ -1232,8 +1250,13 @@ class JspiInterpreter(PythonInterpreter):
                 error_type = error_data.get("type", "Sandbox Error")
                 error_args = error_data.get("args", [])
                 error_msg = error.get("message", "")
+                partial_output = error_data.get("output") or ""
 
+                if partial_output:
+                    self._log_partial_output(partial_output, error_type=error_type)
                 if interpreter_result_logging_enabled(self._verbose):
+                    if partial_output:
+                        emit_trace_result({"output": partial_output})
                     emit_trace_error(error_type, error_msg or error_args)
 
                 if error_type == "SyntaxError":
@@ -1255,7 +1278,10 @@ class JspiInterpreter(PythonInterpreter):
                         detail = ", ".join(parts)
                     raise SyntaxError(detail or "Invalid Python syntax")
                 else:
-                    raise CodeInterpreterError(f"{error_type}: {error_args or error_msg}")
+                    raise SandboxExecutionError(
+                        f"{error_type}: {error_args or error_msg}",
+                        partial_output=partial_output,
+                    )
 
             raise CodeInterpreterError(f"Unexpected message format from sandbox: {result}")
 

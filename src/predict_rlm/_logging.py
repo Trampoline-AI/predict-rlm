@@ -18,6 +18,8 @@ OUTPUT_PREVIEW_CHARS = 2000
 TOOL_PREVIEW_CHARS = 200
 ITERATION_COLOR = "34"
 CODE_COLOR = "36"
+ERROR_COLOR = "31"
+ANSI_RESET = "\033[0m"
 
 _live_tool_call_logging: ContextVar[bool] = ContextVar(
     "_live_tool_call_logging", default=False
@@ -43,7 +45,7 @@ def configure_predict_rlm_logging(*, debug: bool = False, verbose: bool = False)
             _ensure_marked_stream_handler(
                 package_logger,
                 DEBUG_HANDLER_MARKER,
-                logging.Formatter(
+                _PredictRLMDebugFormatter(
                     "%(asctime)s [%(levelname)s] %(name)s: %(message)s",
                     datefmt="%H:%M:%S",
                 ),
@@ -83,6 +85,35 @@ def _ensure_marked_stream_handler(
     handler.setFormatter(formatter)
     setattr(handler, marker, True)
     logger.addHandler(handler)
+
+
+class _PredictRLMDebugFormatter(logging.Formatter):
+    def format(self, record: logging.LogRecord) -> str:
+        message = super().format(record)
+        if _debug_record_is_error(record):
+            return f"\033[{ERROR_COLOR}m{message}{ANSI_RESET}"
+        return message
+
+
+def _debug_record_is_error(record: logging.LogRecord) -> bool:
+    if record.levelno >= logging.ERROR:
+        return True
+
+    message = record.getMessage()
+    if not message:
+        return False
+
+    event = message.split(maxsplit=1)[0]
+    if event.endswith((".error", ".fatal", ".timeout")):
+        return True
+    return any(
+        marker in message
+        for marker in (
+            " status=ERROR",
+            " status=error",
+            " error_type=",
+        )
+    )
 
 
 def format_log_fields(fields: dict[str, Any]) -> str:

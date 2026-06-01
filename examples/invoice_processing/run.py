@@ -59,6 +59,11 @@ def parse_args():
         help="Print REPL code, output, errors, and tool calls to stderr",
     )
     parser.add_argument(
+        "--verbose",
+        action="store_true",
+        help="Print RLM iteration trace logs to stderr",
+    )
+    parser.add_argument(
         "--model",
         default=LLM_MODEL,
         help=f"LLM model to use (default: {LLM_MODEL})",
@@ -135,7 +140,7 @@ async def main():
     processor = InvoiceProcessor(
         sub_lm=sub_lm,
         max_iterations=args.max_iterations,
-        verbose=True,
+        verbose=args.verbose,
         debug=args.debug,
     )
     start_time = time.perf_counter()
@@ -149,6 +154,13 @@ async def main():
     run_id = datetime.now().strftime("%Y%m%d-%H%M%S")
     output_dir = Path(__file__).parent / "output" / run_id
     output_dir.mkdir(parents=True, exist_ok=True)
+
+    trace = getattr(prediction, "trace", None)
+    if trace is not None:
+        trace_path = output_dir / "run_trace.json"
+        trace.to_exportable_json(trace_path)
+        print(f"Run trace file: {trace_path}")
+
     workbook_path = prediction.workbook.path
     if workbook_path:
         for f in Path(workbook_path).parent.glob("*.xlsx"):
