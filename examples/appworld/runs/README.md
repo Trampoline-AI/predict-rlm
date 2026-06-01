@@ -27,9 +27,11 @@ From the repository root:
 
 ```bash
 export RUNS_BUNDLE_PASSWORD='<password>'
-tar \
+COPYFILE_DISABLE=1 tar \
   --exclude='./runs.bundle' \
   --exclude='./README.md' \
+  --exclude='.DS_Store' \
+  --exclude='._*' \
   -C examples/appworld/runs \
   -czf - . \
   | openssl enc -aes-256-cbc -salt -pbkdf2 \

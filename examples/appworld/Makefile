@@ -23,9 +23,11 @@ unpack-runs: $(RUNS_BUNDLE)
 bundle-runs:
 	@test -n "$(RUNS_BUNDLE_PASSWORD)" || \
 		(echo "Set RUNS_BUNDLE_PASSWORD before creating runs.bundle" >&2; exit 1)
-	tar \
+	COPYFILE_DISABLE=1 tar \
 		--exclude='./runs.bundle' \
 		--exclude='./README.md' \
+		--exclude='.DS_Store' \
+		--exclude='._*' \
 		-C runs \
 		-czf - . \
 		| openssl enc -aes-256-cbc -salt -pbkdf2 \
