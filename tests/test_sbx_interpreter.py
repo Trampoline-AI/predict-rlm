@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import shutil
 import subprocess
@@ -28,13 +29,16 @@ def _real_sbx_available() -> bool:
         return False
     if shutil.which("sbx") is None:
         return False
-    return subprocess.run(
-        ["sbx", "ls"],
-        capture_output=True,
-        text=True,
-        timeout=15,
-        check=False,
-    ).returncode == 0
+    return (
+        subprocess.run(
+            ["sbx", "ls"],
+            capture_output=True,
+            text=True,
+            timeout=15,
+            check=False,
+        ).returncode
+        == 0
+    )
 
 
 class LocalRunner:
@@ -149,10 +153,20 @@ class TestPythonRunnerProtocol:
 
 
 class TestSbxInterpreterLocalRunner:
-    def make_interpreter(self, tmp_path: Path) -> SbxInterpreter:
+    def make_interpreter(
+        self,
+        tmp_path: Path,
+        *,
+        debug: bool = False,
+        verbose: bool = False,
+        tools: dict | None = None,
+    ) -> SbxInterpreter:
         return SbxInterpreter(
             config=SbxConfig(name="local-test"),
+            tools=tools,
             preinstall_packages=False,
+            debug=debug,
+            verbose=verbose,
             _runner_command=[sys.executable, "-u", str(RUNNER_PATH)],
             _staging_root=tmp_path / "staging",
         )
@@ -175,6 +189,23 @@ class TestSbxInterpreterLocalRunner:
         assert isinstance(result, FinalOutput)
         assert result.output == {"answer": "ok"}
 
+    def test_debug_logs_runner_and_request_events(self, tmp_path: Path, caplog, capsys):
+        caplog.set_level(logging.DEBUG, logger="predict_rlm")
+        interpreter = self.make_interpreter(tmp_path, debug=True)
+        try:
+            assert interpreter.execute("print('hi')") == "hi\n"
+        finally:
+            interpreter.shutdown()
+
+        stderr = capsys.readouterr().err
+        assert "── Output start ──" not in stderr
+        events = [record.getMessage().split()[0] for record in caplog.records]
+        assert "sbx.runner.start" in events
+        assert "sbx.runner.started" in events
+        assert "sbx.request.start" in events
+        assert "sbx.request.ok" in events
+        assert "sbx.shutdown.complete" in events
+
     def test_execute_raises_recoverable_code_errors(self, tmp_path: Path):
         interpreter = self.make_interpreter(tmp_path)
         try:
@@ -182,6 +213,51 @@ class TestSbxInterpreterLocalRunner:
                 interpreter.execute("print(missing_name)")
         finally:
             interpreter.shutdown()
+
+    def test_verbose_prints_output_tool_calls_and_errors(self, tmp_path: Path, capsys):
+        async def add(a: int, b: int) -> dict:
+            await asyncio.sleep(0)
+            return {"total": a + b}
+
+        interpreter = self.make_interpreter(
+            tmp_path,
+            verbose=True,
+            tools={"add": add},
+        )
+        try:
+            output = interpreter.execute("result = await add(2, 3)\nprint(result['total'])")
+            with pytest.raises(CodeInterpreterError, match="ValueError"):
+                interpreter.execute("raise ValueError('bad')")
+        finally:
+            interpreter.shutdown()
+
+        assert output.strip() == "5"
+        stderr = capsys.readouterr().err
+        assert "[INFO]" not in stderr
+        assert "predict_rlm.trace" not in stderr
+        assert "── Tool: add(" in stderr
+        assert '"args": [2, 3]' in stderr
+        assert "── Output start ──" in stderr
+        assert "5" in stderr
+        assert "── Output end ──" in stderr
+        assert "── Error (ValueError) start ──" in stderr
+        assert "bad" in stderr
+        assert "── Error (ValueError) end ──" in stderr
+
+    def test_verbose_prints_submit_payload(self, tmp_path: Path, capsys):
+        interpreter = self.make_interpreter(tmp_path, verbose=True)
+        try:
+            result = interpreter.execute("SUBMIT(answer='ok')")
+        finally:
+            interpreter.shutdown()
+
+        assert isinstance(result, FinalOutput)
+        stderr = capsys.readouterr().err
+        assert "[INFO]" not in stderr
+        assert "predict_rlm.trace" not in stderr
+        assert "── SUBMIT start ──" in stderr
+        assert '"answer": "ok"' in stderr
+        assert "── SUBMIT end ──" in stderr
 
     def test_file_helpers_round_trip_virtual_paths(self, tmp_path: Path):
         interpreter = self.make_interpreter(tmp_path)
@@ -222,13 +298,7 @@ class TestSbxInterpreterLocalRunner:
             interpreter.mount_file_at(str(source), "/sandbox/input/source/input.txt")
             interpreter.mkdir_p("/sandbox/output/result/nested")
             staged_output = (
-                tmp_path
-                / "staging"
-                / "sandbox"
-                / "output"
-                / "result"
-                / "nested"
-                / "output.txt"
+                tmp_path / "staging" / "sandbox" / "output" / "result" / "nested" / "output.txt"
             )
             staged_output.write_text("from staging", encoding="utf-8")
 
@@ -240,9 +310,7 @@ class TestSbxInterpreterLocalRunner:
         finally:
             interpreter.shutdown()
 
-        staged_input = (
-            tmp_path / "staging" / "sandbox" / "input" / "source" / "input.txt"
-        )
+        staged_input = tmp_path / "staging" / "sandbox" / "input" / "source" / "input.txt"
         assert staged_input.read_text(encoding="utf-8") == "host visible"
         assert (tmp_path / "staging" / "sandbox" / "output" / "result" / "nested").is_dir()
         assert files == ["/sandbox/output/result/nested/output.txt"]
@@ -287,9 +355,9 @@ class TestSbxInterpreterLocalRunner:
             interpreter.shutdown()
 
         assert staging_root.is_dir()
-        assert (
-            staging_root / "sandbox" / "input" / "source" / "input.txt"
-        ).read_text(encoding="utf-8") == "host visible"
+        assert (staging_root / "sandbox" / "input" / "source" / "input.txt").read_text(
+            encoding="utf-8"
+        ) == "host visible"
 
     def test_persist_preserves_owned_staging_root(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -322,18 +390,13 @@ class TestSbxInterpreterLocalRunner:
             _staging_root=tmp_path / "staging",
         )
         try:
-            output = interpreter.execute(
-                "result = await add(2, 3)\n"
-                "print(result['total'])"
-            )
+            output = interpreter.execute("result = await add(2, 3)\nprint(result['total'])")
         finally:
             interpreter.shutdown()
 
         assert output.strip() == "5"
 
-    def test_host_tool_synced_file_writeback_updates_sandbox_file(
-        self, tmp_path: Path
-    ):
+    def test_host_tool_synced_file_writeback_updates_sandbox_file(self, tmp_path: Path):
         received_paths: list[str] = []
 
         def mutate(path: Annotated[str, SyncedFile(writeback=True)]) -> str:
@@ -440,9 +503,7 @@ class TestSbxInterpreterLocalRunner:
             str(host_dir / "input.txt"),
             "sandbox + configured",
         ]
-        assert (host_dir / "input.txt").read_text(encoding="utf-8") == (
-            "sandbox + configured"
-        )
+        assert (host_dir / "input.txt").read_text(encoding="utf-8") == ("sandbox + configured")
 
     def test_execute_serializes_concurrent_requests(self, tmp_path: Path):
         runner_script = tmp_path / "detect_concurrent_requests.py"
@@ -736,9 +797,7 @@ class TestSbxCommandConstruction:
         assert create_cmd[:4] == ["sbx", "create", "shell", workspace_arg]
         assert create_cmd[4:6] == [str(extra_one), str(extra_two)]
 
-    def test_default_workspace_is_staging_root_not_repo(
-        self, monkeypatch, tmp_path: Path
-    ):
+    def test_default_workspace_is_staging_root_not_repo(self, monkeypatch, tmp_path: Path):
         commands: list[list[str]] = []
 
         def fake_run(command, **kwargs):
@@ -802,9 +861,7 @@ class TestSbxCommandConstruction:
         with pytest.raises(SandboxFatalError, match="missing-package"):
             interpreter._bootstrap_packages()
 
-    def test_package_bootstrap_uses_docker_sandbox_safe_pip(
-        self, monkeypatch, tmp_path: Path
-    ):
+    def test_package_bootstrap_uses_docker_sandbox_safe_pip(self, monkeypatch, tmp_path: Path):
         commands = []
 
         def fake_run(command, **kwargs):
@@ -1180,7 +1237,9 @@ class TestSbxPool:
         assert interpreter.shutdown_called
         assert pool._available.qsize() == 0
 
-    def test_shutdown_before_lease_autostart_prevents_acquire(self, tmp_path: Path, monkeypatch):
+    def test_shutdown_before_lease_autostart_prevents_acquire(
+        self, tmp_path: Path, monkeypatch
+    ):
         pool = SbxPool(
             size=1,
             config=SbxConfig(name="pool-test"),

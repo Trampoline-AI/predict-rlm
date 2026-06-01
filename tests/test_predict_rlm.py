@@ -15,7 +15,10 @@ from predict_rlm import PredictRLM, SbxPool
 from predict_rlm.predict_rlm import _models_from_schema
 from predict_rlm.rlm_skills import Skill
 from predict_rlm.telemetry import TelemetryContext, classify_failure
-from predict_rlm.trace import drain_predict_calls, init_predict_call_collector
+from predict_rlm.trace import (
+    drain_predict_calls,
+    init_predict_call_collector,
+)
 
 
 def _run(coro):
@@ -25,6 +28,19 @@ def _run(coro):
     nest_asyncio.apply()
     loop = asyncio.get_event_loop()
     return loop.run_until_complete(coro)
+
+
+def _log_messages(caplog, logger_name: str) -> str:
+    return "\n".join(
+        record.getMessage()
+        for record in caplog.records
+        if record.name.startswith(logger_name)
+    )
+
+
+def _assert_raw_verbose_output(output: str) -> None:
+    assert "[INFO]" not in output
+    assert "predict_rlm.trace" not in output
 
 
 class ImageAnalysisSignature(dspy.Signature):
@@ -117,6 +133,69 @@ class TestSandboxBackendSelection:
                 sandbox_backend="sbx",
             )
 
+    def test_debug_configures_injected_interpreter_debug(self):
+        interpreter = MagicMock()
+        interpreter.configure_debug = MagicMock()
+        interpreter.shutdown = MagicMock()
+        rlm = PredictRLM(
+            ImageAnalysisSignature,
+            sub_lm=MagicMock(),
+            max_iterations=1,
+            interpreter=interpreter,
+            debug=True,
+        )
+
+        with rlm._interpreter_context(execution_tools={"predict": MagicMock()}) as repl:
+            assert repl is interpreter
+            interpreter.configure_debug.assert_called_once_with(True)
+
+        interpreter.shutdown.assert_not_called()
+
+    def test_verbose_configures_injected_interpreter_verbose(self):
+        interpreter = MagicMock()
+        interpreter.configure_verbose = MagicMock()
+        interpreter.shutdown = MagicMock()
+        rlm = PredictRLM(
+            ImageAnalysisSignature,
+            sub_lm=MagicMock(),
+            max_iterations=1,
+            interpreter=interpreter,
+            verbose=True,
+        )
+
+        with rlm._interpreter_context(execution_tools={"predict": MagicMock()}) as repl:
+            assert repl is interpreter
+            interpreter.configure_verbose.assert_called_once_with(True)
+
+        interpreter.shutdown.assert_not_called()
+
+    def test_configures_injected_interpreter_runtime_logging(self):
+        class Interpreter:
+            def __init__(self) -> None:
+                self.tools = {}
+                self.output_fields = []
+                self.runtime_kwargs = None
+                self.shutdown = MagicMock()
+
+            def configure_runtime(self, **kwargs):
+                self.runtime_kwargs = kwargs
+
+        interpreter = Interpreter()
+        rlm = PredictRLM(
+            ImageAnalysisSignature,
+            sub_lm=MagicMock(),
+            max_iterations=1,
+            interpreter=interpreter,
+            debug=True,
+            verbose=True,
+        )
+
+        with rlm._interpreter_context(execution_tools={"predict": MagicMock()}) as repl:
+            assert repl is interpreter
+
+        assert interpreter.runtime_kwargs == {"debug": True, "verbose": True}
+        interpreter.shutdown.assert_not_called()
+
     def test_sbx_pool_requires_sbx_backend(self):
         with pytest.raises(ValueError, match="sbx_pool.*sandbox_backend='sbx'"):
             PredictRLM(
@@ -156,6 +235,7 @@ class TestSandboxBackendSelection:
             max_iterations=1,
             sandbox_backend="sbx",
             sbx_pool=pool,
+            debug=True,
         )
         execution_tools = {"predict": MagicMock()}
 
@@ -165,6 +245,9 @@ class TestSandboxBackendSelection:
 
         pool.lease.assert_called_once()
         assert pool.lease_kwargs["tools"] == execution_tools
+        assert pool.lease_kwargs["output_fields"] == rlm._get_output_fields_info()
+        assert pool.lease_kwargs["debug"] is True
+        assert pool.lease_kwargs["verbose"] is False
         mock_sbx.assert_not_called()
         leased.shutdown.assert_not_called()
 
@@ -180,6 +263,114 @@ class TestPredictRLMOutputDefaults:
                 "default": None,
             }
         ]
+
+
+class TestVerboseDebugLogging:
+    def test_verbose_streams_iteration_header_before_execute_and_output_after(self, capsys):
+        rlm = PredictRLM(
+            ImageAnalysisSignature,
+            sub_lm=MagicMock(),
+            max_iterations=5,
+            verbose=True,
+        )
+
+        mock_pred = MagicMock()
+        mock_pred.reasoning = "thinking"
+        mock_pred.code = "print('model authored')\nprint('done')"
+        rlm.generate_action = MagicMock(return_value=mock_pred)
+
+        seen: dict[str, str] = {}
+
+        class Repl:
+            def execute(self, code, variables=None):
+                from predict_rlm._logging import (
+                    emit_trace_tool_call,
+                    live_tool_call_logging_enabled,
+                )
+
+                seen["before_execute"] = capsys.readouterr().err
+                assert live_tool_call_logging_enabled() is True
+                emit_trace_tool_call("lookup", args=["needle"], kwargs={"limit": 1})
+                return "visible output"
+
+        with patch.object(rlm, "_process_execution_result", return_value=MagicMock()):
+            rlm._execute_iteration(
+                repl=Repl(),
+                variables=[],
+                history=[],
+                iteration=0,
+                input_args={},
+                output_field_names=["answer"],
+            )
+
+        before_execute = seen["before_execute"]
+        after_execute = capsys.readouterr().err
+
+        _assert_raw_verbose_output(before_execute)
+        _assert_raw_verbose_output(after_execute)
+        assert "\033[34m── RLM iteration start ──" in before_execute
+        assert "RLM iteration 1/5" in before_execute
+        assert "── Reasoning start ──" in before_execute
+        assert "thinking" in before_execute
+        assert "── Reasoning end ──" in before_execute
+        assert "Code lines: 2" in before_execute
+        assert "\033[36m── Code start ──" in before_execute
+        assert "print('model authored')" in before_execute
+        assert "── Code end ──" in before_execute
+        assert "── Output start ──" not in before_execute
+
+        assert "── Tool: lookup(" in after_execute
+        assert '"args": ["needle"]' in after_execute
+        assert '"kwargs": {"limit": 1}' in after_execute
+        assert "── Output start ──" in after_execute
+        assert "visible output" in after_execute
+        assert "── Output end ──" in after_execute
+        assert "\033[34m── RLM iteration end ──" in after_execute
+
+    def test_debug_logs_lifecycle_without_verbose_trace(self, capsys, caplog):
+        caplog.set_level(logging.DEBUG, logger="predict_rlm")
+        rlm = PredictRLM(
+            ImageAnalysisSignature,
+            sub_lm=MagicMock(),
+            max_iterations=5,
+            debug=True,
+        )
+
+        mock_pred = MagicMock()
+        mock_pred.reasoning = "thinking"
+        mock_pred.code = "print('model authored')"
+        rlm.generate_action = MagicMock(return_value=mock_pred)
+
+        seen: dict[str, str] = {}
+
+        class Repl:
+            def execute(self, code, variables=None):
+                from predict_rlm._logging import live_tool_call_logging_enabled
+
+                seen["before_execute"] = capsys.readouterr().err
+                assert live_tool_call_logging_enabled() is False
+                return "visible output"
+
+        with patch.object(rlm, "_process_execution_result", return_value=MagicMock()):
+            rlm._execute_iteration(
+                repl=Repl(),
+                variables=[],
+                history=[],
+                iteration=0,
+                input_args={},
+                output_field_names=["answer"],
+            )
+
+        stderr = seen["before_execute"] + capsys.readouterr().err
+        assert "── RLM iteration start ──" not in stderr
+        assert "── Reasoning start ──" not in stderr
+        assert "── Code start ──" not in stderr
+        assert "── Output start ──" not in stderr
+        events = [record.getMessage().split()[0] for record in caplog.records]
+        assert "rlm.action_generation.start" in events
+        assert "rlm.action_generation.ok" in events
+        assert "rlm.execute.start" in events
+        assert "rlm.execute.ok" in events
 
 
 class TestPredictTool:
@@ -1508,6 +1699,55 @@ class TestExecuteIteration:
         mock_repl.execute.assert_called_once_with("print('hello')", variables={})
         assert result is mock_result
 
+    def test_verbose_streams_reasoning_and_code_before_sync_execute(self, capsys):
+        mock_lm = MagicMock()
+        rlm = PredictRLM(
+            ImageAnalysisSignature,
+            sub_lm=mock_lm,
+            max_iterations=5,
+            verbose=True,
+        )
+
+        mock_repl = MagicMock()
+        seen: dict[str, str] = {}
+
+        def execute(code, variables=None):
+            seen["before_execute"] = capsys.readouterr().err
+            return "output from execute"
+
+        mock_repl.execute = MagicMock(side_effect=execute)
+
+        mock_pred = MagicMock()
+        mock_pred.reasoning = "thinking"
+        mock_pred.code = "```python\nprint('model authored')\n```"
+        rlm.generate_action = MagicMock(return_value=mock_pred)
+
+        with patch.object(rlm, "_process_execution_result", return_value=MagicMock()):
+            rlm._execute_iteration(
+                repl=mock_repl,
+                variables=[],
+                history=[],
+                iteration=0,
+                input_args={"internal": "host value"},
+                output_field_names=["answer"],
+            )
+
+        before_execute = seen["before_execute"]
+        after_execute = capsys.readouterr().err
+        _assert_raw_verbose_output(before_execute)
+        _assert_raw_verbose_output(after_execute)
+        assert "── RLM iteration start ──" in before_execute
+        assert "── Reasoning start ──" in before_execute
+        assert "thinking" in before_execute
+        assert "── Reasoning end ──" in before_execute
+        assert "── Code start ──" in before_execute
+        assert "print('model authored')" in before_execute
+        assert "── Code end ──" in before_execute
+        assert "── Output start ──" not in before_execute
+        assert "── Output start ──" in after_execute
+        assert "output from execute" in after_execute
+        assert "── Output end ──" in after_execute
+
     def test_sync_sandbox_fatal_error_propagates(self):
         from predict_rlm.interpreter import SandboxFatalError
 
@@ -1772,6 +2012,58 @@ class TestAexecuteIteration:
             mock_process.assert_called_once_with(
                 mock_pred, "output from aexecute", [], ["answer"]
             )
+
+    @pytest.mark.asyncio
+    async def test_verbose_streams_reasoning_and_code_before_async_execute(self, capsys):
+        mock_lm = MagicMock()
+        rlm = PredictRLM(
+            ImageAnalysisSignature,
+            sub_lm=mock_lm,
+            max_iterations=5,
+            verbose=True,
+        )
+
+        mock_repl = MagicMock()
+        seen: dict[str, str] = {}
+
+        async def aexecute(code, variables=None):
+            seen["before_execute"] = capsys.readouterr().err
+            return "output from aexecute"
+
+        mock_repl.aexecute = AsyncMock(side_effect=aexecute)
+
+        mock_pred = MagicMock()
+        mock_pred.reasoning = "thinking"
+        mock_pred.code = "```python\nprint('async model authored')\n```"
+
+        rlm.generate_action = MagicMock()
+        rlm.generate_action.acall = AsyncMock(return_value=mock_pred)
+
+        with patch.object(rlm, "_process_execution_result", return_value=MagicMock()):
+            await rlm._aexecute_iteration(
+                repl=mock_repl,
+                variables=[],
+                history=[],
+                iteration=0,
+                input_args={"internal": "host value"},
+                output_field_names=["answer"],
+            )
+
+        before_execute = seen["before_execute"]
+        after_execute = capsys.readouterr().err
+        _assert_raw_verbose_output(before_execute)
+        _assert_raw_verbose_output(after_execute)
+        assert "── RLM iteration start ──" in before_execute
+        assert "── Reasoning start ──" in before_execute
+        assert "thinking" in before_execute
+        assert "── Reasoning end ──" in before_execute
+        assert "── Code start ──" in before_execute
+        assert "print('async model authored')" in before_execute
+        assert "── Code end ──" in before_execute
+        assert "── Output start ──" not in before_execute
+        assert "── Output start ──" in after_execute
+        assert "output from aexecute" in after_execute
+        assert "── Output end ──" in after_execute
 
     @pytest.mark.asyncio
     async def test_falls_back_to_execute_when_no_aexecute(self):

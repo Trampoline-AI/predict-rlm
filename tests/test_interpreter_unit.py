@@ -127,9 +127,7 @@ class TestBuildDenoCommand:
     def test_allow_net_with_domains(self, _):
         interp = _make_interpreter()
         with patch.object(interp, "_get_deno_dir", return_value=[]):
-            cmd = interp._build_deno_command(
-                [], [], ["pypi.org", "api.example.com"], []
-            )
+            cmd = interp._build_deno_command([], [], ["pypi.org", "api.example.com"], [])
         assert "--allow-net=pypi.org,api.example.com" in cmd
 
     @patch("predict_rlm.interpreter._needs_jspi_flag", return_value=False)
@@ -174,9 +172,7 @@ class TestGetDenoDir:
 
     def test_includes_deno_dir_env(self):
         interp = _make_interpreter()
-        with patch.dict(
-            "os.environ", {"DENO_DIR": "/custom/deno"}, clear=False
-        ):
+        with patch.dict("os.environ", {"DENO_DIR": "/custom/deno"}, clear=False):
             dirs = interp._get_deno_dir()
         assert "/custom/deno" in dirs
 
@@ -202,6 +198,35 @@ class TestSandboxFatalError:
 
     def test_is_not_code_interpreter_error(self):
         assert not issubclass(SandboxFatalError, CodeInterpreterError)
+
+
+class TestJspiLoggingConfig:
+    def test_configure_debug_and_verbose_are_independent(self):
+        interp = _make_interpreter()
+        interp._debug = False
+        interp._verbose = False
+
+        interp.configure_debug(True)
+        assert interp._debug is True
+        assert interp._verbose is False
+
+        interp.configure_verbose(True)
+        assert interp._debug is True
+        assert interp._verbose is True
+
+        interp.configure_debug(False)
+        assert interp._debug is False
+        assert interp._verbose is True
+
+    def test_configure_runtime_updates_debug_and_verbose(self):
+        interp = _make_interpreter()
+        interp._debug = False
+        interp._verbose = False
+
+        interp.configure_runtime(debug=True, verbose=True)
+
+        assert interp._debug is True
+        assert interp._verbose is True
 
 
 class TestJspiTelemetry:

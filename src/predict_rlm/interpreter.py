@@ -37,6 +37,15 @@ from predict_rlm.interpreters.base import (
     InterpreterExecutionGate,
 )
 
+from ._logging import (
+    configure_predict_rlm_logging,
+    emit_trace_error,
+    emit_trace_result,
+    emit_trace_tool_call,
+    format_log_fields,
+    interpreter_result_logging_enabled,
+    live_tool_call_logging_enabled,
+)
 from .telemetry import (
     TelemetryContext,
     make_span_id,
@@ -220,6 +229,7 @@ class JspiInterpreter(PythonInterpreter):
         preinstall_packages: bool = True,
         skill_packages: list[str] | None = None,
         debug: bool = False,
+        verbose: bool = False,
         # Advanced options (passed through to PythonInterpreter)
         deno_command: list[str] | None = None,
         enable_read_paths: list[PathLike | str] | None = None,
@@ -244,8 +254,10 @@ class JspiInterpreter(PythonInterpreter):
             skill_packages: Additional PyPI packages to install in the sandbox.
                            These come from Skill definitions and are installed
                            alongside the default packages via micropip.
-            debug: If True, print REPL code, output, and errors to stderr
-                  in real-time for debugging. Defaults to False.
+            debug: If True, emit sandbox lifecycle diagnostics through logging.
+                  Defaults to False.
+            verbose: If True, print REPL output, errors, SUBMIT payloads, and
+                  tool calls to stderr in real-time. Defaults to False.
             deno_command: Custom Deno command. If provided, JSPI flag is NOT
                          automatically added (assumes you've configured it).
             enable_read_paths: Files/directories to allow reading from.
@@ -299,6 +311,8 @@ class JspiInterpreter(PythonInterpreter):
             del os.environ["SKILL_PACKAGES"]
 
         self._debug = debug
+        self._verbose = verbose
+        configure_predict_rlm_logging(debug=debug, verbose=verbose)
 
         # Merge extra paths into Deno permissions (but NOT into parent's
         # enable_read_paths/enable_write_paths which trigger auto-mount/sync)
@@ -349,6 +363,41 @@ class JspiInterpreter(PythonInterpreter):
         # Per-execute wall-clock timeout (see __init__ docstring).
         self._exec_timeout = exec_timeout
         self._execution_gate = InterpreterExecutionGate("JSPI interpreter")
+
+    def configure_debug(self, enabled: bool) -> None:
+        self._debug = enabled
+        configure_predict_rlm_logging(debug=enabled)
+
+    def configure_verbose(self, enabled: bool) -> None:
+        self._verbose = enabled
+        configure_predict_rlm_logging(verbose=enabled)
+
+    def configure_runtime(
+        self,
+        *,
+        debug: bool | None = None,
+        verbose: bool | None = None,
+    ) -> None:
+        if debug is not None:
+            self.configure_debug(debug)
+        if verbose is not None:
+            self.configure_verbose(verbose)
+
+    def _log_lifecycle(self, event: str, **fields: Any) -> None:
+        if not getattr(self, "_debug", False):
+            return
+        logger.debug(
+            "%s%s",
+            event,
+            format_log_fields(
+                {
+                    "backend": "jspi",
+                    "interpreter_id": getattr(self, "_interpreter_id", None),
+                    "process_pid": self._telemetry_process_pid(),
+                    **fields,
+                }
+            ),
+        )
 
     def _telemetry_process_pid(self) -> int | None:
         process = getattr(self, "deno_process", None)
@@ -411,6 +460,8 @@ class JspiInterpreter(PythonInterpreter):
             pass  # No running loop or fd already closed
 
         prev = self.deno_process
+        if prev is None or prev.poll() is not None:
+            self._log_lifecycle("jspi.deno.starting")
         super()._ensure_deno_process()
         if self.deno_process is not None and self.deno_process is not prev:
             self._stdout_fd = self.deno_process.stdout.fileno()
@@ -425,6 +476,7 @@ class JspiInterpreter(PythonInterpreter):
             self._executor.shutdown(wait=False)
             self._executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
             self._write_telemetry_span("sandbox.deno.start")
+            self._log_lifecycle("jspi.deno.started")
 
     def shutdown(self) -> None:
         """Shut down the Deno subprocess with timeout guards.
@@ -437,11 +489,10 @@ class JspiInterpreter(PythonInterpreter):
         process = self.deno_process
         if process and process.poll() is None:
             self._write_telemetry_span("sandbox.shutdown.start")
+            self._log_lifecycle("jspi.shutdown.start")
             killed = False
             try:
-                self._write_stdin(
-                    json.dumps({"jsonrpc": "2.0", "method": "shutdown"}) + "\n"
-                )
+                self._write_stdin(json.dumps({"jsonrpc": "2.0", "method": "shutdown"}) + "\n")
                 self.deno_process.stdin.close()
             except (BrokenPipeError, OSError):
                 pass
@@ -455,16 +506,26 @@ class JspiInterpreter(PythonInterpreter):
                         "sandbox.shutdown.kill",
                         attributes={"process.kill_result": "sent"},
                     )
+                    self._log_lifecycle("jspi.shutdown.kill", kill_result="sent")
                 except Exception as exc:
                     self._write_telemetry_span(
                         "sandbox.shutdown.kill",
                         status={"code": "ERROR", "message": str(exc)},
                         attributes={"process.kill_result": "error"},
                     )
+                    self._log_lifecycle(
+                        "jspi.shutdown.kill",
+                        status="error",
+                        error_type=type(exc).__name__,
+                    )
                 self.deno_process.wait()
             self._write_telemetry_span(
                 "sandbox.shutdown.complete",
                 attributes={"process.kill_result": "killed" if killed else "not_needed"},
+            )
+            self._log_lifecycle(
+                "jspi.shutdown.complete",
+                kill_result="killed" if killed else "not_needed",
             )
         self.deno_process = None
         self._owner_thread = None
@@ -497,6 +558,7 @@ class JspiInterpreter(PythonInterpreter):
 
         # Allow reading temp dirs so @file_sync tools can mount files back
         import tempfile as _tempfile
+
         allowed_read.append(_tempfile.gettempdir())
         allowed_read.append("/tmp")
 
@@ -594,9 +656,7 @@ class JspiInterpreter(PythonInterpreter):
         # safety cap.
         max_stale_discards = STALE_RESPONSE_DISCARD_LIMIT
         for _attempt in range(max_stale_discards + 1):
-            response_line = self._read_with_timeout(
-                timeout=DENO_REQUEST_TIMEOUT_SEC
-            )
+            response_line = self._read_with_timeout(timeout=DENO_REQUEST_TIMEOUT_SEC)
             if not response_line:
                 exit_code = self.deno_process.poll()
                 if exit_code is not None:
@@ -641,7 +701,9 @@ class JspiInterpreter(PythonInterpreter):
             logger.warning(
                 "Discarding stale deno response (id=%s, expected %s) "
                 "in %s — likely a prior request's late arrival",
-                resp_id, request_id, context,
+                resp_id,
+                request_id,
+                context,
             )
         else:
             raise CodeInterpreterError(
@@ -710,11 +772,13 @@ class JspiInterpreter(PythonInterpreter):
         # sync_file is a notification (no response expected), but we use
         # _send_request for the JSON-RPC request pattern with a response.
         # Use direct stdin write like the parent's _sync_files does.
-        sync_msg = json.dumps({
-            "jsonrpc": "2.0",
-            "method": "sync_file",
-            "params": {"virtual_path": virtual_path, "host_path": host_path},
-        })
+        sync_msg = json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "method": "sync_file",
+                "params": {"virtual_path": virtual_path, "host_path": host_path},
+            }
+        )
         self.deno_process.stdin.write(sync_msg + "\n")
         self.deno_process.stdin.flush()
 
@@ -817,15 +881,29 @@ class JspiInterpreter(PythonInterpreter):
                 **getattr(self, "_last_semaphore_attrs", {}),
             },
         )
-        input_data = json.dumps({
-            "jsonrpc": "2.0",
-            "method": "execute",
-            "params": {"code": code},
-            "id": execute_request_id,
-        })
+        self._log_lifecycle(
+            "jspi.execute.start",
+            request_id=execute_request_id,
+            timeout_seconds=self._exec_timeout,
+            pending_tool_count=self._telemetry_pending_tool_count(),
+            pending_file_op_count=self._telemetry_pending_file_ops_count(),
+        )
+        input_data = json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "method": "execute",
+                "params": {"code": code},
+                "id": execute_request_id,
+            }
+        )
         try:
             await self._write_stdin_async(input_data + "\n")
         except BrokenPipeError as e:
+            self._log_lifecycle(
+                "jspi.execute.broken_pipe",
+                request_id=execute_request_id,
+                status="error",
+            )
             self._kill_sandbox()
             raise SandboxFatalError(
                 "Sandbox subprocess died before receiving the execute "
@@ -864,6 +942,13 @@ class JspiInterpreter(PythonInterpreter):
                 },
                 start_time_unix_nano=execute_start_time,
             )
+            self._log_lifecycle(
+                "jspi.execute.ok",
+                request_id=execute_request_id,
+                timeout_seconds=self._exec_timeout,
+                pending_tool_count=self._telemetry_pending_tool_count(),
+                pending_file_op_count=self._telemetry_pending_file_ops_count(),
+            )
             return result
         except asyncio.TimeoutError:
             self._write_telemetry_span(
@@ -880,6 +965,14 @@ class JspiInterpreter(PythonInterpreter):
                     "failure.class": "sandbox_exec_timeout",
                 },
                 start_time_unix_nano=execute_start_time,
+            )
+            self._log_lifecycle(
+                "jspi.execute.timeout",
+                request_id=execute_request_id,
+                timeout_seconds=self._exec_timeout,
+                pending_tool_count=self._telemetry_pending_tool_count(),
+                pending_file_op_count=self._telemetry_pending_file_ops_count(),
+                status="error",
             )
             self._kill_sandbox()
             raise SandboxFatalError(
@@ -902,6 +995,7 @@ class JspiInterpreter(PythonInterpreter):
         """
         if self.deno_process is not None:
             self._write_telemetry_span("sandbox.shutdown.start")
+            self._log_lifecycle("jspi.kill.start")
             kill_result = "sent"
             try:
                 self.deno_process.kill()
@@ -920,6 +1014,11 @@ class JspiInterpreter(PythonInterpreter):
                 "sandbox.shutdown.complete",
                 attributes={"process.kill_result": kill_result},
                 status="OK" if kill_result == "sent" else "ERROR",
+            )
+            self._log_lifecycle(
+                "jspi.kill.complete",
+                kill_result=kill_result,
+                status="ok" if kill_result == "sent" else "error",
             )
         self.deno_process = None
         # Cancel any pending file-sync futures; they can't complete now.
@@ -1031,12 +1130,21 @@ class JspiInterpreter(PythonInterpreter):
             # Skip non-JSON lines (e.g., Pyodide package loading messages)
             if not output_line.startswith("{"):
                 logger.debug(f"Skipping non-JSON output: {output_line}")
+                self._log_lifecycle(
+                    "jspi.protocol.non_json_stdout",
+                    preview=output_line[:200],
+                )
                 continue
 
             try:
                 result = json.loads(output_line)
             except json.JSONDecodeError:
                 logger.info(f"Skipping malformed JSON: {output_line[:100]}")
+                self._log_lifecycle(
+                    "jspi.protocol.malformed_json",
+                    preview=output_line[:200],
+                    status="error",
+                )
                 continue
 
             # Route file-sync responses to pending futures (from _execute_tool_async)
@@ -1071,6 +1179,12 @@ class JspiInterpreter(PythonInterpreter):
                     result.get("id"),
                     execute_request_id,
                 )
+                self._log_lifecycle(
+                    "jspi.protocol.stale_response",
+                    request_id=execute_request_id,
+                    response_id=result.get("id"),
+                    stale_discards=stale_discards,
+                )
                 continue
 
             if (
@@ -1089,6 +1203,12 @@ class JspiInterpreter(PythonInterpreter):
                     result.get("id"),
                     execute_request_id,
                 )
+                self._log_lifecycle(
+                    "jspi.protocol.stale_error",
+                    request_id=execute_request_id,
+                    response_id=result.get("id"),
+                    stale_discards=stale_discards,
+                )
                 continue
 
             # Before returning, ensure all pending tool calls complete
@@ -1099,21 +1219,8 @@ class JspiInterpreter(PythonInterpreter):
             if "result" in result:
                 res = result["result"]
                 self._sync_files()
-                if self._debug:
-                    import sys
-
-                    if "final" in res:
-                        print("\n\033[32m── SUBMIT ──\033[0m", file=sys.stderr)
-                        print(
-                            json.dumps(res["final"], indent=2, default=str)[:2000],
-                            file=sys.stderr,
-                        )
-                        print("\033[32m────────────\033[0m", file=sys.stderr)
-                    else:
-                        output = res.get("output", "")
-                        print("\n\033[32m── Output ──\033[0m", file=sys.stderr)
-                        print(str(output)[:2000] if output else "(no output)", file=sys.stderr)
-                        print("\033[32m────────────\033[0m", file=sys.stderr)
+                if interpreter_result_logging_enabled(self._verbose):
+                    emit_trace_result(res)
                 if "final" in res:
                     return FinalOutput(res["final"])
                 return res.get("output", None)
@@ -1126,12 +1233,8 @@ class JspiInterpreter(PythonInterpreter):
                 error_args = error_data.get("args", [])
                 error_msg = error.get("message", "")
 
-                if self._debug:
-                    import sys
-
-                    print(f"\n\033[31m── Error ({error_type}) ──\033[0m", file=sys.stderr)
-                    print(error_msg or error_args, file=sys.stderr)
-                    print("\033[31m─────────────────────────\033[0m", file=sys.stderr)
+                if interpreter_result_logging_enabled(self._verbose):
+                    emit_trace_error(error_type, error_msg or error_args)
 
                 if error_type == "SyntaxError":
                     # Format a helpful message from the args tuple:
@@ -1236,16 +1339,12 @@ class JspiInterpreter(PythonInterpreter):
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     raise TimeoutError(
-                        "deno stdout read exceeded heartbeat budget "
-                        "before newline arrived"
+                        "deno stdout read exceeded heartbeat budget before newline arrived"
                     )
-                ready, _, _ = select.select(
-                    [self._stdout_fd], [], [], remaining
-                )
+                ready, _, _ = select.select([self._stdout_fd], [], [], remaining)
                 if not ready:
                     raise TimeoutError(
-                        "deno stdout read exceeded heartbeat budget "
-                        "before newline arrived"
+                        "deno stdout read exceeded heartbeat budget before newline arrived"
                     )
             chunk = os.read(self._stdout_fd, 65536)
             if not chunk:
@@ -1269,11 +1368,14 @@ class JspiInterpreter(PythonInterpreter):
         loop = asyncio.get_running_loop()
         future = loop.create_future()
         self._pending_file_ops[req_id] = future
-        msg = json.dumps({
-            "jsonrpc": "2.0", "method": "sync_file",
-            "params": {"virtual_path": virtual_path, "host_path": host_path},
-            "id": req_id,
-        })
+        msg = json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "method": "sync_file",
+                "params": {"virtual_path": virtual_path, "host_path": host_path},
+                "id": req_id,
+            }
+        )
         await self._write_stdin_async(msg + "\n")
         result = await future
         if "error" in result:
@@ -1288,11 +1390,14 @@ class JspiInterpreter(PythonInterpreter):
         loop = asyncio.get_running_loop()
         future = loop.create_future()
         self._pending_file_ops[req_id] = future
-        msg = json.dumps({
-            "jsonrpc": "2.0", "method": "mount_file",
-            "params": {"host_path": host_path, "virtual_path": virtual_path},
-            "id": req_id,
-        })
+        msg = json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "method": "mount_file",
+                "params": {"host_path": host_path, "virtual_path": virtual_path},
+                "id": req_id,
+            }
+        )
         await self._write_stdin_async(msg + "\n")
         result = await future
         if "error" in result:
@@ -1312,12 +1417,11 @@ class JspiInterpreter(PythonInterpreter):
         if not hasattr(self, "_execution_gate"):
             self._execution_gate = InterpreterExecutionGate("JSPI interpreter")
 
-        if self._debug:
-            import sys
-
-            kwargs_preview = json.dumps(call_args.get("kwargs", {}), default=str)[:200]
-            print(
-                f"\n\033[33m── Tool: {tool_name}({kwargs_preview}) ──\033[0m", file=sys.stderr
+        if getattr(self, "_verbose", False) or live_tool_call_logging_enabled():
+            emit_trace_tool_call(
+                tool_name,
+                args=call_args.get("args", []),
+                kwargs=call_args.get("kwargs", {}),
             )
 
         call_start = time.perf_counter()
@@ -1332,6 +1436,13 @@ class JspiInterpreter(PythonInterpreter):
                 "sandbox.pending_tool_count": self._telemetry_pending_tool_count(),
                 "sandbox.pending_file_op_count": self._telemetry_pending_file_ops_count(),
             },
+        )
+        self._log_lifecycle(
+            "jspi.tool_call.start",
+            tool=tool_name,
+            request_id=tool_request_id,
+            timeout_seconds=TOOL_CALL_TIMEOUT_SEC,
+            pending_tool_count=self._telemetry_pending_tool_count(),
         )
         # Copy to mutable containers so the SyncedFile handler below can
         # rewrite sandbox paths to host paths before invoking the tool.
@@ -1466,13 +1577,15 @@ class JspiInterpreter(PythonInterpreter):
 
             # Record non-predict tool calls (predict records itself with richer detail)
             if tool_name != "predict":
-                record_tool_call(ToolCall(
-                    name=tool_name,
-                    args=args,
-                    kwargs={k: v for k, v in kwargs.items() if k != "pydantic_schemas"},
-                    result=result,
-                    duration_ms=ms_since(call_start),
-                ))
+                record_tool_call(
+                    ToolCall(
+                        name=tool_name,
+                        args=args,
+                        kwargs={k: v for k, v in kwargs.items() if k != "pydantic_schemas"},
+                        result=result,
+                        duration_ms=ms_since(call_start),
+                    )
+                )
 
             self._write_telemetry_span(
                 "sandbox.tool_call.ok",
@@ -1486,20 +1599,28 @@ class JspiInterpreter(PythonInterpreter):
                 },
                 start_time_unix_nano=telemetry_start,
             )
+            self._log_lifecycle(
+                "jspi.tool_call.ok",
+                tool=tool_name,
+                request_id=tool_request_id,
+                duration_ms=ms_since(call_start),
+            )
             return response
         except Exception as e:
             # Clean up any SyncedFile temp dir before returning
             if temp_dir:
                 shutil.rmtree(temp_dir, ignore_errors=True)
             if tool_name != "predict":
-                record_tool_call(ToolCall(
-                    name=tool_name,
-                    args=args,
-                    kwargs={k: v for k, v in kwargs.items() if k != "pydantic_schemas"},
-                    result=None,
-                    error=str(e),
-                    duration_ms=ms_since(call_start),
-                ))
+                record_tool_call(
+                    ToolCall(
+                        name=tool_name,
+                        args=args,
+                        kwargs={k: v for k, v in kwargs.items() if k != "pydantic_schemas"},
+                        result=None,
+                        error=str(e),
+                        duration_ms=ms_since(call_start),
+                    )
+                )
             if isinstance(e, TimeoutError):
                 self._write_telemetry_span(
                     "sandbox.tool_call.timeout",
@@ -1515,6 +1636,17 @@ class JspiInterpreter(PythonInterpreter):
                     },
                     start_time_unix_nano=telemetry_start,
                 )
+                lifecycle_event = "jspi.tool_call.timeout"
+            else:
+                lifecycle_event = "jspi.tool_call.error"
+            self._log_lifecycle(
+                lifecycle_event,
+                tool=tool_name,
+                request_id=tool_request_id,
+                duration_ms=ms_since(call_start),
+                error_type=type(e).__name__,
+                status="error",
+            )
             return {"error": str(e)}
 
     def _write_stdin(self, data: str) -> None:

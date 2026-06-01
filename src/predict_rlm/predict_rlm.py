@@ -32,12 +32,22 @@ import regex
 from dspy.adapters.base import Adapter
 from dspy.adapters.chat_adapter import ChatAdapter
 from dspy.adapters.json_adapter import JSONAdapter
-from dspy.primitives.code_interpreter import CodeInterpreter, CodeInterpreterError
+from dspy.primitives.code_interpreter import CodeInterpreter, CodeInterpreterError, FinalOutput
 from dspy.utils.callback import ACTIVE_CALL_ID
 from dspy.utils.exceptions import AdapterParseError
 from litellm import ContextWindowExceededError
 from pydantic import ConfigDict, ValidationError, create_model
 
+from ._logging import (
+    configure_predict_rlm_logging,
+    emit_trace_iteration_end,
+    emit_trace_iteration_output,
+    emit_trace_iteration_start,
+    emit_trace_iteration_submit,
+    format_log_fields,
+    live_tool_call_logging,
+    suppress_interpreter_result_logging,
+)
 from ._shared import build_rlm_signatures, format_tool_docs_full
 from .files import File, build_file_plan, scan_file_fields
 from .interpreter import JspiInterpreter, SandboxFatalError
@@ -84,6 +94,7 @@ class _IterationCallbackState:
 _ImageType = dspy.Image
 
 _PARENT_TAKES_CODE = "code" in inspect.signature(dspy.RLM._process_execution_result).parameters
+logger = logging.getLogger(__name__)
 
 _NO_FIELD_DEFAULT = object()
 
@@ -775,7 +786,7 @@ class PredictRLM(dspy.RLM):
             max_iterations: Maximum REPL interaction iterations.
             max_llm_calls: Maximum LM calls per execution.
             max_output_chars: Maximum characters to include from REPL output.
-            verbose: Whether to log detailed execution info.
+            verbose: Whether to log compact per-iteration progress.
             tools: Additional tool functions callable from interpreter code.
                   Accepts a dict mapping names to callables, or a list of
                   callables (names inferred from __name__).
@@ -795,8 +806,8 @@ class PredictRLM(dspy.RLM):
                    PyPI packages, and tools. Skills are merged automatically —
                    instructions are appended to the prompt, packages are installed
                    in the sandbox, and tools are exposed alongside predict().
-            debug: If True, print REPL code, output, errors, and tool calls
-                  to stderr in real-time. Useful for development.
+            debug: If True, enable interpreter debug output and lifecycle
+                  diagnostics. Debug does not imply verbose RLM trace output.
             output_dir: Default host directory for output files. When set,
                        File output fields without an explicit path
                        are written here. If None, a temp directory is used.
@@ -859,6 +870,7 @@ class PredictRLM(dspy.RLM):
         # Store allowed_domains, debug, and output_dir for interpreter creation
         self._allowed_domains = allowed_domains
         self._debug = debug
+        configure_predict_rlm_logging(debug=debug, verbose=verbose)
         self._output_dir = str(output_dir) if output_dir else None
         self._telemetry_context = telemetry_context
         self._current_telemetry_context: TelemetryContext | None = None
@@ -1043,14 +1055,10 @@ class PredictRLM(dspy.RLM):
                         built = _models_from_schema(schema)
                         custom_types.update(built)
                     except Exception as e:
-                        import logging
-
-                        logging.getLogger(__name__).warning(
+                        logger.warning(
                             f"Failed to reconstruct Pydantic model '{name}' from schema: {e}"
                         )
             else:
-                import logging
-
                 # Check if signature has custom types (capitalized identifiers)
                 pattern = r"(?<![.\w])([A-Z][A-Za-z0-9_]*)"
                 matches = re.findall(pattern, signature)
@@ -1068,7 +1076,7 @@ class PredictRLM(dspy.RLM):
                 }
                 custom_in_sig = [m for m in matches if m not in builtins]
                 if custom_in_sig:
-                    logging.getLogger(__name__).debug(
+                    logger.debug(
                         f"predict() called with custom types {custom_in_sig} in signature "
                         f"but no pydantic_schemas provided. This may cause parsing issues. "
                         f"If using asyncio.gather(), ensure Pydantic models are defined in "
@@ -1086,10 +1094,6 @@ class PredictRLM(dspy.RLM):
                 else:
                     sig = dspy.Signature(signature, "")
             except Exception as e:
-                import logging
-
-                logger = logging.getLogger(__name__)
-
                 if "Unknown name" in str(e):
                     pattern = r"(?<![.\w])([A-Z][A-Za-z0-9_]*)"
                     custom_types_in_sig = re.findall(pattern, signature)
@@ -1320,7 +1324,25 @@ class PredictRLM(dspy.RLM):
         """Yield interpreter, creating the configured backend if none provided."""
         if self._interpreter is not None:
             self._inject_execution_context(self._interpreter, execution_tools)
-            yield self._interpreter
+            backend = self._interpreter_backend_label(self._interpreter)
+            configured = self._configure_interpreter_debug(self._interpreter)
+            self._log_lifecycle(
+                "interpreter.injected",
+                backend=backend,
+                interpreter=type(self._interpreter).__name__,
+                debug_configured=configured["debug"],
+                verbose_configured=configured["verbose"],
+                owner="caller",
+            )
+            try:
+                yield self._interpreter
+            finally:
+                self._log_lifecycle(
+                    "interpreter.released",
+                    backend=backend,
+                    interpreter=type(self._interpreter).__name__,
+                    owner="caller",
+                )
         else:
             extra_read = list(file_plan["read_paths"]) if file_plan else []
             extra_write = (
@@ -1337,19 +1359,56 @@ class PredictRLM(dspy.RLM):
                 "allowed_domains": self._allowed_domains,
                 "skill_packages": self._skill_packages or None,
                 "debug": self._debug,
+                "verbose": self._iteration_logging_enabled(),
                 "extra_read_paths": extra_read or None,
                 "extra_write_paths": extra_write,
             }
             if self._sbx_pool is not None:
+                self._log_lifecycle(
+                    "sbx.pool.lease.request",
+                    backend="sbx",
+                    tools=len(execution_tools),
+                    output_fields=len(self._get_output_fields_info()),
+                )
                 with self._sbx_pool.lease(
                     tools=execution_tools,
                     output_fields=self._get_output_fields_info(),
+                    debug=self._debug,
+                    verbose=self._iteration_logging_enabled(),
                 ) as repl:
-                    yield repl
+                    self._log_lifecycle(
+                        "sbx.pool.lease.acquired",
+                        backend="sbx",
+                        interpreter=type(repl).__name__,
+                    )
+                    try:
+                        yield repl
+                    finally:
+                        self._log_lifecycle(
+                            "sbx.pool.lease.released",
+                            backend="sbx",
+                            interpreter=type(repl).__name__,
+                        )
                 return
             if self._sandbox_backend is SandboxBackend.SBX:
+                self._log_lifecycle(
+                    "interpreter.create",
+                    backend="sbx",
+                    tools=len(execution_tools),
+                    output_fields=len(self._get_output_fields_info()),
+                    allowed_domains=len(self._allowed_domains or []),
+                    skill_packages=len(self._skill_packages or []),
+                )
                 repl = SbxInterpreter(config=self._sbx_config, **interpreter_kwargs)
             else:
+                self._log_lifecycle(
+                    "interpreter.create",
+                    backend="jspi",
+                    tools=len(execution_tools),
+                    output_fields=len(self._get_output_fields_info()),
+                    allowed_domains=len(self._allowed_domains or []),
+                    skill_packages=len(self._skill_packages or []),
+                )
                 repl = JspiInterpreter(
                     **interpreter_kwargs,
                     telemetry_context=self._current_telemetry_context,
@@ -1357,6 +1416,12 @@ class PredictRLM(dspy.RLM):
             try:
                 yield repl
             finally:
+                self._log_lifecycle(
+                    "interpreter.shutdown",
+                    backend=self._interpreter_backend_label(repl),
+                    interpreter=type(repl).__name__,
+                    owner="predict_rlm",
+                )
                 repl.shutdown()
 
     def _prepare_execution_tools(self) -> dict[str, Callable]:
@@ -1471,6 +1536,149 @@ class PredictRLM(dspy.RLM):
             )
         except Exception:
             return
+
+    def _process_execution_result(self, pred: Any, *args: Any) -> dspy.Prediction | Any:
+        original_verbose = self.verbose
+        self.verbose = False
+        try:
+            return super()._process_execution_result(pred, *args)
+        finally:
+            self.verbose = original_verbose
+
+    def _submit_payload_from_prediction(
+        self,
+        prediction: dspy.Prediction,
+        output_field_names: list[str],
+    ) -> dict[str, Any]:
+        return {
+            name: prediction.get(name)
+            for name in output_field_names
+            if name in prediction.keys()
+        }
+
+    def _iteration_logging_enabled(self) -> bool:
+        return self.verbose
+
+    def _log_lifecycle(self, event: str, **fields: Any) -> None:
+        if self._debug:
+            logger.debug("%s%s", event, format_log_fields(fields))
+
+    def _interpreter_backend_label(self, repl: Any) -> str:
+        if isinstance(SbxInterpreter, type) and isinstance(repl, SbxInterpreter):
+            return "sbx"
+        if isinstance(JspiInterpreter, type) and isinstance(repl, JspiInterpreter):
+            return "jspi"
+        return type(repl).__name__
+
+    def _configure_interpreter_debug(self, repl: Any) -> dict[str, bool]:
+        return self._configure_interpreter_logging(repl)
+
+    def _configure_interpreter_logging(self, repl: Any) -> dict[str, bool]:
+        configured = {"debug": False, "verbose": False}
+        runtime = self._declared_callable(repl, "configure_runtime")
+        if runtime is not None:
+            kwargs = self._accepted_kwargs(
+                runtime,
+                debug=self._debug,
+                verbose=self._iteration_logging_enabled(),
+            )
+            if kwargs:
+                runtime(**kwargs)
+                configured["debug"] = "debug" in kwargs
+                configured["verbose"] = "verbose" in kwargs
+
+        if not configured["debug"]:
+            configure_debug = self._declared_callable(repl, "configure_debug")
+            if configure_debug is not None:
+                configure_debug(self._debug)
+                configured["debug"] = True
+            elif self._set_declared_attr(repl, "debug", self._debug):
+                configured["debug"] = True
+            elif self._set_declared_attr(repl, "_debug", self._debug):
+                configured["debug"] = True
+
+        if not configured["verbose"]:
+            configure_verbose = self._declared_callable(repl, "configure_verbose")
+            if configure_verbose is not None:
+                configure_verbose(self._iteration_logging_enabled())
+                configured["verbose"] = True
+            elif self._set_declared_attr(
+                repl,
+                "verbose",
+                self._iteration_logging_enabled(),
+            ):
+                configured["verbose"] = True
+            elif self._set_declared_attr(
+                repl,
+                "_verbose",
+                self._iteration_logging_enabled(),
+            ):
+                configured["verbose"] = True
+
+        return configured
+
+    def _declared_callable(self, obj: Any, name: str) -> Callable[..., Any] | None:
+        if not self._declares_member(obj, name):
+            return None
+        value = getattr(obj, name, None)
+        return value if callable(value) else None
+
+    def _declares_member(self, obj: Any, name: str) -> bool:
+        if name in getattr(obj, "__dict__", {}):
+            return True
+        for cls in type(obj).__mro__:
+            if name in vars(cls):
+                return True
+            slots = vars(cls).get("__slots__", ())
+            if isinstance(slots, str):
+                slots = (slots,)
+            if name in slots:
+                return True
+        return False
+
+    def _set_declared_attr(self, obj: Any, name: str, value: Any) -> bool:
+        if not self._declares_member(obj, name):
+            return False
+        setattr(obj, name, value)
+        return True
+
+    def _accepted_kwargs(self, func: Callable[..., Any], **kwargs: Any) -> dict[str, Any]:
+        try:
+            parameters = inspect.signature(func).parameters
+        except (TypeError, ValueError):
+            return kwargs
+        if any(param.kind is inspect.Parameter.VAR_KEYWORD for param in parameters.values()):
+            return kwargs
+        return {name: value for name, value in kwargs.items() if name in parameters}
+
+    def _begin_iteration_log(self, *, iteration: int, pred: Any, code: str) -> bool:
+        if not self._iteration_logging_enabled():
+            return False
+        emit_trace_iteration_start(
+            iteration=iteration + 1,
+            max_iterations=self.max_iterations,
+            reasoning=getattr(pred, "reasoning", "") or "",
+            code=code,
+        )
+        return True
+
+    def _emit_iteration_output_log(self, result: Any) -> None:
+        if self._iteration_logging_enabled():
+            emit_trace_iteration_output("" if result is None else result)
+
+    def _emit_iteration_submit_log(
+        self,
+        prediction: dspy.Prediction,
+        output_field_names: list[str],
+    ) -> None:
+        if self._iteration_logging_enabled():
+            emit_trace_iteration_submit(
+                self._submit_payload_from_prediction(prediction, output_field_names)
+            )
+
+    def _finish_iteration_log(self, opened: bool) -> None:
+        if opened:
+            emit_trace_iteration_end()
 
     def _action_generation_error_attrs(
         self,
@@ -1762,6 +1970,11 @@ class PredictRLM(dspy.RLM):
             start_time_unix_nano=action_start_ns,
             end_time_unix_nano=action_start_ns,
         )
+        self._log_lifecycle(
+            "rlm.action_generation.start",
+            iteration=iteration + 1,
+            max_iterations=self.max_iterations,
+        )
         try:
             lm_hist_before_action = snapshot_lm_history_len(dspy.settings.lm)
             pred = self.generate_action(
@@ -1791,6 +2004,11 @@ class PredictRLM(dspy.RLM):
                 ),
                 start_time_unix_nano=action_start_ns,
             )
+            self._log_lifecycle(
+                "rlm.action_generation.error",
+                iteration=iteration + 1,
+                error_type=type(exc).__name__,
+            )
             raise
         lm_metadata = lm_finish_since(dspy.settings.lm, lm_hist_before_action)
         self._write_telemetry_span(
@@ -1803,17 +2021,20 @@ class PredictRLM(dspy.RLM):
                 "reasoning_chars": len(getattr(pred, "reasoning", "") or ""),
             },
         )
-        if self.verbose:
-            import logging as _logging
-
-            _logging.getLogger("dspy.predict.rlm").info(
-                f"RLM iteration {iteration + 1}/{self.max_iterations}\n"
-                f"Reasoning: {pred.reasoning}\nCode:\n{pred.code}"
-            )
-
+        self._log_lifecycle(
+            "rlm.action_generation.ok",
+            iteration=iteration + 1,
+            code_chars=len(getattr(pred, "code", "") or ""),
+            reasoning_chars=len(getattr(pred, "reasoning", "") or ""),
+        )
         code = pred.code or ""
         code = _strip_code_fences(code)
         self._write_generated_code_event(iteration=iteration, pred=pred, code=code)
+        iteration_log_open = self._begin_iteration_log(
+            iteration=iteration,
+            pred=pred,
+            code=code,
+        )
 
         from dspy.primitives.repl_types import REPLEntry
 
@@ -1825,26 +2046,67 @@ class PredictRLM(dspy.RLM):
         self._partial_pending_start = time.perf_counter()
 
         try:
-            result = repl.execute(code, variables=dict(input_args))
-        except SandboxFatalError:
-            raise
-        except (CodeInterpreterError, SyntaxError) as e:
-            result = _format_execution_error(code, e)
+            execute_start = time.perf_counter()
+            self._log_lifecycle(
+                "rlm.execute.start",
+                backend=self._interpreter_backend_label(repl),
+                iteration=iteration + 1,
+                code_chars=len(code),
+            )
+            try:
+                with (
+                    live_tool_call_logging(iteration_log_open),
+                    suppress_interpreter_result_logging(iteration_log_open),
+                ):
+                    result = repl.execute(code, variables=dict(input_args))
+            except SandboxFatalError as exc:
+                self._log_lifecycle(
+                    "rlm.execute.fatal",
+                    backend=self._interpreter_backend_label(repl),
+                    iteration=iteration + 1,
+                    duration_ms=ms_since(execute_start),
+                    error_type=type(exc).__name__,
+                )
+                raise
+            except (CodeInterpreterError, SyntaxError) as e:
+                result = _format_execution_error(code, e)
+                self._log_lifecycle(
+                    "rlm.execute.error",
+                    backend=self._interpreter_backend_label(repl),
+                    iteration=iteration + 1,
+                    duration_ms=ms_since(execute_start),
+                    error_type=type(e).__name__,
+                )
+            else:
+                self._log_lifecycle(
+                    "rlm.execute.ok",
+                    backend=self._interpreter_backend_label(repl),
+                    iteration=iteration + 1,
+                    duration_ms=ms_since(execute_start),
+                    final=isinstance(result, FinalOutput),
+                )
 
-        if _PARENT_TAKES_CODE:
-            step_result = self._process_execution_result(
-                pred, code, result, history, output_field_names
-            )
-        else:
-            step_result = self._process_execution_result(
-                pred, result, history, output_field_names
-            )
-        if not isinstance(step_result, dspy.Prediction):
-            self._partial_history = step_result
-        self._partial_pending_entry = None
-        self._partial_pending_start = None
-        self._last_action_lm_metadata = lm_metadata
-        return step_result
+            if not isinstance(result, FinalOutput):
+                self._emit_iteration_output_log(result)
+
+            if _PARENT_TAKES_CODE:
+                step_result = self._process_execution_result(
+                    pred, code, result, history, output_field_names
+                )
+            else:
+                step_result = self._process_execution_result(
+                    pred, result, history, output_field_names
+                )
+            if isinstance(step_result, dspy.Prediction):
+                self._emit_iteration_submit_log(step_result, output_field_names)
+            else:
+                self._partial_history = step_result
+            self._partial_pending_entry = None
+            self._partial_pending_start = None
+            self._last_action_lm_metadata = lm_metadata
+            return step_result
+        finally:
+            self._finish_iteration_log(iteration_log_open)
 
     async def _aexecute_iteration(
         self,
@@ -1869,6 +2131,11 @@ class PredictRLM(dspy.RLM):
             iteration=iteration + 1,
             start_time_unix_nano=action_start_ns,
             end_time_unix_nano=action_start_ns,
+        )
+        self._log_lifecycle(
+            "rlm.action_generation.start",
+            iteration=iteration + 1,
+            max_iterations=self.max_iterations,
         )
         try:
             lm_hist_before_action = snapshot_lm_history_len(dspy.settings.lm)
@@ -1899,6 +2166,11 @@ class PredictRLM(dspy.RLM):
                 ),
                 start_time_unix_nano=action_start_ns,
             )
+            self._log_lifecycle(
+                "rlm.action_generation.error",
+                iteration=iteration + 1,
+                error_type=type(exc).__name__,
+            )
             raise
         lm_metadata = lm_finish_since(dspy.settings.lm, lm_hist_before_action)
         self._write_telemetry_span(
@@ -1911,17 +2183,20 @@ class PredictRLM(dspy.RLM):
                 "reasoning_chars": len(getattr(pred, "reasoning", "") or ""),
             },
         )
-        if self.verbose:
-            import logging as _logging
-
-            _logging.getLogger("dspy.predict.rlm").info(
-                f"RLM iteration {iteration + 1}/{self.max_iterations}\n"
-                f"Reasoning: {pred.reasoning}\nCode:\n{pred.code}"
-            )
-
+        self._log_lifecycle(
+            "rlm.action_generation.ok",
+            iteration=iteration + 1,
+            code_chars=len(getattr(pred, "code", "") or ""),
+            reasoning_chars=len(getattr(pred, "reasoning", "") or ""),
+        )
         code = pred.code or ""
         code = _strip_code_fences(code)
         self._write_generated_code_event(iteration=iteration, pred=pred, code=code)
+        iteration_log_open = self._begin_iteration_log(
+            iteration=iteration,
+            pred=pred,
+            code=code,
+        )
 
         # Capture reasoning+code BEFORE executing so a mid-execution
         # cancellation still leaves this iteration visible in the partial
@@ -1936,33 +2211,74 @@ class PredictRLM(dspy.RLM):
         self._partial_pending_start = time.perf_counter()
 
         try:
-            if hasattr(repl, "aexecute"):
-                result = await repl.aexecute(code, variables=dict(input_args))
+            execute_start = time.perf_counter()
+            self._log_lifecycle(
+                "rlm.execute.start",
+                backend=self._interpreter_backend_label(repl),
+                iteration=iteration + 1,
+                code_chars=len(code),
+            )
+            try:
+                with (
+                    live_tool_call_logging(iteration_log_open),
+                    suppress_interpreter_result_logging(iteration_log_open),
+                ):
+                    if hasattr(repl, "aexecute"):
+                        result = await repl.aexecute(code, variables=dict(input_args))
+                    else:
+                        result = repl.execute(code, variables=dict(input_args))
+            except SandboxFatalError as exc:
+                self._log_lifecycle(
+                    "rlm.execute.fatal",
+                    backend=self._interpreter_backend_label(repl),
+                    iteration=iteration + 1,
+                    duration_ms=ms_since(execute_start),
+                    error_type=type(exc).__name__,
+                )
+                raise
+            except Exception as e:
+                result = _format_execution_error(code, e)
+                self._log_lifecycle(
+                    "rlm.execute.error",
+                    backend=self._interpreter_backend_label(repl),
+                    iteration=iteration + 1,
+                    duration_ms=ms_since(execute_start),
+                    error_type=type(e).__name__,
+                )
             else:
-                result = repl.execute(code, variables=dict(input_args))
-        except SandboxFatalError:
-            raise
-        except Exception as e:
-            result = _format_execution_error(code, e)
+                self._log_lifecycle(
+                    "rlm.execute.ok",
+                    backend=self._interpreter_backend_label(repl),
+                    iteration=iteration + 1,
+                    duration_ms=ms_since(execute_start),
+                    final=isinstance(result, FinalOutput),
+                )
 
-        if _PARENT_TAKES_CODE:
-            step_result = self._process_execution_result(
-                pred, code, result, history, output_field_names
-            )
-        else:
-            step_result = self._process_execution_result(
-                pred, result, history, output_field_names
-            )
-        # Snapshot the updated REPL history for partial-trajectory recovery.
-        # step_result is either a new REPLHistory (iteration continues) or a
-        # dspy.Prediction (SUBMIT happened). Only the former gets a history
-        # snapshot, but both mean execution is no longer in flight.
-        if not isinstance(step_result, dspy.Prediction):
-            self._partial_history = step_result
-        self._partial_pending_entry = None
-        self._partial_pending_start = None
-        self._last_action_lm_metadata = lm_metadata
-        return step_result
+            if not isinstance(result, FinalOutput):
+                self._emit_iteration_output_log(result)
+
+            if _PARENT_TAKES_CODE:
+                step_result = self._process_execution_result(
+                    pred, code, result, history, output_field_names
+                )
+            else:
+                step_result = self._process_execution_result(
+                    pred, result, history, output_field_names
+                )
+            # Snapshot the updated REPL history for partial-trajectory recovery.
+            # step_result is either a new REPLHistory (iteration continues) or a
+            # dspy.Prediction (SUBMIT happened). Only the former gets a history
+            # snapshot, but both mean execution is no longer in flight.
+            if isinstance(step_result, dspy.Prediction):
+                self._emit_iteration_submit_log(step_result, output_field_names)
+            else:
+                self._partial_history = step_result
+            self._partial_pending_entry = None
+            self._partial_pending_start = None
+            self._last_action_lm_metadata = lm_metadata
+            return step_result
+        finally:
+            self._finish_iteration_log(iteration_log_open)
 
     def _prepare_file_io(
         self, input_args: dict[str, Any]
@@ -2023,21 +2339,48 @@ class PredictRLM(dspy.RLM):
         self, repl: PredictRLMInterpreter, file_plan: dict[str, Any]
     ) -> None:
         """Mount input files, skill modules, and create output dirs in the sandbox."""
+        self._log_lifecycle(
+            "sandbox.files.setup.start",
+            backend=self._interpreter_backend_label(repl),
+            mounts=len(file_plan["mounts"]),
+            output_dirs=len(file_plan["output_dirs"]),
+            skill_modules=len(self._skill_modules),
+        )
         if hasattr(repl, "_ensure_deno_process"):
             repl._ensure_deno_process()
 
         for host_path, virtual_path in file_plan["mounts"]:
             repl.mount_file_at(host_path, virtual_path)
+            self._log_lifecycle(
+                "sandbox.files.mount",
+                backend=self._interpreter_backend_label(repl),
+                virtual_path=virtual_path,
+            )
 
         for virtual_dir in file_plan["output_dirs"]:
             repl.mkdir_p(virtual_dir)
+            self._log_lifecycle(
+                "sandbox.files.mkdir",
+                backend=self._interpreter_backend_label(repl),
+                virtual_path=virtual_dir,
+            )
 
         # Mount skill modules into /sandbox/lib/ so the RLM can import them
         if self._skill_modules:
             repl.mkdir_p("/sandbox/lib")
             for mod_name, host_path in self._skill_modules.items():
                 repl.mount_file_at(host_path, f"/sandbox/lib/{mod_name}.py")
+                self._log_lifecycle(
+                    "sandbox.files.skill_module_mount",
+                    backend=self._interpreter_backend_label(repl),
+                    module=mod_name,
+                    virtual_path=f"/sandbox/lib/{mod_name}.py",
+                )
             repl.execute("import sys; sys.path.insert(0, '/sandbox/lib')")
+        self._log_lifecycle(
+            "sandbox.files.setup.ok",
+            backend=self._interpreter_backend_label(repl),
+        )
 
     def _sync_output_files(
         self,
@@ -2051,6 +2394,11 @@ class PredictRLM(dspy.RLM):
         The RLM submits the sandbox path(s) it wrote to. We sync those files
         back to the host and replace the prediction value with File objects.
         """
+        self._log_lifecycle(
+            "sandbox.files.sync_outputs.start",
+            backend=self._interpreter_backend_label(repl),
+            fields=len(output_file_fields),
+        )
         for field_name, kind in output_file_fields.items():
             info = file_plan["output_field_map"][field_name]
             host_dir = info["host_dir"]
@@ -2075,10 +2423,24 @@ class PredictRLM(dspy.RLM):
                     host_path = os.path.join(host_dir, basename)
                     os.makedirs(host_dir, exist_ok=True)
                     repl.sync_file_to(submitted_path, host_path)
+                    self._log_lifecycle(
+                        "sandbox.files.sync_output",
+                        backend=self._interpreter_backend_label(repl),
+                        field=field_name,
+                        virtual_path=submitted_path,
+                        host_path=host_path,
+                    )
                     setattr(prediction, field_name, File(path=host_path))
                 else:
                     # Fallback: list the output dir and sync everything
                     virtual_files = repl.list_dir(virtual_dir)
+                    self._log_lifecycle(
+                        "sandbox.files.list_output_dir",
+                        backend=self._interpreter_backend_label(repl),
+                        field=field_name,
+                        virtual_dir=virtual_dir,
+                        files=len(virtual_files),
+                    )
                     if virtual_files:
                         os.makedirs(host_dir, exist_ok=True)
                         for vpath in virtual_files:
@@ -2086,6 +2448,13 @@ class PredictRLM(dspy.RLM):
                             hp = os.path.join(host_dir, rel)
                             os.makedirs(os.path.dirname(hp), exist_ok=True)
                             repl.sync_file_to(vpath, hp)
+                            self._log_lifecycle(
+                                "sandbox.files.sync_output",
+                                backend=self._interpreter_backend_label(repl),
+                                field=field_name,
+                                virtual_path=vpath,
+                                host_path=hp,
+                            )
                         if len(virtual_files) == 1:
                             rel = os.path.relpath(virtual_files[0], virtual_dir)
                             hp = os.path.join(host_dir, rel)
@@ -2097,6 +2466,13 @@ class PredictRLM(dspy.RLM):
                 # Sync all files from the output dir, return list[File]
                 virtual_files = repl.list_dir(virtual_dir)
                 result_files: list[File] = []
+                self._log_lifecycle(
+                    "sandbox.files.list_output_dir",
+                    backend=self._interpreter_backend_label(repl),
+                    field=field_name,
+                    virtual_dir=virtual_dir,
+                    files=len(virtual_files),
+                )
                 if virtual_files:
                     os.makedirs(host_dir, exist_ok=True)
                     for vpath in virtual_files:
@@ -2104,8 +2480,19 @@ class PredictRLM(dspy.RLM):
                         hp = os.path.join(host_dir, rel)
                         os.makedirs(os.path.dirname(hp), exist_ok=True)
                         repl.sync_file_to(vpath, hp)
+                        self._log_lifecycle(
+                            "sandbox.files.sync_output",
+                            backend=self._interpreter_backend_label(repl),
+                            field=field_name,
+                            virtual_path=vpath,
+                            host_path=hp,
+                        )
                         result_files.append(File(path=hp))
                 setattr(prediction, field_name, result_files)
+        self._log_lifecycle(
+            "sandbox.files.sync_outputs.ok",
+            backend=self._interpreter_backend_label(repl),
+        )
 
     def _build_iteration_outcome(
         self,
