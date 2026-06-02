@@ -28,6 +28,7 @@ from typing import Any, Callable
 PROTOCOL_STDIN = sys.stdin
 PROTOCOL_STDOUT = sys.stdout
 REAL_OPEN = builtins.open
+ORIGINAL_PATH = pathlib.Path
 REAL_PATH = type(pathlib.Path())
 SANDBOX_ROOT = REAL_PATH(
     os.environ.get("PREDICT_RLM_SBX_ROOT")
@@ -229,12 +230,22 @@ class _SandboxPath(REAL_PATH):
     def __new__(cls, *args: Any, **kwargs: Any):
         if args:
             args = (_map_virtual_path(args[0]), *args[1:])
-        return super().__new__(cls, *args, **kwargs)
+        current_path = pathlib.Path
+        pathlib.Path = ORIGINAL_PATH  # type: ignore[assignment]
+        try:
+            return super().__new__(cls, *args, **kwargs)
+        finally:
+            pathlib.Path = current_path  # type: ignore[assignment]
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         if args:
             args = (_map_virtual_path(args[0]), *args[1:])
-        super().__init__(*args, **kwargs)
+        current_path = pathlib.Path
+        pathlib.Path = ORIGINAL_PATH  # type: ignore[assignment]
+        try:
+            super().__init__(*args, **kwargs)
+        finally:
+            pathlib.Path = current_path  # type: ignore[assignment]
 
 
 def _submit(**kwargs: Any) -> None:
