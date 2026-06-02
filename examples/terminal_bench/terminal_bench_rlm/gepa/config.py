@@ -31,9 +31,7 @@ class TerminalBenchGepaConfig(OptimizeConfig):
     terminal_bench_output_dir: Path = Path("runs/gepa-terminal-bench")
     terminal_bench_executable: str = ".terminal-bench-venv/bin/tb"
     harbor_executable: str = "harbor"
-    harness_backend: str = "harbor"
     harbor_controller_locality: str = "auto"
-    harbor_agent_interpreter_mode: str = "auto"
     harbor_remote_workdir: str = "/tmp/predict_rlm_terminal_bench"
     harbor_cpus: str = "auto"
     harbor_memory: str = "auto"
@@ -50,12 +48,10 @@ class TerminalBenchGepaConfig(OptimizeConfig):
     def to_dict(self) -> dict[str, Any]:
         payload = super().to_dict()
         payload["terminal_bench_output_dir"] = str(self.terminal_bench_output_dir)
-        payload["harness_backend"] = self.harness_backend
         payload["harbor_executable"] = self.harbor_executable
         payload["harbor_dataset"] = self.harbor_dataset
         payload["harbor_environment"] = self.harbor_environment
         payload["harbor_controller_locality"] = self.harbor_controller_locality
-        payload["harbor_agent_interpreter_mode"] = self.harbor_agent_interpreter_mode
         payload["harbor_remote_workdir"] = self.harbor_remote_workdir
         payload["harbor_cpus"] = self.harbor_cpus
         payload["harbor_memory"] = self.harbor_memory
@@ -82,16 +78,16 @@ def default_config() -> TerminalBenchGepaConfig:
 
 
 def _terminal_bench_tool_signatures() -> str:
-    from terminal_bench_rlm.tools.tbench_agent import HarborPredictRLMAgent
+    from terminal_bench_rlm.tools.tbench_agent import DaytonaRemotePredictRLMAgent
 
-    init_sig = inspect.signature(HarborPredictRLMAgent.__init__)
-    task_sig = inspect.signature(HarborPredictRLMAgent.run)
+    init_sig = inspect.signature(DaytonaRemotePredictRLMAgent.__init__)
+    task_sig = inspect.signature(DaytonaRemotePredictRLMAgent.run)
     return (
-        f"HarborPredictRLMAgent.__init__{init_sig}\n"
-        "Constructs a PredictRLM-backed Harbor agent. The optimized "
+        f"DaytonaRemotePredictRLMAgent.__init__{init_sig}\n"
+        "Constructs a Daytona remote PredictRLM-backed Harbor agent. The optimized "
         "`skill_instructions` component is passed as a PredictRLM Skill.\n\n"
-        f"HarborPredictRLMAgent.run{task_sig}\n"
-        "Runs the RLM inside the Harbor BaseEnvironment for Terminal-Bench 2.x tasks."
+        f"DaytonaRemotePredictRLMAgent.run{task_sig}\n"
+        "Runs the RLM controller inside Daytona for Terminal-Bench 2.x tasks."
     )
 
 

@@ -259,10 +259,11 @@ def test_config_serializes_terminal_bench_fields_for_run_metadata() -> None:
     payload = default_config().to_dict()
 
     json.dumps(payload)
-    assert payload["harness_backend"] == "harbor"
+    assert "harness_backend" not in payload
     assert payload["harbor_dataset"] == "terminal-bench/terminal-bench-2-1"
     assert payload["harbor_environment"] == "docker"
     assert payload["harbor_controller_locality"] == "auto"
+    assert "harbor_agent_interpreter_mode" not in payload
     assert payload["harbor_remote_workdir"] == "/tmp/predict_rlm_terminal_bench"
     assert payload["terminal_bench_output_dir"] == "runs/gepa-terminal-bench"
     assert payload["train_task_ids"] == ["configure-git-webserver", "extract-moves-from-video"]
@@ -270,13 +271,11 @@ def test_config_serializes_terminal_bench_fields_for_run_metadata() -> None:
     assert payload["max_iterations"] == 50
 
 
-def test_cli_accepts_harbor_backend_and_executable_args() -> None:
+def test_cli_accepts_harbor_executable_args_without_backend_choice() -> None:
     parser = argparse.ArgumentParser()
     gepa_cli._add_project_args(parser)
     args = parser.parse_args(
         [
-            "--harness-backend",
-            "harbor",
             "--harbor-executable",
             "uvx harbor",
             "--harbor-dataset",
@@ -292,7 +291,8 @@ def test_cli_accepts_harbor_backend_and_executable_args() -> None:
 
     config = gepa_cli._apply_project_args(default_config(), args)
 
-    assert config.harness_backend == "harbor"
+    assert not hasattr(config, "harness_backend")
+    assert not hasattr(config, "harbor_agent_interpreter_mode")
     assert config.harbor_executable == "uvx harbor"
     assert config.harbor_dataset == "terminal-bench/terminal-bench-2"
     assert config.harbor_environment == "daytona"
@@ -307,6 +307,8 @@ def test_cli_help_advertises_remote_controller_as_supplied_machine() -> None:
     help_text = parser.format_help()
 
     assert "the Harbor host process inside a supplied controller" in help_text
+    assert "--harness-backend" not in help_text
+    assert "--harbor-agent-interpreter-mode" not in help_text
     assert "unsupported for Daytona" not in help_text
 
 
@@ -330,20 +332,20 @@ def test_build_project_uses_harbor_harness_by_default() -> None:
     assert isinstance(project.harness_runner, HarborSubprocessHarnessRunner)
 
 
-def test_build_project_can_still_use_python_harness() -> None:
+def test_build_project_ignores_removed_python_harness_backend_attribute() -> None:
     config = default_config()
     config.harness_backend = "python"
     project = TerminalBenchGepaProject(config)
 
-    assert isinstance(project.harness_runner, TerminalBenchInProcessHarnessRunner)
+    assert isinstance(project.harness_runner, HarborSubprocessHarnessRunner)
 
 
-def test_build_project_can_still_use_cli_harness() -> None:
+def test_build_project_ignores_removed_cli_harness_backend_attribute() -> None:
     config = default_config()
     config.harness_backend = "cli"
     project = TerminalBenchGepaProject(config)
 
-    assert isinstance(project.harness_runner, TerminalBenchSubprocessHarnessRunner)
+    assert isinstance(project.harness_runner, HarborSubprocessHarnessRunner)
 
 
 def test_build_project_explicit_remote_controller_requires_supplied_environment() -> None:
@@ -406,6 +408,20 @@ def test_harbor_controller_local_controller_fails_without_interactive_exec() -> 
     assert env.commands == []
 
 
+def test_daytona_auto_rejects_host_local_controller_fallback_for_interactive_exec() -> None:
+    with pytest.raises(RuntimeError) as exc_info:
+        select_harbor_controller_locality(
+            "auto",
+            FakeInteractiveHarborEnvironment(),
+            harbor_environment="daytona",
+        )
+
+    message = str(exc_info.value)
+    assert "Daytona" in message
+    assert "remote-controller" in message
+    assert "local-controller" in message
+
+
 def test_build_harbor_harness_runner_uses_remote_controller_for_auto_one_shot_env() -> None:
     config = default_config()
     runner = _build_harbor_harness_runner(
@@ -416,16 +432,36 @@ def test_build_harbor_harness_runner_uses_remote_controller_for_auto_one_shot_en
     assert isinstance(runner, HarborRemoteControllerHarnessRunner)
 
 
-def test_daytona_harbor_config_uses_local_subprocess_runner_without_controller_environment() -> None:
+def test_daytona_harbor_config_requires_controller_environment() -> None:
     config = default_config()
     config.harbor_environment = "daytona"
 
-    runner = _build_harbor_harness_runner(config)
+    with pytest.raises(RuntimeError) as exc_info:
+        _build_harbor_harness_runner(config)
 
-    assert isinstance(runner, HarborSubprocessHarnessRunner)
+    message = str(exc_info.value)
+    assert "Daytona" in message
+    assert "controller environment" in message
+    assert "build_project(config) cannot construct it" in message
+    assert "host launcher" in message
 
 
-def test_daytona_harbor_config_can_use_supplied_remote_controller_environment() -> None:
+def test_harbor_controller_auto_rejects_daytona_without_controller_environment() -> None:
+    with pytest.raises(RuntimeError) as exc_info:
+        select_harbor_controller_locality(
+            "auto",
+            None,
+            harbor_environment="daytona",
+        )
+
+    message = str(exc_info.value)
+    assert "Daytona" in message
+    assert "controller environment" in message
+    assert "remote-controller" in message
+    assert "local controller" in message
+
+
+def test_daytona_harbor_config_uses_supplied_remote_controller_environment() -> None:
     config = default_config()
     config.harbor_environment = "daytona"
 
@@ -437,7 +473,7 @@ def test_daytona_harbor_config_can_use_supplied_remote_controller_environment() 
     assert isinstance(runner, HarborRemoteControllerHarnessRunner)
 
 
-def test_daytona_agent_kwargs_keep_environment_interpreter_for_session_exec(tmp_path: Path) -> None:
+def test_daytona_agent_kwargs_do_not_expose_interpreter_mode(tmp_path: Path) -> None:
     config = default_config()
     config.harbor_environment = "daytona"
     request = _task_request(config, tmp_path)
@@ -446,11 +482,11 @@ def test_daytona_agent_kwargs_keep_environment_interpreter_for_session_exec(tmp_
     cmd = _build_harbor_run_command(request, output_dir=tmp_path / "harbor-runs")
 
     assert "interpreter_mode" not in kwargs
-    assert "interpreter_mode=local-process" not in cmd
+    assert "interpreter_mode=" not in cmd
     assert "remote-controller" not in cmd
 
 
-def test_docker_agent_kwargs_keep_environment_interpreter_default(tmp_path: Path) -> None:
+def test_docker_agent_kwargs_do_not_expose_interpreter_mode(tmp_path: Path) -> None:
     config = default_config()
     config.harbor_environment = "docker"
 
@@ -592,8 +628,8 @@ def test_daytona_remote_controller_wraps_sync_async_and_sdk_method_names() -> No
     ]
 
 
-def test_harbor_agent_exposes_agent_info_without_harbor_dependency() -> None:
-    agent = tbench_agent.HarborPredictRLMAgent(
+def test_daytona_remote_agent_exposes_agent_info_without_harbor_dependency() -> None:
+    agent = tbench_agent.DaytonaRemotePredictRLMAgent(
         logs_dir=Path("/tmp/logs"),
         model_name="openai/gpt-5.4-mini",
         lm="openai/gpt-5.4-mini",
@@ -665,7 +701,7 @@ def test_harbor_runner_builds_harbor_run_command(monkeypatch, tmp_path: Path) ->
     assert cmd[cmd.index("--include-task-name") + 1] == "task"
     assert "--agent-import-path" in cmd
     assert cmd[cmd.index("--agent-import-path") + 1] == (
-        "terminal_bench_rlm.tools.tbench_agent:HarborPredictRLMAgent"
+        "terminal_bench_rlm.tools.tbench_agent:DaytonaRemotePredictRLMAgent"
     )
     assert "--jobs-dir" in cmd
     assert cmd[cmd.index("--jobs-dir") + 1] == str(config.terminal_bench_output_dir)

@@ -10,6 +10,7 @@ import tarfile
 import tempfile
 import time
 import uuid
+from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -27,11 +28,6 @@ TERMINAL_WRAPPER_TOOL_NAMES = frozenset(
 )
 PredictRLM: Any | None = None
 TerminalBenchRunnerInterpreter: Any | None = None
-HarborEnvironmentInterpreter: Any | None = None
-LocalProcessRunnerInterpreter: Any | None = None
-
-INTERPRETER_MODE_ENVIRONMENT = "environment"
-INTERPRETER_MODE_LOCAL_PROCESS = "local-process"
 DAYTONA_REMOTE_ROOT = "/tmp/predict_rlm_controller"
 DAYTONA_REMOTE_HOME = "/tmp/predict_rlm_home"
 DAYTONA_REMOTE_RESULT_SENTINEL = "PREDICT_RLM_REMOTE_RESULT_JSON="
@@ -260,57 +256,6 @@ def _interpreter_class() -> Any:
     return TerminalBenchRunnerInterpreter
 
 
-def _harbor_interpreter_class() -> Any:
-    global HarborEnvironmentInterpreter
-    if HarborEnvironmentInterpreter is None:
-        HarborEnvironmentInterpreter = getattr(
-            importlib.import_module(".container_runner", __package__),
-            "HarborEnvironmentInterpreter",
-        )
-    return HarborEnvironmentInterpreter
-
-
-def _local_process_interpreter_class() -> Any:
-    global LocalProcessRunnerInterpreter
-    if LocalProcessRunnerInterpreter is None:
-        LocalProcessRunnerInterpreter = getattr(
-            importlib.import_module(".container_runner", __package__),
-            "LocalProcessRunnerInterpreter",
-        )
-    return LocalProcessRunnerInterpreter
-
-
-def _coerce_interpreter_mode(value: Any) -> str:
-    mode = str(value or INTERPRETER_MODE_ENVIRONMENT).strip().lower()
-    if mode in {"harbor", "harbor-environment"}:
-        return INTERPRETER_MODE_ENVIRONMENT
-    if mode in {"local", "local-process"}:
-        return INTERPRETER_MODE_LOCAL_PROCESS
-    if mode == INTERPRETER_MODE_ENVIRONMENT:
-        return mode
-    raise ValueError(
-        "Unsupported Terminal-Bench PredictRLM interpreter_mode: "
-        f"{value!r}. Expected 'environment' or 'local-process'."
-    )
-
-
-def _environment_has_daytona_session_process(environment: Any) -> bool:
-    process = getattr(getattr(environment, "_sandbox", None), "process", None)
-    return all(
-        callable(getattr(process, name, None))
-        for name in (
-            "create_session",
-            "execute_session_command",
-            "get_session_command",
-            "get_session_command_logs",
-            "send_session_command_input",
-        )
-    )
-
-
-def _use_environment_interpreter_for_local_process_mode(environment: Any) -> bool:
-    return _environment_has_daytona_session_process(environment)
-
 
 @dataclass
 class LocalAgentResult:
@@ -399,7 +344,6 @@ class _TerminalBenchRLMBaseAgentMixin:
         sub_lm_reasoning_effort: str | None = None,
         lm_service_tier: str | None = None,
         sub_lm_service_tier: str | None = None,
-        interpreter_mode: str = INTERPRETER_MODE_ENVIRONMENT,
         exec_timeout: float | str | None = None,
         no_rebuild: bool | None = None,
         phase_log_path: str | Path | None = None,
@@ -411,6 +355,8 @@ class _TerminalBenchRLMBaseAgentMixin:
         predict_rlm_debug_log: str | None = None,
         **predict_rlm_kwargs: Any,
     ) -> None:
+        if "interpreter_mode" in predict_rlm_kwargs:
+            raise TypeError("interpreter_mode is not a supported Terminal-Bench PredictRLM agent parameter")
         _validate_tools(tools)
         self.signature = signature
         self.tools = tools
@@ -423,7 +369,6 @@ class _TerminalBenchRLMBaseAgentMixin:
         self.sub_lm_reasoning_effort = _coerce_optional_text(sub_lm_reasoning_effort)
         self.lm_service_tier = _coerce_optional_text(lm_service_tier)
         self.sub_lm_service_tier = _coerce_optional_text(sub_lm_service_tier)
-        self.interpreter_mode = _coerce_interpreter_mode(interpreter_mode)
         self.phase_log_path = Path(phase_log_path) if phase_log_path is not None else None
         self.task_id = task_id
         self.predict_rlm_kwargs = predict_rlm_kwargs
@@ -463,13 +408,7 @@ class _TerminalBenchRLMBaseAgentMixin:
         runtime = _get_runtime(task=task, session=session, **kwargs)
         if self.codex_lm:
             _install_codex_lm_monkeypatch(self.codex_lm_exclude)
-        if self.interpreter_mode == INTERPRETER_MODE_LOCAL_PROCESS:
-            interpreter = _local_process_interpreter_class()(**self.interpreter_kwargs)
-        else:
-            interpreter = _interpreter_class()(
-                runtime,
-                **self.interpreter_kwargs,
-            )
+        interpreter = _interpreter_class()(runtime, **self.interpreter_kwargs)
         try:
             rlm_kwargs = dict(self.predict_rlm_kwargs)
             if "lm" in rlm_kwargs:
@@ -503,8 +442,8 @@ class _TerminalBenchRLMBaseAgentMixin:
             interpreter.shutdown()
 
 
-class HarborPredictRLMAgent(_TerminalBenchRLMBaseAgentMixin):
-    """Harbor BaseAgent-compatible adapter for Terminal-Bench 2.x tasks."""
+class HarborPredictRLMBaseAgent(_TerminalBenchRLMBaseAgentMixin, ABC):
+    """Shared Harbor BaseAgent-compatible state for remote Terminal-Bench adapters."""
 
     def __init__(
         self,
@@ -538,138 +477,13 @@ class HarborPredictRLMAgent(_TerminalBenchRLMBaseAgentMixin):
     def populate_context_post_run(self, _context: Any) -> None:
         return None
 
+    @abstractmethod
     async def setup(self, environment: Any) -> None:
-        started = time.monotonic()
-        _write_phase_event(
-            self.phase_log_path,
-            task_id=self.task_id,
-            event="agent_setup_start",
-            phase="agent_setup",
-            status="started",
-        )
-        _write_phase_event(
-            self.phase_log_path,
-            task_id=self.task_id,
-            event="agent_setup_end",
-            phase="agent_setup",
-            status="completed",
-            duration_seconds=time.monotonic() - started,
-        )
-        return None
+        raise NotImplementedError
 
+    @abstractmethod
     async def run(self, instruction: str, environment: Any, context: Any) -> None:
-        loop = asyncio.get_running_loop()
-        started = time.monotonic()
-        _write_phase_event(
-            self.phase_log_path,
-            task_id=self.task_id,
-            event="agent_run_start",
-            phase="agent_eval",
-            status="started",
-        )
-        try:
-            result = await self._run_async(instruction, environment, loop)
-        except BaseException:
-            _write_phase_event(
-                self.phase_log_path,
-                task_id=self.task_id,
-                event="agent_run_end",
-                phase="agent_eval",
-                status="failed",
-                duration_seconds=time.monotonic() - started,
-            )
-            raise
-        _write_phase_event(
-            self.phase_log_path,
-            task_id=self.task_id,
-            event="agent_run_end",
-            phase="agent_eval",
-            status="completed",
-            duration_seconds=time.monotonic() - started,
-        )
-        answer = _coerce_answer(result)
-        _set_context_answer(context, answer)
-
-    async def _run_async(
-        self,
-        instruction: str,
-        environment: Any,
-        loop: asyncio.AbstractEventLoop,
-    ) -> Any:
-        if self.codex_lm:
-            _install_codex_lm_monkeypatch(self.codex_lm_exclude)
-        setup_started = time.monotonic()
-        _write_phase_event(
-            self.phase_log_path,
-            task_id=self.task_id,
-            event="sandbox_setup_start",
-            phase="sandbox_setup",
-            status="started",
-        )
-        try:
-            if self.interpreter_mode == INTERPRETER_MODE_LOCAL_PROCESS:
-                if _use_environment_interpreter_for_local_process_mode(environment):
-                    interpreter = _harbor_interpreter_class()(
-                        environment,
-                        loop=loop,
-                        **self.interpreter_kwargs,
-                    )
-                else:
-                    interpreter = _local_process_interpreter_class()(**self.interpreter_kwargs)
-            else:
-                interpreter = _harbor_interpreter_class()(
-                    environment,
-                    loop=loop,
-                    **self.interpreter_kwargs,
-                )
-        except BaseException:
-            _write_phase_event(
-                self.phase_log_path,
-                task_id=self.task_id,
-                event="sandbox_setup_end",
-                phase="sandbox_setup",
-                status="failed",
-                duration_seconds=time.monotonic() - setup_started,
-            )
-            raise
-        _write_phase_event(
-            self.phase_log_path,
-            task_id=self.task_id,
-            event="sandbox_setup_end",
-            phase="sandbox_setup",
-            status="completed",
-            duration_seconds=time.monotonic() - setup_started,
-        )
-        try:
-            rlm_kwargs = dict(self.predict_rlm_kwargs)
-            if "lm" in rlm_kwargs:
-                rlm_kwargs["lm"] = _build_lm(
-                    rlm_kwargs["lm"], self.lm_reasoning_effort, self.lm_service_tier
-                )
-            if "sub_lm" in rlm_kwargs:
-                rlm_kwargs["sub_lm"] = _build_lm(
-                    rlm_kwargs["sub_lm"],
-                    self.sub_lm_reasoning_effort,
-                    self.sub_lm_service_tier,
-                )
-            rlm_kwargs["interpreter"] = interpreter
-            _with_terminal_bench_skill(rlm_kwargs, self.skill_instructions)
-            if "max_iterations" in rlm_kwargs:
-                rlm_kwargs["max_iterations"] = int(rlm_kwargs["max_iterations"])
-            if self.tools is not None:
-                rlm_kwargs["tools"] = self.tools
-            signature = _signature_with_task_instruction(self.signature, instruction)
-            rlm = _predict_rlm_class()(signature, **rlm_kwargs)
-            result = rlm.acall()
-            if inspect.isawaitable(result):
-                result = await result
-            _write_trace(getattr(result, "trace", None), self.logs_dir)
-            return result
-        except BaseException as exc:
-            _write_trace(getattr(exc, "trace", None), self.logs_dir)
-            raise
-        finally:
-            await asyncio.to_thread(interpreter.shutdown)
+        raise NotImplementedError
 
 
 def _repo_root() -> Path:
@@ -816,7 +630,7 @@ def _json_dumps_non_secret_payload(payload: dict[str, Any]) -> str:
     except TypeError as exc:
         raise TypeError(
             "Daytona remote PredictRLM payload must be JSON-serializable; "
-            "custom Python objects such as callables must run through the local Harbor agent."
+            "custom Python objects such as callables are not supported by the remote adapter."
         ) from exc
 
 
@@ -837,7 +651,7 @@ def _parse_remote_result(result: Any) -> dict[str, Any]:
     return parsed
 
 
-class DaytonaRemotePredictRLMAgent(HarborPredictRLMAgent):
+class DaytonaRemotePredictRLMAgent(HarborPredictRLMBaseAgent):
     """Harbor adapter that runs the PredictRLM controller inside Daytona."""
 
     def __init__(

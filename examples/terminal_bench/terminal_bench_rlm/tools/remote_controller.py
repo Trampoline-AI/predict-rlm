@@ -14,7 +14,6 @@ from .tbench_agent import (
     _build_lm,
     _coerce_answer,
     _install_codex_lm_monkeypatch,
-    _local_process_interpreter_class,
     _predict_rlm_class,
     _signature_with_task_instruction,
     _with_terminal_bench_skill,
@@ -77,6 +76,12 @@ def _restore_verbose_rlm_log_stream(state: tuple[logging.Logger, int, bool, logg
     logger.setLevel(old_level)
     logger.propagate = old_propagate
 
+
+
+def _local_process_interpreter_class() -> Any:
+    from .container_runner import LocalProcessRunnerInterpreter
+
+    return LocalProcessRunnerInterpreter
 
 def _run_predict_rlm(payload: dict[str, Any]) -> str:
     _set_debug_environment(payload)

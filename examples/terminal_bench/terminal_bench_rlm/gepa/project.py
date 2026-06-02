@@ -712,13 +712,7 @@ def build_project(config: TerminalBenchGepaConfig | None = None) -> RLMGepaProje
 
 
 def _build_harness_runner(config: TerminalBenchGepaConfig) -> TerminalBenchHarnessRunner:
-    if config.harness_backend == "harbor":
-        return _build_harbor_harness_runner(config)
-    if config.harness_backend == "python":
-        return TerminalBenchInProcessHarnessRunner()
-    if config.harness_backend == "cli":
-        return TerminalBenchSubprocessHarnessRunner()
-    raise ValueError(f"Unsupported Terminal-Bench harness backend: {config.harness_backend}")
+    return _build_harbor_harness_runner(config)
 
 
 def _build_harbor_harness_runner(
@@ -743,15 +737,13 @@ def select_harbor_controller_locality(
     harbor_environment: str | None = None,
 ) -> HarborControllerSelection:
     locality = HarborControllerLocality(str(requested))
-    if _is_daytona_environment(harbor_environment) and controller_environment is None:
-        if locality is HarborControllerLocality.REMOTE_CONTROLLER:
-            raise RuntimeError(
-                "Harbor remote-controller with Daytona requires an explicit Daytona "
-                "controller environment; build_project(config) cannot create it."
-            )
-        return HarborControllerSelection(
-            HarborControllerLocality.LOCAL_CONTROLLER,
-            "Daytona uses the local Harbor launcher when no controller environment is supplied",
+    is_daytona = _is_daytona_environment(harbor_environment)
+    if is_daytona and controller_environment is None:
+        raise RuntimeError(
+            "Harbor Daytona requires an explicit Daytona controller environment "
+            "so the Harbor host/controller runs inside the sandbox via "
+            "remote-controller. build_project(config) cannot construct it. "
+            "Do not treat the host launcher as a local controller."
         )
     if controller_environment is None:
         if locality is HarborControllerLocality.REMOTE_CONTROLLER:
@@ -765,6 +757,22 @@ def select_harbor_controller_locality(
             HarborControllerLocality.LOCAL_CONTROLLER,
             "no explicit remote controller environment was provided; using local Harbor launcher",
         )
+    if is_daytona:
+        if locality is HarborControllerLocality.LOCAL_CONTROLLER:
+            raise RuntimeError(
+                "Harbor Daytona does not support local-controller; use remote-controller "
+                "so the Harbor host/controller runs inside the Daytona sandbox."
+            )
+        if locality is HarborControllerLocality.AUTO:
+            if _supports_remote_controller(controller_environment):
+                return HarborControllerSelection(
+                    HarborControllerLocality.REMOTE_CONTROLLER,
+                    "Daytona auto selected remote-controller so the controller runs inside the sandbox",
+                )
+            raise RuntimeError(
+                "Harbor Daytona auto requires remote-controller exec plus upload/download "
+                "file APIs; local-controller fallback is not allowed."
+            )
     if locality is HarborControllerLocality.LOCAL_CONTROLLER:
         if not _supports_interactive_exec(controller_environment):
             raise RuntimeError(
@@ -932,7 +940,7 @@ def _build_harbor_run_command(
         "--include-task-name",
         request.task_id,
         "--agent-import-path",
-        "terminal_bench_rlm.tools.tbench_agent:HarborPredictRLMAgent",
+        "terminal_bench_rlm.tools.tbench_agent:DaytonaRemotePredictRLMAgent",
         "--n-attempts",
         str(config.n_attempts),
         "--n-concurrent",
@@ -1001,28 +1009,11 @@ def _agent_kwargs(
             kwargs["predict_rlm_debug_log"] = os.environ["PREDICT_RLM_DEBUG_LOG"]
         if config.codex_lm_exclude:
             kwargs["codex_lm_exclude"] = ",".join(config.codex_lm_exclude)
-    interpreter_mode = _harbor_agent_interpreter_mode(config)
-    if interpreter_mode != "environment":
-        kwargs["interpreter_mode"] = interpreter_mode
     return kwargs
 
 
-def _harbor_agent_interpreter_mode(config: TerminalBenchGepaConfig) -> str:
-    mode = str(getattr(config, "harbor_agent_interpreter_mode", "auto") or "auto").strip().lower()
-    if mode == "auto":
-        return "environment"
-    if mode in {"environment", "local-process"}:
-        return mode
-    raise ValueError(
-        "Unsupported harbor_agent_interpreter_mode: "
-        f"{mode!r}. Expected 'auto', 'environment', or 'local-process'."
-    )
-
-
 def _agent_timeout(request: TerminalBenchTaskRunRequest) -> int:
-    if request.config.harness_backend == "harbor":
-        return _harbor_task_timeouts(request).agent
-    return max(1, int(request.task_timeout))
+    return _harbor_task_timeouts(request).agent
 
 
 def _agent_timeout_with_cleanup_grace(request: TerminalBenchTaskRunRequest) -> int:
@@ -1030,9 +1021,7 @@ def _agent_timeout_with_cleanup_grace(request: TerminalBenchTaskRunRequest) -> i
 
 
 def _subprocess_timeout(request: TerminalBenchTaskRunRequest) -> int:
-    if request.config.harness_backend == "harbor":
-        return _harbor_task_timeouts(request).outer
-    return max(1, int(request.task_timeout))
+    return _harbor_task_timeouts(request).outer
 
 
 def _harbor_task_timeouts(request: TerminalBenchTaskRunRequest) -> HarborTaskTimeouts:
