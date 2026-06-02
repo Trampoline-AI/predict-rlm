@@ -1237,7 +1237,7 @@ class JspiInterpreter(PythonInterpreter):
             if "result" in result:
                 res = result["result"]
                 self._sync_files()
-                if interpreter_result_logging_enabled(self._verbose):
+                if interpreter_result_logging_enabled(getattr(self, "_verbose", False)):
                     emit_trace_result(res)
                 if "final" in res:
                     return FinalOutput(res["final"])
@@ -1254,7 +1254,7 @@ class JspiInterpreter(PythonInterpreter):
 
                 if partial_output:
                     self._log_partial_output(partial_output, error_type=error_type)
-                if interpreter_result_logging_enabled(self._verbose):
+                if interpreter_result_logging_enabled(getattr(self, "_verbose", False)):
                     if partial_output:
                         emit_trace_result({"output": partial_output})
                     emit_trace_error(error_type, error_msg or error_args)

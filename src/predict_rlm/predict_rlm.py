@@ -1573,10 +1573,13 @@ class PredictRLM(dspy.RLM):
         }
 
     def _iteration_logging_enabled(self) -> bool:
-        return self.verbose
+        return bool(getattr(self, "verbose", False))
+
+    def _debug_logging_enabled(self) -> bool:
+        return bool(getattr(self, "_debug", False))
 
     def _log_lifecycle(self, event: str, **fields: Any) -> None:
-        if self._debug:
+        if self._debug_logging_enabled():
             logger.debug("%s%s", event, format_log_fields(fields))
 
     def _interpreter_backend_label(self, repl: Any) -> str:
@@ -1591,12 +1594,14 @@ class PredictRLM(dspy.RLM):
 
     def _configure_interpreter_logging(self, repl: Any) -> dict[str, bool]:
         configured = {"debug": False, "verbose": False}
+        debug_enabled = self._debug_logging_enabled()
+        verbose_enabled = self._iteration_logging_enabled()
         runtime = self._declared_callable(repl, "configure_runtime")
         if runtime is not None:
             kwargs = self._accepted_kwargs(
                 runtime,
-                debug=self._debug,
-                verbose=self._iteration_logging_enabled(),
+                debug=debug_enabled,
+                verbose=verbose_enabled,
             )
             if kwargs:
                 runtime(**kwargs)
@@ -1606,29 +1611,21 @@ class PredictRLM(dspy.RLM):
         if not configured["debug"]:
             configure_debug = self._declared_callable(repl, "configure_debug")
             if configure_debug is not None:
-                configure_debug(self._debug)
+                configure_debug(debug_enabled)
                 configured["debug"] = True
-            elif self._set_declared_attr(repl, "debug", self._debug):
+            elif self._set_declared_attr(repl, "debug", debug_enabled):
                 configured["debug"] = True
-            elif self._set_declared_attr(repl, "_debug", self._debug):
+            elif self._set_declared_attr(repl, "_debug", debug_enabled):
                 configured["debug"] = True
 
         if not configured["verbose"]:
             configure_verbose = self._declared_callable(repl, "configure_verbose")
             if configure_verbose is not None:
-                configure_verbose(self._iteration_logging_enabled())
+                configure_verbose(verbose_enabled)
                 configured["verbose"] = True
-            elif self._set_declared_attr(
-                repl,
-                "verbose",
-                self._iteration_logging_enabled(),
-            ):
+            elif self._set_declared_attr(repl, "verbose", verbose_enabled):
                 configured["verbose"] = True
-            elif self._set_declared_attr(
-                repl,
-                "_verbose",
-                self._iteration_logging_enabled(),
-            ):
+            elif self._set_declared_attr(repl, "_verbose", verbose_enabled):
                 configured["verbose"] = True
 
         return configured
