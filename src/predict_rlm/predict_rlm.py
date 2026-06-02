@@ -586,13 +586,13 @@ The REPL runs inside an async event loop — use `await` directly, not `asyncio.
 ### Execution timeouts
 For every iteration, deliberately choose `execution_timeout_seconds` for the current code block. Use `null` for ordinary short, safe blocks. Set a positive timeout when work could hang or run long: loops, scans over many files/items, network or tool fanout, batch `predict()` calls, tests/subprocesses, or data/model processing.
 
-Use lightweight caps: short probes are usually ~1-5 seconds, normal bounded work is usually ~10-60 seconds, and longer caps are only for clearly heavy bounded work. If a timeout fires, stdout/stderr printed before the timeout are preserved and the next iteration can continue. Before risky work, store important partial results in variables so you can resume.
+Use lightweight caps: short probes are usually ~1-5 seconds, normal bounded work is usually ~10-60 seconds, and longer caps are only for clearly heavy bounded work. If a timeout fires, stdout/stderr printed before the timeout are preserved and the next iteration can continue. Before risky work, store important partial results in simple pickleable variables so hard-kill fallback can restore them.
 
 ## Managing state & output
 
 Each iteration's printed output is captured and shown to you in subsequent iterations, but **truncated to ~5000 characters**. This is a hard limit — output beyond 5K chars is cut off.
 
-**What persists fully:** Python variables. Everything you store in a variable (`all_items`, `records`, `chunks`, etc.) survives intact across iterations. The runtime state is never lost.
+**What persists fully:** Python variables. Everything you store in a variable (`all_items`, `records`, `chunks`, etc.) survives intact across successful iterations and cooperative timeouts. If a hard-kill timeout is required, the runtime restores only the pre-timeout pickleable globals snapshot and reports any unpickleable names that were lost.
 
 **What gets truncated:** printed output. If you `print(big_list)` and it's 50K chars, you'll only see the first 5K in the next iteration's context.
 

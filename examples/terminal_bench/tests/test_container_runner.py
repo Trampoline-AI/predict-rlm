@@ -300,7 +300,7 @@ def test_local_runner_preserves_stdout_from_repl_fenced_code(
     assert result == "local stdout survives\n"
 
 
-def test_local_runner_recoverable_timeout_preserves_streams_and_state(
+def test_local_runner_recoverable_timeout_preserves_streams_and_live_state(
     local_runner_interpreter: LocalProcessRunnerInterpreter,
 ) -> None:
     assert local_runner_interpreter.execute("state = 'survived'\nprint('set')") == "set\n"
@@ -313,13 +313,21 @@ def test_local_runner_recoverable_timeout_preserves_streams_and_state(
         "time.sleep(30)\n",
         timeout=0.2,
     )
-    followup = local_runner_interpreter.execute("print(state)")
+    followup = local_runner_interpreter.execute(
+        "print('state' in globals())\nprint('fresh kernel')"
+    )
 
     assert "[Timeout] Iteration execution timed out after 0.2s" in timeout_result
     assert "[stdout]\nbefore timeout" in timeout_result
     assert "[stderr]\nstderr before timeout" in timeout_result
     assert timeout_result.timeout_seconds == 0.2
-    assert followup == "survived\n"
+    assert timeout_result.state == {
+        "preserved": True,
+        "source": "live_kernel",
+        "scope": "full_live",
+    }
+    assert timeout_result.state_preserved is True
+    assert followup == "True\nfresh kernel\n"
 
 
 def test_local_runner_surfaces_subprocess_failure_and_survives(

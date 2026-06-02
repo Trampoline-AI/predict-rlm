@@ -20,11 +20,14 @@ class RecoverableExecutionTimeout(str):
         timeout_seconds: float,
         stdout: str = "",
         stderr: str = "",
+        state: dict[str, Any] | None = None,
     ) -> "RecoverableExecutionTimeout":
         obj = str.__new__(cls, message)
         obj.timeout_seconds = timeout_seconds
         obj.stdout = stdout
         obj.stderr = stderr
+        obj.state = dict(state or {})
+        obj.state_preserved = obj.state.get("preserved")
         return obj
 
 
@@ -76,8 +79,28 @@ def format_recoverable_timeout_result(
     timeout_seconds = float(timeout_info.get("seconds") or 0)
     stdout = str(result.get("stdout") or "")
     stderr = str(result.get("stderr") or "")
+    state = result.get("state") if isinstance(result.get("state"), dict) else {}
     message = f"[Timeout] Iteration execution timed out after {timeout_seconds:g}s"
     parts = [message]
+    if state:
+        if state.get("preserved") is True:
+            parts.append("[state]\nPython globals preserved in the live kernel.")
+        elif state.get("preserved") is False:
+            reason = str(state.get("reason") or "kernel state was discarded")
+            if state.get("source") == "pickle_snapshot":
+                restored = ", ".join(map(str, state.get("restored_globals") or []))
+                lost = ", ".join(map(str, state.get("lost_globals") or []))
+                state_lines = [
+                    "Full live Python state was not preserved.",
+                    f"Reason: {reason}.",
+                    "Restored pickleable globals"
+                    + (f": {restored}." if restored else ": none."),
+                    "Lost globals / imports"
+                    + (f": {lost}." if lost else ": none."),
+                ]
+                parts.append("[state]\n" + "\n".join(state_lines))
+            else:
+                parts.append(f"[state]\nPython globals were lost: {reason}")
     if stdout:
         parts.append(f"[stdout]\n{stdout.rstrip()}")
     if stderr:
@@ -87,4 +110,5 @@ def format_recoverable_timeout_result(
         timeout_seconds=timeout_seconds,
         stdout=stdout,
         stderr=stderr,
+        state=state,
     )
