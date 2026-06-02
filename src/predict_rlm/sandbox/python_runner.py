@@ -16,7 +16,6 @@ import os
 import pathlib
 import pickle
 import queue
-import select
 import shutil
 import signal
 import sys
@@ -38,6 +37,14 @@ TOOL_REQUEST_ID = 0
 TOOL_RESPONSE_LOCK = asyncio.Lock()
 PENDING_TOOL_RESPONSES: dict[int, dict[str, Any]] = {}
 _TRUE_VALUES = {"1", "true", "yes", "on"}
+_KERNEL_PROCESS: multiprocessing.Process | None = None
+_KERNEL_REQUEST_QUEUE: multiprocessing.Queue | None = None
+_KERNEL_RESULT_QUEUE: multiprocessing.Queue | None = None
+_DEFAULT_TIMEOUT_INTERRUPT_GRACE_SECONDS = 0.5
+_INTERNAL_GLOBAL_NAMES = {
+    "SUBMIT",
+    "__predict_rlm_tool_names__",
+}
 
 
 def _debug_enabled() -> bool:
@@ -254,11 +261,14 @@ async def _call_host_tool(name: str, *args: Any, **kwargs: Any) -> Any:
 
 
 def _register_tools(params: dict[str, Any], globals_dict: dict[str, Any]) -> dict[str, Any]:
+    tool_names = globals_dict.setdefault("__predict_rlm_tool_names__", set())
     for name in params.get("tools", []):
         async def _tool(*args: Any, __tool_name: str = name, **kwargs: Any) -> Any:
             return await _call_host_tool(__tool_name, *args, **kwargs)
 
         globals_dict[name] = _tool
+        tool_names.add(name)
+    _discard_kernel()
     return {}
 
 
@@ -349,19 +359,99 @@ def _execution_timeout_seconds(params: dict[str, Any]) -> float | None:
     return float(timeout)
 
 
-def _pickleable_globals(globals_dict: dict[str, Any]) -> dict[str, Any]:
-    updates: dict[str, Any] = {}
-    for name, value in globals_dict.items():
-        if name.startswith("__") and name.endswith("__"):
+def _timeout_interrupt_grace_seconds(params: dict[str, Any]) -> float:
+    grace = params.get(
+        "execution_timeout_interrupt_grace_seconds",
+        _DEFAULT_TIMEOUT_INTERRUPT_GRACE_SECONDS,
+    )
+    if (
+        isinstance(grace, bool)
+        or not isinstance(grace, (int, float))
+        or not math.isfinite(float(grace))
+        or float(grace) < 0
+    ):
+        raise ValueError(
+            "execution_timeout_interrupt_grace_seconds must be a non-negative number"
+        )
+    return float(grace)
+
+
+def _live_kernel_state() -> dict[str, Any]:
+    return {
+        "preserved": True,
+        "source": "live_kernel",
+        "scope": "full_live",
+    }
+
+
+def _pickle_snapshot_state(
+    snapshot: dict[str, Any],
+    reason: str,
+) -> dict[str, Any]:
+    return {
+        "preserved": False,
+        "source": "pickle_snapshot",
+        "scope": "pickleable_globals",
+        "reason": reason,
+        "restored_globals": list(snapshot.get("restored_globals") or []),
+        "lost_globals": list(snapshot.get("lost_globals") or []),
+    }
+
+
+def _is_user_global(name: str, globals_dict: dict[str, Any]) -> bool:
+    if name.startswith("__") and name.endswith("__"):
+        return False
+    if name in _INTERNAL_GLOBAL_NAMES:
+        return False
+    tool_names = globals_dict.get("__predict_rlm_tool_names__", set())
+    return name not in tool_names
+
+
+def _should_exclude_from_pickle_snapshot(value: Any) -> bool:
+    if inspect.ismodule(value) or inspect.isfunction(value) or inspect.isclass(value):
+        return True
+    value_type = type(value)
+    return value_type.__module__ == "__main__" and value_type.__name__ != "type"
+
+
+def _pickleable_globals_snapshot(globals_dict: dict[str, Any]) -> dict[str, Any]:
+    restored: dict[str, Any] = {}
+    lost: list[str] = []
+    for name, value in sorted(globals_dict.items()):
+        if not _is_user_global(name, globals_dict):
             continue
-        if name == "SUBMIT":
+        if _should_exclude_from_pickle_snapshot(value):
+            lost.append(name)
             continue
         try:
-            pickle.dumps(value)
+            pickle.loads(pickle.dumps(value))
         except Exception:
+            lost.append(name)
             continue
-        updates[name] = value
-    return updates
+        restored[name] = value
+    return {
+        "globals": restored,
+        "restored_globals": sorted(restored),
+        "lost_globals": sorted(lost),
+    }
+
+
+def _reset_globals_from_pickle_snapshot(
+    globals_dict: dict[str, Any],
+    snapshot: dict[str, Any],
+) -> None:
+    tool_names = set(globals_dict.get("__predict_rlm_tool_names__", set()))
+    tools = {
+        name: globals_dict[name]
+        for name in tool_names
+        if name in globals_dict
+    }
+    globals_dict.clear()
+    globals_dict.update(_new_globals())
+    if tool_names:
+        globals_dict["__predict_rlm_tool_names__"] = tool_names
+        globals_dict.update(tools)
+    globals_dict.update(snapshot.get("globals") or {})
 
 
 def _raise_runner_error(payload: dict[str, Any]) -> None:
@@ -375,58 +465,152 @@ def _runner_context() -> multiprocessing.context.BaseContext:
         raise RuntimeError("isolated execution requires a fork-capable Python runtime") from exc
 
 
-def _execute_code_runner(
+def _capture_file_path(kind: str) -> pathlib.Path:
+    handle = tempfile.NamedTemporaryFile(
+        prefix=f"predict-rlm-{kind}-",
+        suffix=".txt",
+        dir=SANDBOX_ROOT,
+        delete=False,
+    )
+    path = pathlib.Path(handle.name)
+    handle.close()
+    return path
+
+
+def _read_capture_file(path: pathlib.Path) -> str:
+    try:
+        return path.read_text(encoding="utf-8", errors="replace")
+    except FileNotFoundError:
+        return ""
+
+
+def _unlink_capture_files(*paths: pathlib.Path) -> None:
+    for path in paths:
+        with contextlib.suppress(OSError):
+            path.unlink()
+
+
+@contextlib.contextmanager
+def _redirect_process_stdio_to_files(
+    stdout_path: str,
+    stderr_path: str,
+):
+    saved_stdin_fd = os.dup(0)
+    saved_stdout_fd = os.dup(1)
+    saved_stderr_fd = os.dup(2)
+    stdout_fd = os.open(stdout_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    stderr_fd = os.open(stderr_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    devnull_stdin = REAL_OPEN(os.devnull, "r", encoding="utf-8")
+    old_stdin, old_stdout, old_stderr = sys.stdin, sys.stdout, sys.stderr
+    capture = _ExecutionCapture(
+        stdout=_FdTextStream(stdout_fd),
+        stderr=_FdTextStream(stderr_fd),
+    )
+    try:
+        os.dup2(devnull_stdin.fileno(), 0)
+        os.dup2(stdout_fd, 1)
+        os.dup2(stderr_fd, 2)
+        sys.stdin = devnull_stdin
+        yield capture
+    finally:
+        for stream in (sys.stdout, sys.stderr):
+            with contextlib.suppress(Exception):
+                stream.flush()
+        os.dup2(saved_stdin_fd, 0)
+        os.dup2(saved_stdout_fd, 1)
+        os.dup2(saved_stderr_fd, 2)
+        sys.stdin, sys.stdout, sys.stderr = old_stdin, old_stdout, old_stderr
+        for fd in (
+            stdout_fd,
+            stderr_fd,
+            saved_stdin_fd,
+            saved_stdout_fd,
+            saved_stderr_fd,
+        ):
+            with contextlib.suppress(OSError):
+                os.close(fd)
+        devnull_stdin.close()
+
+
+async def _execute_code_to_capture_files(
     code: str,
     globals_dict: dict[str, Any],
+    stdout_path: str,
+    stderr_path: str,
+) -> dict[str, Any]:
+    with _redirect_process_stdio_to_files(stdout_path, stderr_path) as capture:
+        result = await _execute_code(code, globals_dict, capture)
+    if isinstance(result, dict) and "output" in result:
+        result = dict(result)
+        result["output"] = _read_capture_file(pathlib.Path(stdout_path)) + _read_capture_file(
+            pathlib.Path(stderr_path)
+        )
+    return result
+
+
+def _run_kernel_coroutine(coro: Any) -> Any:
+    loop = asyncio.new_event_loop()
+    try:
+        asyncio.set_event_loop(loop)
+        return loop.run_until_complete(coro)
+    finally:
+        asyncio.set_event_loop(None)
+        loop.close()
+
+
+def _persistent_kernel_runner(
+    globals_dict: dict[str, Any],
+    request_queue: multiprocessing.Queue,
     result_queue: multiprocessing.Queue,
     stdin_fd: int,
-    stdout_fd: int,
-    stderr_fd: int,
 ) -> None:
     with contextlib.suppress(OSError):
         os.setsid()
     global PROTOCOL_STDIN, PROTOCOL_STDOUT
     PROTOCOL_STDIN = os.fdopen(stdin_fd, "r", encoding="utf-8", buffering=1)
     PROTOCOL_STDOUT = os.fdopen(os.dup(1), "w", encoding="utf-8", buffering=1)
-    devnull_stdin = open(os.devnull, "r", encoding="utf-8")
-    os.dup2(devnull_stdin.fileno(), 0)
-    sys.stdin = devnull_stdin
     global PENDING_TOOL_RESPONSES, TOOL_RESPONSE_LOCK
     PENDING_TOOL_RESPONSES = {}
     TOOL_RESPONSE_LOCK = asyncio.Lock()
-    os.dup2(stdout_fd, 1)
-    os.dup2(stderr_fd, 2)
-    capture = _ExecutionCapture(
-        stdout=_FdTextStream(stdout_fd),
-        stderr=_FdTextStream(stderr_fd),
-    )
-    try:
-        result = asyncio.run(_execute_code(code, globals_dict, capture))
-        result_queue.put({
-            "ok": True,
-            "result": result,
-            "globals": _pickleable_globals(globals_dict),
-        })
-    except BaseException as exc:
-        result_queue.put({"ok": False, "error": _exception_payload(exc)})
-    finally:
-        with contextlib.suppress(OSError):
-            os.close(stdout_fd)
-        with contextlib.suppress(OSError):
-            os.close(stderr_fd)
 
-
-def _drain_fd(fd: int, parts: list[str]) -> bool:
     while True:
+        request = request_queue.get()
+        if request is None:
+            return
         try:
-            chunk = os.read(fd, 65536)
-        except BlockingIOError:
-            return True
-        except OSError:
-            return False
-        if not chunk:
-            return False
-        parts.append(chunk.decode("utf-8", errors="replace"))
+            if request.get("op") == "snapshot":
+                result_queue.put({
+                    "ok": True,
+                    "snapshot": _pickleable_globals_snapshot(globals_dict),
+                })
+                continue
+            if request.get("timeout_seconds") is not None:
+                signal.signal(signal.SIGINT, signal.default_int_handler)
+            result = _run_kernel_coroutine(
+                _execute_code_to_capture_files(
+                    request["code"],
+                    globals_dict,
+                    request["stdout_path"],
+                    request["stderr_path"],
+                )
+            )
+            result_queue.put({"ok": True, "result": result})
+        except KeyboardInterrupt:
+            timeout_seconds = request.get("timeout_seconds")
+            if timeout_seconds is None:
+                result_queue.put({"ok": False, "error": _exception_payload(KeyboardInterrupt())})
+                continue
+            result_queue.put({
+                "ok": True,
+                "result": {
+                    "timeout": {"seconds": timeout_seconds},
+                    "stdout": _read_capture_file(pathlib.Path(request["stdout_path"])),
+                    "stderr": _read_capture_file(pathlib.Path(request["stderr_path"])),
+                    "state": _live_kernel_state(),
+                },
+            })
+        except BaseException as exc:
+            result_queue.put({"ok": False, "error": _exception_payload(exc)})
 
 
 def _runner_process_group_id(process: multiprocessing.Process) -> int | None:
@@ -452,20 +636,36 @@ def _signal_runner_process_group(pgid: int | None, sig: int) -> bool:
     return True
 
 
+def _signal_runner(process: multiprocessing.Process, sig: int) -> bool:
+    pgid = _runner_process_group_id(process)
+    if _signal_runner_process_group(pgid, sig):
+        return True
+    pid = process.pid
+    if pid is None or not process.is_alive():
+        return False
+    try:
+        os.kill(pid, sig)
+    except ProcessLookupError:
+        return False
+    except OSError:
+        return False
+    return True
+
+
 def _terminate_runner(process: multiprocessing.Process) -> None:
     pgid = _runner_process_group_id(process)
     if not process.is_alive() and pgid is None:
         return
 
-    if not _signal_runner_process_group(pgid, signal.SIGINT) and process.is_alive():
+    if not _signal_runner(process, signal.SIGINT) and process.is_alive():
         process.terminate()
     process.join(timeout=0.2)
 
-    if not _signal_runner_process_group(pgid, signal.SIGTERM) and process.is_alive():
+    if not _signal_runner(process, signal.SIGTERM) and process.is_alive():
         process.terminate()
     process.join(timeout=0.3)
 
-    if not _signal_runner_process_group(pgid, signal.SIGKILL) and process.is_alive():
+    if not _signal_runner(process, signal.SIGKILL) and process.is_alive():
         if hasattr(process, "kill"):
             process.kill()
         else:
@@ -473,180 +673,266 @@ def _terminate_runner(process: multiprocessing.Process) -> None:
     process.join(timeout=0.5)
 
 
+def _discard_kernel() -> None:
+    global _KERNEL_PROCESS, _KERNEL_REQUEST_QUEUE, _KERNEL_RESULT_QUEUE
+    process = _KERNEL_PROCESS
+    if process is not None:
+        _terminate_runner(process)
+    for message_queue in (_KERNEL_REQUEST_QUEUE, _KERNEL_RESULT_QUEUE):
+        if message_queue is not None:
+            with contextlib.suppress(Exception):
+                message_queue.close()
+    _KERNEL_PROCESS = None
+    _KERNEL_REQUEST_QUEUE = None
+    _KERNEL_RESULT_QUEUE = None
+
+
+def _ensure_kernel(globals_dict: dict[str, Any]) -> multiprocessing.Process:
+    global _KERNEL_PROCESS, _KERNEL_REQUEST_QUEUE, _KERNEL_RESULT_QUEUE
+    if _KERNEL_PROCESS is not None and _KERNEL_PROCESS.is_alive():
+        return _KERNEL_PROCESS
+    _discard_kernel()
+    ctx = _runner_context()
+    _KERNEL_REQUEST_QUEUE = ctx.Queue()
+    _KERNEL_RESULT_QUEUE = ctx.Queue()
+    protocol_stdin_fd = os.dup(0)
+    _KERNEL_PROCESS = ctx.Process(
+        target=_persistent_kernel_runner,
+        args=(
+            globals_dict,
+            _KERNEL_REQUEST_QUEUE,
+            _KERNEL_RESULT_QUEUE,
+            protocol_stdin_fd,
+        ),
+    )
+    _KERNEL_PROCESS.start()
+    os.close(protocol_stdin_fd)
+    return _KERNEL_PROCESS
+
+
+async def _kernel_pickle_snapshot(
+    process: multiprocessing.Process,
+) -> dict[str, Any]:
+    assert _KERNEL_REQUEST_QUEUE is not None
+    assert _KERNEL_RESULT_QUEUE is not None
+    _KERNEL_REQUEST_QUEUE.put({"op": "snapshot"})
+    while process.is_alive():
+        try:
+            message = _KERNEL_RESULT_QUEUE.get_nowait()
+        except queue.Empty:
+            await asyncio.sleep(0.01)
+            continue
+        if message.get("ok"):
+            return message.get("snapshot") or {
+                "globals": {},
+                "restored_globals": [],
+                "lost_globals": [],
+            }
+        _raise_runner_error(message.get("error") or {})
+    return {"globals": {}, "restored_globals": [], "lost_globals": []}
+
+
 async def _execute_code_in_runner_with_timeout(
     code: str,
     globals_dict: dict[str, Any],
     timeout_seconds: float | None,
+    timeout_interrupt_grace_seconds: float,
 ) -> dict[str, Any]:
-    code_digest = _code_hash(code)
-    ctx = _runner_context()
-    stdout_read_fd, stdout_write_fd = os.pipe()
-    stderr_read_fd, stderr_write_fd = os.pipe()
-    protocol_stdin_fd = os.dup(0)
-    os.set_blocking(stdout_read_fd, False)
-    os.set_blocking(stderr_read_fd, False)
-    result_queue = ctx.Queue()
-    process = ctx.Process(
-        target=_execute_code_runner,
-        args=(
-            code,
-            globals_dict,
-            result_queue,
-            protocol_stdin_fd,
-            stdout_write_fd,
-            stderr_write_fd,
-        ),
-    )
-    stdout_parts: list[str] = []
-    stderr_parts: list[str] = []
-    active_fds = {stdout_read_fd: stdout_parts, stderr_read_fd: stderr_parts}
-    process.start()
-    os.close(protocol_stdin_fd)
-    os.close(stdout_write_fd)
-    os.close(stderr_write_fd)
+    process = _ensure_kernel(globals_dict)
+    assert _KERNEL_REQUEST_QUEUE is not None
+    assert _KERNEL_RESULT_QUEUE is not None
+    pre_timeout_snapshot: dict[str, Any] | None = None
+    if timeout_seconds is not None:
+        pre_timeout_snapshot = await _kernel_pickle_snapshot(process)
+    stdout_path = _capture_file_path("stdout")
+    stderr_path = _capture_file_path("stderr")
+    _KERNEL_REQUEST_QUEUE.put({
+        "code": code,
+        "stdout_path": str(stdout_path),
+        "stderr_path": str(stderr_path),
+        "timeout_seconds": timeout_seconds,
+    })
     deadline = (
         time.monotonic() + timeout_seconds if timeout_seconds is not None else None
     )
+    interrupt_deadline: float | None = None
+    interrupt_sent = False
     runner_message: dict[str, Any] | None = None
-
     try:
         while True:
-            for fd, parts in list(active_fds.items()):
-                if not _drain_fd(fd, parts):
-                    active_fds.pop(fd, None)
+            now = time.monotonic()
             try:
-                runner_message = result_queue.get_nowait()
+                runner_message = _KERNEL_RESULT_QUEUE.get_nowait()
                 break
             except queue.Empty:
                 pass
-            if deadline is not None:
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    _terminate_runner(process)
-                    for fd, parts in list(active_fds.items()):
-                        _drain_fd(fd, parts)
-                    stdout = "".join(stdout_parts)
-                    stderr = "".join(stderr_parts)
-                    _debug_event(
-                        "sbx.python_runner.execute",
-                        code_hash=code_digest,
-                        code_len=len(code),
-                        timeout=True,
-                        timeout_seconds=timeout_seconds,
-                        stdout_len=len(stdout),
-                        stderr_len=len(stderr),
-                        child_pid=process.pid,
-                        child_exitcode=process.exitcode,
-                        active_fd_count=len(active_fds),
-                    )
-                    return {
-                        "timeout": {"seconds": timeout_seconds},
-                        "stdout": stdout,
-                        "stderr": stderr,
-                    }
-                select_timeout = min(0.01, remaining)
-            else:
-                if not process.is_alive():
-                    process.join(timeout=0.5)
-                    break
-                select_timeout = 0.01
-            if active_fds:
-                ready, _, _ = await asyncio.to_thread(
-                    select.select,
-                    list(active_fds),
-                    [],
-                    [],
-                    select_timeout,
+            if not process.is_alive():
+                process.join(timeout=0.5)
+                break
+            if deadline is not None and not interrupt_sent and now >= deadline:
+                interrupt_sent = True
+                interrupt_deadline = now + timeout_interrupt_grace_seconds
+                interrupted = _signal_runner(process, signal.SIGINT)
+                _debug_event(
+                    "sbx.python_runner.execute.interrupt",
+                    code_hash=_code_hash(code),
+                    code_len=len(code),
+                    timeout_seconds=timeout_seconds,
+                    interrupt_sent=interrupted,
+                    interrupt_grace_seconds=timeout_interrupt_grace_seconds,
+                    child_pid=process.pid,
+                    child_exitcode=process.exitcode,
                 )
-                for fd in ready:
-                    parts = active_fds.get(fd)
-                    if parts is not None and not _drain_fd(fd, parts):
-                        active_fds.pop(fd, None)
-            else:
-                await asyncio.sleep(select_timeout)
+                if interrupted and timeout_interrupt_grace_seconds > 0:
+                    await asyncio.sleep(0.01)
+                    continue
+            if interrupt_sent and interrupt_deadline is not None and now >= interrupt_deadline:
+                _terminate_runner(process)
+                stdout = _read_capture_file(stdout_path)
+                stderr = _read_capture_file(stderr_path)
+                _discard_kernel()
+                reason = "kernel did not respond to SIGINT before hard kill"
+                snapshot = pre_timeout_snapshot or {
+                    "globals": {},
+                    "restored_globals": [],
+                    "lost_globals": [],
+                }
+                _reset_globals_from_pickle_snapshot(globals_dict, snapshot)
+                _debug_event(
+                    "sbx.python_runner.execute",
+                    code_hash=_code_hash(code),
+                    code_len=len(code),
+                    timeout=True,
+                    timeout_seconds=timeout_seconds,
+                    state_preserved=False,
+                    state_source="pickle_snapshot",
+                    state_loss_reason=reason,
+                    restored_globals=snapshot.get("restored_globals", []),
+                    lost_globals=snapshot.get("lost_globals", []),
+                    stdout_len=len(stdout),
+                    stderr_len=len(stderr),
+                    child_pid=process.pid,
+                    child_exitcode=process.exitcode,
+                )
+                return {
+                    "timeout": {"seconds": timeout_seconds},
+                    "stdout": stdout,
+                    "stderr": stderr,
+                    "state": _pickle_snapshot_state(snapshot, reason),
+                }
+            await asyncio.sleep(0.01)
 
-        process.join(timeout=0.5)
-        if process.is_alive():
-            _terminate_runner(process)
-        for fd, parts in list(active_fds.items()):
-            if not _drain_fd(fd, parts):
-                active_fds.pop(fd, None)
-    finally:
-        for fd in (stdout_read_fd, stderr_read_fd):
-            with contextlib.suppress(OSError):
-                os.close(fd)
-        result_queue.close()
-
-    if runner_message is None:
-        exitcode = process.exitcode
+        if runner_message is None:
+            exitcode = process.exitcode
+            _discard_kernel()
+            if interrupt_sent:
+                stdout = _read_capture_file(stdout_path)
+                stderr = _read_capture_file(stderr_path)
+                reason = (
+                    "kernel exited after SIGINT before returning structured timeout"
+                )
+                snapshot = pre_timeout_snapshot or {
+                    "globals": {},
+                    "restored_globals": [],
+                    "lost_globals": [],
+                }
+                _reset_globals_from_pickle_snapshot(globals_dict, snapshot)
+                _debug_event(
+                    "sbx.python_runner.execute",
+                    code_hash=_code_hash(code),
+                    code_len=len(code),
+                    timeout=True,
+                    timeout_seconds=timeout_seconds,
+                    state_preserved=False,
+                    state_source="pickle_snapshot",
+                    state_loss_reason=reason,
+                    restored_globals=snapshot.get("restored_globals", []),
+                    lost_globals=snapshot.get("lost_globals", []),
+                    stdout_len=len(stdout),
+                    stderr_len=len(stderr),
+                    child_pid=process.pid,
+                    child_exitcode=exitcode,
+                )
+                return {
+                    "timeout": {"seconds": timeout_seconds},
+                    "stdout": stdout,
+                    "stderr": stderr,
+                    "state": _pickle_snapshot_state(snapshot, reason),
+                }
+            _debug_event(
+                "sbx.python_runner.execute",
+                code_hash=_code_hash(code),
+                code_len=len(code),
+                timeout=False,
+                error=True,
+                error_type="RuntimeError",
+                stdout_len=len(_read_capture_file(stdout_path)),
+                stderr_len=len(_read_capture_file(stderr_path)),
+                child_pid=process.pid,
+                child_exitcode=exitcode,
+            )
+            if exitcode is None:
+                raise RuntimeError("execution runner exited without a result")
+            raise RuntimeError(
+                f"execution runner exited without a result (exitcode={exitcode})"
+            )
+        if not runner_message.get("ok"):
+            _debug_event(
+                "sbx.python_runner.execute",
+                code_hash=_code_hash(code),
+                code_len=len(code),
+                timeout=False,
+                error=True,
+                error_type=(runner_message.get("error") or {}).get("type"),
+                error_message=(runner_message.get("error") or {}).get("message"),
+                stdout_len=len(_read_capture_file(stdout_path)),
+                stderr_len=len(_read_capture_file(stderr_path)),
+                child_pid=process.pid,
+                child_exitcode=process.exitcode,
+            )
+            _raise_runner_error(runner_message.get("error") or {})
+        result = runner_message.get("result") or {}
         _debug_event(
             "sbx.python_runner.execute",
-            code_hash=code_digest,
+            code_hash=_code_hash(code),
             code_len=len(code),
             timeout=False,
-            error=True,
-            error_type="RuntimeError",
-            stdout_len=len("".join(stdout_parts)),
-            stderr_len=len("".join(stderr_parts)),
-            child_pid=process.pid,
-            child_exitcode=exitcode,
-            active_fd_count=len(active_fds),
-        )
-        if exitcode is None:
-            raise RuntimeError("execution runner exited without a result")
-        raise RuntimeError(
-            f"execution runner exited without a result (exitcode={exitcode})"
-        )
-    if not runner_message.get("ok"):
-        _debug_event(
-            "sbx.python_runner.execute",
-            code_hash=code_digest,
-            code_len=len(code),
-            timeout=False,
-            error=True,
-            error_type=(runner_message.get("error") or {}).get("type"),
-            error_message=(runner_message.get("error") or {}).get("message"),
-            stdout_len=len("".join(stdout_parts)),
-            stderr_len=len("".join(stderr_parts)),
+            error=False,
+            result_kind=(
+                "timeout"
+                if isinstance(result, dict) and "timeout" in result
+                else "final"
+                if isinstance(result, dict) and "final" in result
+                else "output"
+            ),
+            output_len=len(result.get("output", "")) if isinstance(result, dict) else None,
+            stdout_len=len(_read_capture_file(stdout_path)),
+            stderr_len=len(_read_capture_file(stderr_path)),
+            state_preserved=(
+                (result.get("state") or {}).get("preserved")
+                if isinstance(result, dict)
+                else None
+            ),
             child_pid=process.pid,
             child_exitcode=process.exitcode,
-            active_fd_count=len(active_fds),
         )
-        _raise_runner_error(runner_message.get("error") or {})
-    globals_dict.update(runner_message.get("globals") or {})
-    result = runner_message.get("result") or {}
-    if isinstance(result, dict) and "output" in result:
-        result = dict(result)
-        result["output"] = "".join(stdout_parts) + "".join(stderr_parts)
-    _debug_event(
-        "sbx.python_runner.execute",
-        code_hash=code_digest,
-        code_len=len(code),
-        timeout=False,
-        error=False,
-        result_kind=(
-            "timeout"
-            if isinstance(result, dict) and "timeout" in result
-            else "final"
-            if isinstance(result, dict) and "final" in result
-            else "output"
-        ),
-        output_len=len(result.get("output", "")) if isinstance(result, dict) else None,
-        stdout_len=len("".join(stdout_parts)),
-        stderr_len=len("".join(stderr_parts)),
-        child_pid=process.pid,
-        child_exitcode=process.exitcode,
-        active_fd_count=len(active_fds),
-    )
-    return result
+        return result
+    finally:
+        _unlink_capture_files(stdout_path, stderr_path)
 
 
 async def _execute_code_with_timeout(
     code: str,
     globals_dict: dict[str, Any],
     timeout_seconds: float | None,
+    timeout_interrupt_grace_seconds: float,
 ) -> dict[str, Any]:
-    return await _execute_code_in_runner_with_timeout(code, globals_dict, timeout_seconds)
+    return await _execute_code_in_runner_with_timeout(
+        code,
+        globals_dict,
+        timeout_seconds,
+        timeout_interrupt_grace_seconds,
+    )
 
 
 def _mount_file(params: dict[str, Any]) -> dict[str, Any]:
@@ -697,6 +983,7 @@ async def _handle_request(
                     params.get("code", ""),
                     globals_dict,
                     _execution_timeout_seconds(params),
+                    _timeout_interrupt_grace_seconds(params),
                 ),
             )
         if method == "register_output_fields":
@@ -732,6 +1019,7 @@ async def _main() -> None:
             continue
 
         if request.get("method") == "reset":
+            _discard_kernel()
             PENDING_TOOL_RESPONSES.clear()
             globals_dict = _new_globals()
             _send_protocol(_response(request.get("id"), {}))
@@ -741,6 +1029,7 @@ async def _main() -> None:
         if response is not None:
             _send_protocol(response)
         if request.get("method") == "shutdown":
+            _discard_kernel()
             break
 
 

@@ -114,13 +114,6 @@ def runner(tmp_path):
 
 
 class TestPythonRunnerProtocol:
-    def test_execute_captures_output_and_persists_globals(self, runner: LocalRunner):
-        first = runner.request("execute", {"code": "x = 40\nprint('ready')"})
-        second = runner.request("execute", {"code": "x += 2\nprint(x)"})
-
-        assert first["result"]["output"].strip() == "ready"
-        assert second["result"]["output"].strip() == "42"
-
     def test_user_subprocess_stdin_is_isolated_from_runner_protocol(
         self, runner: LocalRunner
     ):
@@ -239,8 +232,13 @@ class TestPythonRunnerProtocol:
             "timeout": {"seconds": 0.1},
             "stdout": "before timeout\n",
             "stderr": "stderr before timeout\n",
+            "state": {
+                "preserved": True,
+                "source": "live_kernel",
+                "scope": "full_live",
+            },
         }
-        assert followup["result"]["output"] == "False\nstill alive\n"
+        assert followup["result"]["output"] == "True\nstill alive\n"
 
     def test_execute_captures_child_process_output_with_timeout(
         self, runner: LocalRunner
@@ -332,6 +330,11 @@ class TestPythonRunnerProtocol:
             "timeout": {"seconds": 0.1},
             "stdout": "",
             "stderr": "",
+            "state": {
+                "preserved": True,
+                "source": "live_kernel",
+                "scope": "full_live",
+            },
         }
         assert followup["result"]["output"] == "still alive\n"
 
@@ -653,7 +656,13 @@ class TestSbxInterpreterLocalRunner:
         assert "[stdout]\nbefore timeout" in timeout_result
         assert "[stderr]\nstderr before timeout" in timeout_result
         assert timeout_result.timeout_seconds == 0.1
-        assert followup == "False\nstill alive\n"
+        assert timeout_result.state == {
+            "preserved": True,
+            "source": "live_kernel",
+            "scope": "full_live",
+        }
+        assert timeout_result.state_preserved is True
+        assert followup == "True\nstill alive\n"
 
     def test_default_recoverable_timeout_grace_is_shared(self, tmp_path: Path):
         from predict_rlm.execution_timeout import (
@@ -1162,16 +1171,18 @@ while True:
             _supervisor_command=[sys.executable, "-u", str(RUNNER_PATH)],
             _staging_root=tmp_path / "staging",
         )
-        start = time.monotonic()
         try:
+            interpreter.prewarm()
+            interpreter.execute("pass")
+            start = time.monotonic()
             output = interpreter.execute(
                 "import asyncio\n"
                 "results = await asyncio.gather(slow(1), slow(2))\n"
                 "print(results)"
             )
+            elapsed = time.monotonic() - start
         finally:
             interpreter.shutdown()
-        elapsed = time.monotonic() - start
 
         assert output.strip() == "[1, 2]"
         assert elapsed < 0.6

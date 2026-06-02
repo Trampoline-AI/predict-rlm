@@ -40,6 +40,7 @@ RUNNER_DEATH = "runner_death"
 STDIN_ISOLATION = "stdin_isolation"
 HOST_CALLBACKS = "host_callbacks"
 VISUAL_PATH_PREDICT = "visual_path_predict"
+LIVE_REPL_STATE = "live_repl_state"
 
 
 def _predict_tool(signature: str, **kwargs: Any) -> dict[str, Any]:
@@ -86,6 +87,23 @@ def _assert_timeout_observation(result: Any, seconds: float) -> None:
     assert getattr(result, "timeout_seconds") == seconds
 
 
+def _assert_timeout_state(
+    result: Any,
+    *,
+    preserved: bool,
+    source: str,
+    scope: str,
+    reason_contains: str | None = None,
+) -> None:
+    state = result.get("state") if isinstance(result, dict) else getattr(result, "state")
+    assert state["preserved"] is preserved
+    assert state["source"] == source
+    assert state["scope"] == scope
+    assert getattr(result, "state_preserved", preserved) is preserved
+    if reason_contains is not None:
+        assert reason_contains in state.get("reason", "")
+
+
 class RunnerBackend:
     name: str
     capabilities: frozenset[str]
@@ -114,6 +132,7 @@ class JsonRpcPythonRunnerBackend(RunnerBackend):
         STDIN_ISOLATION,
         HOST_CALLBACKS,
         VISUAL_PATH_PREDICT,
+        LIVE_REPL_STATE,
     })
     unsupported = {
         FENCES: "inapplicable: raw JSON-RPC runner payloads receive code after wrapper normalization",
@@ -272,6 +291,24 @@ class ContractFakeProcess:
             self._append({"jsonrpc": "2.0", "id": request_id, "result": {"output": "repl\n"}})
         elif "survivor = 'ok'" in code:
             self._append({"jsonrpc": "2.0", "id": request_id, "result": {"output": "set\n"}})
+        elif "SIG_IGN" in code:
+            self._append({
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "result": {
+                    "timeout": {"seconds": params["execution_timeout_seconds"]},
+                    "stdout": "before timeout\n",
+                    "stderr": "stderr before timeout\n",
+                    "state": {
+                        "preserved": False,
+                        "source": "pickle_snapshot",
+                        "scope": "pickleable_globals",
+                        "reason": "kernel did not respond to SIGINT before hard kill",
+                        "restored_globals": ["data", "mapping", "x"],
+                        "lost_globals": ["C", "f", "json", "obj"],
+                    },
+                },
+            })
         elif "before timeout" in code:
             self._append({
                 "jsonrpc": "2.0",
@@ -280,10 +317,38 @@ class ContractFakeProcess:
                     "timeout": {"seconds": params["execution_timeout_seconds"]},
                     "stdout": "before timeout\n",
                     "stderr": "stderr before timeout\n",
+                    "state": {
+                        "preserved": True,
+                        "source": "live_kernel",
+                        "scope": "full_live",
+                    },
                 },
             })
-        elif "print(survivor)" in code:
-            self._append({"jsonrpc": "2.0", "id": request_id, "result": {"output": "ok\n"}})
+        elif "hard_partial' in globals()" in code:
+            self._append({
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "result": {
+                    "output": (
+                        "7\n[1, 2]\n{'a': 3}\nFalse\nFalse\nFalse\nFalse\n"
+                        "False\nafter hard timeout\n"
+                    )
+                },
+            })
+        elif "partial_timeout_state" in code and "bump(4)" in code:
+            self._append({
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "result": {
+                    "output": "True\nok\n9.0\n5\nTrue\n15\nkept\nafter timeout\n"
+                },
+            })
+        elif "survivor' in globals()" in code:
+            self._append({
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "result": {"output": "True\nafter timeout\n"},
+            })
         elif "child failed" in code:
             self._append({
                 "jsonrpc": "2.0",
@@ -365,6 +430,7 @@ class FakeTerminalBenchBackend(InterpreterBackend):
                 STDIN_ISOLATION: "inapplicable: FakeAdapter has no real JSON-RPC stdin or OS fd 0",
                 HOST_CALLBACKS: "inapplicable: FakeAdapter does not execute code or issue tool calls",
                 VISUAL_PATH_PREDICT: "inapplicable: FakeAdapter does not provide filesystem or callback execution",
+                LIVE_REPL_STATE: "inapplicable: FakeAdapter validates wrapper mapping without executing live Python state",
             },
         )
 
@@ -396,6 +462,7 @@ def _local_process_backend(tmp_path: Path) -> RunnerBackend:
             STDIN_ISOLATION,
             HOST_CALLBACKS,
             VISUAL_PATH_PREDICT,
+            LIVE_REPL_STATE,
         },
         interpreter=LocalProcessRunnerInterpreter(
             tools={"predict": _predict_tool},
@@ -419,6 +486,7 @@ def _sbx_local_backend(tmp_path: Path) -> RunnerBackend:
             STDIN_ISOLATION,
             HOST_CALLBACKS,
             VISUAL_PATH_PREDICT,
+            LIVE_REPL_STATE,
         },
         interpreter=SbxInterpreter(
             config=SbxConfig(name="contract-local", exec_timeout=10),
@@ -448,6 +516,7 @@ def _real_sbx_backend(tmp_path: Path) -> RunnerBackend:
             STDIN_ISOLATION,
             HOST_CALLBACKS,
             VISUAL_PATH_PREDICT,
+            LIVE_REPL_STATE,
         },
         interpreter=SbxInterpreter(
             config=SbxConfig(name="contract-real-sbx", exec_timeout=10),
@@ -479,7 +548,16 @@ def _jspi_backend(tmp_path: Path) -> RunnerBackend:
             RUNNER_DEATH: "inapplicable: Pyodide cannot execute os._exit in a CPython child runner",
             STDIN_ISOLATION: "inapplicable: Pyodide/Deno has no CPython child process fd 0 contract",
             VISUAL_PATH_PREDICT: "inapplicable: this contract covers shared runner /sandbox path mapping",
+            LIVE_REPL_STATE: "inapplicable here: JSPI/Pyodide persistence is not the shared CPython runner process",
         },
+    )
+
+
+def _real_harbor_backend(tmp_path: Path) -> RunnerBackend:
+    del tmp_path
+    pytest.skip(
+        "opt-in/integration-only: real Harbor environments are not unit-testable "
+        "from this repository contract matrix without an active Harbor session"
     )
 
 
@@ -489,6 +567,7 @@ BACKENDS = [
     BackendSpec("terminal-bench-fake-adapter", lambda tmp_path: FakeTerminalBenchBackend()),
     BackendSpec("sbx-local-supervisor", _sbx_local_backend),
     BackendSpec("sbx-real-docker", _real_sbx_backend),
+    BackendSpec("harbor-real-environment", _real_harbor_backend),
     BackendSpec("jspi-deno", _jspi_backend),
 ]
 
@@ -567,24 +646,139 @@ def test_contract_fd_print_and_child_output_stay_in_execute_result(
     assert runner_backend.protocol_stderr() == ""
 
 
-def test_contract_recoverable_timeout_returns_observation_and_survives(
+def test_contract_recoverable_timeout_interrupt_preserves_live_state(
+    runner_backend: RunnerBackend,
+) -> None:
+    _require(runner_backend, RECOVERABLE_TIMEOUT)
+    _require(runner_backend, LIVE_REPL_STATE)
+
+    assert str(runner_backend.execute(
+        "survivor = 'ok'\n"
+        "import math\n"
+        "def bump(n):\n"
+        "    return n + 1\n"
+        "class Box:\n"
+        "    def __init__(self):\n"
+        "        self.value = 10\n"
+        "    def inc(self, amount):\n"
+        "        self.value += amount\n"
+        "box = Box()\n"
+        "print('set')"
+    )) == "set\n"
+    timeout_result = runner_backend.execute(
+        "import sys, time\n"
+        "print('before timeout')\n"
+        "print('stderr before timeout', file=sys.stderr)\n"
+        "box.inc(5)\n"
+        "partial_timeout_state = 'kept'\n"
+        "sys.stdout.flush(); sys.stderr.flush()\n"
+        "while True:\n"
+        "    time.sleep(0.05)\n",
+        timeout=0.2,
+    )
+    followup = runner_backend.execute(
+        "print('survivor' in globals())\n"
+        "print(survivor)\n"
+        "print(math.sqrt(81))\n"
+        "print(bump(4))\n"
+        "print(isinstance(box, Box))\n"
+        "print(box.value)\n"
+        "print(partial_timeout_state)\n"
+        "print('after timeout')"
+    )
+
+    _assert_timeout_observation(timeout_result, 0.2)
+    _assert_timeout_state(
+        timeout_result,
+        preserved=True,
+        source="live_kernel",
+        scope="full_live",
+    )
+    assert str(followup) == "True\nok\n9.0\n5\nTrue\n15\nkept\nafter timeout\n"
+
+
+def test_contract_recoverable_timeout_reports_state_preserved_metadata(
     runner_backend: RunnerBackend,
 ) -> None:
     _require(runner_backend, RECOVERABLE_TIMEOUT)
 
-    assert str(runner_backend.execute("survivor = 'ok'\nprint('set')")) == "set\n"
     timeout_result = runner_backend.execute(
         "import sys, time\n"
         "print('before timeout')\n"
         "print('stderr before timeout', file=sys.stderr)\n"
         "sys.stdout.flush(); sys.stderr.flush()\n"
-        "time.sleep(30)\n",
+        "while True:\n"
+        "    time.sleep(0.05)\n",
         timeout=0.2,
     )
-    followup = runner_backend.execute("print(survivor)")
 
     _assert_timeout_observation(timeout_result, 0.2)
-    assert str(followup) == "ok\n"
+    _assert_timeout_state(
+        timeout_result,
+        preserved=True,
+        source="live_kernel",
+        scope="full_live",
+    )
+
+
+def test_contract_timeout_ignoring_sigint_restores_pickle_snapshot_and_reports_losses(
+    runner_backend: RunnerBackend,
+) -> None:
+    _require(runner_backend, RECOVERABLE_TIMEOUT)
+    _require(runner_backend, LIVE_REPL_STATE)
+
+    assert str(runner_backend.execute(
+        "x = 7\n"
+        "data = [1, 2]\n"
+        "mapping = {'a': 3}\n"
+        "import json\n"
+        "def f():\n"
+        "    return 'lost'\n"
+        "class C:\n"
+        "    pass\n"
+        "obj = C()\n"
+        "print('set')"
+    )) == "set\n"
+    timeout_result = runner_backend.execute(
+        "import signal, sys, time\n"
+        "print('before timeout')\n"
+        "print('stderr before timeout', file=sys.stderr)\n"
+        "signal.signal(signal.SIGINT, signal.SIG_IGN)\n"
+        "x = 99\n"
+        "data.append(99)\n"
+        "hard_partial = 'lost'\n"
+        "sys.stdout.flush(); sys.stderr.flush()\n"
+        "while True:\n"
+        "    time.sleep(0.05)\n",
+        timeout=0.2,
+    )
+    followup = runner_backend.execute(
+        "print(x)\n"
+        "print(data)\n"
+        "print(mapping)\n"
+        "print('json' in globals())\n"
+        "print('f' in globals())\n"
+        "print('C' in globals())\n"
+        "print('obj' in globals())\n"
+        "print('hard_partial' in globals())\n"
+        "print('after hard timeout')"
+    )
+
+    _assert_timeout_observation(timeout_result, 0.2)
+    _assert_timeout_state(
+        timeout_result,
+        preserved=False,
+        source="pickle_snapshot",
+        scope="pickleable_globals",
+        reason_contains="SIGINT",
+    )
+    state = timeout_result.get("state") if isinstance(timeout_result, dict) else timeout_result.state
+    assert set(state["restored_globals"]) >= {"x", "data", "mapping"}
+    assert set(state["lost_globals"]) >= {"json", "f", "C", "obj"}
+    assert str(followup) == (
+        "7\n[1, 2]\n{'a': 3}\nFalse\nFalse\nFalse\nFalse\nFalse\n"
+        "after hard timeout\n"
+    )
 
 
 def test_contract_nonzero_user_subprocess_error_is_recoverable(
@@ -650,6 +844,72 @@ def test_contract_protocol_stdin_is_isolated_from_user_subprocesses(
     assert str(followup) == "123\n"
 
 
+def test_contract_successful_execute_preserves_full_live_repl_state(
+    runner_backend: RunnerBackend,
+) -> None:
+    _require(runner_backend, LIVE_REPL_STATE)
+
+    setup = runner_backend.execute(
+        "value = 41\n"
+        "import math\n"
+        "def bump(n):\n"
+        "    return n + value\n"
+        "class Counter:\n"
+        "    def __init__(self, start):\n"
+        "        self.value = start\n"
+        "    def inc(self, amount):\n"
+        "        self.value += amount\n"
+        "        return self.value\n"
+        "counter = Counter(10)\n"
+        "print('ready')"
+    )
+    followup = runner_backend.execute(
+        "value += 1\n"
+        "print(value)\n"
+        "print(math.sqrt(81))\n"
+        "print(bump(8))\n"
+        "print(isinstance(counter, Counter))\n"
+        "print(counter.inc(5))"
+    )
+
+    assert str(setup) == "ready\n"
+    assert str(followup) == "42\n9.0\n50\nTrue\n15\n"
+
+
+def test_contract_successful_execute_preserves_pydantic_model_state_when_available(
+    runner_backend: RunnerBackend,
+) -> None:
+    _require(runner_backend, LIVE_REPL_STATE)
+
+    available = runner_backend.execute(
+        "try:\n"
+        "    import pydantic\n"
+        "except ImportError:\n"
+        "    print('no')\n"
+        "else:\n"
+        "    print('yes')"
+    )
+    if str(available) != "yes\n":
+        pytest.skip(f"{runner_backend.name} Python environment does not have pydantic")
+
+    setup = runner_backend.execute(
+        "from pydantic import BaseModel\n"
+        "class Item(BaseModel):\n"
+        "    name: str\n"
+        "    count: int\n"
+        "item = Item(name='bolt', count=3)\n"
+        "print(item.model_dump()['name'])"
+    )
+    followup = runner_backend.execute(
+        "item.count += 4\n"
+        "print(isinstance(item, Item))\n"
+        "print(item.model_dump())"
+    )
+
+    assert str(setup) == "bolt\n"
+    assert str(followup) == "True\n{'name': 'bolt', 'count': 7}\n"
+
+
 def test_contract_host_tool_callback_round_trips(
     runner_backend: RunnerBackend,
 ) -> None:
@@ -661,6 +921,26 @@ def test_contract_host_tool_callback_round_trips(
     )
 
     assert str(result) == "4\n"
+
+
+def test_contract_host_tool_predict_result_object_persists_across_successful_executes(
+    runner_backend: RunnerBackend,
+) -> None:
+    _require(runner_backend, LIVE_REPL_STATE)
+    _require(runner_backend, HOST_CALLBACKS)
+
+    setup = runner_backend.execute(
+        "prediction = await predict('question -> answer', question='2+2?')\n"
+        "print(prediction.answer)"
+    )
+    followup = runner_backend.execute(
+        "print(prediction.answer)\n"
+        "print(prediction['answer'])\n"
+        "print(prediction.to_dict())"
+    )
+
+    assert str(setup) == "4\n"
+    assert str(followup) == "4\n4\n{'answer': '4'}\n"
 
 
 def test_contract_visual_data_url_path_round_trips_to_host_tool(
