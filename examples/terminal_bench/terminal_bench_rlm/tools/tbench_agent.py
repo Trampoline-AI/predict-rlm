@@ -50,6 +50,12 @@ _SECRET_PAYLOAD_KEY_PARTS = (
     "secret",
     "token",
 )
+_REMOTE_CONTROLLER_ENV_KEYS = (
+    "OPENAI_API_KEY",
+    "OPENAI_BASE_URL",
+    "OPENAI_ORG_ID",
+    "OPENAI_ORGANIZATION",
+)
 
 
 def _tool_name(tool: Callable[..., Any]) -> str:
@@ -1126,6 +1132,11 @@ class DaytonaRemotePredictRLMAgent(HarborPredictRLMAgent):
         }
         return _json_dumps_non_secret_payload(payload)
 
+    def _remote_controller_env_assignments(self) -> list[str]:
+        env = {key: os.environ[key] for key in _REMOTE_CONTROLLER_ENV_KEYS if os.environ.get(key)}
+        env.update({key: value for key, value in self.extra_env.items() if value})
+        return [f"{key}={shlex.quote(str(value))}" for key, value in sorted(env.items())]
+
     async def _run_remote_controller(self, environment: Any, payload_json: str) -> Any:
         payload_remote_path = f"{self.remote_root}/payload-{uuid.uuid4().hex}.json"
         with tempfile.NamedTemporaryFile("w", encoding="utf-8", suffix=".json", delete=False) as tmp:
@@ -1146,9 +1157,11 @@ class DaytonaRemotePredictRLMAgent(HarborPredictRLMAgent):
             ]
         )
         python = shlex.quote(f"{self.remote_root}/.venv/bin/python")
+        env_assignments = self._remote_controller_env_assignments()
         command = " ".join(
             [
                 f"HOME={shlex.quote(self.remote_home)}",
+                *env_assignments,
                 "PYTHONUNBUFFERED=1",
                 f"PYTHONPATH={shlex.quote(pythonpath)}:${{PYTHONPATH:-}}",
                 python,

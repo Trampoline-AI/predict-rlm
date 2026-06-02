@@ -489,6 +489,25 @@ def test_daytona_remote_agent_payload_is_non_secret_and_uses_remote_home(tmp_pat
     assert "HOME=/tmp/predict_rlm_home" in remote_command
     assert "PYTHONPATH=" in remote_command
     assert env.command_timeouts[remote_command_index] is None
+    assert "OPENAI_API_KEY=super-secret-token" in remote_command
+
+
+def test_daytona_remote_agent_forwards_host_openai_env(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("OPENAI_API_KEY", "host-secret-token")
+    env = FakeDaytonaRemoteEnvironment(answer="remote done")
+    context = SimpleNamespace()
+    agent = tbench_agent.DaytonaRemotePredictRLMAgent(logs_dir=tmp_path)
+
+    asyncio.run(agent.run("solve remotely", env, context))
+
+    payload_text = json.dumps(env.payloads[-1], sort_keys=True)
+    assert "host-secret-token" not in payload_text
+    remote_command = next(
+        command
+        for command in env.commands
+        if "terminal_bench_rlm.tools.remote_controller" in command
+    )
+    assert "OPENAI_API_KEY=host-secret-token" in remote_command
 
 
 def test_daytona_remote_agent_sentinel_parsing_sets_answer(tmp_path: Path) -> None:
