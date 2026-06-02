@@ -267,7 +267,7 @@ def test_config_serializes_terminal_bench_fields_for_run_metadata() -> None:
     assert payload["terminal_bench_output_dir"] == "runs/gepa-terminal-bench"
     assert payload["train_task_ids"] == ["configure-git-webserver", "extract-moves-from-video"]
     assert payload["val_task_ids"] == ["super-benchmark-upet"]
-    assert payload["max_iterations"] == 20
+    assert payload["max_iterations"] == 50
 
 
 def test_cli_accepts_harbor_backend_and_executable_args() -> None:

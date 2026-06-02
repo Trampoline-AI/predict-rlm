@@ -76,7 +76,7 @@ def default_config() -> TerminalBenchGepaConfig:
         max_metric_calls=2,
         minibatch_size=1,
         concurrency=1,
-        max_iterations=20,
+        max_iterations=50,
         task_timeout=900,
     )
 
