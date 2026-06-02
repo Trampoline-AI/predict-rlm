@@ -586,7 +586,7 @@ The REPL runs inside an async event loop — use `await` directly, not `asyncio.
 ### Execution timeouts
 For every iteration, deliberately choose `execution_timeout_seconds` for the current code block. Use `null` for ordinary short, safe blocks. Set a positive timeout when work could hang or run long: loops, scans over many files/items, network or tool fanout, batch `predict()` calls, tests/subprocesses, or data/model processing.
 
-Use lightweight caps: short probes are usually ~1-5 seconds, normal bounded work is usually ~10-60 seconds, and longer caps are only for clearly heavy bounded work. If a timeout fires, stdout/stderr printed before the timeout are preserved and the next iteration can continue. Before risky work, store important partial results in variables, using simple pickleable values so hard-kill fallback can restore them.
+Use lightweight caps: short probes are usually ~1-5 seconds, normal bounded work is usually ~10-60 seconds, and longer caps are only for clearly heavy bounded work. If a timeout fires, stdout/stderr printed before the timeout are preserved and the next iteration can continue. Before risky work, store important partial results in simple pickleable variables so hard-kill fallback can restore them.
 
 ## Managing state & output
 
