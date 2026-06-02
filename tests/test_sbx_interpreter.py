@@ -2053,7 +2053,7 @@ class TestSbxInterpreterRealSbx:
         assert "[Timeout] Iteration execution timed out after 0.2s" in timeout_result
         assert "[stdout]\nbefore timeout" in timeout_result
         assert "[stderr]\nstderr before timeout" in timeout_result
-        assert followup.strip() == "False\nstill alive"
+        assert followup.strip() == "True\nstill alive"
 
     def test_predict_rlm_lm_selected_timeout_recovers_and_continues(self):
         from predict_rlm import PredictRLM

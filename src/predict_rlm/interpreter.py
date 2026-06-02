@@ -20,7 +20,6 @@ import inspect
 import json
 import logging
 import os
-import re
 import select
 import shutil
 import tempfile
@@ -32,6 +31,7 @@ from dspy.primitives.code_interpreter import CodeInterpreterError, FinalOutput
 from dspy.primitives.python_interpreter import PythonInterpreter
 from pydantic import BaseModel
 
+from predict_rlm._shared import strip_code_fences
 from predict_rlm.execution_timeout import (
     ITERATION_TIMEOUT_FAILURE_CLASS,
     RecoverableExecutionTimeout,
@@ -810,22 +810,7 @@ class JspiInterpreter(PythonInterpreter):
         self.deno_process.stdin.flush()
 
     def _strip_code_fences(self, code: str) -> str:
-        """Extract code from markdown fences.
-
-        The closing ``` must be on its own line (^```$) to handle:
-        1. Code containing inline ``` (like in strings) - not on own line, won't match
-        2. Double fences from model (```...```\\n```) - stops at first proper close
-
-        Supports multiple fenced blocks - all blocks are concatenated with newlines.
-        """
-        matches = re.findall(
-            r"```(?:python|py|repl)?\s*\n(.*?)^```\s*$", code, re.DOTALL | re.MULTILINE
-        )
-        if matches:
-            return "\n\n".join(block.rstrip() for block in matches)
-
-        # No fences found, return as-is
-        return code
+        return strip_code_fences(code)
 
     def _to_python(self, value: Any) -> Any:
         """Recursively convert Pydantic models to plain Python dicts."""
