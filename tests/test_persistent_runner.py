@@ -149,6 +149,22 @@ def test_persistent_client_discards_stale_response_then_returns_fresh() -> None:
     assert client.execute("print('fresh')") == "fresh"
 
 
+def test_persistent_client_discards_stale_error_then_returns_fresh() -> None:
+    process = FakeProcess(
+        [
+            {
+                "jsonrpc": "2.0",
+                "id": 99,
+                "error": {"code": -32000, "message": "late failure"},
+            },
+            {"jsonrpc": "2.0", "id": 1, "result": {"output": "fresh"}},
+        ]
+    )
+    client = FakeClient([process])
+
+    assert client.execute("print('fresh')") == "fresh"
+
+
 def test_persistent_client_exhausted_stale_resync_raises_cleanly() -> None:
     process = FakeProcess(
         [
