@@ -34,6 +34,7 @@ def _make_lm() -> MagicMock:
     lm = MagicMock(spec=dspy.LM)
     lm.history = []
     lm.model = "mock-lm"
+    lm.kwargs = {}
     return lm
 
 
@@ -72,12 +73,27 @@ def _build_rlm(**kwargs) -> PredictRLM:
     return rlm
 
 
+def _mock_action_accounting(rlm: PredictRLM, returns: list):
+    iterator = iter(returns)
+
+    def next_value(*_, **__):
+        rlm._last_action_lm_metadata = None
+        rlm._last_action_lm_history = [{"usage": {}, "cost": 0.0}]
+        value = next(iterator)
+        if isinstance(value, BaseException):
+            raise value
+        return value
+
+    return next_value
+
+
 def _drive_sync(rlm: PredictRLM, iteration_returns: list, fallback: dspy.Prediction | None = None):
     """Run rlm(...) with patched _execute_iteration returning the
     given sequence of values. ``fallback`` is used by _extract_fallback if
     we exhaust max_iterations without a final Prediction."""
     fallback = fallback or _final_prediction(answer="fallback")
-    with patch.object(rlm, "_execute_iteration", side_effect=iteration_returns), \
+    side_effect = _mock_action_accounting(rlm, iteration_returns)
+    with patch.object(rlm, "_execute_iteration", side_effect=side_effect), \
          patch.object(rlm, "_extract_fallback", return_value=fallback), \
          dspy.context(lm=_make_lm()):
         return rlm(query="hi")
@@ -85,7 +101,8 @@ def _drive_sync(rlm: PredictRLM, iteration_returns: list, fallback: dspy.Predict
 
 async def _drive_async(rlm: PredictRLM, iteration_returns: list, fallback: dspy.Prediction | None = None):
     fallback = fallback or _final_prediction(answer="fallback")
-    aexec = AsyncMock(side_effect=iteration_returns)
+    side_effect = _mock_action_accounting(rlm, iteration_returns)
+    aexec = AsyncMock(side_effect=side_effect)
     aextract = AsyncMock(return_value=fallback)
     with patch.object(rlm, "_aexecute_iteration", aexec), \
          patch.object(rlm, "_aextract_fallback", aextract), \
@@ -363,11 +380,16 @@ class TestCallbacksIntegration:
             )
             rlm.callbacks = [cb]
 
-            scripted = [
+            scripted = iter([
                 dspy.Prediction(reasoning="probe", code="print('hello-from-sandbox')"),
                 dspy.Prediction(reasoning="finish", code="SUBMIT(answer='42')"),
-            ]
-            rlm.generate_action = MagicMock(side_effect=scripted)
+            ])
+
+            def generate_action(*_, **__):
+                dspy.settings.lm.history.append({"usage": {}, "cost": 0.0})
+                return next(scripted)
+
+            rlm.generate_action = MagicMock(side_effect=generate_action)
 
             with dspy.context(lm=_make_lm()):
                 result = rlm(query="anything")
