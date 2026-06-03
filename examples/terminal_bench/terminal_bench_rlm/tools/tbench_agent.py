@@ -779,32 +779,24 @@ class DaytonaRemotePredictRLMAgent(HarborPredictRLMBaseAgent):
         )
         _raise_for_remote_failure(result, "unpacking the remote controller bundle")
         extra = "[codex-lm]" if self.codex_lm else ""
-        install_target = shlex.quote(f"{self.remote_root}/repo{extra}")
-        venv_python = shlex.quote(f"{self.remote_root}/.venv/bin/python")
-        uv_bootstrap = shlex.quote(f"{self.remote_root}/uv-bootstrap")
+        bootstrap_script = shlex.quote(
+            f"{self.remote_root}/repo/src/predict_rlm/remote/bootstrap_controller.sh"
+        )
+        bootstrap_args = [
+            f"sh {bootstrap_script}",
+            f"--root {shlex.quote(self.remote_root)}",
+            f"--repo {shlex.quote(f'{self.remote_root}/repo')}",
+        ]
+        if extra:
+            bootstrap_args.append(f"--extra {shlex.quote(extra)}")
+        bootstrap_args.append("--python 3.12")
         setup_command = " ".join(
             [
                 f"HOME={home}",
                 "PATH=\"$HOME/.local/bin:$PATH\"",
                 "sh",
                 "-lc",
-                shlex.quote(
-                    "if ! command -v python3 >/dev/null 2>&1; then "
-                    "if command -v apt-get >/dev/null 2>&1; then "
-                    "apt-get update && DEBIAN_FRONTEND=noninteractive "
-                    "apt-get install -y python3 python3-pip python3-venv; "
-                    "elif command -v apk >/dev/null 2>&1; then "
-                    "apk add --no-cache python3 py3-pip; "
-                    "else echo 'python3 not found and no supported package manager available' >&2; "
-                    "exit 127; fi; fi; "
-                    "if ! command -v uv >/dev/null 2>&1; then "
-                    f"python3 -m venv {uv_bootstrap} && "
-                    f"{uv_bootstrap}/bin/python -m pip install --disable-pip-version-check uv && "
-                    f"UV_COMMAND='{uv_bootstrap}/bin/python -m uv'; "
-                    "else UV_COMMAND='uv'; fi; "
-                    f"$UV_COMMAND venv --seed --python 3.12 {shlex.quote(f'{self.remote_root}/.venv')} && "
-                    f"{venv_python} -m pip install --disable-pip-version-check -e {install_target}"
-                ),
+                shlex.quote(" ".join(bootstrap_args)),
             ]
         )
         result = await _remote_exec(environment, setup_command, timeout=900)

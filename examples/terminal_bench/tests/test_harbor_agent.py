@@ -4,6 +4,7 @@ import asyncio
 import inspect
 import json
 import logging
+import shlex
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -15,6 +16,10 @@ if str(_EXAMPLE_DIR) not in sys.path:
     sys.path.insert(0, str(_EXAMPLE_DIR))
 
 from terminal_bench_rlm.tools import remote_controller, tbench_agent  # noqa: E402
+
+
+def _bootstrap_command_args(command: str) -> list[str]:
+    return shlex.split(shlex.split(command)[-1])
 
 
 def test_daytona_remote_agent_constructor_has_no_interpreter_mode_parameter() -> None:
@@ -186,18 +191,27 @@ def test_daytona_remote_agent_streams_remote_debug_logs(tmp_path: Path, capsys) 
     assert "remote debug line" in capsys.readouterr().out
 
 
-def test_daytona_remote_agent_bootstrap_installs_python_before_uv(tmp_path: Path) -> None:
+def test_daytona_remote_agent_bootstrap_invokes_packaged_script(tmp_path: Path) -> None:
     env = FakeDaytonaRemoteEnvironment(answer="remote done")
     agent = tbench_agent.DaytonaRemotePredictRLMAgent(logs_dir=tmp_path)
 
     asyncio.run(agent.setup(env))
 
-    setup_command = next(command for command in env.commands if "$UV_COMMAND venv" in command)
-    assert "apt-get install -y python3 python3-pip python3-venv" in setup_command
-    assert "apk add --no-cache python3 py3-pip" in setup_command
-    assert "python3 -m venv /tmp/predict_rlm_controller/uv-bootstrap" in setup_command
-    assert "/tmp/predict_rlm_controller/uv-bootstrap/bin/python -m pip install" in setup_command
-    assert setup_command.index("command -v python3") < setup_command.index("python3 -m venv")
+    setup_command = next(command for command in env.commands if "bootstrap_controller.sh" in command)
+    bootstrap_args = _bootstrap_command_args(setup_command)
+    assert bootstrap_args == [
+        "sh",
+        "/tmp/predict_rlm_controller/repo/src/predict_rlm/remote/bootstrap_controller.sh",
+        "--root",
+        "/tmp/predict_rlm_controller",
+        "--repo",
+        "/tmp/predict_rlm_controller/repo",
+        "--python",
+        "3.12",
+    ]
+    assert "apt-get install -y python3 python3-pip python3-venv" not in setup_command
+    assert "apk add --no-cache python3 py3-pip" not in setup_command
+    assert "python3 -m venv /tmp/predict_rlm_controller/uv-bootstrap" not in setup_command
 
 
 def test_daytona_remote_agent_codex_lm_uploads_opaque_auth_dir(
@@ -219,6 +233,9 @@ def test_daytona_remote_agent_codex_lm_uploads_opaque_auth_dir(
     asyncio.run(agent.setup(env))
     asyncio.run(agent.run("solve remotely", env, context))
 
+    setup_command = next(command for command in env.commands if "bootstrap_controller.sh" in command)
+    bootstrap_args = _bootstrap_command_args(setup_command)
+    assert bootstrap_args[bootstrap_args.index("--extra") + 1] == "[codex-lm]"
     assert context.answer == "codex answer"
     assert env.upload_dirs == [
         (str(credentials_dir), "/tmp/predict_rlm_home/.codex-lm"),
