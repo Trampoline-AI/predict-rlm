@@ -78,7 +78,10 @@ class SbxInterpreter(PredictRLMInterpreter):
         self.skill_packages = skill_packages or []
         self.debug = debug
         self.verbose = verbose
-        configure_predict_rlm_logging(debug=debug, verbose=verbose)
+        configure_predict_rlm_logging(
+            debug=True if debug else None,
+            verbose=True if verbose else None,
+        )
         self.extra_read_paths = extra_read_paths or []
         self.extra_write_paths = extra_write_paths or []
         self._runner_command = _runner_command

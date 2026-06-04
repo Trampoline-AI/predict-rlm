@@ -50,7 +50,10 @@ class SbxPool:
         )
         self.debug = debug
         self.verbose = verbose
-        configure_predict_rlm_logging(debug=debug, verbose=verbose)
+        configure_predict_rlm_logging(
+            debug=True if debug else None,
+            verbose=True if verbose else None,
+        )
         self._interpreter_kwargs = {
             "config": self.config,
             "allowed_domains": allowed_domains,

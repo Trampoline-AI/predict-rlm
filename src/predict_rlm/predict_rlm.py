@@ -908,7 +908,10 @@ class PredictRLM(dspy.RLM):
         # Store allowed_domains, debug, and output_dir for interpreter creation
         self._allowed_domains = allowed_domains
         self._debug = debug
-        configure_predict_rlm_logging(debug=debug, verbose=verbose)
+        configure_predict_rlm_logging(
+            debug=True if debug else None,
+            verbose=True if verbose else None,
+        )
         self._output_dir = str(output_dir) if output_dir else None
         self._telemetry_context = telemetry_context
         self._current_telemetry_context: TelemetryContext | None = None

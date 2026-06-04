@@ -7,6 +7,7 @@ import logging
 import sys
 from contextlib import contextmanager
 from contextvars import ContextVar
+from dataclasses import dataclass
 from typing import Any
 
 PACKAGE_LOGGER_NAME = "predict_rlm"
@@ -28,41 +29,110 @@ _suppress_interpreter_result_logging: ContextVar[bool] = ContextVar(
     "_suppress_interpreter_result_logging", default=False
 )
 _trace_logger = logging.getLogger(TRACE_LOGGER_NAME)
-_trace_logger.propagate = False
 
 
-def configure_predict_rlm_logging(*, debug: bool = False, verbose: bool = False) -> None:
+@dataclass(frozen=True)
+class _LoggerState:
+    level: int
+    propagate: bool
+    disabled: bool
+
+
+_debug_logger_state: _LoggerState | None = None
+_trace_logger_state: _LoggerState | None = None
+
+
+def configure_predict_rlm_logging(
+    *,
+    debug: bool | None = None,
+    verbose: bool | None = None,
+) -> None:
     """Make predict-rlm debug/trace logs visible without touching root logging."""
-    if not debug and not verbose:
-        return
+    if debug is not None:
+        _configure_debug_logging(debug)
+    if verbose is not None:
+        _configure_trace_logging(verbose)
+
+
+def _configure_debug_logging(enabled: bool) -> None:
+    global _debug_logger_state
 
     package_logger = logging.getLogger(PACKAGE_LOGGER_NAME)
-    if debug:
-        package_logger.setLevel(logging.DEBUG)
-        if _has_marked_handler(package_logger, DEBUG_HANDLER_MARKER) or not (
-            package_logger.hasHandlers()
-        ):
-            _ensure_marked_stream_handler(
+    if not enabled:
+        if _debug_logger_state is not None:
+            _restore_logger_state(
                 package_logger,
-                DEBUG_HANDLER_MARKER,
-                _PredictRLMDebugFormatter(
-                    "%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-                    datefmt="%H:%M:%S",
-                ),
+                _debug_logger_state,
+                marker=DEBUG_HANDLER_MARKER,
             )
+            _debug_logger_state = None
+        return
 
-    if verbose:
-        _trace_logger.setLevel(logging.INFO)
-        _trace_logger.propagate = False
-        if not _trace_logger.handlers or _has_marked_handler(
+    if _debug_logger_state is None:
+        _debug_logger_state = _capture_logger_state(package_logger)
+    package_logger.setLevel(logging.DEBUG)
+    if _has_marked_handler(package_logger, DEBUG_HANDLER_MARKER) or not (
+        package_logger.hasHandlers()
+    ):
+        _ensure_marked_stream_handler(
+            package_logger,
+            DEBUG_HANDLER_MARKER,
+            _PredictRLMDebugFormatter(
+                "%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+                datefmt="%H:%M:%S",
+            ),
+        )
+
+
+def _configure_trace_logging(enabled: bool) -> None:
+    global _trace_logger_state
+
+    if not enabled:
+        if _trace_logger_state is not None:
+            _restore_logger_state(
+                _trace_logger,
+                _trace_logger_state,
+                marker=TRACE_HANDLER_MARKER,
+            )
+            _trace_logger_state = None
+        return
+
+    if _trace_logger_state is None:
+        _trace_logger_state = _capture_logger_state(_trace_logger)
+    _trace_logger.setLevel(logging.INFO)
+    _trace_logger.propagate = False
+    if not _trace_logger.handlers or _has_marked_handler(
+        _trace_logger,
+        TRACE_HANDLER_MARKER,
+    ):
+        _ensure_marked_stream_handler(
             _trace_logger,
             TRACE_HANDLER_MARKER,
-        ):
-            _ensure_marked_stream_handler(
-                _trace_logger,
-                TRACE_HANDLER_MARKER,
-                logging.Formatter("%(message)s"),
-            )
+            logging.Formatter("%(message)s"),
+        )
+
+
+def _capture_logger_state(logger: logging.Logger) -> _LoggerState:
+    return _LoggerState(
+        level=logger.level,
+        propagate=logger.propagate,
+        disabled=logger.disabled,
+    )
+
+
+def _restore_logger_state(
+    logger: logging.Logger,
+    state: _LoggerState,
+    *,
+    marker: str,
+) -> None:
+    logger.setLevel(state.level)
+    logger.propagate = state.propagate
+    logger.disabled = state.disabled
+    for handler in list(logger.handlers):
+        if getattr(handler, marker, False):
+            logger.removeHandler(handler)
+            handler.close()
 
 
 def _has_marked_handler(logger: logging.Logger, marker: str) -> bool:

@@ -1,6 +1,31 @@
 import logging
 
-from predict_rlm._logging import _PredictRLMDebugFormatter
+import predict_rlm._logging as logging_module
+from predict_rlm._logging import (
+    DEBUG_HANDLER_MARKER,
+    PACKAGE_LOGGER_NAME,
+    TRACE_HANDLER_MARKER,
+    TRACE_LOGGER_NAME,
+    _PredictRLMDebugFormatter,
+    configure_predict_rlm_logging,
+)
+
+
+def _snapshot_logger(logger: logging.Logger):
+    return (
+        logger.level,
+        logger.propagate,
+        logger.disabled,
+        list(logger.handlers),
+    )
+
+
+def _restore_logger(logger: logging.Logger, state) -> None:
+    level, propagate, disabled, handlers = state
+    logger.setLevel(level)
+    logger.propagate = propagate
+    logger.disabled = disabled
+    logger.handlers[:] = handlers
 
 
 def _format_debug_message(message: str) -> str:
@@ -35,3 +60,62 @@ def test_debug_formatter_leaves_non_error_records_plain():
     formatted = _format_debug_message("rlm.execute.ok duration_ms=12")
 
     assert formatted == "DEBUG:rlm.execute.ok duration_ms=12"
+
+
+def test_debug_logging_can_restore_prior_logger_state():
+    logger = logging.getLogger(PACKAGE_LOGGER_NAME)
+    original_logger = _snapshot_logger(logger)
+    original_module_state = logging_module._debug_logger_state
+    try:
+        logging_module._debug_logger_state = None
+        logger.handlers[:] = []
+        logger.setLevel(logging.WARNING)
+        logger.propagate = False
+        logger.disabled = False
+
+        configure_predict_rlm_logging(debug=True)
+
+        assert logger.level == logging.DEBUG
+        assert any(getattr(handler, DEBUG_HANDLER_MARKER, False) for handler in logger.handlers)
+
+        configure_predict_rlm_logging(debug=False)
+
+        assert logger.level == logging.WARNING
+        assert logger.propagate is False
+        assert logger.disabled is False
+        assert not any(
+            getattr(handler, DEBUG_HANDLER_MARKER, False) for handler in logger.handlers
+        )
+    finally:
+        logging_module._debug_logger_state = original_module_state
+        _restore_logger(logger, original_logger)
+
+
+def test_verbose_logging_can_restore_prior_trace_logger_state():
+    logger = logging.getLogger(TRACE_LOGGER_NAME)
+    original_logger = _snapshot_logger(logger)
+    original_module_state = logging_module._trace_logger_state
+    try:
+        logging_module._trace_logger_state = None
+        logger.handlers[:] = []
+        logger.setLevel(logging.WARNING)
+        logger.propagate = True
+        logger.disabled = False
+
+        configure_predict_rlm_logging(verbose=True)
+
+        assert logger.level == logging.INFO
+        assert logger.propagate is False
+        assert any(getattr(handler, TRACE_HANDLER_MARKER, False) for handler in logger.handlers)
+
+        configure_predict_rlm_logging(verbose=False)
+
+        assert logger.level == logging.WARNING
+        assert logger.propagate is True
+        assert logger.disabled is False
+        assert not any(
+            getattr(handler, TRACE_HANDLER_MARKER, False) for handler in logger.handlers
+        )
+    finally:
+        logging_module._trace_logger_state = original_module_state
+        _restore_logger(logger, original_logger)

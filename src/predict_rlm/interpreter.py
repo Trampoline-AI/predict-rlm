@@ -313,7 +313,10 @@ class JspiInterpreter(PythonInterpreter):
 
         self._debug = debug
         self._verbose = verbose
-        configure_predict_rlm_logging(debug=debug, verbose=verbose)
+        configure_predict_rlm_logging(
+            debug=True if debug else None,
+            verbose=True if verbose else None,
+        )
 
         # Merge extra paths into Deno permissions (but NOT into parent's
         # enable_read_paths/enable_write_paths which trigger auto-mount/sync)
