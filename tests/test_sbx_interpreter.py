@@ -987,6 +987,76 @@ class TestSbxPool:
         finally:
             pool.shutdown()
 
+    def test_lease_logging_overrides_do_not_reconfigure_pool(
+        self, tmp_path: Path, monkeypatch
+    ):
+        pool = SbxPool(
+            size=2,
+            config=SbxConfig(name="pool-test"),
+            preinstall_packages=False,
+            _staging_root=tmp_path / "pool",
+        )
+        created = []
+
+        class FakeInterpreter:
+            def __init__(self, index: int) -> None:
+                self.index = index
+                self.configure_debug_calls: list[bool] = []
+                self.configure_verbose_calls: list[bool] = []
+                self.runtime_calls: list[dict] = []
+
+            def prewarm(self) -> None:
+                return None
+
+            def configure_debug(self, enabled: bool) -> None:
+                self.configure_debug_calls.append(enabled)
+
+            def configure_verbose(self, enabled: bool) -> None:
+                self.configure_verbose_calls.append(enabled)
+
+            def configure_runtime(self, **kwargs) -> None:
+                self.runtime_calls.append(kwargs)
+
+            def reset(self) -> None:
+                return None
+
+            def shutdown(self) -> None:
+                return None
+
+        def create_interpreter(index: int) -> FakeInterpreter:
+            interpreter = FakeInterpreter(index)
+            created.append(interpreter)
+            return interpreter
+
+        monkeypatch.setattr(pool, "_create_interpreter", create_interpreter)
+
+        try:
+            pool.start()
+
+            with pool.lease(debug=True, verbose=True) as interpreter:
+                assert interpreter is created[0]
+
+            assert created[0].runtime_calls[-1]["debug"] is True
+            assert created[0].runtime_calls[-1]["verbose"] is True
+            assert created[0].configure_debug_calls == []
+            assert created[0].configure_verbose_calls == []
+            assert created[1].configure_debug_calls == []
+            assert created[1].configure_verbose_calls == []
+            assert pool.debug is False
+            assert pool.verbose is False
+            assert pool._interpreter_kwargs["debug"] is False
+            assert pool._interpreter_kwargs["verbose"] is False
+
+            with pool.lease() as interpreter:
+                assert interpreter is created[1]
+            with pool.lease() as interpreter:
+                assert interpreter is created[0]
+
+            assert created[0].runtime_calls[-1]["debug"] is False
+            assert created[0].runtime_calls[-1]["verbose"] is False
+        finally:
+            pool.shutdown()
+
     def test_start_failure_shuts_down_created_interpreters_and_leaves_pool_stopped(
         self, tmp_path: Path, monkeypatch
     ):

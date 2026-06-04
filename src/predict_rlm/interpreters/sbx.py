@@ -1007,10 +1007,8 @@ class SbxPool:
         debug: bool | None = None,
         verbose: bool | None = None,
     ):
-        if debug is not None:
-            self.configure_debug(debug)
-        if verbose is not None:
-            self.configure_verbose(verbose)
+        effective_debug = self.debug if debug is None else debug
+        effective_verbose = self.verbose if verbose is None else verbose
         self._ensure_started_for_lease()
         lease_start = time.perf_counter()
         self._log_lifecycle("sbx.pool.lease.wait")
@@ -1024,8 +1022,8 @@ class SbxPool:
             interpreter.configure_runtime(
                 tools=tools,
                 output_fields=output_fields,
-                debug=debug,
-                verbose=verbose,
+                debug=effective_debug,
+                verbose=effective_verbose,
             )
             yield interpreter
         finally:
