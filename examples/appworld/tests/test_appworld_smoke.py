@@ -26,6 +26,7 @@ from appworld_rlm.gepa import cli as gepa_cli
 from appworld_rlm.gepa import project as gepa_project_module
 from appworld_rlm.gepa.config import APPWORLD_SPEC, AppWorldGepaConfig, default_config
 from appworld_rlm.gepa.project import COMPONENT_SKILL, AppWorldGepaProject, score_runner_result
+from appworld_rlm.tools import runner as runner_module
 from appworld_rlm.tools.appworld_worker import (
     JsonlAppWorldWorker,
     _appworld_root_from_data_root,
@@ -320,13 +321,29 @@ def test_default_appworld_python_prefers_local_runtime(tmp_path, monkeypatch):
     assert _default_appworld_python() == str(appworld_python)
 
 
-def test_default_appworld_python_finds_example_runtime_from_repo_root(tmp_path, monkeypatch):
+def test_default_appworld_python_finds_file_relative_example_runtime(tmp_path, monkeypatch):
+    example_root = tmp_path / "pkg" / "examples" / "appworld"
+    appworld_python = example_root / ".appworld-venv" / "bin" / "python"
+    appworld_python.parent.mkdir(parents=True)
+    appworld_python.write_text("")
+    module_file = example_root / "appworld_rlm" / "tools" / "runner.py"
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(runner_module, "__file__", str(module_file))
+
+    assert _default_appworld_python() == str(appworld_python)
+
+
+def test_default_appworld_python_ignores_repo_root_example_runtime(tmp_path, monkeypatch):
     appworld_python = tmp_path / "examples" / "appworld" / ".appworld-venv" / "bin" / "python"
     appworld_python.parent.mkdir(parents=True)
     appworld_python.write_text("")
+    fallback_python = tmp_path / "fallback" / "python"
+    module_file = tmp_path / "pkg" / "examples" / "appworld" / "appworld_rlm" / "tools" / "runner.py"
     monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(runner_module, "__file__", str(module_file))
+    monkeypatch.setattr(runner_module.sys, "executable", str(fallback_python))
 
-    assert _default_appworld_python() == str(appworld_python)
+    assert _default_appworld_python() == str(fallback_python)
 
 
 def test_session_client_call_api_rejects_non_object_kwargs():

@@ -235,9 +235,10 @@ class AppWorldSessionClient:
 
 
 def _default_appworld_python() -> str:
+    example_root = Path(__file__).parents[2]
     for appworld_python in (
         Path.cwd() / ".appworld-venv" / "bin" / "python",
-        Path.cwd() / "examples" / "appworld" / ".appworld-venv" / "bin" / "python",
+        example_root / ".appworld-venv" / "bin" / "python",
     ):
         if appworld_python.is_file():
             # Do not resolve the venv interpreter symlink: on macOS/uv venvs the
