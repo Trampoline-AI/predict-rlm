@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import concurrent.futures
-import logging
 import queue
 import threading
 import time
@@ -12,15 +11,14 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable
 
-from predict_rlm._logging import configure_predict_rlm_logging, format_log_fields
+from predict_rlm._logging import configure_predict_rlm_logging
 from predict_rlm.trace import ms_since
 
 from .base import SbxConfig
+from .sbx_logging import log_pool_lifecycle
 
 if TYPE_CHECKING:
     from .sbx import SbxInterpreter
-
-logger = logging.getLogger("predict_rlm.interpreters.sbx")
 
 
 class SbxPool:
@@ -100,19 +98,12 @@ class SbxPool:
                 configure(enabled)
 
     def _log_lifecycle(self, event: str, **fields: Any) -> None:
-        if not self.debug:
-            return
-        logger.debug(
-            "%s%s",
-            event,
-            format_log_fields(
-                {
-                    "backend": "sbx",
-                    "pool": self._pool_name_prefix,
-                    "pool_size": self.size,
-                    **fields,
-                }
-            ),
+        log_pool_lifecycle(
+            enabled=self.debug,
+            event=event,
+            pool_name=self._pool_name_prefix,
+            pool_size=self.size,
+            **fields,
         )
 
     def __enter__(self) -> SbxPool:

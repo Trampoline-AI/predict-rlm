@@ -7,7 +7,6 @@ import concurrent.futures
 import contextvars
 import inspect
 import json
-import logging
 import os
 import queue
 import shutil
@@ -26,7 +25,6 @@ from predict_rlm._logging import (
     emit_trace_error,
     emit_trace_result,
     emit_trace_tool_call,
-    format_log_fields,
     interpreter_result_logging_enabled,
     live_tool_call_logging_enabled,
 )
@@ -41,12 +39,12 @@ from .base import (
     SandboxExecutionError,
     SbxConfig,
 )
+from .sbx_logging import log_interpreter_lifecycle, log_partial_output
 from .sbx_pool import SbxPool as SbxPool
 
 RUNNER_PATH = Path(__file__).parents[1] / "sandbox" / "python_runner.py"
 DEFAULT_PACKAGE_DOMAINS = ["pypi.org", "files.pythonhosted.org"]
 SBX_PYTHON_EXECUTABLE = "python3"
-logger = logging.getLogger(__name__)
 
 
 class SbxInterpreter(PredictRLMInterpreter):
@@ -113,40 +111,25 @@ class SbxInterpreter(PredictRLMInterpreter):
         configure_predict_rlm_logging(verbose=enabled)
 
     def _log_lifecycle(self, event: str, **fields: Any) -> None:
-        if not getattr(self, "debug", False):
-            return
         process_pid = getattr(self._proc, "pid", None) if self._proc else None
-        logger.debug(
-            "%s%s",
-            event,
-            format_log_fields(
-                {
-                    "backend": "sbx",
-                    "sandbox_name": getattr(self, "_sandbox_name", None),
-                    "process_pid": process_pid,
-                    "staging_root": str(getattr(self, "_staging_root", "")) or None,
-                    **fields,
-                }
-            ),
+        log_interpreter_lifecycle(
+            enabled=getattr(self, "debug", False),
+            event=event,
+            sandbox_name=getattr(self, "_sandbox_name", None),
+            process_pid=process_pid,
+            staging_root=getattr(self, "_staging_root", None),
+            **fields,
         )
 
     def _log_partial_output(self, output: str, **fields: Any) -> None:
-        if not getattr(self, "debug", False) or not output:
-            return
         process_pid = getattr(self._proc, "pid", None) if self._proc else None
-        logger.debug(
-            "sandbox.partial_output%s\n%s",
-            format_log_fields(
-                {
-                    "backend": "sbx",
-                    "sandbox_name": getattr(self, "_sandbox_name", None),
-                    "process_pid": process_pid,
-                    "staging_root": str(getattr(self, "_staging_root", "")) or None,
-                    "chars": len(output),
-                    **fields,
-                }
-            ),
-            output.rstrip(),
+        log_partial_output(
+            enabled=getattr(self, "debug", False),
+            output=output,
+            sandbox_name=getattr(self, "_sandbox_name", None),
+            process_pid=process_pid,
+            staging_root=getattr(self, "_staging_root", None),
+            **fields,
         )
 
     def execute(self, code: str, variables: dict[str, Any] | None = None) -> Any:
