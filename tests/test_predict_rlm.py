@@ -196,6 +196,36 @@ class TestSandboxBackendSelection:
         assert interpreter.runtime_kwargs == {"debug": True, "verbose": True}
         interpreter.shutdown.assert_not_called()
 
+    def test_injected_interpreter_logging_does_not_mutate_ad_hoc_attrs(self):
+        class Interpreter:
+            def __init__(self) -> None:
+                self.tools = {}
+                self.output_fields = []
+                self.debug = False
+                self._debug = False
+                self.verbose = False
+                self._verbose = False
+                self.shutdown = MagicMock()
+
+        interpreter = Interpreter()
+        rlm = PredictRLM(
+            ImageAnalysisSignature,
+            sub_lm=MagicMock(),
+            max_iterations=1,
+            interpreter=interpreter,
+            debug=True,
+            verbose=True,
+        )
+
+        with rlm._interpreter_context(execution_tools={"predict": MagicMock()}) as repl:
+            assert repl is interpreter
+
+        assert interpreter.debug is False
+        assert interpreter._debug is False
+        assert interpreter.verbose is False
+        assert interpreter._verbose is False
+        interpreter.shutdown.assert_not_called()
+
     def test_sbx_pool_requires_sbx_backend(self):
         with pytest.raises(ValueError, match="sbx_pool.*sandbox_backend='sbx'"):
             PredictRLM(

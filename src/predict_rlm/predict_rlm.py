@@ -22,8 +22,10 @@ from typing import (
     List,
     Literal,
     Optional,
+    Protocol,
     get_args,
     get_origin,
+    runtime_checkable,
 )
 
 import dspy
@@ -122,6 +124,26 @@ def _to_json_safe(value: Any) -> Any:
     if isinstance(value, (list, tuple, set)):
         return [_to_json_safe(v) for v in value]
     return value
+
+
+@runtime_checkable
+class RuntimeLoggingConfigurable(Protocol):
+    def configure_runtime(
+        self,
+        *,
+        debug: bool | None = None,
+        verbose: bool | None = None,
+    ) -> Any: ...
+
+
+@runtime_checkable
+class DebugLoggingConfigurable(Protocol):
+    def configure_debug(self, enabled: bool) -> Any: ...
+
+
+@runtime_checkable
+class VerboseLoggingConfigurable(Protocol):
+    def configure_verbose(self, enabled: bool) -> Any: ...
 
 
 def _strip_code_fences(code: str) -> str:
@@ -1596,64 +1618,26 @@ class PredictRLM(dspy.RLM):
         configured = {"debug": False, "verbose": False}
         debug_enabled = self._debug_logging_enabled()
         verbose_enabled = self._iteration_logging_enabled()
-        runtime = self._declared_callable(repl, "configure_runtime")
-        if runtime is not None:
+        if isinstance(repl, RuntimeLoggingConfigurable):
             kwargs = self._accepted_kwargs(
-                runtime,
+                repl.configure_runtime,
                 debug=debug_enabled,
                 verbose=verbose_enabled,
             )
             if kwargs:
-                runtime(**kwargs)
+                repl.configure_runtime(**kwargs)
                 configured["debug"] = "debug" in kwargs
                 configured["verbose"] = "verbose" in kwargs
 
-        if not configured["debug"]:
-            configure_debug = self._declared_callable(repl, "configure_debug")
-            if configure_debug is not None:
-                configure_debug(debug_enabled)
-                configured["debug"] = True
-            elif self._set_declared_attr(repl, "debug", debug_enabled):
-                configured["debug"] = True
-            elif self._set_declared_attr(repl, "_debug", debug_enabled):
-                configured["debug"] = True
+        if not configured["debug"] and isinstance(repl, DebugLoggingConfigurable):
+            repl.configure_debug(debug_enabled)
+            configured["debug"] = True
 
-        if not configured["verbose"]:
-            configure_verbose = self._declared_callable(repl, "configure_verbose")
-            if configure_verbose is not None:
-                configure_verbose(verbose_enabled)
-                configured["verbose"] = True
-            elif self._set_declared_attr(repl, "verbose", verbose_enabled):
-                configured["verbose"] = True
-            elif self._set_declared_attr(repl, "_verbose", verbose_enabled):
-                configured["verbose"] = True
+        if not configured["verbose"] and isinstance(repl, VerboseLoggingConfigurable):
+            repl.configure_verbose(verbose_enabled)
+            configured["verbose"] = True
 
         return configured
-
-    def _declared_callable(self, obj: Any, name: str) -> Callable[..., Any] | None:
-        if not self._declares_member(obj, name):
-            return None
-        value = getattr(obj, name, None)
-        return value if callable(value) else None
-
-    def _declares_member(self, obj: Any, name: str) -> bool:
-        if name in getattr(obj, "__dict__", {}):
-            return True
-        for cls in type(obj).__mro__:
-            if name in vars(cls):
-                return True
-            slots = vars(cls).get("__slots__", ())
-            if isinstance(slots, str):
-                slots = (slots,)
-            if name in slots:
-                return True
-        return False
-
-    def _set_declared_attr(self, obj: Any, name: str, value: Any) -> bool:
-        if not self._declares_member(obj, name):
-            return False
-        setattr(obj, name, value)
-        return True
 
     def _accepted_kwargs(self, func: Callable[..., Any], **kwargs: Any) -> dict[str, Any]:
         try:
