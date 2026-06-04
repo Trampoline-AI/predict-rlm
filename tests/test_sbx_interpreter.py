@@ -540,6 +540,17 @@ class TestPythonRunnerProtocol:
         assert events[2]["args"][0] >= 3
         assert events[3]["args"][0][0] == sys.executable
 
+    def test_runtime_hooks_do_not_emit_internal_capture_file_events(self, runner: LocalRunner):
+        runner.request(
+            "register_runtime_hooks",
+            {"hooks": [{"target": "os.open", "phases": ["before"]}]},
+        )
+
+        execute = runner.request("execute", {"code": "print('user output')"})
+
+        assert "method" not in execute
+        assert execute["result"]["output"] == "user output\n"
+
     def test_runtime_hooks_emit_error_events(self, runner: LocalRunner):
         runner.request(
             "register_runtime_hooks",

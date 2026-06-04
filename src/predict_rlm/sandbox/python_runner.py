@@ -944,8 +944,13 @@ async def _execute_code_to_capture_files(
     stdout_path: str,
     stderr_path: str,
 ) -> dict[str, Any]:
+    global RUNTIME_HOOKS_ENABLED
     with _redirect_process_stdio_to_files(stdout_path, stderr_path) as capture:
-        result = await _execute_code(code, globals_dict, capture)
+        RUNTIME_HOOKS_ENABLED = True
+        try:
+            result = await _execute_code(code, globals_dict, capture)
+        finally:
+            RUNTIME_HOOKS_ENABLED = False
     if isinstance(result, dict) and "output" in result:
         result = dict(result)
         result["output"] = _read_capture_file(pathlib.Path(stdout_path)) + _read_capture_file(
@@ -995,7 +1000,6 @@ def _persistent_kernel_runner(
                 continue
             if request.get("timeout_seconds") is not None:
                 signal.signal(signal.SIGINT, signal.default_int_handler)
-            RUNTIME_HOOKS_ENABLED = True
             try:
                 result = _run_kernel_coroutine(
                     _execute_code_to_capture_files(
