@@ -134,18 +134,23 @@ codex-lm usage
 
 ### With your coding agent
 
-Install the [predict-rlm skill](.agents/skills/rlm/SKILL.md) in Claude Code,
-Codex, Cursor, or any compatible coding agent:
+Install the repo's agent skills in Claude Code, Codex, Cursor, or any compatible
+coding agent:
 
 ```bash
 npx skills add Trampoline-AI/predict-rlm
 ```
 
-Then ask your agent to build an RLM:
+Then ask your agent to build an RLM with [`rlm`](.agents/skills/rlm/SKILL.md):
 
 ```
-❯ /rlm build an RLM that extracts line items from PDF invoices into a spreadsheet
+❯ $rlm build an RLM that extracts line items from PDF invoices into a spreadsheet
 ```
+
+Use [`rlm-gepa`](.agents/skills/rlm-gepa/SKILL.md) when you want GEPA
+optimization wiring, and
+[`predict-rlm-contributor`](.agents/skills/predict-rlm-contributor/SKILL.md)
+when contributing to this repository itself.
 
 ### Quick Example
 

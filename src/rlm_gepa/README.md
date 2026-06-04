@@ -29,28 +29,31 @@ improvement versus a benchmark-specific hack. Budget knobs such as
 
 ## Start with a coding agent
 
-The repository’s `/rlm` agent skill in `.agents/skills/rlm/SKILL.md` is the
-recommended starting point. It can build a normal PredictRLM package, and when
-you ask for optimization it can also add the RLM-GEPA project wiring.
+The repository ships separate agent skills for separate jobs:
 
-Install the skill in Claude Code, Codex, Cursor, or any compatible coding agent:
+- `.agents/skills/rlm/SKILL.md` builds normal PredictRLM packages.
+- `.agents/skills/rlm-gepa/SKILL.md` adds RLM-GEPA optimization wiring.
+- `.agents/skills/predict-rlm-contributor/SKILL.md` is for contributing to this
+  repository itself.
+
+Install the skills in Claude Code, Codex, Cursor, or any compatible coding agent:
 
 ```bash
 npx skills add Trampoline-AI/predict-rlm
 ```
 
-Then ask the agent to use `/rlm` and be explicit about whether you want just the
-PredictRLM, evals, or RLM-GEPA optimization too:
+Use `$rlm` to design the PredictRLM itself, and use `$rlm-gepa` when evals or
+RLM-GEPA optimization are in scope:
 
 ```text
-/rlm interview me to design a PredictRLM that extracts renewal terms, pricing
+$rlm-gepa interview me to design a PredictRLM that extracts renewal terms, pricing
 changes, and notice windows from vendor contracts. Then build the RLM, evals,
 and RLM-GEPA optimization wiring.
 ```
 
-When the prompt asks for an interview, the `/rlm` skill is expected to scope the
-RLM and GEPA setup before it writes the plan. The RLM itself should remain the
-source of truth for the DSPy signature and tools; GEPA should derive those via
+When the prompt asks for an interview, the `$rlm-gepa` skill scopes the RLM and
+GEPA setup before it writes the plan. The RLM itself should remain the source of
+truth for the DSPy signature and tools; GEPA should derive those via
 `agent_spec_from_rlm(...)`. The interview fills in the extra GEPA brief:
 
 - input shape and scale, for example “PDF/MSA/SOW contracts, 20-200 pages,”
@@ -69,7 +72,7 @@ source of truth for the DSPy signature and tools; GEPA should derive those via
   “sales coaching,” “customer-support QA,” “data-cleaning workflows,” or
   “competitive research.”
 
-When optimization is in scope, the `/rlm` skill should add the project-local
+When optimization is in scope, the `$rlm-gepa` skill should add the project-local
 `gepa/` package:
 
 ```text
@@ -100,7 +103,7 @@ from predict_rlm import PredictRLM, Skill
 from predict_rlm.trace import RunTrace
 from rlm_gepa import EvaluationContext, RLMGepaExampleResult, RLMGepaProject, agent_spec_from_rlm
 
-from .signature import AnalyzeDocuments
+from ..agent.signature import AnalyzeDocuments
 
 
 SEED_SKILL_INSTRUCTIONS = "Initial domain instructions for the RLM."
@@ -214,7 +217,7 @@ component needs a different proposer brief.
 
 RLM-GEPA projects should feel like a product CLI: from the project root, run
 `uv run rlm-gepa ...` for checks, evals, optimization, stats, and plots. When
-the `/rlm` skill scaffolds an optimization project, it should set this up in
+the `$rlm-gepa` skill scaffolds an optimization project, it should set this up in
 `pyproject.toml` for you:
 
 ```toml
@@ -256,6 +259,14 @@ uv run rlm-gepa eval --dataset testset --run-dir runs/<run-dir>
 The `eval` subcommand is project-specific because datasets and metrics are
 project-specific. Agent-only or optimization-only projects do not need a
 held-out `eval` command unless the user asks for one.
+
+For eval and optimization CLIs, route task execution through
+`rlm_gepa.runtime.adapter.RLMGepaAdapter` rather than bespoke `asyncio.gather`
+loops. Project-local code can own dataset selection, candidate loading, task
+setup, and `eval.json` summary shaping; the shared adapter owns concurrency,
+per-task timeouts, progress display, verbose RLM logs, `task_traces/*.jsonl`,
+and `cost_log.jsonl`. Write `eval.json` in the run directory so
+`rlm-gepa stats <run_dir>` works for held-out evals as well as optimization runs.
 
 Use `--verbose-rlm` to print human-readable RLM trace blocks during eval:
 reasoning, generated code, output, tool calls, errors, and `SUBMIT` payloads.
