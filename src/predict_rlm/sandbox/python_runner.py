@@ -84,7 +84,7 @@ def _debug_event(event: str, **metadata: Any) -> None:
         **metadata,
     }
     try:
-        pathlib.Path(log_path).parent.mkdir(parents=True, exist_ok=True)
+        REAL_PATH(log_path).parent.mkdir(parents=True, exist_ok=True)
         with REAL_OPEN(log_path, "a", encoding="utf-8") as log_file:
             log_file.write(json.dumps(payload, sort_keys=True, default=str) + "\n")
     except Exception:
@@ -238,6 +238,8 @@ class _SandboxPath(REAL_PATH):
             pathlib.Path = current_path  # type: ignore[assignment]
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
+        if sys.version_info < (3, 12):
+            return
         if args:
             args = (_map_virtual_path(args[0]), *args[1:])
         current_path = pathlib.Path
@@ -878,7 +880,7 @@ def _capture_file_path(kind: str) -> pathlib.Path:
         dir=SANDBOX_ROOT,
         delete=False,
     )
-    path = pathlib.Path(handle.name)
+    path = REAL_PATH(handle.name)
     handle.close()
     return path
 
@@ -953,8 +955,8 @@ async def _execute_code_to_capture_files(
             RUNTIME_HOOKS_ENABLED = False
     if isinstance(result, dict) and "output" in result:
         result = dict(result)
-        result["output"] = _read_capture_file(pathlib.Path(stdout_path)) + _read_capture_file(
-            pathlib.Path(stderr_path)
+        result["output"] = _read_capture_file(REAL_PATH(stdout_path)) + _read_capture_file(
+            REAL_PATH(stderr_path)
         )
     return result
 
@@ -1021,8 +1023,8 @@ def _persistent_kernel_runner(
                 "ok": True,
                 "result": {
                     "timeout": {"seconds": timeout_seconds},
-                    "stdout": _read_capture_file(pathlib.Path(request["stdout_path"])),
-                    "stderr": _read_capture_file(pathlib.Path(request["stderr_path"])),
+                    "stdout": _read_capture_file(REAL_PATH(request["stdout_path"])),
+                    "stderr": _read_capture_file(REAL_PATH(request["stderr_path"])),
                     "state": _live_kernel_state(),
                 },
             })
