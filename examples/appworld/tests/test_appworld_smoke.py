@@ -669,6 +669,9 @@ class _AutoCompleteClient:
         self.calls.append((task_id, app_name, api_name, kwargs_json))
         return json.dumps({"success": True, "feedback": "completed"})
 
+    def complete_appworld_task(self, task_id, kwargs_json):
+        return self.call_appworld_api(task_id, "supervisor", "complete_task", kwargs_json)
+
     def close_appworld_task(self, task_id):
         return task_id
 
@@ -829,6 +832,9 @@ def test_service_binds_current_task_appworld_tools(monkeypatch):
             if app_name == "supervisor" and api_name == "complete_task":
                 return json.dumps({"success": True})
             return json.dumps({"success": True, "result": {"echo": json.loads(kwargs_json)}})
+
+        def complete_appworld_task(self, task_id, kwargs_json):
+            return self.call_appworld_api(task_id, "supervisor", "complete_task", kwargs_json)
 
         def evaluate_appworld_task(self, task_id):
             return task_id
@@ -1028,6 +1034,7 @@ def test_eval_builds_lms_before_constructing_appworld_rlm(monkeypatch, tmp_path)
                 evaluate_appworld_task=lambda task_id: eval_calls.append(task_id)
                 or _runner_result_text(success=True, score=1.0, feedback="ok"),
                 close_appworld_task=lambda task_id: close_calls.append(task_id) or "",
+                close=lambda: None,
             )
             agent_calls.append(
                 {
@@ -1103,6 +1110,9 @@ def test_run_evaluation_scores_from_harness_side_evaluator(monkeypatch, tmp_path
             events.append(("close", task_id))
             return ""
 
+        def close(self):
+            events.append(("close_client", None))
+
     class FakeAppWorldRLM:
         def __init__(self, **_kwargs):
             self.appworld_client = FakeAppWorldClient()
@@ -1153,6 +1163,7 @@ def test_run_evaluation_scores_from_harness_side_evaluator(monkeypatch, tmp_path
         ("agent", "aaa111_1"),
         ("evaluate", "aaa111_1"),
         ("close", "aaa111_1"),
+        ("close_client", None),
     ]
     eval_payload = __import__("json").loads((tmp_path / "eval-run" / "eval.json").read_text())
     assert eval_payload["total_tasks"] == 1

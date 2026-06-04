@@ -123,16 +123,7 @@ class AppWorldRLM(dspy.Module):
 
     def _complete_task_from_prediction(self, task_id: str, prediction: Any) -> None:
         kwargs_json = json.dumps(_completion_payload_from_prediction(prediction))
-        complete_task = getattr(self.appworld_client, "complete_appworld_task", None)
-        if callable(complete_task):
-            result = complete_task(task_id, kwargs_json)
-        else:
-            result = self.appworld_client.call_appworld_api(
-                task_id,
-                "supervisor",
-                "complete_task",
-                kwargs_json,
-            )
+        result = self.appworld_client.complete_appworld_task(task_id, kwargs_json)
         payload = _parse_tool_result(result)
         if payload is None:
             raise RuntimeError(f"AppWorld auto complete_task returned unsupported payload: {result!r}")
@@ -169,15 +160,8 @@ def _is_successful_complete_task_call(call: Any) -> bool:
         return False
     args = list(getattr(call, "args", []) or [])
     kwargs = dict(getattr(call, "kwargs", {}) or {})
-    if "app_name" in kwargs or "api_name" in kwargs:
-        app_name = kwargs.get("app_name")
-        api_name = kwargs.get("api_name")
-    elif len(args) >= 4:
-        app_name = args[1]
-        api_name = args[2]
-    else:
-        app_name = args[0] if len(args) > 0 else None
-        api_name = args[1] if len(args) > 1 else None
+    app_name = kwargs.get("app_name") if "app_name" in kwargs else args[0]
+    api_name = kwargs.get("api_name") if "api_name" in kwargs else args[1]
     if app_name != "supervisor" or api_name != "complete_task":
         return False
     payload = _parse_tool_result(getattr(call, "result", None))

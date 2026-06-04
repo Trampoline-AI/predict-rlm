@@ -76,7 +76,6 @@ def _forward_with_rate_limit_retry(self: dspy.LM, *args: Any, **kwargs: Any) -> 
     for attempt in retryer:
         with attempt:
             return super(type(self), self).forward(*args, **kwargs)
-    raise RuntimeError("unreachable")
 
 
 class RateLimitRetryLM(dspy.LM):

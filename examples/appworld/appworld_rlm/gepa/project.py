@@ -114,16 +114,8 @@ class AppWorldGepaProject(RLMGepaProject):
         except Exception as exc:
             return self._error_result(example, f"RLM {type(exc).__name__}: {exc}", exc)
         finally:
-            try:
-                agent.appworld_client.close_appworld_task(example.task_id)
-            except Exception:
-                pass
-            close_client = getattr(agent.appworld_client, "close", None)
-            if callable(close_client):
-                try:
-                    close_client()
-                except Exception:
-                    pass
+            agent.appworld_client.close_appworld_task(example.task_id)
+            agent.appworld_client.close()
 
     def component_focus(self, component_name: str) -> str:
         if component_name == COMPONENT_SKILL:
