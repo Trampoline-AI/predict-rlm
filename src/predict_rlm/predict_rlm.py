@@ -1965,16 +1965,7 @@ class PredictRLM(dspy.RLM):
         finally:
             self._context_lm = None
 
-    def _execute_iteration(
-        self,
-        repl,
-        variables,
-        history,
-        iteration,
-        input_args,
-        output_field_names,
-    ):
-        """Execute one synchronous RLM iteration with PredictRLM validation."""
+    def _begin_action_generation(self, variables, iteration: int) -> tuple[list[str], int]:
         variables_info = [variable.format() for variable in variables]
         action_start_ns = time.time_ns()
         self._write_telemetry_span(
@@ -1988,41 +1979,52 @@ class PredictRLM(dspy.RLM):
             iteration=iteration + 1,
             max_iterations=self.max_iterations,
         )
-        try:
-            lm_hist_before_action = snapshot_lm_history_len(dspy.settings.lm)
-            pred = self.generate_action(
-                variables_info=variables_info,
-                repl_history=history,
-                iteration=f"{iteration + 1}/{self.max_iterations}",
+        return variables_info, action_start_ns
+
+    def _validate_iteration_action(self, pred: Any) -> None:
+        if not isinstance(getattr(pred, "reasoning", None), str):
+            raise RuntimeError(
+                "PredictRLM action adapter returned invalid reasoning; "
+                "expected a validated non-null string."
             )
-            if not isinstance(getattr(pred, "reasoning", None), str):
-                raise RuntimeError(
-                    "PredictRLM action adapter returned invalid reasoning; "
-                    "expected a validated non-null string."
-                )
-            if not isinstance(getattr(pred, "code", None), str) or len(pred.code) < 1:
-                raise RuntimeError(
-                    "PredictRLM action adapter returned invalid code; "
-                    "expected a validated non-empty string."
-                )
-        except BaseException as exc:
-            lm_metadata = lm_completion_metadata_since(dspy.settings.lm, lm_hist_before_action)
-            self._write_telemetry_span(
-                "rlm.action_generation.parse_error",
-                iteration=iteration + 1,
-                status=self._action_generation_error_status(exc),
-                attributes=self._action_generation_error_attrs(
-                    exc,
-                    lm_metadata=lm_metadata,
-                ),
-                start_time_unix_nano=action_start_ns,
+        if not isinstance(getattr(pred, "code", None), str) or len(pred.code) < 1:
+            raise RuntimeError(
+                "PredictRLM action adapter returned invalid code; "
+                "expected a validated non-empty string."
             )
-            self._log_lifecycle(
-                "rlm.action_generation.error",
-                iteration=iteration + 1,
-                error_type=type(exc).__name__,
-            )
-            raise
+
+    def _record_action_generation_error(
+        self,
+        exc: BaseException,
+        *,
+        iteration: int,
+        action_start_ns: int,
+        lm_metadata: Any,
+    ) -> None:
+        self._write_telemetry_span(
+            "rlm.action_generation.parse_error",
+            iteration=iteration + 1,
+            status=self._action_generation_error_status(exc),
+            attributes=self._action_generation_error_attrs(
+                exc,
+                lm_metadata=lm_metadata,
+            ),
+            start_time_unix_nano=action_start_ns,
+        )
+        self._log_lifecycle(
+            "rlm.action_generation.error",
+            iteration=iteration + 1,
+            error_type=type(exc).__name__,
+        )
+
+    def _record_action_generation_ok(
+        self,
+        pred: Any,
+        *,
+        iteration: int,
+        action_start_ns: int,
+        lm_hist_before_action: int,
+    ) -> Any:
         lm_metadata = lm_finish_since(dspy.settings.lm, lm_hist_before_action)
         self._write_telemetry_span(
             "rlm.action_generation.ok",
@@ -2040,6 +2042,9 @@ class PredictRLM(dspy.RLM):
             code_chars=len(getattr(pred, "code", "") or ""),
             reasoning_chars=len(getattr(pred, "reasoning", "") or ""),
         )
+        return lm_metadata
+
+    def _prepare_iteration_execution(self, pred: Any, iteration: int) -> tuple[str, bool]:
         code = pred.code or ""
         code = _strip_code_fences(code)
         self._write_generated_code_event(iteration=iteration, pred=pred, code=code)
@@ -2057,67 +2062,245 @@ class PredictRLM(dspy.RLM):
             output="",
         )
         self._partial_pending_start = time.perf_counter()
+        return code, iteration_log_open
+
+    def _log_iteration_execute_start(self, repl: Any, *, iteration: int, code: str) -> float:
+        execute_start = time.perf_counter()
+        self._log_lifecycle(
+            "rlm.execute.start",
+            backend=self._interpreter_backend_label(repl),
+            iteration=iteration + 1,
+            code_chars=len(code),
+        )
+        return execute_start
+
+    def _log_iteration_execute_fatal(
+        self,
+        repl: Any,
+        *,
+        iteration: int,
+        execute_start: float,
+        exc: BaseException,
+    ) -> None:
+        self._log_lifecycle(
+            "rlm.execute.fatal",
+            backend=self._interpreter_backend_label(repl),
+            iteration=iteration + 1,
+            duration_ms=ms_since(execute_start),
+            error_type=type(exc).__name__,
+        )
+
+    def _format_iteration_execute_error(
+        self,
+        repl: Any,
+        *,
+        iteration: int,
+        execute_start: float,
+        code: str,
+        exc: BaseException,
+    ) -> str:
+        result = _format_execution_error(code, exc)
+        self._log_lifecycle(
+            "rlm.execute.error",
+            backend=self._interpreter_backend_label(repl),
+            iteration=iteration + 1,
+            duration_ms=ms_since(execute_start),
+            error_type=type(exc).__name__,
+        )
+        return result
+
+    def _log_iteration_execute_ok(
+        self,
+        repl: Any,
+        *,
+        iteration: int,
+        execute_start: float,
+        result: Any,
+    ) -> None:
+        self._log_lifecycle(
+            "rlm.execute.ok",
+            backend=self._interpreter_backend_label(repl),
+            iteration=iteration + 1,
+            duration_ms=ms_since(execute_start),
+            final=isinstance(result, FinalOutput),
+        )
+
+    def _execute_iteration_code(
+        self,
+        repl: Any,
+        *,
+        code: str,
+        input_args: dict[str, Any],
+        iteration: int,
+        iteration_log_open: bool,
+    ) -> Any:
+        execute_start = self._log_iteration_execute_start(
+            repl,
+            iteration=iteration,
+            code=code,
+        )
+        try:
+            with (
+                live_tool_call_logging(iteration_log_open),
+                suppress_interpreter_result_logging(iteration_log_open),
+            ):
+                result = repl.execute(code, variables=dict(input_args))
+        except SandboxFatalError as exc:
+            self._log_iteration_execute_fatal(
+                repl,
+                iteration=iteration,
+                execute_start=execute_start,
+                exc=exc,
+            )
+            raise
+        except (CodeInterpreterError, SyntaxError) as exc:
+            return self._format_iteration_execute_error(
+                repl,
+                iteration=iteration,
+                execute_start=execute_start,
+                code=code,
+                exc=exc,
+            )
+        self._log_iteration_execute_ok(
+            repl,
+            iteration=iteration,
+            execute_start=execute_start,
+            result=result,
+        )
+        return result
+
+    async def _aexecute_iteration_code(
+        self,
+        repl: Any,
+        *,
+        code: str,
+        input_args: dict[str, Any],
+        iteration: int,
+        iteration_log_open: bool,
+    ) -> Any:
+        execute_start = self._log_iteration_execute_start(
+            repl,
+            iteration=iteration,
+            code=code,
+        )
+        try:
+            with (
+                live_tool_call_logging(iteration_log_open),
+                suppress_interpreter_result_logging(iteration_log_open),
+            ):
+                if hasattr(repl, "aexecute"):
+                    result = await repl.aexecute(code, variables=dict(input_args))
+                else:
+                    result = repl.execute(code, variables=dict(input_args))
+        except SandboxFatalError as exc:
+            self._log_iteration_execute_fatal(
+                repl,
+                iteration=iteration,
+                execute_start=execute_start,
+                exc=exc,
+            )
+            raise
+        except Exception as exc:
+            return self._format_iteration_execute_error(
+                repl,
+                iteration=iteration,
+                execute_start=execute_start,
+                code=code,
+                exc=exc,
+            )
+        self._log_iteration_execute_ok(
+            repl,
+            iteration=iteration,
+            execute_start=execute_start,
+            result=result,
+        )
+        return result
+
+    def _complete_iteration_execution(
+        self,
+        pred: Any,
+        *,
+        code: str,
+        result: Any,
+        history: Any,
+        output_field_names: list[str],
+        lm_metadata: Any,
+    ) -> Any:
+        if not isinstance(result, FinalOutput):
+            self._emit_iteration_output_log(result)
+
+        if _PARENT_TAKES_CODE:
+            step_result = self._process_execution_result(
+                pred, code, result, history, output_field_names
+            )
+        else:
+            step_result = self._process_execution_result(
+                pred, result, history, output_field_names
+            )
+        if isinstance(step_result, dspy.Prediction):
+            self._emit_iteration_submit_log(step_result, output_field_names)
+        else:
+            self._partial_history = step_result
+        self._partial_pending_entry = None
+        self._partial_pending_start = None
+        self._last_action_lm_metadata = lm_metadata
+        return step_result
+
+    def _execute_iteration(
+        self,
+        repl,
+        variables,
+        history,
+        iteration,
+        input_args,
+        output_field_names,
+    ):
+        """Execute one synchronous RLM iteration with PredictRLM validation."""
+        variables_info, action_start_ns = self._begin_action_generation(
+            variables,
+            iteration,
+        )
+        try:
+            lm_hist_before_action = snapshot_lm_history_len(dspy.settings.lm)
+            pred = self.generate_action(
+                variables_info=variables_info,
+                repl_history=history,
+                iteration=f"{iteration + 1}/{self.max_iterations}",
+            )
+            self._validate_iteration_action(pred)
+        except BaseException as exc:
+            lm_metadata = lm_completion_metadata_since(dspy.settings.lm, lm_hist_before_action)
+            self._record_action_generation_error(
+                exc,
+                iteration=iteration,
+                action_start_ns=action_start_ns,
+                lm_metadata=lm_metadata,
+            )
+            raise
+        lm_metadata = self._record_action_generation_ok(
+            pred,
+            iteration=iteration,
+            action_start_ns=action_start_ns,
+            lm_hist_before_action=lm_hist_before_action,
+        )
+        code, iteration_log_open = self._prepare_iteration_execution(pred, iteration)
 
         try:
-            execute_start = time.perf_counter()
-            self._log_lifecycle(
-                "rlm.execute.start",
-                backend=self._interpreter_backend_label(repl),
-                iteration=iteration + 1,
-                code_chars=len(code),
+            result = self._execute_iteration_code(
+                repl,
+                code=code,
+                input_args=input_args,
+                iteration=iteration,
+                iteration_log_open=iteration_log_open,
             )
-            try:
-                with (
-                    live_tool_call_logging(iteration_log_open),
-                    suppress_interpreter_result_logging(iteration_log_open),
-                ):
-                    result = repl.execute(code, variables=dict(input_args))
-            except SandboxFatalError as exc:
-                self._log_lifecycle(
-                    "rlm.execute.fatal",
-                    backend=self._interpreter_backend_label(repl),
-                    iteration=iteration + 1,
-                    duration_ms=ms_since(execute_start),
-                    error_type=type(exc).__name__,
-                )
-                raise
-            except (CodeInterpreterError, SyntaxError) as e:
-                result = _format_execution_error(code, e)
-                self._log_lifecycle(
-                    "rlm.execute.error",
-                    backend=self._interpreter_backend_label(repl),
-                    iteration=iteration + 1,
-                    duration_ms=ms_since(execute_start),
-                    error_type=type(e).__name__,
-                )
-            else:
-                self._log_lifecycle(
-                    "rlm.execute.ok",
-                    backend=self._interpreter_backend_label(repl),
-                    iteration=iteration + 1,
-                    duration_ms=ms_since(execute_start),
-                    final=isinstance(result, FinalOutput),
-                )
-
-            if not isinstance(result, FinalOutput):
-                self._emit_iteration_output_log(result)
-
-            if _PARENT_TAKES_CODE:
-                step_result = self._process_execution_result(
-                    pred, code, result, history, output_field_names
-                )
-            else:
-                step_result = self._process_execution_result(
-                    pred, result, history, output_field_names
-                )
-            if isinstance(step_result, dspy.Prediction):
-                self._emit_iteration_submit_log(step_result, output_field_names)
-            else:
-                self._partial_history = step_result
-            self._partial_pending_entry = None
-            self._partial_pending_start = None
-            self._last_action_lm_metadata = lm_metadata
-            return step_result
+            return self._complete_iteration_execution(
+                pred,
+                code=code,
+                result=result,
+                history=history,
+                output_field_names=output_field_names,
+                lm_metadata=lm_metadata,
+            )
         finally:
             self._finish_iteration_log(iteration_log_open)
 
@@ -2137,18 +2320,9 @@ class PredictRLM(dspy.RLM):
         repl.aexecute() (available on JspiInterpreter) so the event loop
         stays free for other coroutines.
         """
-        variables_info = [variable.format() for variable in variables]
-        action_start_ns = time.time_ns()
-        self._write_telemetry_span(
-            "rlm.action_generation.start",
-            iteration=iteration + 1,
-            start_time_unix_nano=action_start_ns,
-            end_time_unix_nano=action_start_ns,
-        )
-        self._log_lifecycle(
-            "rlm.action_generation.start",
-            iteration=iteration + 1,
-            max_iterations=self.max_iterations,
+        variables_info, action_start_ns = self._begin_action_generation(
+            variables,
+            iteration,
         )
         try:
             lm_hist_before_action = snapshot_lm_history_len(dspy.settings.lm)
@@ -2157,139 +2331,40 @@ class PredictRLM(dspy.RLM):
                 repl_history=history,
                 iteration=f"{iteration + 1}/{self.max_iterations}",
             )
-            if not isinstance(getattr(pred, "reasoning", None), str):
-                raise RuntimeError(
-                    "PredictRLM action adapter returned invalid reasoning; "
-                    "expected a validated non-null string."
-                )
-            if not isinstance(getattr(pred, "code", None), str) or len(pred.code) < 1:
-                raise RuntimeError(
-                    "PredictRLM action adapter returned invalid code; "
-                    "expected a validated non-empty string."
-                )
+            self._validate_iteration_action(pred)
         except BaseException as exc:
             lm_metadata = lm_completion_metadata_since(dspy.settings.lm, lm_hist_before_action)
-            self._write_telemetry_span(
-                "rlm.action_generation.parse_error",
-                iteration=iteration + 1,
-                status=self._action_generation_error_status(exc),
-                attributes=self._action_generation_error_attrs(
-                    exc,
-                    lm_metadata=lm_metadata,
-                ),
-                start_time_unix_nano=action_start_ns,
-            )
-            self._log_lifecycle(
-                "rlm.action_generation.error",
-                iteration=iteration + 1,
-                error_type=type(exc).__name__,
+            self._record_action_generation_error(
+                exc,
+                iteration=iteration,
+                action_start_ns=action_start_ns,
+                lm_metadata=lm_metadata,
             )
             raise
-        lm_metadata = lm_finish_since(dspy.settings.lm, lm_hist_before_action)
-        self._write_telemetry_span(
-            "rlm.action_generation.ok",
-            iteration=iteration + 1,
-            start_time_unix_nano=action_start_ns,
-            attributes={
-                "has_code": True,
-                "code_chars": len(getattr(pred, "code", "") or ""),
-                "reasoning_chars": len(getattr(pred, "reasoning", "") or ""),
-            },
-        )
-        self._log_lifecycle(
-            "rlm.action_generation.ok",
-            iteration=iteration + 1,
-            code_chars=len(getattr(pred, "code", "") or ""),
-            reasoning_chars=len(getattr(pred, "reasoning", "") or ""),
-        )
-        code = pred.code or ""
-        code = _strip_code_fences(code)
-        self._write_generated_code_event(iteration=iteration, pred=pred, code=code)
-        iteration_log_open = self._begin_iteration_log(
+        lm_metadata = self._record_action_generation_ok(
+            pred,
             iteration=iteration,
-            pred=pred,
-            code=code,
+            action_start_ns=action_start_ns,
+            lm_hist_before_action=lm_hist_before_action,
         )
-
-        # Capture reasoning+code BEFORE executing so a mid-execution
-        # cancellation still leaves this iteration visible in the partial
-        # trajectory (output will be empty / placeholder).
-        from dspy.primitives.repl_types import REPLEntry
-
-        self._partial_pending_entry = REPLEntry(
-            reasoning=getattr(pred, "reasoning", "") or "",
-            code=code,
-            output="",
-        )
-        self._partial_pending_start = time.perf_counter()
+        code, iteration_log_open = self._prepare_iteration_execution(pred, iteration)
 
         try:
-            execute_start = time.perf_counter()
-            self._log_lifecycle(
-                "rlm.execute.start",
-                backend=self._interpreter_backend_label(repl),
-                iteration=iteration + 1,
-                code_chars=len(code),
+            result = await self._aexecute_iteration_code(
+                repl,
+                code=code,
+                input_args=input_args,
+                iteration=iteration,
+                iteration_log_open=iteration_log_open,
             )
-            try:
-                with (
-                    live_tool_call_logging(iteration_log_open),
-                    suppress_interpreter_result_logging(iteration_log_open),
-                ):
-                    if hasattr(repl, "aexecute"):
-                        result = await repl.aexecute(code, variables=dict(input_args))
-                    else:
-                        result = repl.execute(code, variables=dict(input_args))
-            except SandboxFatalError as exc:
-                self._log_lifecycle(
-                    "rlm.execute.fatal",
-                    backend=self._interpreter_backend_label(repl),
-                    iteration=iteration + 1,
-                    duration_ms=ms_since(execute_start),
-                    error_type=type(exc).__name__,
-                )
-                raise
-            except Exception as e:
-                result = _format_execution_error(code, e)
-                self._log_lifecycle(
-                    "rlm.execute.error",
-                    backend=self._interpreter_backend_label(repl),
-                    iteration=iteration + 1,
-                    duration_ms=ms_since(execute_start),
-                    error_type=type(e).__name__,
-                )
-            else:
-                self._log_lifecycle(
-                    "rlm.execute.ok",
-                    backend=self._interpreter_backend_label(repl),
-                    iteration=iteration + 1,
-                    duration_ms=ms_since(execute_start),
-                    final=isinstance(result, FinalOutput),
-                )
-
-            if not isinstance(result, FinalOutput):
-                self._emit_iteration_output_log(result)
-
-            if _PARENT_TAKES_CODE:
-                step_result = self._process_execution_result(
-                    pred, code, result, history, output_field_names
-                )
-            else:
-                step_result = self._process_execution_result(
-                    pred, result, history, output_field_names
-                )
-            # Snapshot the updated REPL history for partial-trajectory recovery.
-            # step_result is either a new REPLHistory (iteration continues) or a
-            # dspy.Prediction (SUBMIT happened). Only the former gets a history
-            # snapshot, but both mean execution is no longer in flight.
-            if isinstance(step_result, dspy.Prediction):
-                self._emit_iteration_submit_log(step_result, output_field_names)
-            else:
-                self._partial_history = step_result
-            self._partial_pending_entry = None
-            self._partial_pending_start = None
-            self._last_action_lm_metadata = lm_metadata
-            return step_result
+            return self._complete_iteration_execution(
+                pred,
+                code=code,
+                result=result,
+                history=history,
+                output_field_names=output_field_names,
+                lm_metadata=lm_metadata,
+            )
         finally:
             self._finish_iteration_log(iteration_log_open)
 
