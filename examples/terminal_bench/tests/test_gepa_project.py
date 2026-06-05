@@ -5,6 +5,7 @@ import ast
 import asyncio
 import json
 import re
+import shlex
 import subprocess
 import sys
 import tarfile
@@ -177,6 +178,30 @@ class FakeDaytonaSdkSandbox:
 
     def _download_file(self, remote_path, host_path):
         self.calls.append(("fs.download_file", (remote_path, host_path), {}))
+
+
+class RecordingDaytonaBootstrapEnvironment:
+    def __init__(self) -> None:
+        self.commands: list[tuple[str, int | None]] = []
+        self.uploads: list[tuple[str, str]] = []
+        self.upload_archive_contents: dict[str, bytes] = {}
+
+    async def exec(self, *, command, timeout_sec):
+        self.commands.append((command, timeout_sec))
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    async def upload_file(self, host_path, remote_path):
+        self.uploads.append((host_path, remote_path))
+        if host_path.endswith(".tar.gz"):
+            with tarfile.open(host_path, "r:gz") as archive:
+                self.upload_archive_contents = {}
+                for member in archive.getmembers():
+                    if not member.isfile():
+                        continue
+                    source = archive.extractfile(member)
+                    if source is not None:
+                        with source:
+                            self.upload_archive_contents[member.name] = source.read()
 
 
 def _task_request(config, tmp_path: Path, *, run_id: str = "gepa-val-task"):
@@ -641,6 +666,70 @@ def test_daytona_remote_agent_exposes_agent_info_without_harbor_dependency() -> 
         "version": "unknown",
         "model_info": None,
     }
+
+
+def test_daytona_installed_source_bundle_contains_bootstrap_at_remote_path(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(tbench_agent, "_source_checkout_root", lambda start=None: None)
+
+    bundle_path = tmp_path / "repo.tar.gz"
+    tbench_agent._create_source_bundle(bundle_path)
+
+    with tarfile.open(bundle_path, "r:gz") as archive:
+        members = set(archive.getnames())
+        bootstrap = archive.extractfile("repo/src/predict_rlm/remote/bootstrap_controller.sh")
+        assert bootstrap is not None
+        with bootstrap:
+            bootstrap_text = bootstrap.read().decode("utf-8")
+
+    assert "repo/pyproject.toml" in members
+    assert "repo/examples/terminal_bench/pyproject.toml" in members
+    assert "repo/examples/terminal_bench/terminal_bench_rlm/tools/remote_controller.py" in members
+    assert bootstrap_text.startswith("#!/bin/sh\n")
+
+
+@pytest.mark.asyncio
+async def test_daytona_bootstrap_command_uses_packaged_asset_and_requests_python312(
+    tmp_path: Path,
+) -> None:
+    env = RecordingDaytonaBootstrapEnvironment()
+    agent = tbench_agent.DaytonaRemotePredictRLMAgent(
+        logs_dir=tmp_path,
+        lm="openai/gpt-5.4-mini",
+        remote_root="/remote/controller",
+        remote_home="/remote/home",
+    )
+
+    await agent._bootstrap_remote_controller(env)
+
+    assert len(env.uploads) == 1
+    assert env.uploads[0][1] == "/remote/controller/repo.tar.gz"
+    assert (
+        "repo/src/predict_rlm/remote/bootstrap_controller.sh" in env.upload_archive_contents
+    )
+    assert env.commands[0] == (
+        "rm -rf /remote/controller && mkdir -p /remote/controller /remote/home",
+        120,
+    )
+    assert env.commands[1] == ("tar -xzf /remote/controller/repo.tar.gz -C /remote/controller", 120)
+    setup_command, setup_timeout = env.commands[2]
+    assert setup_timeout == 900
+    outer_tokens = shlex.split(setup_command)
+    inner_command = outer_tokens[outer_tokens.index("-lc") + 1]
+    inner_tokens = shlex.split(inner_command)
+    assert inner_tokens == [
+        "sh",
+        "/remote/controller/repo/src/predict_rlm/remote/bootstrap_controller.sh",
+        "--root",
+        "/remote/controller",
+        "--repo",
+        "/remote/controller/repo",
+        "--python",
+        "3.12",
+    ]
+    assert agent._remote_setup_complete is True
 
 
 def test_harbor_runner_builds_harbor_run_command(monkeypatch, tmp_path: Path) -> None:

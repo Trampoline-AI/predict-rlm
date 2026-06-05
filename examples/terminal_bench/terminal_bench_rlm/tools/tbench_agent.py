@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import asyncio
 import importlib
+import importlib.resources
 import inspect
+import io
 import json
 import os
 import shlex
@@ -13,6 +15,7 @@ import uuid
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from datetime import datetime
+from importlib.resources.abc import Traversable
 from pathlib import Path
 from typing import Any, Callable
 
@@ -38,6 +41,67 @@ _SOURCE_BUNDLE_RELATIVE_PATHS = (
     "examples/terminal_bench/pyproject.toml",
     "examples/terminal_bench/terminal_bench_rlm",
 )
+_SOURCE_CHECKOUT_SENTINELS = (
+    "pyproject.toml",
+    "src/predict_rlm/remote/bootstrap_controller.sh",
+    "examples/terminal_bench/terminal_bench_rlm/tools/remote_controller.py",
+)
+_INSTALLED_SOURCE_BUNDLE_PACKAGES = (
+    ("predict_rlm", "repo/src/predict_rlm"),
+    ("rlm_gepa", "repo/src/rlm_gepa"),
+    ("dspy_codex_lm", "repo/src/codex-lm/dspy_codex_lm"),
+    ("terminal_bench_rlm", "repo/examples/terminal_bench/terminal_bench_rlm"),
+)
+_GENERATED_SOURCE_BUNDLE_PYPROJECT_TEMPLATE = """\
+[project]
+name = "predict-rlm"
+version = "0.0.0"
+requires-python = ">=3.12"
+dependencies = [
+    "deno>=2",
+    "dspy>=3.1.2",
+    "nest-asyncio>=1.6.0",
+    "pydantic>=2.8.2,<3",
+]
+
+[project.optional-dependencies]
+codex-lm = [
+    "litellm>=1.50",
+    "openai>=1.60",
+    "tenacity>=9.1.4",
+]
+gepa = [
+    "gepa>=0.0.26",
+    "tqdm>=4.0.0",
+]
+gepa-viz = [
+    "plotly>=5.0.0",
+    "kaleido>=0.2.0",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = [
+{packages}
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+"""
+_GENERATED_TERMINAL_BENCH_PYPROJECT = """\
+[project]
+name = "terminal-bench-rlm"
+version = "0.0.0"
+requires-python = ">=3.12"
+dependencies = ["predict-rlm[codex-lm,gepa,gepa-viz]"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["terminal_bench_rlm"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+"""
 _SECRET_PAYLOAD_KEY_PARTS = (
     "api_key",
     "authorization",
@@ -487,7 +551,18 @@ class HarborPredictRLMBaseAgent(_TerminalBenchRLMBaseAgentMixin, ABC):
 
 
 def _repo_root() -> Path:
-    return Path(__file__).resolve().parents[4]
+    root = _source_checkout_root()
+    if root is None:
+        raise RuntimeError("Could not locate predict-rlm source checkout")
+    return root
+
+
+def _source_checkout_root(start: Path | None = None) -> Path | None:
+    current = (start or Path(__file__).resolve()).parent
+    for candidate in (current, *current.parents):
+        if all((candidate / sentinel).exists() for sentinel in _SOURCE_CHECKOUT_SENTINELS):
+            return candidate
+    return None
 
 
 def _source_bundle_filter(info: tarfile.TarInfo) -> tarfile.TarInfo | None:
@@ -508,8 +583,80 @@ def _source_bundle_filter(info: tarfile.TarInfo) -> tarfile.TarInfo | None:
     return info
 
 
+def _archive_add_bytes(archive: tarfile.TarFile, arcname: str, data: bytes) -> None:
+    info = tarfile.TarInfo(arcname)
+    info.size = len(data)
+    info.mode = 0o644
+    if arcname.endswith(".sh"):
+        info.mode = 0o755
+    archive.addfile(info, io.BytesIO(data))
+
+
+def _resource_bundle_filter(arcname: str) -> bool:
+    parts = Path(arcname).parts
+    if any(part in {".git", "__pycache__"} for part in parts):
+        return False
+    return not arcname.endswith((".pyc", ".pyo"))
+
+
+def _archive_add_resource_tree(
+    archive: tarfile.TarFile,
+    resource: Traversable,
+    arcroot: str,
+) -> None:
+    for child in resource.iterdir():
+        arcname = f"{arcroot}/{child.name}"
+        if not _resource_bundle_filter(arcname):
+            continue
+        if child.is_dir():
+            _archive_add_resource_tree(archive, child, arcname)
+        elif child.is_file():
+            _archive_add_bytes(archive, arcname, child.read_bytes())
+
+
+def _generated_source_bundle_pyproject(package_paths: list[str]) -> str:
+    packages = "".join(f'    "{path}",\n' for path in package_paths)
+    return _GENERATED_SOURCE_BUNDLE_PYPROJECT_TEMPLATE.format(packages=packages.rstrip())
+
+
+def _create_installed_source_bundle(destination: Path) -> None:
+    with tarfile.open(destination, "w:gz") as archive:
+        resources: list[tuple[Traversable, str, str]] = []
+        package_paths: list[str] = []
+        missing: list[str] = []
+        for package_name, arcroot in _INSTALLED_SOURCE_BUNDLE_PACKAGES:
+            try:
+                resource = importlib.resources.files(package_name)
+            except ModuleNotFoundError:
+                missing.append(package_name)
+                continue
+            resources.append((resource, arcroot, package_name))
+            if arcroot.startswith("repo/"):
+                package_paths.append(arcroot[len("repo/") :])
+        if "predict_rlm" in missing or "terminal_bench_rlm" in missing:
+            raise RuntimeError(
+                "Could not build Daytona source bundle from installed packages; "
+                f"missing required package resources: {', '.join(missing)}"
+            )
+        _archive_add_bytes(
+            archive,
+            "repo/pyproject.toml",
+            _generated_source_bundle_pyproject(package_paths).encode("utf-8"),
+        )
+        _archive_add_bytes(
+            archive,
+            "repo/examples/terminal_bench/pyproject.toml",
+            _GENERATED_TERMINAL_BENCH_PYPROJECT.encode("utf-8"),
+        )
+        for resource, arcroot, _package_name in resources:
+            _archive_add_resource_tree(archive, resource, arcroot)
+
+
 def _create_source_bundle(destination: Path) -> None:
-    root = _repo_root()
+    root = _source_checkout_root()
+    if root is None:
+        _create_installed_source_bundle(destination)
+        return
     with tarfile.open(destination, "w:gz") as archive:
         for relative in _SOURCE_BUNDLE_RELATIVE_PATHS:
             source = root / relative
