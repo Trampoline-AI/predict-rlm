@@ -1555,6 +1555,9 @@ def _retryable_harbor_trial_exception_reason(trial_result: Any) -> str | None:
     normalized = text.lower()
     if "agenttimeouterror" in normalized:
         return None
+    if exception_type == "DaytonaError":
+        if "harbor/environments/daytona" in normalized or "failed to execute session command" in normalized:
+            return "daytona_environment_setup"
     if "failed to fetch anonymous token" in normalized:
         return "docker_registry_anonymous_token"
     if "failed to resolve reference" in normalized and _has_harbor_registry_context(normalized):

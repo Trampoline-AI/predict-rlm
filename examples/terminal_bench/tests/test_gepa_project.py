@@ -1076,6 +1076,66 @@ def test_harbor_subprocess_runner_retries_transient_registry_exception_result(
     assert result.trial_result["verifier_result"]["rewards"]["reward"] == 1.0
 
 
+def test_harbor_subprocess_runner_retries_daytona_setup_exception_result(
+    monkeypatch, tmp_path: Path
+) -> None:
+    config = default_config()
+    config.terminal_bench_output_dir = tmp_path / "harbor-runs"
+    calls: list[list[str]] = []
+
+    def fake_run(cmd, **_kwargs):
+        calls.append(cmd)
+        run_dir = config.terminal_bench_output_dir / "gepa-val-task"
+        run_dir.mkdir(parents=True, exist_ok=True)
+        if len(calls) == 1:
+            trial_result = {
+                "task_name": "task",
+                "agent_result": None,
+                "verifier_result": None,
+                "agent_setup": None,
+                "agent_execution": None,
+                "exception_info": {
+                    "exception_type": "DaytonaError",
+                    "exception_message": "Failed to execute session command: ",
+                    "exception_traceback": (
+                        "harbor/trial/trial.py in _setup_agent_environment\n"
+                        "harbor/environments/daytona/environment.py in start\n"
+                        "await env.ensure_dirs(env._mount_targets(writable_only=True))"
+                    ),
+                },
+            }
+        else:
+            trial_result = {
+                "task_name": "task",
+                "exception_info": None,
+                "verifier_result": {"rewards": {"reward": 1.0}},
+            }
+        (run_dir / "result.json").write_text(json.dumps({"trial_results": [trial_result]}))
+        return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    result = HarborSubprocessHarnessRunner(cwd=tmp_path)._run_sync(
+        TerminalBenchTaskRunRequest(
+            task_id="task",
+            instruction="",
+            skill_instructions="skill",
+            lm="main",
+            sub_lm="sub",
+            max_iterations=3,
+            task_timeout=30,
+            verbose_rlm=False,
+            output_dir=tmp_path,
+            run_id="gepa-val-task",
+            config=config,
+        )
+    )
+
+    assert len(calls) == 2
+    assert result.error is None
+    assert result.trial_result["exception_info"] is None
+
+
 def test_harbor_subprocess_runner_does_not_retry_non_registry_exception_result(
     monkeypatch, tmp_path: Path
 ) -> None:
