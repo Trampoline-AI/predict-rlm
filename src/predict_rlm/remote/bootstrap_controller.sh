@@ -89,6 +89,10 @@ detect_package_manager() {
     fi
 }
 
+is_root_user() {
+    [ "$(id -u 2>/dev/null || echo 1)" = "0" ]
+}
+
 probe_venv() {
     cleanup_probe
     : > "$PROBE_LOG"
@@ -135,13 +139,21 @@ repair_python() {
     echo "bootstrap_controller.sh: repairing Python/pip/venv with package manager: $pm" >&2
     case "$pm" in
         apt)
+            if ! is_root_user; then
+                echo "bootstrap_controller.sh: root privileges are required to install Python prerequisites with apt-get" >&2
+                return 1
+            fi
             apt_install_python > "$INSTALL_LOG" 2>&1
             ;;
         apk)
+            if ! is_root_user; then
+                echo "bootstrap_controller.sh: root privileges are required to install Python prerequisites with apk" >&2
+                return 1
+            fi
             apk_install_python > "$INSTALL_LOG" 2>&1
             ;;
         *)
-            echo "bootstrap_controller.sh: python3/pip/venv unavailable and no supported package manager found" >&2
+            echo "bootstrap_controller.sh: python3/pip/venv unavailable; unsupported package manager and unable to install Python prerequisites" >&2
             return 1
             ;;
     esac
@@ -153,6 +165,7 @@ diagnostics() {
     echo "bootstrap_controller.sh: $reason" >&2
     echo "bootstrap_controller.sh: diagnostics follow" >&2
     echo "package_manager=$pm" >&2
+    echo "is_root=$(is_root_user && echo true || echo false)" >&2
     echo "python_path=$(command -v python3 2>/dev/null || true)" >&2
     echo "python_version=$(python_version)" >&2
     echo "pip_status=$(pip_status)" >&2

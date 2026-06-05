@@ -1,10 +1,6 @@
-FROM ubuntu:24.04
+FROM ghcr.io/laude-institute/t-bench/python-3-13:20250620
 
 ENV ROOT=/tmp/predict_rlm_controller
-
-RUN apt-get update \
-    && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends ca-certificates python3 python3-pip \
-    && rm -rf /var/lib/apt/lists/*
 
 COPY src/predict_rlm/remote/bootstrap_controller.sh /tmp/bootstrap_controller.sh
 
@@ -17,5 +13,4 @@ RUN mkdir -p "$ROOT/repo" \
 
 RUN sh /tmp/bootstrap_controller.sh --root "$ROOT" --repo "$ROOT/repo" --extra '[codex-lm]' --python 3.12 > /tmp/bootstrap.log 2>&1 \
     || { cat /tmp/bootstrap.log; exit 1; } \
-    && grep -q 'repairing Python/pip/venv with package manager: apt' /tmp/bootstrap.log \
     && "$ROOT/.venv/bin/python" -c 'import sys, fake_controller_repo; assert sys.version_info[:2] == (3, 12), sys.version; assert fake_controller_repo.ok() == "ok"'

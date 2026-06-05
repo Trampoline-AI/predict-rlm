@@ -1,9 +1,9 @@
-FROM ubuntu:24.04
+FROM debian:13.0-slim
 
 ENV ROOT=/tmp/predict_rlm_controller
 
 RUN apt-get update \
-    && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends ca-certificates python3 python3-pip \
+    && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
 COPY src/predict_rlm/remote/bootstrap_controller.sh /tmp/bootstrap_controller.sh
