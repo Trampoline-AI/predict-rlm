@@ -71,7 +71,7 @@ class LocalRunner:
         )
         self._request_id = 0
 
-    def request(self, method: str, params: dict | None = None) -> dict:
+    def send(self, method: str, params: dict | None = None) -> int:
         self._request_id += 1
         payload = {
             "jsonrpc": "2.0",
@@ -83,7 +83,24 @@ class LocalRunner:
         assert self.proc.stdout is not None
         self.proc.stdin.write(json.dumps(payload) + "\n")
         self.proc.stdin.flush()
-        return json.loads(self.proc.stdout.readline())
+        return self._request_id
+
+    def write_message(self, message: dict) -> None:
+        assert self.proc.stdin is not None
+        self.proc.stdin.write(json.dumps(message) + "\n")
+        self.proc.stdin.flush()
+
+    def read_message(self, timeout: float = 3) -> dict:
+        assert self.proc.stdout is not None
+        ready, _, _ = select.select([self.proc.stdout], [], [], timeout)
+        assert ready, "timed out waiting for runner message"
+        line = self.proc.stdout.readline()
+        assert line, "runner stdout closed"
+        return json.loads(line)
+
+    def request(self, method: str, params: dict | None = None) -> dict:
+        self.send(method, params)
+        return self.read_message()
 
     def close(self) -> None:
         if self.proc.poll() is None:
@@ -200,6 +217,73 @@ class TestPythonRunnerProtocol:
         response = json.loads(runner.proc.stdout.readline())
 
         assert response["result"]["output"] == "hello\n"
+
+    def test_stale_concurrent_tool_calls_do_not_poison_later_execute(
+        self, runner: LocalRunner
+    ):
+        runner.request("register_tools", {"tools": ["predict"]})
+        first_execute_id = runner.send(
+            "execute",
+            {
+                "code": (
+                    "import asyncio\n"
+                    "for idx in range(11):\n"
+                    "    asyncio.create_task(predict('x: int -> answer: int', x=idx))\n"
+                    "await asyncio.sleep(0.05)\n"
+                    "print('scheduled stale calls')\n"
+                )
+            },
+        )
+
+        stale_tool_ids: list[int] = []
+        while True:
+            message = runner.read_message()
+            if message.get("method") == "tool_call":
+                stale_tool_ids.append(message["id"])
+                continue
+            if message.get("id") == first_execute_id:
+                assert message["result"]["output"] == "scheduled stale calls\n"
+                break
+
+        assert len(stale_tool_ids) == 11
+        for tool_id in stale_tool_ids:
+            runner.write_message(
+                {
+                    "jsonrpc": "2.0",
+                    "id": tool_id,
+                    "result": {"type": "json", "value": '{"answer": -1}'},
+                }
+            )
+
+        followup_execute_id = runner.send(
+            "execute",
+            {
+                "code": (
+                    "result = await predict('x: int -> answer: int', x=999)\n"
+                    "print(result.answer)\n"
+                )
+            },
+        )
+
+        saw_followup_tool_call = False
+        while True:
+            message = runner.read_message()
+            if message.get("method") == "tool_call":
+                assert message["params"]["kwargs"] == {"x": 999}
+                saw_followup_tool_call = True
+                runner.write_message(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": message["id"],
+                        "result": {"type": "json", "value": '{"answer": 123}'},
+                    }
+                )
+                continue
+            if message.get("id") == followup_execute_id:
+                assert message["result"]["output"] == "123\n"
+                break
+
+        assert saw_followup_tool_call
 
     def test_syntax_error_uses_json_rpc_error(self, runner: LocalRunner):
         result = runner.request("execute", {"code": "for"})

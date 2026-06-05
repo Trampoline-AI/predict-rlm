@@ -16,10 +16,12 @@ import os
 import pathlib
 import pickle
 import queue
+import select
 import shutil
 import signal
 import sys
 import tempfile
+import threading
 import time
 from typing import Any
 
@@ -34,8 +36,12 @@ SANDBOX_ROOT = REAL_PATH(
 SANDBOX_DIR = SANDBOX_ROOT / "sandbox"
 SANDBOX_DIR.mkdir(parents=True, exist_ok=True)
 TOOL_REQUEST_ID = 0
-TOOL_RESPONSE_LOCK = asyncio.Lock()
 PENDING_TOOL_RESPONSES: dict[int, dict[str, Any]] = {}
+TOOL_RESPONSE_CONDITION = threading.Condition()
+TOOL_RESPONSE_READER_THREAD: threading.Thread | None = None
+TOOL_RESPONSE_READER_ERROR: BaseException | None = None
+TOOL_RESPONSE_READ_BUFFER = ""
+WAITING_TOOL_RESPONSE_IDS: set[int] = set()
 _TRUE_VALUES = {"1", "true", "yes", "on"}
 _KERNEL_PROCESS: multiprocessing.Process | None = None
 _KERNEL_REQUEST_QUEUE: multiprocessing.Queue | None = None
@@ -214,11 +220,22 @@ def _send_protocol(message: dict[str, Any]) -> None:
     PROTOCOL_STDOUT.flush()
 
 
-def _read_protocol_response_line() -> dict[str, Any]:
+def _read_protocol_response_line(timeout: float | None = None) -> dict[str, Any] | None:
+    global TOOL_RESPONSE_READ_BUFFER
+    fd = PROTOCOL_STDIN.fileno()
     while True:
-        line = PROTOCOL_STDIN.readline()
+        while "\n" not in TOOL_RESPONSE_READ_BUFFER:
+            if timeout is not None:
+                ready, _, _ = select.select([fd], [], [], timeout)
+                if not ready:
+                    return None
+            chunk = os.read(fd, 65536)
+            if not chunk:
+                raise RuntimeError("Host closed stdin while waiting for tool response")
+            TOOL_RESPONSE_READ_BUFFER += chunk.decode("utf-8", errors="replace")
+        line, TOOL_RESPONSE_READ_BUFFER = TOOL_RESPONSE_READ_BUFFER.split("\n", 1)
         if not line:
-            raise RuntimeError("Host closed stdin while waiting for tool response")
+            continue
         try:
             return json.loads(line)
         except json.JSONDecodeError:
@@ -226,16 +243,82 @@ def _read_protocol_response_line() -> dict[str, Any]:
 
 
 async def _read_protocol_response(request_id: int) -> dict[str, Any]:
-    async with TOOL_RESPONSE_LOCK:
-        if request_id in PENDING_TOOL_RESPONSES:
-            return PENDING_TOOL_RESPONSES.pop(request_id)
+    with TOOL_RESPONSE_CONDITION:
+        WAITING_TOOL_RESPONSE_IDS.add(request_id)
+    _ensure_tool_response_reader()
+    try:
         while True:
-            response = await asyncio.to_thread(_read_protocol_response_line)
+            with TOOL_RESPONSE_CONDITION:
+                if request_id in PENDING_TOOL_RESPONSES:
+                    return PENDING_TOOL_RESPONSES.pop(request_id)
+                if TOOL_RESPONSE_READER_ERROR is not None:
+                    raise TOOL_RESPONSE_READER_ERROR
+            await asyncio.sleep(0.01)
+    finally:
+        with TOOL_RESPONSE_CONDITION:
+            WAITING_TOOL_RESPONSE_IDS.discard(request_id)
+            TOOL_RESPONSE_CONDITION.notify_all()
+
+
+def _ensure_tool_response_reader() -> None:
+    global TOOL_RESPONSE_READER_THREAD
+    if (
+        TOOL_RESPONSE_READER_THREAD is not None
+        and TOOL_RESPONSE_READER_THREAD.is_alive()
+    ):
+        return
+    TOOL_RESPONSE_READER_THREAD = threading.Thread(
+        target=_tool_response_reader_loop,
+        name="predict-rlm-tool-response-reader",
+        daemon=True,
+    )
+    TOOL_RESPONSE_READER_THREAD.start()
+    _debug_event("sbx.python_runner.tool_response_reader.start")
+
+
+def _tool_response_reader_loop() -> None:
+    global TOOL_RESPONSE_READER_ERROR, TOOL_RESPONSE_READER_THREAD
+    try:
+        while True:
+            with TOOL_RESPONSE_CONDITION:
+                if not WAITING_TOOL_RESPONSE_IDS:
+                    TOOL_RESPONSE_READER_THREAD = None
+                    return
+            response = _read_protocol_response_line(timeout=0.05)
+            if response is None:
+                continue
             response_id = response.get("id")
-            if response_id == request_id:
-                return response
+            _debug_event(
+                "sbx.python_runner.tool_response_reader.response",
+                response_id=response_id,
+            )
             if isinstance(response_id, int):
-                PENDING_TOOL_RESPONSES[response_id] = response
+                with TOOL_RESPONSE_CONDITION:
+                    PENDING_TOOL_RESPONSES[response_id] = response
+                    TOOL_RESPONSE_CONDITION.notify_all()
+    except BaseException as exc:
+        with TOOL_RESPONSE_CONDITION:
+            TOOL_RESPONSE_READER_ERROR = exc
+            TOOL_RESPONSE_CONDITION.notify_all()
+
+
+def _reset_tool_protocol_state() -> None:
+    global PENDING_TOOL_RESPONSES, TOOL_REQUEST_ID, TOOL_RESPONSE_CONDITION
+    global TOOL_RESPONSE_READER_ERROR, TOOL_RESPONSE_READER_THREAD
+    global TOOL_RESPONSE_READ_BUFFER
+    global WAITING_TOOL_RESPONSE_IDS
+    PENDING_TOOL_RESPONSES = {}
+    TOOL_RESPONSE_CONDITION = threading.Condition()
+    TOOL_RESPONSE_READER_THREAD = None
+    TOOL_RESPONSE_READER_ERROR = None
+    TOOL_RESPONSE_READ_BUFFER = ""
+    WAITING_TOOL_RESPONSE_IDS = set()
+    TOOL_REQUEST_ID = os.getpid() << 32
+
+
+def _has_waiting_tool_responses() -> bool:
+    with TOOL_RESPONSE_CONDITION:
+        return bool(WAITING_TOOL_RESPONSE_IDS)
 
 
 async def _call_host_tool(name: str, *args: Any, **kwargs: Any) -> Any:
@@ -569,9 +652,7 @@ def _persistent_kernel_runner(
     global PROTOCOL_STDIN, PROTOCOL_STDOUT
     PROTOCOL_STDIN = os.fdopen(stdin_fd, "r", encoding="utf-8", buffering=1)
     PROTOCOL_STDOUT = os.fdopen(os.dup(1), "w", encoding="utf-8", buffering=1)
-    global PENDING_TOOL_RESPONSES, TOOL_RESPONSE_LOCK
-    PENDING_TOOL_RESPONSES = {}
-    TOOL_RESPONSE_LOCK = asyncio.Lock()
+    _reset_tool_protocol_state()
 
     while True:
         request = request_queue.get()
@@ -595,10 +676,14 @@ def _persistent_kernel_runner(
                 )
             )
             result_queue.put({"ok": True, "result": result})
+            if _has_waiting_tool_responses():
+                return
         except KeyboardInterrupt:
             timeout_seconds = request.get("timeout_seconds")
             if timeout_seconds is None:
                 result_queue.put({"ok": False, "error": _exception_payload(KeyboardInterrupt())})
+                if _has_waiting_tool_responses():
+                    return
                 continue
             result_queue.put({
                 "ok": True,
@@ -609,8 +694,12 @@ def _persistent_kernel_runner(
                     "state": _live_kernel_state(),
                 },
             })
+            if _has_waiting_tool_responses():
+                return
         except BaseException as exc:
             result_queue.put({"ok": False, "error": _exception_payload(exc)})
+            if _has_waiting_tool_responses():
+                return
 
 
 def _runner_process_group_id(process: multiprocessing.Process) -> int | None:
