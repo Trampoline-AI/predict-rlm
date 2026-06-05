@@ -1621,26 +1621,38 @@ class PredictRLM(dspy.RLM):
         configured = {"debug": False, "verbose": False}
         debug_enabled = self._debug_logging_enabled()
         verbose_enabled = self._iteration_logging_enabled()
-        if isinstance(repl, RuntimeLoggingConfigurable):
+
+        configure_runtime = self._declared_callable(repl, "configure_runtime")
+        if configure_runtime is not None:
             kwargs = self._accepted_kwargs(
-                repl.configure_runtime,
+                configure_runtime,
                 debug=debug_enabled,
                 verbose=verbose_enabled,
             )
             if kwargs:
-                repl.configure_runtime(**kwargs)
+                configure_runtime(**kwargs)
                 configured["debug"] = "debug" in kwargs
                 configured["verbose"] = "verbose" in kwargs
 
-        if not configured["debug"] and isinstance(repl, DebugLoggingConfigurable):
-            repl.configure_debug(debug_enabled)
+        configure_debug = self._declared_callable(repl, "configure_debug")
+        if not configured["debug"] and configure_debug is not None:
+            configure_debug(debug_enabled)
             configured["debug"] = True
 
-        if not configured["verbose"] and isinstance(repl, VerboseLoggingConfigurable):
-            repl.configure_verbose(verbose_enabled)
+        configure_verbose = self._declared_callable(repl, "configure_verbose")
+        if not configured["verbose"] and configure_verbose is not None:
+            configure_verbose(verbose_enabled)
             configured["verbose"] = True
 
         return configured
+
+    def _declared_callable(self, obj: Any, name: str) -> Callable[..., Any] | None:
+        try:
+            inspect.getattr_static(obj, name)
+        except AttributeError:
+            return None
+        value = getattr(obj, name, None)
+        return value if callable(value) else None
 
     def _accepted_kwargs(self, func: Callable[..., Any], **kwargs: Any) -> dict[str, Any]:
         try:
