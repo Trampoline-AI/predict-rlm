@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import dspy
 import pytest
@@ -19,6 +19,28 @@ class _FakeRepl:
     async def aexecute(self, code, variables=None, timeout=None):
         self.calls.append({"code": code, "variables": variables, "timeout": timeout})
         return "[Success] ok"
+
+
+class _SequentialActions:
+    def __init__(self, *actions: SimpleNamespace) -> None:
+        self.actions = list(actions)
+        self.calls: list[dict] = []
+
+    def __call__(self, **kwargs):
+        self.calls.append(kwargs)
+        assert self.actions, "PredictRLM requested more actions than the test provided"
+        return self.actions.pop(0)
+
+
+class _PredictionStub:
+    def __init__(self, answer: str) -> None:
+        self.answer = answer
+
+    def keys(self) -> list[str]:
+        return ["answer"]
+
+    def __getitem__(self, key: str) -> str:
+        return getattr(self, key)
 
 
 def _build_executor():
@@ -360,6 +382,73 @@ while True:
         assert followup == 123
     finally:
         interpreter.shutdown()
+
+
+def test_predict_rlm_jspi_timeout_preserves_state_history_and_predict_tool():
+    from predict_rlm import PredictRLM
+    from predict_rlm.predict_rlm import dspy
+
+    actions = _SequentialActions(
+        SimpleNamespace(
+            reasoning="call predict before a bounded risky loop",
+            code=(
+                "first = await predict('question: str -> answer: str', "
+                "question='first call')\n"
+                "saved = {'first': first['answer'], 'marker': 123}\n"
+                "print('first predict:', saved['first'])\n"
+                "print('marker before timeout:', saved['marker'])\n"
+                "while True:\n"
+                "    pass\n"
+            ),
+            execution_timeout_seconds=0.2,
+        ),
+        SimpleNamespace(
+            reasoning="continue with preserved state and call predict again",
+            code=(
+                "print('marker after timeout:', saved['marker'])\n"
+                "second = await predict('question: str -> answer: str', "
+                "question='second call')\n"
+                "SUBMIT(answer=f\"{saved['first']} -> {second['answer']} / {saved['marker']}\")"
+            ),
+        ),
+    )
+    mock_lm = MagicMock()
+    mock_predictor = MagicMock()
+    mock_predictor.acall = AsyncMock(
+        side_effect=[
+            _PredictionStub("pre-timeout prediction"),
+            _PredictionStub("post-timeout prediction"),
+        ]
+    )
+    rlm = PredictRLM(
+        "prompt -> answer",
+        sub_lm=mock_lm,
+        max_iterations=2,
+        sandbox_backend="jspi",
+    )
+    rlm.generate_action = actions
+
+    with patch.object(dspy, "Predict", return_value=mock_predictor):
+        prediction = rlm(prompt="exercise deno timeout recovery")
+
+    assert prediction.answer == "pre-timeout prediction -> post-timeout prediction / 123"
+    assert [call["iteration"] for call in actions.calls] == ["1/2", "2/2"]
+    assert mock_predictor.acall.await_count == 2
+    assert [call.kwargs["question"] for call in mock_predictor.acall.await_args_list] == [
+        "first call",
+        "second call",
+    ]
+    assert len(prediction.trace.steps) == 2
+    timeout_step, final_step = prediction.trace.steps
+    assert "[Timeout] Iteration execution timed out after 0.2s" in timeout_step.untruncated_output
+    assert "first predict: pre-timeout prediction" in timeout_step.untruncated_output
+    assert "marker before timeout: 123" in timeout_step.untruncated_output
+    assert final_step.output == (
+        "FINAL: {'answer': 'pre-timeout prediction -> post-timeout prediction / 123'}"
+    )
+    second_history = str(actions.calls[1]["repl_history"])
+    assert "[Timeout] Iteration execution timed out after 0.2s" in second_history
+    assert "first predict: pre-timeout prediction" in second_history
 
 
 def test_jspi_no_timeout_execution_still_returns_output_and_stderr():
