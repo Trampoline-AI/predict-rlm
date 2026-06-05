@@ -8,6 +8,7 @@ import sys
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
+from io import StringIO
 from typing import Any
 
 PACKAGE_LOGGER_NAME = "predict_rlm"
@@ -17,8 +18,6 @@ TRACE_HANDLER_MARKER = "_predict_rlm_trace_handler"
 CODE_PREVIEW_CHARS = 4000
 OUTPUT_PREVIEW_CHARS = 2000
 TOOL_PREVIEW_CHARS = 200
-ITERATION_COLOR = "34"
-CODE_COLOR = "36"
 ERROR_COLOR = "31"
 ANSI_RESET = "\033[0m"
 
@@ -212,21 +211,102 @@ def _preview(value: Any, limit: int | None) -> str:
     return text if text else "(no output)"
 
 
-def _format_block_header(title: str, body: Any, *, color: str, limit: int | None) -> str:
-    return f"\n\033[{color}m── {title} start ──\033[0m\n{_preview(body, limit)}"
+def _render_rich(renderable: Any) -> str:
+    try:
+        from rich.console import Console
+    except Exception:
+        return str(renderable)
+
+    buffer = StringIO()
+    Console(
+        file=buffer,
+        force_terminal=True,
+        color_system="256",
+        no_color=False,
+        legacy_windows=False,
+    ).print(renderable)
+    return buffer.getvalue().rstrip("\n")
 
 
-def _format_block_footer(title: str, *, color: str) -> str:
-    return f"\033[{color}m── {title} end ──\033[0m"
+def _render_trace_header(iteration: int, max_iterations: int) -> str:
+    try:
+        from rich.text import Text
+    except Exception:
+        return f"RLM turn {iteration}/{max_iterations}"
+
+    text = Text()
+    text.append(f"RLM turn {iteration}/{max_iterations}", style="bold bright_black")
+    return _render_rich(text)
 
 
-def _format_block(title: str, body: Any, *, color: str, limit: int | None) -> str:
-    return "\n".join(
-        [
-            _format_block_header(title, body, color=color, limit=limit),
-            _format_block_footer(title, color=color),
-        ]
+def _render_reasoning(reasoning: str) -> str:
+    try:
+        from rich.padding import Padding
+        from rich.table import Table
+        from rich.text import Text
+    except Exception:
+        return f"  reasoning: {reasoning.strip()}"
+
+    table = Table.grid(expand=True, padding=(0, 1))
+    table.add_column(no_wrap=True)
+    table.add_column(ratio=1)
+    table.add_row(
+        Text("reasoning:", style="dim italic"),
+        Text(reasoning.strip(), style="dim italic"),
     )
+    return _render_rich(Padding(table, (0, 0, 0, 2)))
+
+
+def _render_trace_detail(
+    label: str,
+    body: Any,
+    *,
+    syntax: str | None = None,
+    limit: int | None = None,
+) -> str:
+    if isinstance(body, str):
+        text = body
+    else:
+        text = json.dumps(body, indent=2, default=str)
+    if limit is not None:
+        text = text[:limit]
+    try:
+        from rich.console import Group
+        from rich.padding import Padding
+        from rich.syntax import Syntax
+        from rich.text import Text
+    except Exception:
+        content = text if text else "(empty)"
+        return "\n".join([f"  {label}", *(f"    {line}" for line in content.splitlines())])
+
+    if text:
+        content: Text | Syntax = (
+            Syntax(
+                text,
+                syntax,
+                background_color="default",
+                line_numbers=False,
+                word_wrap=True,
+            )
+            if syntax is not None
+            else Text(text, style="dim")
+        )
+    else:
+        content = Text("(empty)", style="dim italic")
+    return _render_rich(
+        Group(
+            Padding(Text(label, style="dim italic"), (0, 0, 0, 2)),
+            Padding(content, (0, 0, 0, 4)),
+        )
+    )
+
+
+def _render_runtime_event(message: str) -> str:
+    try:
+        from rich.text import Text
+    except Exception:
+        return f"  {message}"
+    return _render_rich(Text.assemble(("  ", "dim"), (message, "magenta")))
 
 
 def _emit_trace(message: str) -> None:
@@ -282,7 +362,7 @@ def _format_tool_call_preview(
     kwargs: dict[str, Any] | None = None,
 ) -> str:
     preview = json.dumps(_tool_call_payload(args, kwargs), default=str)[:TOOL_PREVIEW_CHARS]
-    return f"── Tool: {tool_name}({preview}) ──"
+    return f"Tool: {tool_name}({preview})"
 
 
 def emit_trace_iteration_start(
@@ -292,47 +372,39 @@ def emit_trace_iteration_start(
     reasoning: str,
     code: str,
 ) -> None:
-    _emit_trace(
-        _format_block_header(
-            "RLM iteration",
-            (
-                f"RLM iteration {iteration}/{max_iterations}\n"
-                f"Code lines: {_code_line_count(code)}"
-            ),
-            color=ITERATION_COLOR,
-            limit=None,
-        )
-    )
-    emit_trace_block("Reasoning", reasoning, color="35", limit=None)
-    emit_trace_block("Code", code, color=CODE_COLOR, limit=None)
+    _emit_trace("\n" + _render_trace_header(iteration, max_iterations))
+    if reasoning.strip():
+        _emit_trace(_render_reasoning(reasoning))
+    _emit_trace(_render_trace_detail("code:", code, syntax="python"))
 
 
 def emit_trace_iteration_output(output: Any) -> None:
-    emit_trace_block("Output", output, color="32", limit=None)
+    emit_trace_block("output:", output, color="32", limit=None)
 
 
 def emit_trace_iteration_submit(submit_payload: Any) -> None:
-    emit_trace_block("SUBMIT", submit_payload, color="32", limit=None)
+    emit_trace_block("output:", submit_payload, color="32", limit=None)
 
 
 def emit_trace_iteration_end() -> None:
-    _emit_trace(_format_block_footer("RLM iteration", color=ITERATION_COLOR) + "\n")
+    return
 
 
 def emit_trace_block(title: str, body: Any, *, color: str, limit: int | None) -> None:
-    _emit_trace(_format_block(title, body, color=color, limit=limit))
+    del color
+    _emit_trace(_render_trace_detail(title, body, limit=limit))
 
 
 def emit_trace_result(result: dict[str, Any]) -> None:
     if "final" in result:
-        emit_trace_block("SUBMIT", result["final"], color="32", limit=OUTPUT_PREVIEW_CHARS)
+        emit_trace_block("output:", result["final"], color="32", limit=OUTPUT_PREVIEW_CHARS)
         return
-    emit_trace_block("Output", result.get("output", ""), color="32", limit=OUTPUT_PREVIEW_CHARS)
+    emit_trace_block("output:", result.get("output", ""), color="32", limit=OUTPUT_PREVIEW_CHARS)
 
 
 def emit_trace_error(error_type: str, message: Any) -> None:
     emit_trace_block(
-        f"Error ({error_type})",
+        f"error ({error_type}):",
         message,
         color="31",
         limit=OUTPUT_PREVIEW_CHARS,
@@ -346,4 +418,4 @@ def emit_trace_tool_call(
     kwargs: dict[str, Any] | None = None,
 ) -> None:
     preview = _format_tool_call_preview(tool_name, args=args, kwargs=kwargs)
-    _emit_trace(f"\n\033[33m{preview}\033[0m")
+    _emit_trace(_render_runtime_event(preview))

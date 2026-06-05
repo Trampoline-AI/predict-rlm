@@ -133,12 +133,10 @@ print(42)
             interpreter.shutdown()
 
         stderr = capsys.readouterr().err
-        assert "── Output start ──" in stderr
+        assert "output:" in stderr
         assert "before failure" in stderr
-        assert "── Output end ──" in stderr
-        assert "── Error (ValueError) start ──" in stderr
+        assert "error (ValueError):" in stderr
         assert "bad" in stderr
-        assert "── Error (ValueError) end ──" in stderr
 
     def test_double_fence_handled(self):
         """Double fences (model outputs ```...```\\n```) are handled correctly."""

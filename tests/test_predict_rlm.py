@@ -3,6 +3,7 @@
 import asyncio
 import hashlib
 import logging
+import re
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -41,6 +42,10 @@ def _log_messages(caplog, logger_name: str) -> str:
 def _assert_raw_verbose_output(output: str) -> None:
     assert "[INFO]" not in output
     assert "predict_rlm.trace" not in output
+
+
+def _strip_ansi(output: str) -> str:
+    return re.sub(r"\x1b\[[0-9;]*m", "", output)
 
 
 class ImageAnalysisSignature(dspy.Signature):
@@ -335,27 +340,24 @@ class TestVerboseDebugLogging:
 
         before_execute = seen["before_execute"]
         after_execute = capsys.readouterr().err
+        before_text = _strip_ansi(before_execute)
+        after_text = _strip_ansi(after_execute)
 
         _assert_raw_verbose_output(before_execute)
         _assert_raw_verbose_output(after_execute)
-        assert "\033[34m── RLM iteration start ──" in before_execute
-        assert "RLM iteration 1/5" in before_execute
-        assert "── Reasoning start ──" in before_execute
-        assert "thinking" in before_execute
-        assert "── Reasoning end ──" in before_execute
-        assert "Code lines: 2" in before_execute
-        assert "\033[36m── Code start ──" in before_execute
-        assert "print('model authored')" in before_execute
-        assert "── Code end ──" in before_execute
-        assert "── Output start ──" not in before_execute
+        assert "\033[1;90mRLM turn 1/5" in before_execute
+        assert "RLM turn 1/5" in before_text
+        assert "reasoning:" in before_text
+        assert "thinking" in before_text
+        assert "code:" in before_text
+        assert "model authored" in before_text
+        assert "output:" not in before_text
 
-        assert "── Tool: lookup(" in after_execute
-        assert '"args": ["needle"]' in after_execute
-        assert '"kwargs": {"limit": 1}' in after_execute
-        assert "── Output start ──" in after_execute
-        assert "visible output" in after_execute
-        assert "── Output end ──" in after_execute
-        assert "\033[34m── RLM iteration end ──" in after_execute
+        assert "Tool: lookup(" in after_text
+        assert '"args": ["needle"]' in after_text
+        assert '"kwargs": {"limit": 1}' in after_text
+        assert "output:" in after_text
+        assert "visible output" in after_text
 
     def test_debug_logs_lifecycle_without_verbose_trace(self, capsys, caplog):
         caplog.set_level(logging.DEBUG, logger="predict_rlm")
@@ -392,10 +394,10 @@ class TestVerboseDebugLogging:
             )
 
         stderr = seen["before_execute"] + capsys.readouterr().err
-        assert "── RLM iteration start ──" not in stderr
-        assert "── Reasoning start ──" not in stderr
-        assert "── Code start ──" not in stderr
-        assert "── Output start ──" not in stderr
+        assert "RLM turn" not in stderr
+        assert "reasoning:" not in stderr
+        assert "code:" not in stderr
+        assert "output:" not in stderr
         events = [record.getMessage().split()[0] for record in caplog.records]
         assert "rlm.action_generation.start" in events
         assert "rlm.action_generation.ok" in events
@@ -1764,19 +1766,18 @@ class TestExecuteIteration:
 
         before_execute = seen["before_execute"]
         after_execute = capsys.readouterr().err
+        before_text = _strip_ansi(before_execute)
+        after_text = _strip_ansi(after_execute)
         _assert_raw_verbose_output(before_execute)
         _assert_raw_verbose_output(after_execute)
-        assert "── RLM iteration start ──" in before_execute
-        assert "── Reasoning start ──" in before_execute
-        assert "thinking" in before_execute
-        assert "── Reasoning end ──" in before_execute
-        assert "── Code start ──" in before_execute
-        assert "print('model authored')" in before_execute
-        assert "── Code end ──" in before_execute
-        assert "── Output start ──" not in before_execute
-        assert "── Output start ──" in after_execute
-        assert "output from execute" in after_execute
-        assert "── Output end ──" in after_execute
+        assert "RLM turn 1/5" in before_text
+        assert "reasoning:" in before_text
+        assert "thinking" in before_text
+        assert "code:" in before_text
+        assert "model authored" in before_text
+        assert "output:" not in before_text
+        assert "output:" in after_text
+        assert "output from execute" in after_text
 
     def test_sync_sandbox_fatal_error_propagates(self):
         from predict_rlm.interpreter import SandboxFatalError
@@ -2118,19 +2119,18 @@ class TestAexecuteIteration:
 
         before_execute = seen["before_execute"]
         after_execute = capsys.readouterr().err
+        before_text = _strip_ansi(before_execute)
+        after_text = _strip_ansi(after_execute)
         _assert_raw_verbose_output(before_execute)
         _assert_raw_verbose_output(after_execute)
-        assert "── RLM iteration start ──" in before_execute
-        assert "── Reasoning start ──" in before_execute
-        assert "thinking" in before_execute
-        assert "── Reasoning end ──" in before_execute
-        assert "── Code start ──" in before_execute
-        assert "print('async model authored')" in before_execute
-        assert "── Code end ──" in before_execute
-        assert "── Output start ──" not in before_execute
-        assert "── Output start ──" in after_execute
-        assert "output from aexecute" in after_execute
-        assert "── Output end ──" in after_execute
+        assert "RLM turn 1/5" in before_text
+        assert "reasoning:" in before_text
+        assert "thinking" in before_text
+        assert "code:" in before_text
+        assert "async model authored" in before_text
+        assert "output:" not in before_text
+        assert "output:" in after_text
+        assert "output from aexecute" in after_text
 
     @pytest.mark.asyncio
     async def test_falls_back_to_execute_when_no_aexecute(self):

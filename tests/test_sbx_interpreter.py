@@ -198,7 +198,7 @@ class TestSbxInterpreterLocalRunner:
             interpreter.shutdown()
 
         stderr = capsys.readouterr().err
-        assert "── Output start ──" not in stderr
+        assert "output:" not in stderr
         events = [record.getMessage().split()[0] for record in caplog.records]
         assert "sbx.runner.start" in events
         assert "sbx.runner.started" in events
@@ -260,14 +260,12 @@ class TestSbxInterpreterLocalRunner:
         stderr = capsys.readouterr().err
         assert "[INFO]" not in stderr
         assert "predict_rlm.trace" not in stderr
-        assert "── Tool: add(" in stderr
+        assert "Tool: add(" in stderr
         assert '"args": [2, 3]' in stderr
-        assert "── Output start ──" in stderr
+        assert "output:" in stderr
         assert "5" in stderr
-        assert "── Output end ──" in stderr
-        assert "── Error (ValueError) start ──" in stderr
+        assert "error (ValueError):" in stderr
         assert "bad" in stderr
-        assert "── Error (ValueError) end ──" in stderr
 
     def test_verbose_prints_partial_output_before_error(self, tmp_path: Path, capsys):
         interpreter = self.make_interpreter(tmp_path, verbose=True)
@@ -278,12 +276,10 @@ class TestSbxInterpreterLocalRunner:
             interpreter.shutdown()
 
         stderr = capsys.readouterr().err
-        assert "── Output start ──" in stderr
+        assert "output:" in stderr
         assert "before failure" in stderr
-        assert "── Output end ──" in stderr
-        assert "── Error (ValueError) start ──" in stderr
+        assert "error (ValueError):" in stderr
         assert "bad" in stderr
-        assert "── Error (ValueError) end ──" in stderr
 
     def test_verbose_prints_submit_payload(self, tmp_path: Path, capsys):
         interpreter = self.make_interpreter(tmp_path, verbose=True)
@@ -296,9 +292,8 @@ class TestSbxInterpreterLocalRunner:
         stderr = capsys.readouterr().err
         assert "[INFO]" not in stderr
         assert "predict_rlm.trace" not in stderr
-        assert "── SUBMIT start ──" in stderr
+        assert "output:" in stderr
         assert '"answer": "ok"' in stderr
-        assert "── SUBMIT end ──" in stderr
 
     def test_file_helpers_round_trip_virtual_paths(self, tmp_path: Path):
         interpreter = self.make_interpreter(tmp_path)
