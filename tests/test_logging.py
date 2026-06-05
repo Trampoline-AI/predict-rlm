@@ -91,6 +91,25 @@ def test_debug_logging_can_restore_prior_logger_state():
         _restore_logger(logger, original_logger)
 
 
+def test_verbose_trace_detail_does_not_hard_wrap_long_logical_lines():
+    long_line = "x" * 160
+
+    rendered = logging_module._render_trace_detail("output:", long_line)
+
+    assert long_line in rendered
+
+
+def test_verbose_trace_detail_preserves_code_syntax_color():
+    rendered = logging_module._render_trace_detail(
+        "code:",
+        "value = {'x': 1}",
+        syntax="python",
+    )
+
+    assert "\033[33m'" in rendered
+    assert "\033[34m1" in rendered
+
+
 def test_verbose_logging_can_restore_prior_trace_logger_state():
     logger = logging.getLogger(TRACE_LOGGER_NAME)
     original_logger = _snapshot_logger(logger)

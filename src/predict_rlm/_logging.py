@@ -8,8 +8,11 @@ import sys
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
-from io import StringIO
 from typing import Any
+
+from pygments import highlight
+from pygments.formatters import TerminalFormatter
+from pygments.lexers import JsonLexer, PythonLexer
 
 PACKAGE_LOGGER_NAME = "predict_rlm"
 TRACE_LOGGER_NAME = "predict_rlm.trace"
@@ -20,6 +23,10 @@ OUTPUT_PREVIEW_CHARS = 2000
 TOOL_PREVIEW_CHARS = 200
 ERROR_COLOR = "31"
 ANSI_RESET = "\033[0m"
+ANSI_DIM = "\033[2m"
+ANSI_DIM_ITALIC = "\033[2;3m"
+ANSI_HEADER = "\033[1;90m"
+ANSI_MAGENTA = "\033[35m"
 
 _live_tool_call_logging: ContextVar[bool] = ContextVar(
     "_live_tool_call_logging", default=False
@@ -211,50 +218,20 @@ def _preview(value: Any, limit: int | None) -> str:
     return text if text else "(no output)"
 
 
-def _render_rich(renderable: Any) -> str:
-    try:
-        from rich.console import Console
-    except Exception:
-        return str(renderable)
-
-    buffer = StringIO()
-    Console(
-        file=buffer,
-        force_terminal=True,
-        color_system="256",
-        no_color=False,
-        legacy_windows=False,
-    ).print(renderable)
-    return buffer.getvalue().rstrip("\n")
-
-
 def _render_trace_header(iteration: int, max_iterations: int) -> str:
-    try:
-        from rich.text import Text
-    except Exception:
-        return f"RLM turn {iteration}/{max_iterations}"
-
-    text = Text()
-    text.append(f"RLM turn {iteration}/{max_iterations}", style="bold bright_black")
-    return _render_rich(text)
+    return f"{ANSI_HEADER}RLM turn {iteration}/{max_iterations}{ANSI_RESET}"
 
 
 def _render_reasoning(reasoning: str) -> str:
-    try:
-        from rich.padding import Padding
-        from rich.table import Table
-        from rich.text import Text
-    except Exception:
-        return f"  reasoning: {reasoning.strip()}"
-
-    table = Table.grid(expand=True, padding=(0, 1))
-    table.add_column(no_wrap=True)
-    table.add_column(ratio=1)
-    table.add_row(
-        Text("reasoning:", style="dim italic"),
-        Text(reasoning.strip(), style="dim italic"),
+    return "\n".join(
+        [
+            f"  {ANSI_DIM_ITALIC}reasoning:{ANSI_RESET}",
+            *(
+                f"    {ANSI_DIM_ITALIC}{line}{ANSI_RESET}"
+                for line in reasoning.strip().splitlines()
+            ),
+        ]
     )
-    return _render_rich(Padding(table, (0, 0, 0, 2)))
 
 
 def _render_trace_detail(
@@ -270,43 +247,33 @@ def _render_trace_detail(
         text = json.dumps(body, indent=2, default=str)
     if limit is not None:
         text = text[:limit]
-    try:
-        from rich.console import Group
-        from rich.padding import Padding
-        from rich.syntax import Syntax
-        from rich.text import Text
-    except Exception:
-        content = text if text else "(empty)"
-        return "\n".join([f"  {label}", *(f"    {line}" for line in content.splitlines())])
-
-    if text:
-        content: Text | Syntax = (
-            Syntax(
-                text,
-                syntax,
-                background_color="default",
-                line_numbers=False,
-                word_wrap=True,
-            )
-            if syntax is not None
-            else Text(text, style="dim")
-        )
-    else:
-        content = Text("(empty)", style="dim italic")
-    return _render_rich(
-        Group(
-            Padding(Text(label, style="dim italic"), (0, 0, 0, 2)),
-            Padding(content, (0, 0, 0, 4)),
-        )
+    content = text if text else "(empty)"
+    if syntax:
+        content = _highlight_trace_detail(content, syntax)
+    return "\n".join(
+        [
+            f"  {ANSI_DIM_ITALIC}{label}{ANSI_RESET}",
+            *(f"    {_style_trace_line(line, syntax)}" for line in content.splitlines()),
+        ]
     )
 
 
+def _highlight_trace_detail(content: str, syntax: str) -> str:
+    lexer = PythonLexer() if syntax == "python" else JsonLexer()
+    highlighted = highlight(content, lexer, TerminalFormatter())
+    if not content.endswith("\n") and highlighted.endswith("\n"):
+        highlighted = highlighted[:-1]
+    return highlighted
+
+
+def _style_trace_line(line: str, syntax: str | None) -> str:
+    if syntax:
+        return line
+    return f"{ANSI_DIM}{line}{ANSI_RESET}"
+
+
 def _render_runtime_event(message: str) -> str:
-    try:
-        from rich.text import Text
-    except Exception:
-        return f"  {message}"
-    return _render_rich(Text.assemble(("  ", "dim"), (message, "magenta")))
+    return f"  {ANSI_MAGENTA}{message}{ANSI_RESET}"
 
 
 def _emit_trace(message: str) -> None:
