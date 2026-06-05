@@ -9,6 +9,7 @@ import logging
 import os
 import select
 import shutil
+import socket
 import subprocess
 import sys
 import threading
@@ -169,6 +170,85 @@ class TestPythonRunnerProtocol:
         result = runner.request("execute", {"code": "SUBMIT(answer='done')"})
 
         assert result["result"]["final"] == {"answer": "done"}
+
+    def test_deferred_submit_preserves_background_service_for_confirmation(
+        self, runner: LocalRunner
+    ):
+        runner.request(
+            "register_output_fields",
+            {"fields": [{"name": "answer", "annotation": "str"}]},
+        )
+        start_service = runner.request(
+            "execute",
+            {
+                "code": (
+                    "import socket, subprocess, sys, time\n"
+                    "server_code = "
+                    "'import http.server, socketserver; '"
+                    "'srv = socketserver.TCPServer((\\\"127.0.0.1\\\", 0), http.server.SimpleHTTPRequestHandler); '"
+                    "'print(srv.server_address[1], flush=True); '"
+                    "'srv.serve_forever()'\n"
+                    "server = subprocess.Popen(\n"
+                    "    [sys.executable, '-u', '-c', server_code],\n"
+                    "    stdin=subprocess.DEVNULL,\n"
+                    "    stdout=subprocess.PIPE,\n"
+                    "    stderr=subprocess.DEVNULL,\n"
+                    "    text=True,\n"
+                    ")\n"
+                    "port = int(server.stdout.readline())\n"
+                    "deadline = time.time() + 5\n"
+                    "while True:\n"
+                    "    try:\n"
+                    "        with socket.create_connection(('127.0.0.1', port), timeout=0.2):\n"
+                    "            break\n"
+                    "    except OSError:\n"
+                    "        if time.time() > deadline:\n"
+                    "            raise\n"
+                    "        time.sleep(0.05)\n"
+                    "print(port, server.pid)\n"
+                )
+            },
+        )
+        port_text, server_pid_text = start_service["result"]["output"].strip().split()
+        port = int(port_text)
+        server_pid = int(server_pid_text)
+
+        try:
+            submitted = runner.request(
+                "execute",
+                {
+                    "code": "SUBMIT(answer='started')",
+                    "defer_final_output": True,
+                },
+            )
+            probe = runner.request(
+                "execute",
+                {
+                    "code": (
+                        "import socket\n"
+                        f"with socket.create_connection(('127.0.0.1', {port}), timeout=1):\n"
+                        "    print('alive')\n"
+                    )
+                },
+            )
+            final = runner.request("execute", {"code": "SUBMIT(answer='confirmed')"})
+            runner.request("shutdown", {"preserve_kernel_process": True})
+            runner.proc.wait(timeout=5)
+
+            post_final_socket = socket.socket()
+            post_final_socket.settimeout(1)
+            post_final_result = post_final_socket.connect_ex(("127.0.0.1", port))
+            post_final_socket.close()
+        finally:
+            try:
+                os.kill(server_pid, 15)
+            except OSError:
+                pass
+
+        assert submitted["result"] == {"submitted": {"answer": "started"}}
+        assert probe["result"]["output"].strip() == "alive"
+        assert final["result"] == {"final": {"answer": "confirmed"}}
+        assert post_final_result == 0
 
     def test_predict_image_data_url_round_trips_to_host_tool(self, runner: LocalRunner):
         png_bytes = b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR"
@@ -1424,6 +1504,25 @@ class TestSbxCommandConstruction:
         assert "--persist" not in create_cmd
         assert command[:4] == ["sbx", "exec", "-i", "-w"]
         assert not any(cmd[:2] == ["sbx", "rm"] for cmd in commands)
+
+    def test_shutdown_forces_sbx_removal_without_confirmation(self, monkeypatch, tmp_path: Path):
+        commands: list[list[str]] = []
+
+        def fake_run(command, **kwargs):
+            commands.append(command)
+            return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+        monkeypatch.setattr(subprocess, "run", fake_run)
+        interpreter = SbxInterpreter(
+            config=SbxConfig(name="created-name"),
+            preinstall_packages=False,
+            _staging_root=tmp_path / "staging",
+        )
+        interpreter._sandbox_name = "created-name"
+
+        interpreter.shutdown()
+
+        assert ["sbx", "rm", "--force", "created-name"] in commands
 
     def test_workspace_flags_include_read_only_primary_and_extra_workspaces(
         self, monkeypatch, tmp_path: Path

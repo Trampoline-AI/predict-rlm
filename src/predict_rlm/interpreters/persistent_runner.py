@@ -298,6 +298,8 @@ class PersistentJsonRpcRunnerClient(ABC):
             return format_recoverable_timeout_result(result)
         if "final" in result:
             return FinalOutput(result["final"])
+        if "submitted" in result:
+            return FinalOutput(result["submitted"])
         return result.get("output")
 
     def _serialize_supervisor_message(self, message: dict[str, Any]) -> str:
