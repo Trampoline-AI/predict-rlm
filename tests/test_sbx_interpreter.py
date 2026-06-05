@@ -16,6 +16,7 @@ import time
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Annotated
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from dspy.primitives.code_interpreter import CodeInterpreterError, FinalOutput
@@ -2187,3 +2188,73 @@ class TestSbxInterpreterRealSbx:
         assert "[stdout]\nbefore rlm timeout" in timeout_step.untruncated_output
         assert "[stderr]\nstderr before rlm timeout" in timeout_step.untruncated_output
         assert final_step.output == "FINAL: {'answer': 'continued after timeout'}"
+
+    def test_predict_rlm_can_use_predict_after_lm_selected_timeout(self):
+        from predict_rlm import PredictRLM
+
+        actions = SequentialActions(
+            SimpleNamespace(
+                reasoning="call predict before the risky loop",
+                code=(
+                    "first = await predict('question: str -> answer: str', "
+                    "question='first call')\n"
+                    "print('first predict:', first['answer'])\n"
+                    "while True:\n"
+                    "    pass\n"
+                ),
+                execution_timeout_seconds=0.2,
+            ),
+            SimpleNamespace(
+                reasoning="call predict again after timeout recovery",
+                code=(
+                    "second = await predict('question: str -> answer: str', "
+                    "question='second call')\n"
+                    "SUBMIT(answer=second['answer'])"
+                ),
+            ),
+        )
+        class PredictionStub:
+            def __init__(self, answer: str) -> None:
+                self.answer = answer
+
+            def keys(self) -> list[str]:
+                return ["answer"]
+
+            def __getitem__(self, key: str) -> str:
+                return getattr(self, key)
+
+        mock_lm = MagicMock()
+        mock_predictor = MagicMock()
+        mock_predictor.acall = AsyncMock(side_effect=[
+            PredictionStub("pre-timeout prediction"),
+            PredictionStub("post-timeout prediction"),
+        ])
+        pool = SbxPool(
+            size=1,
+            config=SbxConfig(name=f"predict-rlm-test-predict-timeout-{os.getpid()}"),
+            preinstall_packages=False,
+        )
+        rlm = PredictRLM(
+            "prompt -> answer",
+            sub_lm=mock_lm,
+            max_iterations=2,
+            sandbox_backend="sbx",
+            sbx_pool=pool,
+        )
+        rlm.generate_action = actions
+        try:
+            with patch("predict_rlm.predict_rlm.dspy.Predict", return_value=mock_predictor):
+                prediction = rlm(prompt="exercise predict across timeout recovery")
+        finally:
+            pool.shutdown()
+
+        assert prediction.answer == "post-timeout prediction"
+        assert mock_predictor.acall.await_count == 2
+        assert [call.kwargs["question"] for call in mock_predictor.acall.await_args_list] == [
+            "first call",
+            "second call",
+        ]
+        timeout_step, final_step = prediction.trace.steps
+        assert "[Timeout] Iteration execution timed out after 0.2s" in timeout_step.untruncated_output
+        assert "first predict: pre-timeout prediction" in timeout_step.untruncated_output
+        assert final_step.output == "FINAL: {'answer': 'post-timeout prediction'}"
