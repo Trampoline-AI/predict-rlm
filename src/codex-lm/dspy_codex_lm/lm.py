@@ -810,6 +810,8 @@ class CodexLM(dspy.LM):
                         for event in _iter_stream_with_heartbeat(stream):
                             timing.observe_event(event)
                             self._handle_event(event, state)
+                            if state["completed"]:
+                                break
                         timing.mark_stream_end()
                         self._raise_if_failed(state)
                         result = self._assemble(
@@ -869,6 +871,8 @@ class CodexLM(dspy.LM):
                         async for event in _aiter_stream_with_heartbeat(stream):
                             timing.observe_event(event)
                             self._handle_event(event, state)
+                            if state["completed"]:
+                                break
                         timing.mark_stream_end()
                         self._raise_if_failed(state)
                         result = self._assemble(
