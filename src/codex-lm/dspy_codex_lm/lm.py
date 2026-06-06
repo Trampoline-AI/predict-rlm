@@ -5,12 +5,15 @@ import os
 import random
 import uuid
 import warnings
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from time import monotonic
 from typing import Any
+from urllib.parse import urlparse, urlunparse
 
+import aiohttp
 import dspy
 import litellm
 from dspy.clients.lm import _convert_chat_request_to_responses_request
@@ -24,6 +27,7 @@ from tenacity import (
     stop_after_attempt,
     wait_random_exponential,
 )
+from tenacity.wait import wait_base
 
 from dspy_codex_lm.auth import (
     list_enabled_auth_profiles,
@@ -34,6 +38,7 @@ from dspy_codex_lm.auth import (
 from dspy_codex_lm.cost import compute_cost, register_known_model_costs
 
 CODEX_BASE = "https://chatgpt.com/backend-api/codex"
+CODEX_WS_BETA_HEADER = "responses_websockets=2026-02-06"
 CODEX_AUTH_CONFIG_REFRESH_SECONDS: float = 60.0
 
 register_known_model_costs()
@@ -49,14 +54,13 @@ for _slug in ("gpt-5.3-codex-spark", "gpt-5.5"):
         litellm.model_cost[f"openai/{_slug}"] = {**_GPT54_ENTRY}
 
 # Retry config for transient Codex stream failures (rate limits,
-# incomplete streams, dropped connections). 4 total attempts (initial +
-# 3 retries) with jittered exponential backoff — each retry waits a
-# uniform random duration in [0, min(multiplier·2^(n-1), max)] so N
-# concurrent callers hitting the same rate-limit window fan out across
-# the backoff window instead of retrying in lockstep (which just
-# re-concentrates load on the endpoint that was already struggling).
+# incomplete streams, dropped connections). 5 total attempts (initial +
+# 4 retries). When Codex includes a retry-after delay on a stream error,
+# honor that server-requested delay; otherwise use jittered exponential
+# backoff so concurrent callers fan out instead of retrying in lockstep.
 # Exposed as module-level knobs so callers / tests can override.
-CODEX_STREAM_MAX_ATTEMPTS: int = 4
+DEFAULT_CODEX_STREAM_MAX_ATTEMPTS: int = 5
+CODEX_STREAM_MAX_ATTEMPTS: int = DEFAULT_CODEX_STREAM_MAX_ATTEMPTS
 CODEX_STREAM_WAIT_MULTIPLIER: float = 2.0
 CODEX_STREAM_WAIT_MAX: float = 8.0
 # Max wall-clock between consecutive SSE events before we consider the
@@ -65,16 +69,37 @@ CODEX_STREAM_WAIT_MAX: float = 8.0
 # but then goes silent leaves ``async for event in stream:`` blocked
 # indefinitely — asyncio.wait_for on the caller cannot cancel an inner
 # socket read that never hits an await point, and TCP keepalive is 2
-# hours by default on macOS. 30s comfortably covers slow first-token
-# latency and normal inter-token gaps while keeping stalls observable.
+# hours by default on macOS. Match upstream Codex's 300s default idle
+# timeout while still making the watchdog configurable for focused tests
+# and more aggressive caller-specific deployments.
 CODEX_STREAM_HEARTBEAT_SEC: float = float(
-    os.environ.get("CODEX_STREAM_HEARTBEAT_SEC", "30.0")
+    os.environ.get("CODEX_STREAM_HEARTBEAT_SEC", "300.0")
 )
 DEFAULT_CODEX_MODEL = "gpt-5.5"
 
 logger = logging.getLogger(__name__)
 
 _DEBUG_TRUE_VALUES = {"1", "true", "yes", "on"}
+
+
+@contextmanager
+def _scoped_proxy_env(proxy_url: str | None):
+    if proxy_url is None:
+        yield
+        return
+
+    names = ("HTTPS_PROXY", "HTTP_PROXY", "https_proxy", "http_proxy")
+    previous = {name: os.environ.get(name) for name in names}
+    try:
+        for name in names:
+            os.environ[name] = proxy_url
+        yield
+    finally:
+        for name, value in previous.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
 
 
 def _debug_env_enabled() -> bool:
@@ -93,12 +118,15 @@ def _codex_debug_event(event: str, **metadata: Any) -> None:
     if not _debug_env_enabled():
         return
 
+    dedicated_log_path = os.environ.get("CODEX_LM_DEBUG_LOG")
     try:
         from predict_rlm.debug import debug_event, sanitize_metadata
     except Exception:
         sanitize_metadata = None
     else:
-        if os.environ.get("PREDICT_RLM_DEBUG") or os.environ.get("RLM_DEBUG"):
+        if (
+            os.environ.get("PREDICT_RLM_DEBUG") or os.environ.get("RLM_DEBUG")
+        ) and not dedicated_log_path:
             debug_event(event, **metadata)
             return
 
@@ -108,7 +136,7 @@ def _codex_debug_event(event: str, **metadata: Any) -> None:
         **(sanitize_metadata(metadata) if sanitize_metadata is not None else metadata),
     }
     line = json.dumps(payload, sort_keys=True, default=str)
-    log_path = os.environ.get("CODEX_LM_DEBUG_LOG") or os.environ.get("PREDICT_RLM_DEBUG_LOG")
+    log_path = dedicated_log_path or os.environ.get("PREDICT_RLM_DEBUG_LOG")
     if log_path:
         try:
             path = Path(log_path)
@@ -144,6 +172,16 @@ def _prompt_cache_stats(usage: Any) -> dict[str, Any]:
     return stats
 
 
+def _request_debug_metadata(request: dict[str, Any]) -> dict[str, Any]:
+    metadata: dict[str, Any] = {}
+    reasoning = request.get("reasoning")
+    if isinstance(reasoning, dict) and reasoning.get("effort") is not None:
+        metadata["reasoning_effort"] = reasoning["effort"]
+    if request.get("service_tier") is not None:
+        metadata["service_tier"] = request["service_tier"]
+    return metadata
+
+
 def _coerce_int(value: Any) -> int | None:
     if isinstance(value, bool) or value is None:
         return None
@@ -153,12 +191,20 @@ def _coerce_int(value: Any) -> int | None:
         return None
 
 
+def _is_output_text_delta_type(event_type: Any) -> bool:
+    if event_type == "response.output_text.delta":
+        return True
+    return str(event_type).endswith("OUTPUT_TEXT_DELTA")
+
+
 @dataclass
 class _StreamTiming:
     model: str
     attempt_number: int | None
     start_at: float
+    transport: str
     auth_metadata: dict[str, Any] | None = None
+    request_metadata: dict[str, Any] | None = None
     first_event_at: float | None = None
     first_text_delta_at: float | None = None
     stream_end_at: float | None = None
@@ -174,6 +220,8 @@ class _StreamTiming:
             "codex_lm.stream.start",
             model=self.model,
             attempt_number=self.attempt_number,
+            transport=self.transport,
+            **(self.request_metadata or {}),
             **(self.auth_metadata or {}),
         )
 
@@ -189,11 +237,13 @@ class _StreamTiming:
                 "codex_lm.stream.first_event",
                 model=self.model,
                 attempt_number=self.attempt_number,
+                transport=self.transport,
                 first_event_type=etype,
                 tt_first_event_ms=_elapsed_ms(self.start_at, now),
+                **(self.request_metadata or {}),
                 **(self.auth_metadata or {}),
             )
-        if etype == "response.output_text.delta":
+        if _is_output_text_delta_type(etype):
             delta = _g(event, "delta")
             if delta:
                 self.output_text_chars += len(delta)
@@ -203,12 +253,14 @@ class _StreamTiming:
                         "codex_lm.stream.first_text_delta",
                         model=self.model,
                         attempt_number=self.attempt_number,
+                        transport=self.transport,
                         tt_first_event_ms=_elapsed_ms(
                             self.start_at,
                             self.first_event_at,
                         ),
                         ttft_ms=_elapsed_ms(self.start_at, now),
                         first_delta_chars=len(delta),
+                        **(self.request_metadata or {}),
                         **(self.auth_metadata or {}),
                     )
             elif self.first_text_delta_at is None:
@@ -250,6 +302,7 @@ class _StreamTiming:
             "codex_lm.stream.end",
             model=self.model,
             attempt_number=self.attempt_number,
+            transport=self.transport,
             tt_first_event_ms=_elapsed_ms(self.start_at, self.first_event_at),
             ttft_ms=_elapsed_ms(self.start_at, self.first_text_delta_at),
             stream_total_ms=_elapsed_ms(self.start_at, self.stream_end_at),
@@ -258,6 +311,7 @@ class _StreamTiming:
             else None,
             output_text_chars=self.output_text_chars,
             completed=bool(state.get("completed")),
+            **(self.request_metadata or {}),
             **(self.auth_metadata or {}),
             **self._event_gap_metadata(finished_at),
             **_prompt_cache_stats(state.get("usage_raw")),
@@ -271,6 +325,7 @@ class _StreamTiming:
             "codex_lm.stream.error",
             model=self.model,
             attempt_number=self.attempt_number,
+            transport=self.transport,
             tt_first_event_ms=_elapsed_ms(self.start_at, self.first_event_at),
             ttft_ms=_elapsed_ms(self.start_at, self.first_text_delta_at),
             stream_total_ms=_elapsed_ms(self.start_at, self.stream_end_at),
@@ -279,6 +334,7 @@ class _StreamTiming:
             failure_kind=failure.get("kind") or type(exc).__name__,
             failure_code=failure.get("code"),
             exception_type=type(exc).__name__,
+            **(self.request_metadata or {}),
             **(self.auth_metadata or {}),
             **self._event_gap_metadata(self.stream_end_at),
         )
@@ -293,10 +349,7 @@ def _codex_retry_kwargs() -> dict[str, Any]:
     return dict(
         retry=retry_if_exception_type(CodexStreamError),
         stop=stop_after_attempt(CODEX_STREAM_MAX_ATTEMPTS),
-        wait=wait_random_exponential(
-            multiplier=CODEX_STREAM_WAIT_MULTIPLIER,
-            max=CODEX_STREAM_WAIT_MAX,
-        ),
+        wait=_WaitServerRetryAfterOrRandomExponential(),
         before_sleep=before_sleep_log(logger, logging.WARNING),
         reraise=True,
     )
@@ -415,11 +468,68 @@ def _disable_litellm_stream_logging(stream: Any) -> Any:
     return stream
 
 
+def _coerce_retry_after_seconds(value: Any) -> float | None:
+    if value is None:
+        return None
+    try:
+        seconds = float(value)
+    except (TypeError, ValueError):
+        return None
+    if seconds < 0:
+        return None
+    return seconds
+
+
+def _first_present(obj: Any, *keys: str) -> Any:
+    for key in keys:
+        value = _g(obj, key)
+        if value is not None:
+            return value
+    return None
+
+
+def _retry_after_seconds_from_error(error: Any) -> float | None:
+    seconds = _coerce_retry_after_seconds(
+        _first_present(
+            error,
+            "retry_after_seconds",
+            "retryAfterSeconds",
+            "retry_after",
+            "retryAfter",
+        )
+    )
+    if seconds is not None:
+        return seconds
+    milliseconds = _coerce_retry_after_seconds(
+        _first_present(error, "retry_after_ms", "retryAfterMs")
+    )
+    if milliseconds is None:
+        return None
+    return milliseconds / 1000.0
+
+
 class CodexStreamError(RuntimeError):
-    """Raised when the Codex response stream emits a failure event (rate
-    limit, backend error, incomplete response) or ends without ever
-    completing. Contains the upstream error code/message when available.
-    """
+    """Raised when the Codex response stream fails before completion."""
+
+    def __init__(self, message: str, *, retry_after_seconds: float | None = None):
+        super().__init__(message)
+        self.retry_after_seconds = retry_after_seconds
+
+
+class _WaitServerRetryAfterOrRandomExponential(wait_base):
+    def __init__(self):
+        self._fallback = wait_random_exponential(
+            multiplier=CODEX_STREAM_WAIT_MULTIPLIER,
+            max=CODEX_STREAM_WAIT_MAX,
+        )
+
+    def __call__(self, retry_state: Any) -> float:
+        if retry_state.outcome is not None:
+            exception = retry_state.outcome.exception()
+            retry_after = getattr(exception, "retry_after_seconds", None)
+            if retry_after is not None:
+                return retry_after
+        return self._fallback(retry_state)
 
 
 def _g(obj: Any, key: str, default: Any = None) -> Any:
@@ -428,6 +538,21 @@ def _g(obj: Any, key: str, default: Any = None) -> Any:
     if isinstance(obj, dict):
         return obj.get(key, default)
     return getattr(obj, key, default)
+
+
+def _codex_stream_error_from_state(state: dict[str, Any]) -> CodexStreamError | None:
+    failure = state["failure"]
+    if failure is None:
+        return None
+    msg = (
+        f"Codex stream {failure['kind']}"
+        + (f" ({failure['code']})" if failure.get("code") else "")
+        + f": {failure['message']}"
+    )
+    return CodexStreamError(
+        msg,
+        retry_after_seconds=failure.get("retry_after_seconds"),
+    )
 
 
 @dataclass(frozen=True)
@@ -445,8 +570,8 @@ class _AuthConfigSnapshot:
     rotating: bool = False
 
 
-class CodexLM(dspy.LM):
-    """DSPy LM that routes calls through the ChatGPT subscription backend.
+class CodexHTTPLM(dspy.LM):
+    """DSPy LM that routes calls through the ChatGPT subscription HTTP/SSE backend.
 
     Reads the OAuth access token from ``~/.codex/auth.json`` (or a provided
     path / explicit token). Streams the Responses API, assembles a full
@@ -467,6 +592,7 @@ class CodexLM(dspy.LM):
         auth_config_refresh_seconds: float = CODEX_AUTH_CONFIG_REFRESH_SECONDS,
         **kwargs,
     ):
+        self._proxy_url = kwargs.pop("proxy_url", None)
         self._auth_path = auth_path
         self._auth_profile = auth_profile
         self._pinned_access_token = access_token
@@ -517,6 +643,7 @@ class CodexLM(dspy.LM):
         # absent from the request and Codex uses its default.
         if merged.get("reasoning_effort") is None:
             merged.pop("reasoning_effort", None)
+        proxy_url = merged.pop("proxy_url", self._proxy_url)
 
         request = dict(model=self.model, messages=messages, **merged)
         request = _convert_chat_request_to_responses_request(request)
@@ -532,6 +659,7 @@ class CodexLM(dspy.LM):
         self._apply_request_auth(request, headers)
         headers["originator"] = "opencode"
         headers["session_id"] = str(uuid.uuid4())
+        request["_codex_lm_proxy_url"] = proxy_url
         return request, headers
 
     def _request_auth(
@@ -662,7 +790,7 @@ class CodexLM(dspy.LM):
 
     def _handle_event(self, event: Any, state: dict[str, Any]) -> None:
         etype = _g(event, "type")
-        if etype == "response.output_text.delta":
+        if _is_output_text_delta_type(etype):
             delta = _g(event, "delta")
             if delta:
                 state["text_parts"].append(delta)
@@ -679,6 +807,7 @@ class CodexLM(dspy.LM):
                 "kind": "failed",
                 "code": _g(err, "code"),
                 "message": _g(err, "message") or "response.failed (no message)",
+                "retry_after_seconds": _retry_after_seconds_from_error(err),
             }
         elif etype == "response.incomplete":
             raw = _g(event, "response")
@@ -696,15 +825,11 @@ class CodexLM(dspy.LM):
             }
 
     def _raise_if_failed(self, state: dict[str, Any]) -> None:
-        failure = state["failure"]
-        if failure is not None:
-            msg = (
-                f"Codex stream {failure['kind']}"
-                + (f" ({failure['code']})" if failure.get("code") else "")
-                + f": {failure['message']}"
-            )
-            logger.warning("codex stream failure: %s", msg)
-            raise CodexStreamError(msg)
+        error = _codex_stream_error_from_state(state)
+        if error is not None:
+            logger.warning("codex stream failure: %s", error)
+            raise error
+
         if not state["completed"]:
             msg = (
                 "Codex stream ended without a response.completed event "
@@ -779,6 +904,7 @@ class CodexLM(dspy.LM):
     def forward(self, prompt=None, messages=None, **kwargs):
         request, headers = self._build_request(prompt, messages, kwargs)
         auth_metadata = request.pop("_codex_lm_auth_metadata", {})
+        proxy_url = request.pop("_codex_lm_proxy_url", None)
         cache = kwargs.pop("cache", self.cache)
 
         def _completion(request, num_retries, cache):
@@ -796,21 +922,24 @@ class CodexLM(dspy.LM):
                         model=str(request.get("model") or self.model),
                         attempt_number=attempt.retry_state.attempt_number,
                         start_at=monotonic(),
+                        transport="http_sse",
+                        request_metadata=_request_debug_metadata(request),
                         auth_metadata=auth_metadata,
                     )
                     state = self._fresh_state()
                     timing.emit_start()
                     try:
-                        stream = litellm.responses(
-                            headers=headers,
-                            num_retries=num_retries,
-                            **request,
-                        )
+                        with _scoped_proxy_env(proxy_url):
+                            stream = litellm.responses(
+                                headers=headers,
+                                num_retries=num_retries,
+                                **request,
+                            )
                         stream = _disable_litellm_stream_logging(stream)
                         for event in _iter_stream_with_heartbeat(stream):
                             timing.observe_event(event)
                             self._handle_event(event, state)
-                            if state["completed"]:
+                            if state["completed"] or state["failure"] is not None:
                                 break
                         timing.mark_stream_end()
                         self._raise_if_failed(state)
@@ -840,6 +969,7 @@ class CodexLM(dspy.LM):
     async def aforward(self, prompt=None, messages=None, **kwargs):
         request, headers = self._build_request(prompt, messages, kwargs)
         auth_metadata = request.pop("_codex_lm_auth_metadata", {})
+        proxy_url = request.pop("_codex_lm_proxy_url", None)
         cache = kwargs.pop("cache", self.cache)
 
         async def _acompletion(request, num_retries, cache):
@@ -857,21 +987,24 @@ class CodexLM(dspy.LM):
                         model=str(request.get("model") or self.model),
                         attempt_number=attempt.retry_state.attempt_number,
                         start_at=monotonic(),
+                        transport="http_sse",
+                        request_metadata=_request_debug_metadata(request),
                         auth_metadata=auth_metadata,
                     )
                     state = self._fresh_state()
                     timing.emit_start()
                     try:
-                        stream = await litellm.aresponses(
-                            headers=headers,
-                            num_retries=num_retries,
-                            **request,
-                        )
+                        with _scoped_proxy_env(proxy_url):
+                            stream = await litellm.aresponses(
+                                headers=headers,
+                                num_retries=num_retries,
+                                **request,
+                            )
                         stream = _disable_litellm_stream_logging(stream)
                         async for event in _aiter_stream_with_heartbeat(stream):
                             timing.observe_event(event)
                             self._handle_event(event, state)
-                            if state["completed"]:
+                            if state["completed"] or state["failure"] is not None:
                                 break
                         timing.mark_stream_end()
                         self._raise_if_failed(state)
@@ -895,6 +1028,323 @@ class CodexLM(dspy.LM):
         )
         _fire_usage_tracker_hook(self.model, results)
         return results
+
+
+class _UnavailableCodexWSTransport:
+    def stream_turn(self, **_: Any):
+        raise CodexStreamError("Codex WebSocket transport is not configured")
+
+    async def astream_turn(self, **_: Any):
+        raise CodexStreamError("Codex WebSocket transport is not configured")
+
+
+def _responses_ws_url(base: str) -> str:
+    parsed = urlparse(base.rstrip("/"))
+    scheme = {"http": "ws", "https": "wss"}.get(parsed.scheme, parsed.scheme)
+    path = parsed.path.rstrip("/")
+    if not path.endswith("/responses"):
+        path = f"{path}/responses"
+    return urlunparse(parsed._replace(scheme=scheme, path=path))
+
+
+def _ws_request_payload(request: dict[str, Any]) -> dict[str, Any]:
+    excluded = {
+        "api_base",
+        "api_key",
+        "custom_llm_provider",
+        "_codex_lm_auth_metadata",
+        "_codex_lm_proxy_url",
+    }
+    payload = {
+        key: value for key, value in request.items() if key not in excluded and value is not None
+    }
+    payload["type"] = "response.create"
+    return payload
+
+
+class _AiohttpCodexWSTransport:
+    def __init__(self, base_url: str = CODEX_BASE):
+        self.url = _responses_ws_url(base_url)
+
+    def stream_turn(self, **kwargs: Any):
+        async def collect() -> list[Any]:
+            events = []
+            stream = self.astream_turn(**kwargs)
+            async for event in _aiter_stream_with_heartbeat(stream):
+                events.append(event)
+                event_type = _g(event, "type")
+                if event_type in {"response.completed", "response.failed"}:
+                    break
+            return events
+
+        return iter(asyncio.run(collect()))
+
+    async def astream_turn(
+        self,
+        *,
+        request: dict[str, Any],
+        headers: dict[str, str],
+        request_id: str,
+        sticky_state: dict[str, Any],
+    ):
+        ws_headers = dict(headers)
+        ws_headers["Authorization"] = f"Bearer {request['api_key']}"
+        ws_headers["OpenAI-Beta"] = CODEX_WS_BETA_HEADER
+        ws_headers["x-client-request-id"] = request_id
+        if sticky_state.get("turn_state"):
+            ws_headers["x-codex-turn-state"] = sticky_state["turn_state"]
+
+        async with aiohttp.ClientSession() as session:
+            async with session.ws_connect(self.url, headers=ws_headers, compress=15) as ws:
+                response = getattr(ws, "_response", None)
+                turn_state = getattr(response, "headers", {}).get("x-codex-turn-state")
+                if turn_state:
+                    sticky_state["turn_state"] = turn_state
+                await ws.send_str(json.dumps(_ws_request_payload(request)))
+                async for message in ws:
+                    if message.type == aiohttp.WSMsgType.TEXT:
+                        yield json.loads(message.data)
+                    elif message.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.CLOSE):
+                        break
+                    elif message.type == aiohttp.WSMsgType.ERROR:
+                        raise CodexStreamError(f"Codex WebSocket error: {ws.exception()}")
+
+
+@dataclass
+class _CodexWSTurnSession:
+    transport: Any
+    request: dict[str, Any]
+    headers: dict[str, str]
+    request_id: str
+    sticky_state: dict[str, Any]
+
+    def stream(self):
+        return self.transport.stream_turn(
+            request=self.request,
+            headers=self.headers,
+            request_id=self.request_id,
+            sticky_state=self.sticky_state,
+        )
+
+    async def astream(self):
+        stream = self.transport.astream_turn(
+            request=self.request,
+            headers=self.headers,
+            request_id=self.request_id,
+            sticky_state=self.sticky_state,
+        )
+        if hasattr(stream, "__await__"):
+            return await stream
+        return stream
+
+
+class CodexWSLM(CodexHTTPLM):
+    """Codex LM variant with an injectable WebSocket turn transport.
+
+    The live Codex WebSocket wire protocol is deliberately not hard-coded here.
+    Tests and callers can inject a transport implementing ``stream_turn`` and
+    ``astream_turn``. The default transport speaks the live Codex WebSocket
+    protocol; ``ws_fallback`` controls whether exhausted WS turns fall back to
+    the HTTP/SSE ``CodexHTTPLM`` path.
+    """
+
+    def __init__(
+        self,
+        model: str = "gpt-5.3-codex",
+        instructions: str = "You are a helpful assistant.",
+        access_token: str | None = None,
+        account_id: str | None = None,
+        auth_path: str | Path | None = None,
+        auth_profile: str | None = None,
+        auth_config_refresh_seconds: float = CODEX_AUTH_CONFIG_REFRESH_SECONDS,
+        ws_transport: Any | None = None,
+        ws_base: str = CODEX_BASE,
+        ws_fallback: bool = True,
+        fallback_lm: Any | None = None,
+        **kwargs,
+    ):
+        fallback_kwargs = dict(kwargs)
+        super().__init__(
+            model=model,
+            instructions=instructions,
+            access_token=access_token,
+            account_id=account_id,
+            auth_path=auth_path,
+            auth_profile=auth_profile,
+            auth_config_refresh_seconds=auth_config_refresh_seconds,
+            **kwargs,
+        )
+        self._ws_transport = ws_transport or _AiohttpCodexWSTransport(ws_base)
+        self._ws_fallback_enabled = ws_fallback
+        self._ws_fallback_active = False
+        self._fallback_lm = fallback_lm or CodexHTTPLM(
+            model=model,
+            instructions=instructions,
+            access_token=access_token,
+            account_id=account_id,
+            auth_path=auth_path,
+            auth_profile=auth_profile,
+            auth_config_refresh_seconds=auth_config_refresh_seconds,
+            **fallback_kwargs,
+        )
+
+    def _make_ws_turn(
+        self,
+        request: dict[str, Any],
+        headers: dict[str, str],
+    ) -> _CodexWSTurnSession:
+        return _CodexWSTurnSession(
+            transport=self._ws_transport,
+            request=request,
+            headers=headers,
+            request_id=str(uuid.uuid4()),
+            sticky_state={},
+        )
+
+    def forward(self, prompt=None, messages=None, **kwargs):
+        if self._ws_fallback_active:
+            return self._fallback_lm.forward(prompt=prompt, messages=messages, **kwargs)
+
+        fallback_kwargs = dict(kwargs)
+        request, headers = self._build_request(prompt, messages, kwargs)
+        auth_metadata = request.pop("_codex_lm_auth_metadata", {})
+        request.pop("_codex_lm_proxy_url", None)
+        cache = kwargs.pop("cache", self.cache)
+
+        def _completion(request, headers, num_retries, cache):
+            nonlocal auth_metadata
+            turn = self._make_ws_turn(request, headers)
+            for attempt in Retrying(**_codex_retry_kwargs()):
+                with attempt:
+                    if attempt.retry_state.attempt_number > 1:
+                        auth_metadata = self._apply_request_auth(
+                            request,
+                            headers,
+                            exclude_profile=auth_metadata.get("auth_profile"),
+                        )
+                        request.pop("_codex_lm_auth_metadata", None)
+                    timing = _StreamTiming(
+                        model=str(request.get("model") or self.model),
+                        attempt_number=attempt.retry_state.attempt_number,
+                        start_at=monotonic(),
+                        transport="websocket",
+                        request_metadata=_request_debug_metadata(request),
+                        auth_metadata=auth_metadata,
+                    )
+                    state = self._fresh_state()
+                    timing.emit_start()
+                    try:
+                        stream = turn.stream()
+                        for event in _iter_stream_with_heartbeat(stream):
+                            timing.observe_event(event)
+                            self._handle_event(event, state)
+                            if state["completed"] or state["failure"] is not None:
+                                break
+                        timing.mark_stream_end()
+                        self._raise_if_failed(state)
+                        result = self._assemble(
+                            text_parts=state["text_parts"],
+                            usage_raw=state["usage_raw"],
+                            response_id=state["response_id"],
+                            model_name=state["model_name"],
+                        )
+                        timing.emit_end(state, finished_at=monotonic())
+                        return result
+                    except Exception as exc:
+                        timing.emit_error(state, exc)
+                        raise
+
+        completion_fn, litellm_cache_args = self._get_cached_completion_fn(_completion, cache)
+        try:
+            results = completion_fn(
+                request=request,
+                headers=headers,
+                num_retries=self.num_retries,
+                cache=litellm_cache_args,
+            )
+        except CodexStreamError:
+            if not self._ws_fallback_enabled:
+                raise
+            self._ws_fallback_active = True
+            return self._fallback_lm.forward(prompt=prompt, messages=messages, **fallback_kwargs)
+        _fire_usage_tracker_hook(self.model, results)
+        return results
+
+    async def aforward(self, prompt=None, messages=None, **kwargs):
+        if self._ws_fallback_active:
+            return await self._fallback_lm.aforward(prompt=prompt, messages=messages, **kwargs)
+
+        fallback_kwargs = dict(kwargs)
+        request, headers = self._build_request(prompt, messages, kwargs)
+        auth_metadata = request.pop("_codex_lm_auth_metadata", {})
+        request.pop("_codex_lm_proxy_url", None)
+        cache = kwargs.pop("cache", self.cache)
+
+        async def _acompletion(request, headers, num_retries, cache):
+            nonlocal auth_metadata
+            turn = self._make_ws_turn(request, headers)
+            async for attempt in AsyncRetrying(**_codex_retry_kwargs()):
+                with attempt:
+                    if attempt.retry_state.attempt_number > 1:
+                        auth_metadata = self._apply_request_auth(
+                            request,
+                            headers,
+                            exclude_profile=auth_metadata.get("auth_profile"),
+                        )
+                        request.pop("_codex_lm_auth_metadata", None)
+                    timing = _StreamTiming(
+                        model=str(request.get("model") or self.model),
+                        attempt_number=attempt.retry_state.attempt_number,
+                        start_at=monotonic(),
+                        transport="websocket",
+                        request_metadata=_request_debug_metadata(request),
+                        auth_metadata=auth_metadata,
+                    )
+                    state = self._fresh_state()
+                    timing.emit_start()
+                    try:
+                        stream = await turn.astream()
+                        async for event in _aiter_stream_with_heartbeat(stream):
+                            timing.observe_event(event)
+                            self._handle_event(event, state)
+                            if state["completed"] or state["failure"] is not None:
+                                break
+                        timing.mark_stream_end()
+                        self._raise_if_failed(state)
+                        result = self._assemble(
+                            text_parts=state["text_parts"],
+                            usage_raw=state["usage_raw"],
+                            response_id=state["response_id"],
+                            model_name=state["model_name"],
+                        )
+                        timing.emit_end(state, finished_at=monotonic())
+                        return result
+                    except Exception as exc:
+                        timing.emit_error(state, exc)
+                        raise
+
+        completion_fn, litellm_cache_args = self._get_cached_completion_fn(_acompletion, cache)
+        try:
+            results = await completion_fn(
+                request=request,
+                headers=headers,
+                num_retries=self.num_retries,
+                cache=litellm_cache_args,
+            )
+        except CodexStreamError:
+            if not self._ws_fallback_enabled:
+                raise
+            self._ws_fallback_active = True
+            return await self._fallback_lm.aforward(
+                prompt=prompt,
+                messages=messages,
+                **fallback_kwargs,
+            )
+        _fire_usage_tracker_hook(self.model, results)
+        return results
+
+
+CodexLM = CodexWSLM
 
 
 def _fire_usage_tracker_hook(model: str, results: Any) -> None:

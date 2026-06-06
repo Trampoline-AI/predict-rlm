@@ -105,16 +105,14 @@ def test_retry_wait_respects_exponential_cap(monkeypatch):
     assert min(samples) >= 0, f"wait went negative: min = {min(samples)}"
 
 
-def test_retry_wait_function_is_jitter_type():
-    """Source-anchor: the production retry config must use a jittered
-    wait strategy. If someone ever swaps it back to the deterministic
-    ``wait_exponential``, this fails explicitly instead of regressing
-    silently into a thundering-herd pattern.
+def test_retry_wait_fallback_is_jitter_type():
+    """Source-anchor: absent a server retry-after delay, the production
+    retry config must still use a jittered wait strategy.
     """
     kwargs = codex_lm._codex_retry_kwargs()
     wait_fn = kwargs["wait"]
-    assert isinstance(wait_fn, wait_random_exponential), (
-        "retry wait strategy regressed to deterministic wait_exponential — "
+    assert isinstance(wait_fn._fallback, wait_random_exponential), (
+        "retry fallback regressed to deterministic wait_exponential — "
         "this re-enables the thundering-herd failure mode that the jitter "
         "swap was introduced to prevent"
     )

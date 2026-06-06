@@ -9,7 +9,7 @@ from unittest import mock
 
 import pytest
 from conftest import build_stream_events
-from dspy_codex_lm import CodexLM
+from dspy_codex_lm import CodexHTTPLM as CodexLM
 
 # ---- unit: _build_request rewrites effort into reasoning field ----
 

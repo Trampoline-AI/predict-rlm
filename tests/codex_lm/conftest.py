@@ -5,7 +5,7 @@ from typing import Any
 
 import dspy
 import pytest
-from dspy_codex_lm.lm import CodexLM
+from dspy_codex_lm.lm import CodexHTTPLM as CodexLM
 
 
 @pytest.fixture(autouse=True)

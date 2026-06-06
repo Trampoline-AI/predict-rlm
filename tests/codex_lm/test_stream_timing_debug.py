@@ -57,6 +57,8 @@ def test_forward_emits_stream_timing_events(lm, monkeypatch, tmp_path):
         make_completed(input_tokens=5, output_tokens=1, cached_tokens=3),
     ]
 
+    lm.kwargs["reasoning_effort"] = "xhigh"
+    lm.kwargs["service_tier"] = "priority"
     with mock.patch("dspy_codex_lm.lm.litellm.responses", return_value=iter(events)):
         result = lm.forward(prompt="hi", cache=False)
 
@@ -70,6 +72,13 @@ def test_forward_emits_stream_timing_events(lm, monkeypatch, tmp_path):
     }
     assert records["codex_lm.stream.start"]["attempt_number"] == 1
     assert records["codex_lm.stream.start"]["model"] == "gpt-5.3-codex"
+    assert records["codex_lm.stream.start"]["transport"] == "http_sse"
+    assert records["codex_lm.stream.start"]["reasoning_effort"] == "xhigh"
+    assert records["codex_lm.stream.start"]["service_tier"] == "priority"
+    assert records["codex_lm.stream.first_event"]["reasoning_effort"] == "xhigh"
+    assert records["codex_lm.stream.first_text_delta"]["service_tier"] == "priority"
+    assert records["codex_lm.stream.end"]["reasoning_effort"] == "xhigh"
+    assert records["codex_lm.stream.end"]["service_tier"] == "priority"
     assert records["codex_lm.stream.first_event"]["first_event_type"] == "response.created"
     assert records["codex_lm.stream.first_event"]["tt_first_event_ms"] == 100.0
     assert records["codex_lm.stream.first_text_delta"]["ttft_ms"] == 250.0
@@ -110,6 +119,30 @@ async def test_aforward_emits_stream_timing_events(lm, monkeypatch, tmp_path):
     assert records["codex_lm.stream.end"]["completed"] is True
 
 
+def test_codex_debug_log_gets_records_when_predict_rlm_debug_is_also_enabled(
+    lm,
+    monkeypatch,
+    tmp_path,
+):
+    predict_log = tmp_path / "predict-debug.jsonl"
+    codex_log = tmp_path / "codex-debug.jsonl"
+    monkeypatch.setenv("PREDICT_RLM_DEBUG", "1")
+    monkeypatch.setenv("PREDICT_RLM_DEBUG_JSON", "1")
+    monkeypatch.setenv("PREDICT_RLM_DEBUG_LOG", str(predict_log))
+    monkeypatch.setenv("CODEX_LM_DEBUG_LOG", str(codex_log))
+    _patch_monotonic(monkeypatch, [10.0, 10.1, 10.2, 10.3, 10.35, 10.36])
+    events = [make_text_delta("ok"), make_completed(input_tokens=5, output_tokens=1)]
+
+    with mock.patch("dspy_codex_lm.lm.litellm.responses", return_value=iter(events)):
+        lm.forward(prompt="hi", cache=False)
+
+    records = _records_by_event(codex_log)
+    assert records["codex_lm.stream.start"]["transport"] == "http_sse"
+    assert records["codex_lm.stream.end"]["transport"] == "http_sse"
+    assert not predict_log.exists()
+
+
+
 def test_stream_end_reports_non_text_event_counts_and_inter_event_gap(lm, monkeypatch, tmp_path):
     log_path = _enable_json_debug(monkeypatch, tmp_path)
     _patch_monotonic(
@@ -148,7 +181,7 @@ def test_stream_events_include_selected_rotation_profile(monkeypatch, tmp_path):
     import json
     from pathlib import Path
 
-    from dspy_codex_lm import CodexLM
+    from dspy_codex_lm import CodexHTTPLM as CodexLM
     from dspy_codex_lm.auth import import_auth_profile
     from dspy_codex_lm.cli import main
 
@@ -202,12 +235,18 @@ def test_stream_error_reports_last_event_when_stream_stalls(monkeypatch, tmp_pat
     log_path = _enable_json_debug(monkeypatch, tmp_path)
     from dspy_codex_lm.lm import _StreamTiming
 
-    timing = _StreamTiming(model="gpt-5.5", attempt_number=1, start_at=50.0)
+    timing = _StreamTiming(
+        model="gpt-5.5",
+        attempt_number=1,
+        start_at=50.0,
+        transport="websocket",
+    )
     _patch_monotonic(monkeypatch, [50.2, 80.2])
     timing.observe_event(_response_created_event())
     timing.emit_error({}, CodexStreamError("stall"))
 
     error = _records_by_event(log_path)["codex_lm.stream.error"]
+    assert error["transport"] == "websocket"
     assert error["last_event_type"] == "response.created"
     assert error["last_event_age_ms"] == 30000.0
     assert error["events_before_first_text"] == 1

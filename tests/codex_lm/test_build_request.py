@@ -47,7 +47,7 @@ def test_build_request_canonicalizes_model_for_codex_backend(lm):
 
 
 def test_build_request_canonicalizes_spark_model():
-    from dspy_codex_lm import CodexLM
+    from dspy_codex_lm import CodexHTTPLM as CodexLM
     from litellm.utils import supports_native_streaming
 
     spark = CodexLM(
@@ -63,7 +63,7 @@ def test_build_request_canonicalizes_spark_model():
 
 
 def test_custom_instructions_via_ctor(lm):
-    from dspy_codex_lm import CodexLM
+    from dspy_codex_lm import CodexHTTPLM as CodexLM
 
     custom = CodexLM(
         model="gpt-5.3-codex",
@@ -79,7 +79,7 @@ def test_ctor_can_pin_auth_profile(tmp_path, monkeypatch):
     import json
     from pathlib import Path
 
-    from dspy_codex_lm import CodexLM
+    from dspy_codex_lm import CodexHTTPLM as CodexLM
     from dspy_codex_lm.auth import import_auth_profile
 
     monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
@@ -108,7 +108,7 @@ def test_long_lived_lm_randomly_selects_accounts_per_request(tmp_path, monkeypat
     from pathlib import Path
     from types import SimpleNamespace
 
-    from dspy_codex_lm import CodexLM
+    from dspy_codex_lm import CodexHTTPLM as CodexLM
     from dspy_codex_lm.auth import import_auth_profile
     from dspy_codex_lm.cli import main
 
@@ -201,7 +201,7 @@ def test_long_lived_lm_resyncs_disabled_and_reenabled_profiles(tmp_path, monkeyp
     import json
     from pathlib import Path
 
-    from dspy_codex_lm import CodexLM
+    from dspy_codex_lm import CodexHTTPLM as CodexLM
     from dspy_codex_lm.auth import enable_auth_profile, import_auth_profile
     from dspy_codex_lm.cli import main
 
@@ -308,7 +308,7 @@ def test_long_lived_lm_randomly_selects_cached_snapshot_without_auth_reload(
     import json
     from pathlib import Path
 
-    from dspy_codex_lm import CodexLM
+    from dspy_codex_lm import CodexHTTPLM as CodexLM
     from dspy_codex_lm.auth import import_auth_profile
     from dspy_codex_lm.cli import main
 
@@ -405,7 +405,7 @@ def test_pinned_access_token_bypasses_rotation_random_choice(tmp_path, monkeypat
     import json
     from pathlib import Path
 
-    from dspy_codex_lm import CodexLM
+    from dspy_codex_lm import CodexHTTPLM as CodexLM
     from dspy_codex_lm.auth import import_auth_profile
     from dspy_codex_lm.cli import main
 

@@ -36,17 +36,57 @@ def _write_auth(path: Path, *, access_token: str, account_id: str) -> Path:
     return path
 
 
-def _failed_events(code: str = "rate_limit_exceeded", msg: str = "slow down"):
+def _failed_events(
+    code: str = "rate_limit_exceeded",
+    msg: str = "slow down",
+    **error_fields,
+):
     from types import SimpleNamespace
 
     return [
         SimpleNamespace(
             type="response.failed",
             response=SimpleNamespace(
-                error=SimpleNamespace(code=code, message=msg),
+                error=SimpleNamespace(code=code, message=msg, **error_fields),
             ),
         )
     ]
+
+
+def test_default_stream_attempts_match_upstream_codex():
+    import dspy_codex_lm.lm as codex_lm
+
+    assert codex_lm.DEFAULT_CODEX_STREAM_MAX_ATTEMPTS == 5
+
+
+def test_response_failed_retry_after_ms_is_attached_to_stream_error(lm):
+    from dspy_codex_lm.lm import _codex_stream_error_from_state
+
+    state = lm._fresh_state()
+    lm._handle_event(_failed_events(retry_after_ms=1250)[0], state)
+
+    error = _codex_stream_error_from_state(state)
+
+    assert error is not None
+    assert error.retry_after_seconds == 1.25
+
+
+def test_retry_wait_prefers_server_requested_retry_after(monkeypatch):
+    from dspy_codex_lm.lm import _codex_retry_kwargs
+
+    monkeypatch.setattr("dspy_codex_lm.lm.CODEX_STREAM_WAIT_MULTIPLIER", 0.0)
+    monkeypatch.setattr("dspy_codex_lm.lm.CODEX_STREAM_WAIT_MAX", 0.0)
+    wait = _codex_retry_kwargs()["wait"]
+    error = CodexStreamError("slow down", retry_after_seconds=3.5)
+
+    class Outcome:
+        def exception(self):
+            return error
+
+    class RetryState:
+        outcome = Outcome()
+
+    assert wait(RetryState()) == 3.5
 
 
 def test_retries_on_transient_stream_failure_and_succeeds(lm, monkeypatch):
@@ -75,7 +115,7 @@ def test_retries_on_transient_stream_failure_and_succeeds(lm, monkeypatch):
 
 
 def test_retry_uses_alternate_rotation_profile_after_stream_stall(tmp_path, monkeypatch):
-    from dspy_codex_lm import CodexLM
+    from dspy_codex_lm import CodexHTTPLM as CodexLM
     from dspy_codex_lm.auth import import_auth_profile
     from dspy_codex_lm.cli import main
 
@@ -146,7 +186,7 @@ async def test_aforward_retry_uses_alternate_rotation_profile_after_stream_stall
     tmp_path,
     monkeypatch,
 ):
-    from dspy_codex_lm import CodexLM
+    from dspy_codex_lm import CodexHTTPLM as CodexLM
     from dspy_codex_lm.auth import import_auth_profile
     from dspy_codex_lm.cli import main
 

@@ -62,6 +62,10 @@ class _NeverYieldsAsync:
         raise AssertionError("unreachable")  # pragma: no cover
 
 
+async def test_default_stream_heartbeat_matches_upstream_idle_timeout():
+    assert codex_lm.CODEX_STREAM_HEARTBEAT_SEC == 300.0
+
+
 async def test_async_stream_that_never_yields_raises_within_heartbeat(lm, monkeypatch):
     """The async stream consumer must raise CodexStreamError within the
     configured heartbeat window when the stream goes silent.
