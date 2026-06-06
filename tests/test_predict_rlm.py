@@ -9,6 +9,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import dspy
 import pytest
+from dspy.primitives.code_interpreter import FinalOutput
 from dspy.primitives.repl_types import REPLEntry, REPLHistory
 from pydantic import BaseModel
 
@@ -88,6 +89,42 @@ class ListTelemetrySink:
 
     def write(self, record: dict[str, Any]) -> None:
         self.records.append(record)
+
+
+class FakeSubmitRepl:
+    def __init__(self, final_payload: dict[str, Any] | None = None):
+        self.final_payload = final_payload or {"answer": "done"}
+        self.executed: list[str] = []
+        self.defer_count = 0
+        self.deferred_submit_count = 0
+
+    def defer_next_submit_finalization(self) -> None:
+        self.defer_count += 1
+        self._defer_next_submit = True
+
+    def execute(self, code, variables=None, timeout=None):
+        self.executed.append(code)
+        if code.startswith("SUBMIT"):
+            if getattr(self, "_defer_next_submit", False):
+                self._defer_next_submit = False
+                self.deferred_submit_count += 1
+            return FinalOutput(self.final_payload)
+        self._defer_next_submit = False
+        return "checked output"
+
+    async def aexecute(self, code, variables=None, timeout=None):
+        return self.execute(code, variables=variables, timeout=timeout)
+
+
+class FakeInterpreterContext:
+    def __init__(self, repl):
+        self.repl = repl
+
+    def __enter__(self):
+        return self.repl
+
+    def __exit__(self, *_args):
+        return False
 
 
 class TestSandboxBackendSelection:
@@ -1766,6 +1803,186 @@ class TestUnresolvedTypesFallback:
                 assert result == {"answer": "fallback"}
                 sig_arg = mock_predict_class.call_args[0][0]
                 assert isinstance(sig_arg, str)
+
+
+class TestSubmitConfirmation:
+    """Tests for configurable submit confirmation in the main RLM loop."""
+
+    @staticmethod
+    def _prediction(code: str, reasoning: str = "thinking") -> dspy.Prediction:
+        return dspy.Prediction(reasoning=reasoning, code=code)
+
+    def _run_sync(
+        self,
+        rlm: PredictRLM,
+        actions: list[dspy.Prediction],
+        repl: FakeSubmitRepl | None = None,
+    ) -> dspy.Prediction:
+        repl = repl or FakeSubmitRepl()
+        mock_lm = MagicMock()
+        mock_lm.history = []
+        rlm.generate_action = MagicMock(side_effect=actions)
+
+        with (
+            dspy.context(lm=mock_lm),
+            patch.object(rlm, "_interpreter_context", return_value=FakeInterpreterContext(repl)),
+        ):
+            return rlm._forward_traced(None, images=["img"], query="Original task")
+
+    async def _run_async(
+        self,
+        rlm: PredictRLM,
+        actions: list[dspy.Prediction],
+        repl: FakeSubmitRepl | None = None,
+    ) -> dspy.Prediction:
+        repl = repl or FakeSubmitRepl()
+        mock_lm = MagicMock()
+        mock_lm.history = []
+        rlm.generate_action = MagicMock()
+        rlm.generate_action.acall = AsyncMock(side_effect=actions)
+
+        with (
+            dspy.context(lm=mock_lm),
+            patch.object(rlm, "_interpreter_context", return_value=FakeInterpreterContext(repl)),
+        ):
+            return await rlm._aforward_traced(None, images=["img"], query="Original task")
+
+    def test_default_submit_completes_immediately(self):
+        rlm = PredictRLM(ImageAnalysisSignature, sub_lm=MagicMock(), max_iterations=3)
+
+        result = self._run_sync(
+            rlm,
+            [self._prediction("SUBMIT(answer='done')")],
+        )
+
+        assert result.answer == "done"
+        assert result.trace.status == "completed"
+        assert len(result.trace.steps) == 1
+        assert rlm.generate_action.call_count == 1
+
+    def test_first_submit_prompts_and_second_submit_completes(self):
+        seen_contexts = []
+
+        def confirm(context):
+            seen_contexts.append(context)
+            return "Please verify the answer before final submit."
+
+        rlm = PredictRLM(
+            ImageAnalysisSignature,
+            sub_lm=MagicMock(),
+            max_iterations=3,
+            submit_confirmation=confirm,
+        )
+
+        repl = FakeSubmitRepl()
+        result = self._run_sync(
+            rlm,
+            [
+                self._prediction("SUBMIT(answer='done')", reasoning="first submit"),
+                self._prediction("SUBMIT(answer='done')", reasoning="second submit"),
+            ],
+            repl=repl,
+        )
+
+        assert result.answer == "done"
+        assert result.trace.status == "completed"
+        assert [step.output for step in result.trace.steps] == [
+            "Please verify the answer before final submit.",
+            "FINAL: {'answer': 'done'}",
+        ]
+        assert rlm.generate_action.call_count == 2
+        assert repl.deferred_submit_count == 1
+        assert len(seen_contexts) == 1
+        context = seen_contexts[0]
+        assert context.inputs == {"images": ["img"], "query": "Original task"}
+        assert context.output_field_names == ("answer",)
+        assert context.submitted_payload == {"answer": "done"}
+        assert context.prediction.answer == "done"
+        assert context.reasoning == "first submit"
+        assert context.code == "SUBMIT(answer='done')"
+        assert context.iteration == 1
+        assert "FINAL" in context.latest_observation
+        assert len(context.history.entries) == 1
+
+    def test_confirmation_callback_can_skip_with_none_or_empty_string(self):
+        callbacks = [lambda _context: None, lambda _context: ""]
+
+        for callback in callbacks:
+            rlm = PredictRLM(
+                ImageAnalysisSignature,
+                sub_lm=MagicMock(),
+                max_iterations=3,
+                submit_confirmation=callback,
+            )
+
+            result = self._run_sync(
+                rlm,
+                [self._prediction("SUBMIT(answer='done')")],
+            )
+
+            assert result.answer == "done"
+            assert result.trace.status == "completed"
+            assert len(result.trace.steps) == 1
+            assert rlm.generate_action.call_count == 1
+
+    def test_non_submit_after_confirmation_clears_pending_confirmation(self):
+        prompts = []
+
+        def confirm(context):
+            prompts.append(context.iteration)
+            return f"confirm attempt {context.iteration}"
+
+        rlm = PredictRLM(
+            ImageAnalysisSignature,
+            sub_lm=MagicMock(),
+            max_iterations=5,
+            submit_confirmation=confirm,
+        )
+
+        result = self._run_sync(
+            rlm,
+            [
+                self._prediction("SUBMIT(answer='done')"),
+                self._prediction("print('checking')"),
+                self._prediction("SUBMIT(answer='done')"),
+                self._prediction("SUBMIT(answer='done')"),
+            ],
+        )
+
+        assert result.answer == "done"
+        assert prompts == [1, 3]
+        assert [step.output for step in result.trace.steps] == [
+            "confirm attempt 1",
+            "checked output",
+            "confirm attempt 3",
+            "FINAL: {'answer': 'done'}",
+        ]
+        assert rlm.generate_action.call_count == 4
+
+    @pytest.mark.asyncio
+    async def test_async_submit_confirmation_matches_sync_path(self):
+        rlm = PredictRLM(
+            ImageAnalysisSignature,
+            sub_lm=MagicMock(),
+            max_iterations=3,
+            submit_confirmation=lambda _context: "async confirm",
+        )
+
+        result = await self._run_async(
+            rlm,
+            [
+                self._prediction("SUBMIT(answer='done')"),
+                self._prediction("SUBMIT(answer='done')"),
+            ],
+        )
+
+        assert result.answer == "done"
+        assert result.trace.status == "completed"
+        assert [step.output for step in result.trace.steps] == [
+            "async confirm",
+            "FINAL: {'answer': 'done'}",
+        ]
+        assert rlm.generate_action.acall.call_count == 2
 
 
 class TestExecuteIteration:

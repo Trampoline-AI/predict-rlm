@@ -400,6 +400,8 @@ async def _execute_code(
     code: str,
     globals_dict: dict[str, Any],
     capture: _ExecutionCapture | None = None,
+    *,
+    defer_final_output: bool = False,
 ) -> dict[str, Any]:
     capture = capture or _ExecutionCapture()
     try:
@@ -417,6 +419,8 @@ async def _execute_code(
             if inspect.isawaitable(result):
                 await result
     except _FinalOutputError as final:
+        if defer_final_output:
+            return {"submitted": final.payload}
         return {"final": final.payload}
     except BaseException as exc:
         setattr(
@@ -620,9 +624,16 @@ async def _execute_code_to_capture_files(
     globals_dict: dict[str, Any],
     stdout_path: str,
     stderr_path: str,
+    *,
+    defer_final_output: bool = False,
 ) -> dict[str, Any]:
     with _redirect_process_stdio_to_files(stdout_path, stderr_path) as capture:
-        result = await _execute_code(code, globals_dict, capture)
+        result = await _execute_code(
+            code,
+            globals_dict,
+            capture,
+            defer_final_output=defer_final_output,
+        )
     if isinstance(result, dict) and "output" in result:
         result = dict(result)
         result["output"] = _read_capture_file(pathlib.Path(stdout_path)) + _read_capture_file(
@@ -673,6 +684,7 @@ def _persistent_kernel_runner(
                     globals_dict,
                     request["stdout_path"],
                     request["stderr_path"],
+                    defer_final_output=bool(request.get("defer_final_output")),
                 )
             )
             result_queue.put({"ok": True, "result": result})
@@ -826,6 +838,8 @@ async def _execute_code_in_runner_with_timeout(
     globals_dict: dict[str, Any],
     timeout_seconds: float | None,
     timeout_interrupt_grace_seconds: float,
+    *,
+    defer_final_output: bool = False,
 ) -> dict[str, Any]:
     process = _ensure_kernel(globals_dict)
     assert _KERNEL_REQUEST_QUEUE is not None
@@ -840,6 +854,7 @@ async def _execute_code_in_runner_with_timeout(
         "stdout_path": str(stdout_path),
         "stderr_path": str(stderr_path),
         "timeout_seconds": timeout_seconds,
+        "defer_final_output": defer_final_output,
     })
     deadline = (
         time.monotonic() + timeout_seconds if timeout_seconds is not None else None
@@ -1015,12 +1030,15 @@ async def _execute_code_with_timeout(
     globals_dict: dict[str, Any],
     timeout_seconds: float | None,
     timeout_interrupt_grace_seconds: float,
+    *,
+    defer_final_output: bool = False,
 ) -> dict[str, Any]:
     return await _execute_code_in_runner_with_timeout(
         code,
         globals_dict,
         timeout_seconds,
         timeout_interrupt_grace_seconds,
+        defer_final_output=defer_final_output,
     )
 
 
@@ -1073,6 +1091,7 @@ async def _handle_request(
                     globals_dict,
                     _execution_timeout_seconds(params),
                     _timeout_interrupt_grace_seconds(params),
+                    defer_final_output=bool(params.get("defer_final_output")),
                 ),
             )
         if method == "register_output_fields":
@@ -1118,6 +1137,8 @@ async def _main() -> None:
         if response is not None:
             _send_protocol(response)
         if request.get("method") == "shutdown":
+            if (request.get("params") or {}).get("preserve_kernel_process"):
+                os._exit(0)
             _discard_kernel()
             break
 

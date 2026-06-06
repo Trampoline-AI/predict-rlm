@@ -188,6 +188,22 @@ if TYPE_CHECKING:
     from dspy.signatures.signature import Signature
 
 
+@dataclass(frozen=True)
+class SubmitConfirmationContext:
+    """Context passed to PredictRLM submit-confirmation callbacks."""
+
+    inputs: dict[str, Any]
+    signature: type[Any]
+    output_field_names: tuple[str, ...]
+    prediction: dspy.Prediction
+    submitted_payload: dict[str, Any]
+    history: Any
+    latest_observation: str
+    reasoning: str
+    code: str
+    iteration: int
+
+
 _OUTPUT_VALIDATION_MODELS: dict[type[Any], type[Any]] = {}
 
 
@@ -852,6 +868,7 @@ class PredictRLM(dspy.RLM):
         debug: bool = False,
         output_dir: str | Path | None = None,
         telemetry_context: TelemetryContext | None = None,
+        submit_confirmation: Callable[[SubmitConfirmationContext], str | None] | None = None,
     ):
         """
         Args:
@@ -895,6 +912,10 @@ class PredictRLM(dspy.RLM):
             telemetry_context: Optional run/case telemetry context for
                        OTel-shaped local JSONL events. Disabled/failed
                        telemetry writes are always ignored.
+            submit_confirmation: Optional callback invoked after a valid
+                       SUBMIT. It receives SubmitConfirmationContext and may
+                       return a message to feed back as the next observation.
+                       Returning None or "" preserves normal immediate submit.
         """
         if interpreter is not None and sbx_pool is not None:
             raise ValueError(
@@ -959,6 +980,7 @@ class PredictRLM(dspy.RLM):
         self._telemetry_context = telemetry_context
         self._current_telemetry_context: TelemetryContext | None = None
         self._current_predictor_id: str | None = None
+        self._submit_confirmation = submit_confirmation
 
         # Merge skills into instructions, packages, modules, and tools
         self._skill_instructions = ""
@@ -2025,6 +2047,96 @@ class PredictRLM(dspy.RLM):
             steps=trace_steps,
         )
 
+    def _history_from_prediction(self, prediction: dspy.Prediction, fallback_history: Any):
+        from dspy.primitives.repl_types import REPLEntry, REPLHistory
+
+        entries = []
+        for item in getattr(prediction, "trajectory", None) or []:
+            if isinstance(item, REPLEntry):
+                entries.append(item)
+            elif isinstance(item, dict):
+                entries.append(
+                    REPLEntry(
+                        reasoning=item.get("reasoning", "") or "",
+                        code=item.get("code", "") or "",
+                        output=item.get("output", "") or "",
+                    )
+                )
+
+        if entries:
+            return REPLHistory(
+                entries=entries,
+                max_output_chars=getattr(fallback_history, "max_output_chars", 10_000),
+            )
+        return fallback_history
+
+    def _submitted_payload(
+        self,
+        prediction: dspy.Prediction,
+        output_field_names: list[str],
+    ) -> dict[str, Any]:
+        payload: dict[str, Any] = {}
+        for name in output_field_names:
+            if hasattr(prediction, name):
+                payload[name] = getattr(prediction, name)
+        return payload
+
+    def _submit_confirmation_message(
+        self, context: SubmitConfirmationContext
+    ) -> str | None:
+        callback = getattr(self, "_submit_confirmation", None)
+        if callback is None:
+            return None
+        message = callback(context)
+        if message is None or message == "":
+            return None
+        if not isinstance(message, str):
+            raise TypeError(
+                "submit_confirmation must return a string, None, or an empty string."
+            )
+        return message
+
+    def _maybe_request_submit_confirmation(
+        self,
+        prediction: dspy.Prediction,
+        history: Any,
+        input_args: dict[str, Any],
+        output_field_names: list[str],
+        iteration: int,
+        pending: bool,
+    ):
+        if pending or getattr(self, "_submit_confirmation", None) is None:
+            return None
+
+        final_history = self._history_from_prediction(prediction, history)
+        latest_entry = final_history.entries[-1] if getattr(final_history, "entries", None) else None
+        latest_observation = latest_entry.output if latest_entry is not None else ""
+        context = SubmitConfirmationContext(
+            inputs=dict(input_args),
+            signature=self.signature,
+            output_field_names=tuple(output_field_names),
+            prediction=prediction,
+            submitted_payload=self._submitted_payload(prediction, output_field_names),
+            history=final_history,
+            latest_observation=latest_observation,
+            reasoning=(
+                latest_entry.reasoning
+                if latest_entry is not None
+                else getattr(prediction, "final_reasoning", "") or ""
+            ),
+            code=latest_entry.code if latest_entry is not None else "",
+            iteration=iteration + 1,
+        )
+        message = self._submit_confirmation_message(context)
+        if not message:
+            return None
+
+        return history.append(
+            reasoning=context.reasoning,
+            code=context.code,
+            output=message,
+        )
+
     async def aforward(self, **kwargs: Any) -> dspy.Prediction:
         """Async version of forward(). Sets the LM context for async execution.
 
@@ -2227,6 +2339,12 @@ class PredictRLM(dspy.RLM):
                 live_tool_call_logging(iteration_log_open),
                 suppress_interpreter_result_logging(iteration_log_open),
             ):
+                if (
+                    getattr(self, "_submit_confirmation", None) is not None
+                    and not getattr(self, "_pending_submit_confirmation", False)
+                    and hasattr(repl, "defer_next_submit_finalization")
+                ):
+                    repl.defer_next_submit_finalization()
                 if execution_timeout is None:
                     result = repl.execute(code, variables=dict(input_args))
                 else:
@@ -2279,6 +2397,12 @@ class PredictRLM(dspy.RLM):
                 live_tool_call_logging(iteration_log_open),
                 suppress_interpreter_result_logging(iteration_log_open),
             ):
+                if (
+                    getattr(self, "_submit_confirmation", None) is not None
+                    and not getattr(self, "_pending_submit_confirmation", False)
+                    and hasattr(repl, "defer_next_submit_finalization")
+                ):
+                    repl.defer_next_submit_finalization()
                 if hasattr(repl, "aexecute"):
                     if execution_timeout is None:
                         result = await repl.aexecute(code, variables=dict(input_args))
@@ -2348,9 +2472,7 @@ class PredictRLM(dspy.RLM):
             self._partial_history = step_result
         self._partial_pending_entry = None
         self._partial_pending_start = None
-        self._last_action_lm_metadata = lm_finish_since(
-            dspy.settings.lm, lm_hist_before_action
-        )
+        self._last_action_lm_metadata = lm_metadata
         return step_result
 
     def _execute_iteration(
@@ -2791,6 +2913,7 @@ class PredictRLM(dspy.RLM):
                 try:
                     status = "max_iterations"
                     history = REPLHistory()
+                    pending_submit_confirmation = False
                     # Reset partial-trajectory capture for this forward() call
                     # so crash-recovery consumers (see e.g. the spreadbench
                     # optimizer's _recover_partial_trace) can read the last
@@ -2803,15 +2926,40 @@ class PredictRLM(dspy.RLM):
                     for iteration in range(self.max_iterations):
                         iter_start = time.perf_counter()
                         with self._iteration_callback_scope(call_id, iteration) as state:
-                            result = self._execute_iteration(
-                                repl,
-                                variables,
-                                history,
-                                iteration,
-                                input_args,
-                                output_field_names,
+                            self._pending_submit_confirmation = pending_submit_confirmation
+                            try:
+                                result = self._execute_iteration(
+                                    repl,
+                                    variables,
+                                    history,
+                                    iteration,
+                                    input_args,
+                                    output_field_names,
+                                )
+                            finally:
+                                self._pending_submit_confirmation = False
+
+                            if isinstance(result, dspy.Prediction):
+                                confirmation_history = self._maybe_request_submit_confirmation(
+                                    prediction=result,
+                                    history=history,
+                                    input_args=input_args,
+                                    output_field_names=output_field_names,
+                                    iteration=iteration,
+                                    pending=pending_submit_confirmation,
+                                )
+                                if confirmation_history is not None:
+                                    result = confirmation_history
+                                    self._partial_history = confirmation_history
+                                    pending_submit_confirmation = True
+                                else:
+                                    pending_submit_confirmation = False
+                            elif pending_submit_confirmation:
+                                pending_submit_confirmation = False
+
+                            action_lm_metadata = getattr(
+                                self, "_last_action_lm_metadata", None
                             )
-                            action_lm_metadata = getattr(self, "_last_action_lm_metadata", None)
                             self._last_action_lm_metadata = None
                             state.step, state.is_final = self._build_iteration_outcome(
                                 result,
@@ -2921,6 +3069,7 @@ class PredictRLM(dspy.RLM):
                 try:
                     status = "max_iterations"
                     history = REPLHistory()
+                    pending_submit_confirmation = False
                     # Reset partial-trajectory capture for this aforward() call
                     # so crash-recovery consumers (see e.g. the spreadbench
                     # optimizer's _recover_partial_trace) can read the last
@@ -2932,16 +3081,43 @@ class PredictRLM(dspy.RLM):
 
                     for iteration in range(self.max_iterations):
                         iter_start = time.perf_counter()
-                        async with self._aiteration_callback_scope(call_id, iteration) as state:
-                            result = await self._aexecute_iteration(
-                                repl,
-                                variables,
-                                history,
-                                iteration,
-                                input_args,
-                                output_field_names,
+                        async with self._aiteration_callback_scope(
+                            call_id, iteration
+                        ) as state:
+                            self._pending_submit_confirmation = pending_submit_confirmation
+                            try:
+                                result = await self._aexecute_iteration(
+                                    repl,
+                                    variables,
+                                    history,
+                                    iteration,
+                                    input_args,
+                                    output_field_names,
+                                )
+                            finally:
+                                self._pending_submit_confirmation = False
+
+                            if isinstance(result, dspy.Prediction):
+                                confirmation_history = self._maybe_request_submit_confirmation(
+                                    prediction=result,
+                                    history=history,
+                                    input_args=input_args,
+                                    output_field_names=output_field_names,
+                                    iteration=iteration,
+                                    pending=pending_submit_confirmation,
+                                )
+                                if confirmation_history is not None:
+                                    result = confirmation_history
+                                    self._partial_history = confirmation_history
+                                    pending_submit_confirmation = True
+                                else:
+                                    pending_submit_confirmation = False
+                            elif pending_submit_confirmation:
+                                pending_submit_confirmation = False
+
+                            action_lm_metadata = getattr(
+                                self, "_last_action_lm_metadata", None
                             )
-                            action_lm_metadata = getattr(self, "_last_action_lm_metadata", None)
                             self._last_action_lm_metadata = None
                             state.step, state.is_final = self._build_iteration_outcome(
                                 result,

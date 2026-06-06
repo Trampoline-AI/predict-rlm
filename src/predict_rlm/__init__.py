@@ -23,7 +23,7 @@ from .interpreters import (
     SbxInterpreter,
     SbxPool,
 )
-from .predict_rlm import PredictRLM
+from .predict_rlm import PredictRLM, SubmitConfirmationContext
 from .rlm_skills import Skill
 from .trace import IterationStep, RunTrace
 
@@ -36,6 +36,7 @@ __all__ = [
     "OutputFile",
     "PredictRLM",
     "RunTrace",
+    "SubmitConfirmationContext",
     "DEFAULT_SBX_TEMPLATE",
     "SandboxBackend",
     "Skill",
