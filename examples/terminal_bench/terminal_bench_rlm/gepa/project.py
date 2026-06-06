@@ -980,6 +980,7 @@ def _agent_kwargs(
         "skill_instructions": request.skill_instructions,
         "task_id": request.task_id,
         "phase_log_path": _phase_log_path_text(request, output_dir=output_dir),
+        "submit_confirmation_mode": "terminal_bench",
     }
     lm_reasoning_effort = _reasoning_effort(request.lm)
     if lm_reasoning_effort is not None:

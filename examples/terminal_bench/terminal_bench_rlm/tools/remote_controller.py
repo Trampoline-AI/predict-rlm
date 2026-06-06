@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import inspect
 import json
 import logging
 import os
@@ -12,7 +11,9 @@ from typing import Any
 from .tbench_agent import (
     DAYTONA_REMOTE_RESULT_SENTINEL,
     _build_lm,
+    _build_submit_confirmation,
     _coerce_answer,
+    _coerce_submit_confirmation_mode,
     _install_codex_lm_monkeypatch,
     _predict_rlm_class,
     _signature_with_task_instruction,
@@ -83,7 +84,7 @@ def _local_process_interpreter_class() -> Any:
 
     return LocalProcessRunnerInterpreter
 
-def _run_predict_rlm(payload: dict[str, Any]) -> str:
+async def _run_predict_rlm_async(payload: dict[str, Any]) -> str:
     _set_debug_environment(payload)
     verbose_log_state = _install_verbose_rlm_log_stream(payload)
     if payload.get("codex_lm"):
@@ -109,14 +110,26 @@ def _run_predict_rlm(payload: dict[str, Any]) -> str:
         _with_terminal_bench_skill(rlm_kwargs, payload.get("skill_instructions"))
         if "max_iterations" in rlm_kwargs:
             rlm_kwargs["max_iterations"] = int(rlm_kwargs["max_iterations"])
+        submit_confirmation_mode = _coerce_submit_confirmation_mode(
+            payload.get("submit_confirmation_mode")
+        )
+        submit_confirmation = _build_submit_confirmation(
+            submit_confirmation_mode,
+            str(payload.get("instruction", "")),
+        )
+        if submit_confirmation is not None:
+            if "submit_confirmation" in rlm_kwargs:
+                raise ValueError(
+                    "submit_confirmation_mode cannot be combined with a custom "
+                    "submit_confirmation callback."
+                )
+            rlm_kwargs["submit_confirmation"] = submit_confirmation
         signature = _signature_with_task_instruction(
             payload.get("signature", "instruction -> answer"),
             str(payload.get("instruction", "")),
         )
         rlm = _predict_rlm_class()(signature, **rlm_kwargs)
-        result = rlm()
-        if inspect.isawaitable(result):
-            result = asyncio.run(result)
+        result = await rlm.acall()
         logging_dir = payload.get("logging_dir")
         _write_trace(getattr(result, "trace", None), Path(logging_dir) if logging_dir else None)
         return _coerce_answer(result)
@@ -126,7 +139,11 @@ def _run_predict_rlm(payload: dict[str, Any]) -> str:
         raise
     finally:
         _restore_verbose_rlm_log_stream(verbose_log_state)
-        interpreter.shutdown()
+        await asyncio.to_thread(interpreter.shutdown)
+
+
+def _run_predict_rlm(payload: dict[str, Any]) -> str:
+    return asyncio.run(_run_predict_rlm_async(payload))
 
 
 def _print_result(payload: dict[str, Any]) -> None:

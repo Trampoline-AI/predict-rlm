@@ -21,6 +21,24 @@ def _assert_task_instruction_signature(signature, task_instruction: str) -> None
     assert task_instruction in signature.instructions
 
 
+def _assert_terminal_bench_submit_confirmation_contract(message: str) -> None:
+    normalized = " ".join(message.split())
+    assert "re-read the original task" in normalized
+    assert "todos" in message
+    assert "required verification" in message
+    assert "current final state" in message
+    assert "fresh evidence" in message
+    assert "verifier-shaped" in message
+    assert "unverified" in message
+    assert "blocker" in message
+    assert "stale debug history" in message
+    assert "file existence alone" in message
+    assert "The second SUBMIT" in message
+    assert "same already-verified answer" in message
+    assert "Does your solution meet" not in message
+    assert "If everything looks good" not in message
+
+
 def test_agent_exposes_terminal_bench_name() -> None:
     assert tbench_agent.TerminalBenchRLMBaseAgent.name() == "predict-rlm"
 
@@ -48,8 +66,11 @@ def test_agent_constructs_predict_rlm_with_container_interpreter(monkeypatch) ->
             self.kwargs = kwargs
             events.append(("rlm", self))
 
-        def __call__(self, **kwargs):
-            events.append(("call", kwargs))
+        def __call__(self, **_kwargs):
+            raise AssertionError("Harbor agents should use PredictRLM.acall()")
+
+        async def acall(self, **kwargs):
+            events.append(("acall", kwargs))
             return SimpleNamespace(answer="done")
 
     monkeypatch.setattr(tbench_agent, "TerminalBenchRunnerInterpreter", FakeInterpreter)
@@ -66,6 +87,7 @@ def test_agent_constructs_predict_rlm_with_container_interpreter(monkeypatch) ->
     interpreter = events[0][1]
     rlm = events[1][1]
     call = events[2][1]
+    assert events[2][0] == "acall"
     assert result.total_input_tokens == 0
     assert result.total_output_tokens == 0
     assert result.failure_mode is None
@@ -76,6 +98,7 @@ def test_agent_constructs_predict_rlm_with_container_interpreter(monkeypatch) ->
     assert rlm.kwargs["lm"] == "main"
     assert rlm.kwargs["sub_lm"] == "sub"
     assert "no_rebuild" not in rlm.kwargs
+    assert callable(rlm.kwargs["submit_confirmation"])
     assert not (
         set(rlm.kwargs.get("tools") or {})
         & tbench_agent.TERMINAL_WRAPPER_TOOL_NAMES
@@ -98,7 +121,7 @@ def test_agent_preserves_custom_signature_instructions(monkeypatch) -> None:
         def __init__(self, signature, **_kwargs) -> None:
             captured["signature"] = signature
 
-        def __call__(self, **kwargs):
+        async def acall(self, **kwargs):
             captured["call_kwargs"] = kwargs
             return SimpleNamespace(answer="done")
 
@@ -119,6 +142,58 @@ def test_agent_preserves_custom_signature_instructions(monkeypatch) -> None:
     assert captured["call_kwargs"] == {}
 
 
+def test_agent_terminal_bench_submit_confirmation_mode_passes_callback(monkeypatch) -> None:
+    captured: dict[str, object] = {}
+
+    class FakeInterpreter:
+        def __init__(self, *_args, **_kwargs) -> None:
+            pass
+
+        def shutdown(self) -> None:
+            pass
+
+    class FakePredictRLM:
+        def __init__(self, _signature, **kwargs) -> None:
+            captured["rlm_kwargs"] = kwargs
+
+        async def acall(self, **_kwargs):
+            return SimpleNamespace(answer="done")
+
+    monkeypatch.setattr(tbench_agent, "TerminalBenchRunnerInterpreter", FakeInterpreter)
+    monkeypatch.setattr(tbench_agent, "PredictRLM", FakePredictRLM)
+
+    agent = tbench_agent.TerminalBenchRLMBaseAgent(
+        submit_confirmation_mode="terminal_bench"
+    )
+    agent.perform_task(
+        "Edit the config and verify the service starts.",
+        SimpleNamespace(container="container"),
+    )
+
+    rlm_kwargs = captured["rlm_kwargs"]
+    assert isinstance(rlm_kwargs, dict)
+    callback = rlm_kwargs["submit_confirmation"]
+    assert callable(callback)
+
+    message = str(
+        callback(
+            SimpleNamespace(
+                submitted_payload={"answer": "changed config"},
+                latest_observation="pytest passed",
+                iteration=4,
+            )
+        )
+    )
+    assert "Original task:" in message
+    assert "Edit the config and verify the service starts." in message
+    assert "Current submitted payload / terminal state:" in message
+    assert '"answer": "changed config"' in message
+    assert "pytest passed" in message
+    assert "Are you sure you want to mark the task as complete?" in message
+    _assert_terminal_bench_submit_confirmation_contract(message)
+    assert "call SUBMIT again" in message
+
+
 def test_agent_installs_codex_lm_before_constructing_predict_rlm(monkeypatch) -> None:
     events: list[tuple[str, object]] = []
     captured_env: dict[str, str | None] = {}
@@ -136,7 +211,7 @@ def test_agent_installs_codex_lm_before_constructing_predict_rlm(monkeypatch) ->
             self.signature = signature
             self.kwargs = kwargs
 
-        def __call__(self, **_kwargs):
+        async def acall(self, **_kwargs):
             return SimpleNamespace(answer="done")
 
     def install_monkeypatch(*, exclude=()):
@@ -219,7 +294,7 @@ def test_agent_exports_predict_rlm_trace_to_logging_dir(monkeypatch, tmp_path: P
         def __init__(self, *_args, **_kwargs) -> None:
             pass
 
-        def __call__(self, **_kwargs):
+        async def acall(self, **_kwargs):
             return SimpleNamespace(answer="done", trace=FakeTrace())
 
     monkeypatch.setattr(tbench_agent, "TerminalBenchRunnerInterpreter", FakeInterpreter)

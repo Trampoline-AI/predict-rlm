@@ -83,6 +83,8 @@ def test_daytona_remote_agent_payload_is_non_secret_and_uses_remote_home(tmp_pat
     payload_text = json.dumps(env.payloads[-1], sort_keys=True)
     assert "super-secret-token" not in payload_text
     assert "OPENAI_API_KEY" not in payload_text
+    assert "submit_confirmation\":" not in payload_text
+    assert env.payloads[-1]["submit_confirmation_mode"] == "terminal_bench"
     assert env.payloads[-1]["interpreter_kwargs"] == {"cwd": "/tmp/task"}
     remote_command = next(
         command
@@ -97,6 +99,7 @@ def test_daytona_remote_agent_payload_is_non_secret_and_uses_remote_home(tmp_pat
 
 
 def test_daytona_remote_agent_forwards_host_openai_env(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("CODEX_LM_AUTH_PROFILE", "gabriel-at-trampoline")
     monkeypatch.setenv("OPENAI_API_KEY", "host-secret-token")
     env = FakeDaytonaRemoteEnvironment(answer="remote done")
     context = SimpleNamespace()
@@ -106,11 +109,13 @@ def test_daytona_remote_agent_forwards_host_openai_env(monkeypatch, tmp_path: Pa
 
     payload_text = json.dumps(env.payloads[-1], sort_keys=True)
     assert "host-secret-token" not in payload_text
+    assert "gabriel-at-trampoline" not in payload_text
     remote_command = next(
         command
         for command in env.commands
         if "terminal_bench_rlm.tools.remote_controller" in command
     )
+    assert "CODEX_LM_AUTH_PROFILE=gabriel-at-trampoline" in remote_command
     assert "OPENAI_API_KEY=host-secret-token" in remote_command
 
 
@@ -134,6 +139,9 @@ def test_remote_controller_verbose_streams_rlm_iteration_logs(monkeypatch, tmp_p
             self.verbose = kwargs["verbose"]
 
         def __call__(self):
+            raise AssertionError("remote controller must use PredictRLM.acall")
+
+        async def acall(self):
             logging.getLogger("dspy.predict.rlm").info("RLM iteration 1/2\nCode:\nprint(1)")
             return SimpleNamespace(answer="done", trace=None)
 
@@ -151,6 +159,65 @@ def test_remote_controller_verbose_streams_rlm_iteration_logs(monkeypatch, tmp_p
 
     assert answer == "done"
     assert "RLM iteration 1/2" in log_path.read_text()
+
+
+def test_daytona_remote_agent_payload_carries_submit_confirmation_mode(tmp_path: Path) -> None:
+    env = FakeDaytonaRemoteEnvironment(answer="remote done")
+    agent = tbench_agent.DaytonaRemotePredictRLMAgent(
+        logs_dir=tmp_path,
+        submit_confirmation_mode="terminal_bench",
+    )
+
+    asyncio.run(agent.run("solve remotely", env, SimpleNamespace()))
+
+    payload = env.payloads[-1]
+    assert payload["submit_confirmation_mode"] == "terminal_bench"
+    assert "submit_confirmation" not in payload
+
+
+def test_remote_controller_reconstructs_terminal_bench_submit_confirmation_callback(
+    monkeypatch,
+) -> None:
+    captured: dict[str, object] = {}
+
+    class FakeInterpreter:
+        def shutdown(self) -> None:
+            pass
+
+    class FakePredictRLM:
+        def __init__(self, _signature, **kwargs) -> None:
+            captured["rlm_kwargs"] = kwargs
+
+        async def acall(self):
+            return SimpleNamespace(answer="done", trace=None)
+
+    monkeypatch.setattr(remote_controller, "_local_process_interpreter_class", lambda: FakeInterpreter)
+    monkeypatch.setattr(remote_controller, "_predict_rlm_class", lambda: FakePredictRLM)
+
+    answer = remote_controller._run_predict_rlm(
+        {
+            "instruction": "Fix the script and run the tests.",
+            "submit_confirmation_mode": "terminal_bench",
+        }
+    )
+
+    assert answer == "done"
+    rlm_kwargs = captured["rlm_kwargs"]
+    assert isinstance(rlm_kwargs, dict)
+    callback = rlm_kwargs["submit_confirmation"]
+    assert callable(callback)
+    message = callback(
+        SimpleNamespace(
+            submitted_payload={"answer": "script fixed"},
+            latest_observation="tests passed",
+            iteration=2,
+        )
+    )
+    assert "Original task:" in message
+    assert "Fix the script and run the tests." in message
+    assert '"answer": "script fixed"' in message
+    assert "tests passed" in message
+    assert "After this point, grading will begin" in message
 
 
 def test_daytona_remote_agent_streams_remote_debug_logs(tmp_path: Path, capsys) -> None:
@@ -189,6 +256,37 @@ def test_daytona_remote_agent_streams_remote_debug_logs(tmp_path: Path, capsys) 
     assert env.payloads[-1]["predict_rlm_debug_log"] == "/tmp/predict_rlm_controller/predict_rlm_debug.jsonl"
     assert env.polls > 0
     assert "remote debug line" in capsys.readouterr().out
+
+
+def test_daytona_remote_agent_log_stream_shutdown_failure_does_not_block_answer(
+    tmp_path: Path,
+) -> None:
+    class FailingLogStreamEnvironment(FakeDaytonaRemoteEnvironment):
+        async def exec(self, *, command: str, timeout_sec: int | None = None):
+            self.command_timeouts.append(timeout_sec)
+            self.commands.append(command)
+            if "terminal_bench_rlm.tools.remote_controller" in command:
+                await asyncio.sleep(0.05)
+                stdout = (
+                    f"{tbench_agent.DAYTONA_REMOTE_RESULT_SENTINEL}"
+                    f"{json.dumps({'ok': True, 'answer': self.answer})}\n"
+                )
+                return SimpleNamespace(returncode=0, stdout=stdout, stderr="")
+            if "PREDICT_RLM_REMOTE_LOG_OFFSET" in command:
+                raise RuntimeError("remote log read failed")
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    env = FailingLogStreamEnvironment(answer="controller finished")
+    context = SimpleNamespace()
+    agent = tbench_agent.DaytonaRemotePredictRLMAgent(
+        logs_dir=tmp_path,
+        predict_rlm_debug=True,
+        remote_log_poll_interval=0.01,
+    )
+
+    asyncio.run(agent.run("solve remotely", env, context))
+
+    assert context.answer == "controller finished"
 
 
 def test_daytona_remote_agent_bootstrap_invokes_packaged_script(tmp_path: Path) -> None:

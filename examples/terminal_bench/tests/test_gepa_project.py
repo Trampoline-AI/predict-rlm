@@ -508,6 +508,8 @@ def test_daytona_agent_kwargs_do_not_expose_interpreter_mode(tmp_path: Path) -> 
     cmd = _build_harbor_run_command(request, output_dir=tmp_path / "harbor-runs")
 
     assert "interpreter_mode" not in kwargs
+    assert kwargs["submit_confirmation_mode"] == "terminal_bench"
+    assert "submit_confirmation_mode=terminal_bench" in cmd
     assert "interpreter_mode=" not in cmd
     assert "remote-controller" not in cmd
 
@@ -519,6 +521,7 @@ def test_docker_agent_kwargs_do_not_expose_interpreter_mode(tmp_path: Path) -> N
     kwargs = _agent_kwargs(_task_request(config, tmp_path))
 
     assert "interpreter_mode" not in kwargs
+    assert kwargs["submit_confirmation_mode"] == "terminal_bench"
 
 
 def test_daytona_explicit_remote_controller_requires_supplied_environment() -> None:
@@ -1698,7 +1701,7 @@ def test_default_terminal_bench_skill_includes_concurrent_timeout_snippet() -> N
         skill.index(heading) for heading in headings
     )
     assert hashlib.sha256(skill.encode()).hexdigest() == (
-        "db48891a1505903fc2c4d942bb42188de49e8550f7c2d67bb5ff9d3df8bd20a6"
+        "cfcce3ff3ba4c293f9d3c68cc61b618befa2c2ed8727043633b37b6de255283c"
     )
     assert "command-line tasks in a Linux environment" in skill
     assert "Terminal-Bench tasks inside a Linux task container" not in skill
@@ -1714,25 +1717,35 @@ def test_default_terminal_bench_skill_includes_concurrent_timeout_snippet() -> N
     assert "unobserved verification command" in skill
     assert bad_required_verification_prefix not in skill
     assert "@dataclass" in skill
+    assert "class Todo" in skill
+    assert "task: str" in skill
+    assert "done: bool = False" in skill
     assert "class RequiredVerification" in skill
     assert "requirement: str" in skill
+    assert "check: Callable[[], bool] | str" in skill
     assert "verified: bool = False" in skill
     assert 'evidence: str = ""' in skill
     assert "verification: str" not in skill
-    assert "required verification list" in skill
+    assert "todos and required verification" in skill
+    assert "Mark a todo done" in skill
     assert "required checks" in skill
-    assert "Mark an" in skill
-    assert "short list" in skill
-    assert "extracted from the task" in skill
+    assert "both lists short" in skill
+    assert "extracted from the task" not in skill
+    assert "callable or command check evaluates true" in skill
+    assert "passed against the current final state" in skill
     assert "verified:" in skill
     assert "schema" not in skill.lower()
     assert "yaml" not in skill.lower()
     assert all(term not in skill for term in obsolete_schema_terms)
     assert "ledger" not in skill.lower()
-    assert "task requirements" in skill
+    assert "task into todos" in skill
     assert "Before SUBMIT" in skill
-    assert "proportional evidence" in skill
-    assert "literal paths/endpoints" in skill
+    assert "fresh verifier-shaped evidence" in skill
+    assert "current final state" in skill
+    assert "Any unverified required verification entry is a blocker" in normalized_skill
+    assert "file existence alone" in skill
+    assert "self-attestation" in skill
+    assert "literal paths/endpoints" in normalized_skill
     assert "config values" in skill
     assert "processes or services" in normalized_skill
     assert "absolute minimum" in skill
@@ -1760,8 +1773,15 @@ def test_default_terminal_bench_skill_includes_concurrent_timeout_snippet() -> N
     assert "stdout/stderr" in skill
     assert "exit code" in normalized_skill or "exit codes" in normalized_skill
     assert "service behavior" in skill
+    assert "ready_to_submit(todos, required)" in skill
+    assert "all(todo.done for todo in todos)" in skill
+    assert "all(item.verified for item in required)" in skill
+    assert "When every todo is done" in skill
     assert "SUBMIT makes the result final" in skill
-    assert "stale debug history" in skill
+    assert "targeted proof is enough" not in skill
+    assert "SUBMIT immediately" not in skill
+    assert "SUBMIT while budget remains" not in skill
+    assert "stale debug history" in normalized_skill
     assert "Once the observable task contract is satisfied" not in skill
     assert "run the verification in one iteration" not in skill
     assert "separate later iteration" not in skill
@@ -1772,42 +1792,40 @@ def test_default_terminal_bench_skill_includes_concurrent_timeout_snippet() -> N
 
     snippet = skill.split("```python\n", 1)[1].split("\n```", 1)[0]
     compile(snippet, "<terminal-bench-skill>", "exec", flags=ast.PyCF_ALLOW_TOP_LEVEL_AWAIT)
-    comment_anchors = [
-        (
-            "# Use run() for bounded foreground commands; inspect output before continuing.",
-            "async def run(cmd, timeout=60):",
-        ),
-        (
-            "# Use requests timeouts for network calls.",
-            "response = requests.get(url, timeout=10)",
-        ),
-        (
-            "# Use asyncio.wait_for for expensive computations or async work that may hang.",
-            "computation = await asyncio.wait_for",
-        ),
-        (
-            "# Use asyncio.gather for independent non-mutating checks that can run concurrently.",
-            "results = await asyncio.gather",
-        ),
-    ]
-    for comment, code_anchor in comment_anchors:
-        assert comment in snippet
-        assert code_anchor in snippet
-        assert snippet.index(comment) < snippet.index(code_anchor)
-
     for anchor in [
-        "async def run(cmd, timeout=60):",
+        "async def run(cmd):",
         "subprocess.run",
         "capture_output=True",
-        "timeout=timeout",
+        "result = await run('python -m pytest tests/unit -q')",
         "requests.get(url, timeout=10)",
         "asyncio.wait_for",
-        "await asyncio.gather",
         "print(result.returncode)",
         "print(result.stdout[-2000:])",
         "print(result.stderr[-2000:])",
     ]:
         assert anchor in snippet
+
+    assert "Parallelize only expensive checks" in skill
+    assert "await asyncio.gather" not in snippet
+    assert "timeout=timeout" not in snippet
+    assert "import asyncio" not in snippet
+    assert "import subprocess" not in snippet
+    assert "import requests" not in snippet
+
+    visual_snippet = skill.split("## Visual perception with predict", 1)[1].split(
+        "## Required verification", 1
+    )[0]
+    for anchor in [
+        "await predict(...)",
+        "dspy.Image",
+        "data:image/png;base64,",
+        "base64.b64encode(image_bytes).decode()",
+        "image=data_url",
+        "print(result.visible_text)",
+    ]:
+        assert anchor in visual_snippet
+    assert "import base64" not in visual_snippet
+    assert "from pathlib import Path" not in visual_snippet
 
     for removed_anchor in [
         "async def start",
@@ -1831,7 +1849,7 @@ def test_seed_candidate_skill_is_passed_to_terminal_bench_agent(monkeypatch) -> 
             captured["signature"] = signature
             captured["kwargs"] = kwargs
 
-        def __call__(self, **_kwargs):
+        async def acall(self, **_kwargs):
             return SimpleNamespace(answer="done")
 
     class FakeInterpreter:
@@ -2117,7 +2135,7 @@ def test_agent_builds_low_effort_lms_from_agent_kwargs(monkeypatch) -> None:
             captured["signature"] = signature
             captured["kwargs"] = kwargs
 
-        def __call__(self, **_kwargs):
+        async def acall(self, **_kwargs):
             return SimpleNamespace(answer="done")
 
     class FakeInterpreter:

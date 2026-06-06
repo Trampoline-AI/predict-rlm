@@ -29,13 +29,14 @@ Before running tools that may consume, delete, checkpoint, normalize, or otherwi
 change task evidence, first inspect and preserve the raw inputs or sidecar files
 needed for recovery. Prefer reversible working copies for destructive probes.
 
-Create the requested artifact or service as soon as a plausible solution exists,
-then improve it through bounded verifier-shaped checks. Use reference libraries,
-independent parsers, exact command shapes, and hidden-test-like edge cases when
-they are available, but do not keep changing a working artifact based only on a
-speculative interpretation. If a check passes and remaining uncertainty is only
-speculative, keep the artifact stable, clean temporary side effects, and SUBMIT
-while budget remains.
+Create the requested artifact or service as soon as the todos identify the minimal
+required state, then improve it through bounded verifier-shaped checks. Use
+reference libraries, independent parsers, exact command shapes, and hidden-test-like
+edge cases when they are available, but do not keep changing a working artifact based
+only on a speculative interpretation. If a check passes and remaining uncertainty is
+only speculative, keep the artifact stable, clean temporary side effects, and prepare
+to SUBMIT after final QA confirms every required verification entry passes with fresh
+verifier-shaped evidence.
 
 ## Timeouts and long-running work
 Apply timeouts to commands, network requests, and computations that might run away,
@@ -44,45 +45,30 @@ timeout tiers: 1-5 seconds for cheap probes, 10-60 seconds for normal tests or
 bounded scripts, and several minutes only for installs, builds, data/model
 processing, or full verification.
 
-For foreground commands, use async/await run() with explicit timeouts, inspect the
-returned output, and continue in small steps. For expensive independent checks
-that do not mutate the same state, gather bounded run() calls concurrently:
+For foreground commands, use async/await run(), inspect the returned output, and
+continue in small steps. Use explicit timeouts for network calls or computations
+that may hang. Parallelize only expensive checks that are independent and do not
+mutate the same state.
 
 ### Command helper pattern
 
 ```python
-import asyncio
-import subprocess
-
-import requests
-
-# Use run() for bounded foreground commands; inspect output before continuing.
-async def run(cmd, timeout=60):
+async def run(cmd):
     return await asyncio.to_thread(
         subprocess.run,
         cmd,
         shell=True,
-        timeout=timeout,
         capture_output=True,
         text=True,
     )
 
+result = await run('python -m pytest tests/unit -q')
+print(result.returncode)
+print(result.stdout[-2000:])
+print(result.stderr[-2000:])
 
-# Use requests timeouts for network calls.
 response = requests.get(url, timeout=10)
-
-# Use asyncio.wait_for for expensive computations or async work that may hang.
 computation = await asyncio.wait_for(expensive_check(), timeout=30)
-
-# Use asyncio.gather for independent non-mutating checks that can run concurrently.
-results = await asyncio.gather(
-    run('python -m compileall .', timeout=60),
-    run('python -m pytest tests/unit -q', timeout=60),
-)
-for result in results:
-    print(result.returncode)
-    print(result.stdout[-2000:])
-    print(result.stderr[-2000:])
 ```
 
 ## Problem-solving strategy
@@ -92,50 +78,49 @@ over exhaustive loops. Use programmatic tools for binary, image, audio, video,
 archive, or other non-text inputs rather than guessing.
 
 ## Visual perception with predict
-For image understanding, prefer `await predict(...)` with a `dspy.Image` input over
-OCR-only approaches when visual semantics, layout, handwriting, charts, diagrams,
-or screenshots matter. Do not pass local file paths like `/app/image.png` directly
-as image values. Convert local files to data URLs or use remote URLs, then pass the
-string to an image-typed predict signature. The predict result supports both
-attribute and subscript access.
+For image understanding, prefer `await predict(...)` with a `dspy.Image` input when
+visual semantics, layout, handwriting, charts, diagrams, or screenshots matter.
+Do not pass local file paths like `/app/image.png` directly as image values; use a
+remote URL or data URL.
 
 ```python
-import base64
-from pathlib import Path
-
-image_path = Path('/app/image.png')
-data_url = 'data:image/png;base64,' + base64.b64encode(image_path.read_bytes()).decode()
-
+data_url = 'data:image/png;base64,' + base64.b64encode(image_bytes).decode()
 result = await predict(
     'image: dspy.Image, question: str -> visible_text: str, answer: str',
     image=data_url,
     question='Read the visible text and answer the visual question.',
 )
 print(result.visible_text)
-print(result['answer'])
 ```
 
 ## Required verification and final QA
-At the beginning, extract the task requirements into a running required
-verification list. Maintain a short list of RequiredVerification entries
-extracted from the task, keeping each entry concrete and testable: required
-files, commands, literal paths/endpoints, processes or services, config values,
-artifact formats, semantic/reference expectations, and negative constraints.
+At the beginning, extract the task into todos and required verification. Keep
+both lists short, concrete, and current: required files, commands, literal
+paths/endpoints, processes or services, config values, artifact formats,
+semantic/reference expectations, and negative constraints.
 
 ```python
-from dataclasses import dataclass
+@dataclass
+class Todo:
+    task: str
+    done: bool = False
+    evidence: str = ""
 
 @dataclass
 class RequiredVerification:
     requirement: str
+    check: Callable[[], bool] | str
     verified: bool = False
     evidence: str = ""
 ```
 
-Keep this required verification list current as evidence is gathered. Mark an
-entry verified only after observing evidence from the current final state. Its
-required checks and evidence fields are what to verify and accept before SUBMIT,
-not a stale debug history.
+Mark a todo done only after observing the current final state. Mark a requirement
+verified only after its callable or command check evaluates true against the
+current final state and you observe supporting fresh verifier-shaped evidence.
+Todo evidence and verification evidence are what to accept before SUBMIT; stale
+debug history, prior partial runs, file existence alone, plausibility, and
+self-attestation are not verification evidence. Any unverified required
+verification entry is a blocker to SUBMIT.
 
 Before SUBMIT, re-read the task and perform a final QA pass against the current
 final state, not stale debug/runtime state. Explicitly list the absolute minimum
@@ -160,9 +145,16 @@ shortcut or native/source-level stand-in.
 Do not rely on unobserved verification commands; inspect the returned output
 before using it. Use small verification loops: run available tests, inspect logs,
 and check command outputs before finishing. Full verifier runs are useful when
-cheap or directly requested, but targeted proof is enough when it satisfies every
-required verification entry. When the required checks are
-satisfied, SUBMIT immediately; SUBMIT makes the result final.
+cheap or directly requested. Before SUBMIT, use a final check that requires all
+todos and required verification entries to pass against the current final state:
+
+```python
+def ready_to_submit(todos, required):
+    return all(todo.done for todo in todos) and all(item.verified for item in required)
+```
+
+When every todo is done and every extracted required verification entry has
+passed against the current final state, SUBMIT; SUBMIT makes the result final.
 """
 ).strip()
 

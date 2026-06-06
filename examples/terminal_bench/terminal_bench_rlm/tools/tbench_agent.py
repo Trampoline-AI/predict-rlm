@@ -6,6 +6,7 @@ import importlib.resources
 import inspect
 import io
 import json
+import logging
 import os
 import shlex
 import tarfile
@@ -34,6 +35,7 @@ TerminalBenchRunnerInterpreter: Any | None = None
 DAYTONA_REMOTE_ROOT = "/tmp/predict_rlm_controller"
 DAYTONA_REMOTE_HOME = "/tmp/predict_rlm_home"
 DAYTONA_REMOTE_RESULT_SENTINEL = "PREDICT_RLM_REMOTE_RESULT_JSON="
+logger = logging.getLogger(__name__)
 _SOURCE_BUNDLE_RELATIVE_PATHS = (
     "pyproject.toml",
     "README.md",
@@ -111,11 +113,13 @@ _SECRET_PAYLOAD_KEY_PARTS = (
     "token",
 )
 _REMOTE_CONTROLLER_ENV_KEYS = (
+    "CODEX_LM_AUTH_PROFILE",
     "OPENAI_API_KEY",
     "OPENAI_BASE_URL",
     "OPENAI_ORG_ID",
     "OPENAI_ORGANIZATION",
 )
+_SUBMIT_CONFIRMATION_MODE_TERMINAL_BENCH = "terminal_bench"
 
 
 def _tool_name(tool: Callable[..., Any]) -> str:
@@ -157,6 +161,21 @@ def _coerce_optional_text(value: Any) -> str | None:
         return None
     text = str(value).strip()
     return text or None
+
+
+def _coerce_submit_confirmation_mode(value: Any) -> str | None:
+    if value in (None, False):
+        return None
+    if value is True:
+        return _SUBMIT_CONFIRMATION_MODE_TERMINAL_BENCH
+    text = str(value).strip().lower()
+    if text in {"", "0", "false", "none", "off", "no"}:
+        return None
+    if text == _SUBMIT_CONFIRMATION_MODE_TERMINAL_BENCH:
+        return text
+    raise ValueError(
+        "submit_confirmation_mode must be 'terminal_bench', True, False, or None."
+    )
 
 
 def _coerce_float(value: Any) -> float:
@@ -209,6 +228,70 @@ def _signature_with_task_instruction(signature: Any, task_instruction: str) -> A
     else:
         instructions = task_block
     return dspy.Signature({**base_signature.output_fields}, instructions)
+
+
+def _format_submit_confirmation_state(context: Any) -> str:
+    submitted_payload = getattr(context, "submitted_payload", {})
+    try:
+        payload_text = json.dumps(submitted_payload, indent=2, sort_keys=True, default=str)
+    except TypeError:
+        payload_text = str(submitted_payload)
+    latest_observation = str(getattr(context, "latest_observation", "") or "").strip()
+    iteration = getattr(context, "iteration", None)
+    parts = [f"Submitted payload:\n{payload_text}"]
+    parts.append(
+        "Latest terminal observation:\n"
+        f"{latest_observation or '(no terminal observation captured)'}"
+    )
+    if iteration is not None:
+        parts.append(f"Submit iteration: {iteration}")
+    return "\n\n".join(parts)
+
+
+def _build_terminal_bench_submit_confirmation(task_instruction: str) -> Callable[[Any], str]:
+    instruction = task_instruction.strip() or "(no task instruction provided)"
+
+    def confirm(context: Any) -> str:
+        return (
+            "Original task:\n"
+            f"{instruction}\n\n"
+            "Current submitted payload / terminal state:\n"
+            f"{_format_submit_confirmation_state(context)}\n\n"
+            "Are you sure you want to mark the task as complete?\n"
+            "[!] Final verification gate\n"
+            "Before calling SUBMIT again, re-read the original task and compare it "
+            "to the current final state. Use the skill's todos and required "
+            "verification entries as the contract.\n"
+            "- Convert every required outcome, file/path, command behavior, service, "
+            "format, semantic expectation, and negative constraint into concrete "
+            "required verification predicates.\n"
+            "- Mark each todo done and each required verification entry verified only "
+            "with fresh evidence from the current final state: task-local tests, "
+            "public verifier commands, verifier-shaped emulation, parser/load/exercise "
+            "checks, or direct inspection of named paths/processes/configs.\n"
+            "- Do not rely on stale debug history, prior partial runs, file existence "
+            "alone, plausibility, or self-attestation as verification evidence.\n"
+            "- Any unverified todo or required verification entry is a blocker to "
+            "SUBMIT; continue checking or fixing instead of confirming.\n"
+            "- The second SUBMIT is only to confirm the same already-verified answer; "
+            "do not use it to do new work, change the answer, or defer verification.\n"
+            "After this point, grading will begin and no further edits will be possible. "
+            "If every todo and required verification entry is verified now, call SUBMIT again. "
+            "Otherwise continue working."
+        )
+
+    return confirm
+
+
+def _build_submit_confirmation(
+    mode: str | None,
+    task_instruction: str,
+) -> Callable[[Any], str] | None:
+    if mode is None:
+        return None
+    if mode == _SUBMIT_CONFIRMATION_MODE_TERMINAL_BENCH:
+        return _build_terminal_bench_submit_confirmation(task_instruction)
+    raise ValueError(f"Unsupported submit_confirmation_mode: {mode}")
 
 
 def _get_runtime(task: Any = None, session: Any = None, **kwargs: Any) -> Any:
@@ -417,6 +500,7 @@ class _TerminalBenchRLMBaseAgentMixin:
         predict_rlm_debug: bool | str = False,
         predict_rlm_debug_json: bool | str = False,
         predict_rlm_debug_log: str | None = None,
+        submit_confirmation_mode: str | bool | None = _SUBMIT_CONFIRMATION_MODE_TERMINAL_BENCH,
         **predict_rlm_kwargs: Any,
     ) -> None:
         if "interpreter_mode" in predict_rlm_kwargs:
@@ -441,6 +525,7 @@ class _TerminalBenchRLMBaseAgentMixin:
         self.predict_rlm_debug = _coerce_bool(predict_rlm_debug)
         self.predict_rlm_debug_json = _coerce_bool(predict_rlm_debug_json)
         self.predict_rlm_debug_log = _coerce_optional_text(predict_rlm_debug_log)
+        self.submit_confirmation_mode = _coerce_submit_confirmation_mode(submit_confirmation_mode)
         if self.codex_lm_debug:
             os.environ["CODEX_LM_DEBUG"] = "1"
         if self.codex_lm_debug_log:
@@ -491,9 +576,20 @@ class _TerminalBenchRLMBaseAgentMixin:
                 rlm_kwargs["max_iterations"] = int(rlm_kwargs["max_iterations"])
             if self.tools is not None:
                 rlm_kwargs["tools"] = self.tools
+            submit_confirmation = _build_submit_confirmation(
+                self.submit_confirmation_mode,
+                task_instruction,
+            )
+            if submit_confirmation is not None:
+                if "submit_confirmation" in rlm_kwargs:
+                    raise ValueError(
+                        "submit_confirmation_mode cannot be combined with a custom "
+                        "submit_confirmation callback."
+                    )
+                rlm_kwargs["submit_confirmation"] = submit_confirmation
             signature = _signature_with_task_instruction(self.signature, task_instruction)
             rlm = _predict_rlm_class()(signature, **rlm_kwargs)
-            result = rlm()
+            result = rlm.acall()
             if inspect.isawaitable(result):
                 result = asyncio.run(result)
             _write_trace(getattr(result, "trace", None), logging_dir)
@@ -875,7 +971,10 @@ class DaytonaRemotePredictRLMAgent(HarborPredictRLMBaseAgent):
             finally:
                 stop_streaming.set()
                 if stream_task is not None:
-                    await stream_task
+                    try:
+                        await stream_task
+                    except Exception as exc:
+                        logger.warning("Remote log streaming stopped with an error", exc_info=exc)
             parsed = _parse_remote_result(result)
             if not parsed.get("ok"):
                 error_type = parsed.get("error_type") or "RemotePredictRLMError"
@@ -1083,6 +1182,8 @@ class DaytonaRemotePredictRLMAgent(HarborPredictRLMBaseAgent):
             "sub_lm_reasoning_effort": self.sub_lm_reasoning_effort,
             "sub_lm_service_tier": self.sub_lm_service_tier,
         }
+        if self.submit_confirmation_mode is not None:
+            payload["submit_confirmation_mode"] = self.submit_confirmation_mode
         return _json_dumps_non_secret_payload(payload)
 
     def _remote_controller_env_assignments(self) -> list[str]:

@@ -448,6 +448,24 @@ def test_harbor_environment_interpreter_unwraps_submit_on_persistent_runner() ->
     asyncio.run(scenario())
 
 
+def test_harbor_environment_interpreter_can_defer_next_submit_finalization() -> None:
+    async def scenario() -> None:
+        process = FakeInteractiveProcess(
+            [{"id": 1, "ok": True, "result": {"submitted": {"answer": "done"}}}]
+        )
+        env = FakeEnvironment(process)
+        interpreter = HarborEnvironmentInterpreter(env, loop=asyncio.get_running_loop())
+        interpreter.defer_next_submit_finalization()
+
+        result = await asyncio.to_thread(interpreter.execute, 'SUBMIT(answer="done")')
+
+        assert isinstance(result, FinalOutput)
+        assert result.output == {"answer": "done"}
+        assert process.requests[0]["params"]["defer_final_output"] is True
+
+    asyncio.run(scenario())
+
+
 def test_harbor_environment_interpreter_requires_interactive_exec() -> None:
     class OneShotOnlyEnvironment(FakeEnvironment):
         start_exec = None

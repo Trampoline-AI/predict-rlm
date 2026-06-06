@@ -901,6 +901,10 @@ class TerminalBenchRunnerInterpreter(PersistentJsonRpcRunnerClient, PredictRLMIn
         self._stdout_reader: _TimeoutLineReader | None = None
         self._execution_gate = InterpreterExecutionGate("Terminal-Bench supervisor")
         self._debug_request_context: dict[int, dict[str, Any]] = {}
+        self._defer_next_submit_finalization = False
+
+    def defer_next_submit_finalization(self) -> None:
+        self._defer_next_submit_finalization = True
 
     def execute(
         self,
@@ -958,7 +962,7 @@ class TerminalBenchRunnerInterpreter(PersistentJsonRpcRunnerClient, PredictRLMIn
         process = self._process
         if process is not None and process.poll() is None:
             try:
-                self._send_request("shutdown", {})
+                self._send_request("shutdown", {"preserve_kernel_process": True})
             except Exception:
                 pass
             try:
@@ -1017,6 +1021,9 @@ class TerminalBenchRunnerInterpreter(PersistentJsonRpcRunnerClient, PredictRLMIn
             assignments = "\n".join(f"{name} = {value!r}" for name, value in variables.items())
             code = f"{assignments}\n{code}"
         params: dict[str, Any] = {"code": code}
+        if self._defer_next_submit_finalization:
+            params["defer_final_output"] = True
+            self._defer_next_submit_finalization = False
         host_timeout = self.exec_timeout
         if timeout is not None:
             execution_timeout = self._resolve_execution_timeout(timeout)
@@ -1263,6 +1270,8 @@ class TerminalBenchRunnerInterpreter(PersistentJsonRpcRunnerClient, PredictRLMIn
             return "timeout"
         if isinstance(result, dict) and "final" in result:
             return "final"
+        if isinstance(result, dict) and "submitted" in result:
+            return "submitted"
         return "output"
 
     def _response_debug_lengths(self, response: dict[str, Any]) -> dict[str, Any]:
