@@ -380,7 +380,7 @@ class TestVerboseDebugLogging:
 
         _assert_raw_verbose_output(before_execute)
         _assert_raw_verbose_output(after_execute)
-        assert "\033[1;90mRLM turn 1/5" in before_execute
+        assert "\033[1;97mRLM turn \033[1;32m1\033[1;97m/5" in before_execute
         assert "RLM turn 1/5" in before_text
         assert "reasoning:" in before_text
         assert "thinking" in before_text

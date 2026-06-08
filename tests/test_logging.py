@@ -99,6 +99,24 @@ def test_verbose_trace_detail_does_not_hard_wrap_long_logical_lines():
     assert long_line in rendered
 
 
+def test_verbose_trace_header_colors_only_current_iteration_green():
+    rendered = logging_module._render_trace_header(3, 12)
+
+    assert rendered == (
+        "\033[1;97mRLM turn "
+        "\033[1;32m3"
+        "\033[1;97m/12"
+        "\033[0m"
+    )
+
+
+def test_verbose_trace_detail_uses_lighter_label_and_dim_body():
+    rendered = logging_module._render_trace_detail("output:", "result")
+
+    assert "\033[3;97moutput:\033[0m" in rendered
+    assert "\033[2mresult\033[0m" in rendered
+
+
 def test_verbose_trace_detail_preserves_code_syntax_color():
     rendered = logging_module._render_trace_detail(
         "code:",

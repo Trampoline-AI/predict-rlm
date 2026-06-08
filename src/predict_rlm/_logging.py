@@ -25,7 +25,9 @@ ERROR_COLOR = "31"
 ANSI_RESET = "\033[0m"
 ANSI_DIM = "\033[2m"
 ANSI_DIM_ITALIC = "\033[2;3m"
-ANSI_HEADER = "\033[1;90m"
+ANSI_HEADER = "\033[1;97m"
+ANSI_HEADER_SUCCESS = "\033[1;32m"
+ANSI_LABEL = "\033[3;97m"
 ANSI_MAGENTA = "\033[35m"
 
 _live_tool_call_logging: ContextVar[bool] = ContextVar(
@@ -219,13 +221,18 @@ def _preview(value: Any, limit: int | None) -> str:
 
 
 def _render_trace_header(iteration: int, max_iterations: int) -> str:
-    return f"{ANSI_HEADER}RLM turn {iteration}/{max_iterations}{ANSI_RESET}"
+    return (
+        f"{ANSI_HEADER}RLM turn "
+        f"{ANSI_HEADER_SUCCESS}{iteration}"
+        f"{ANSI_HEADER}/{max_iterations}"
+        f"{ANSI_RESET}"
+    )
 
 
 def _render_reasoning(reasoning: str) -> str:
     return "\n".join(
         [
-            f"  {ANSI_DIM_ITALIC}reasoning:{ANSI_RESET}",
+            f"  {ANSI_LABEL}reasoning:{ANSI_RESET}",
             *(
                 f"    {ANSI_DIM_ITALIC}{line}{ANSI_RESET}"
                 for line in reasoning.strip().splitlines()
@@ -252,7 +259,7 @@ def _render_trace_detail(
         content = _highlight_trace_detail(content, syntax)
     return "\n".join(
         [
-            f"  {ANSI_DIM_ITALIC}{label}{ANSI_RESET}",
+            f"  {ANSI_LABEL}{label}{ANSI_RESET}",
             *(f"    {_style_trace_line(line, syntax)}" for line in content.splitlines()),
         ]
     )
