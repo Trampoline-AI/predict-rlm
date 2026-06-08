@@ -568,8 +568,10 @@ def reset_tool_call_collector(token: Token) -> None:
     _tool_calls.reset(token)
 
 
-def snapshot_lm_history_len(lm: dspy.LM) -> int:
+def snapshot_lm_history_len(lm: dspy.LM | None) -> int:
     """Return the current length of an LM's history list."""
+    if lm is None:
+        return 0
     return len(lm.history)
 
 
@@ -682,9 +684,11 @@ def iteration_cost_from_accounting(
     )
 
 
-def lm_history_since(lm: dspy.LM, since: int) -> list[dict[str, Any]]:
+def lm_history_since(lm: dspy.LM | None, since: int) -> list[dict[str, Any]]:
     """Return raw usage objects and per-call accounting records after ``since``."""
 
+    if lm is None:
+        return []
     history = lm.history
     if not history or len(history) <= since:
         return []
@@ -722,7 +726,7 @@ def _numeric_cost(value: Any) -> float:
     return float(value)
 
 
-def lm_finish_since(lm: dspy.LM, since: int) -> LMFinishMetadata | None:
+def lm_finish_since(lm: dspy.LM | None, since: int) -> LMFinishMetadata | None:
     """Extract compact finish metadata from LM history entries."""
 
     metadata = lm_completion_metadata_since(lm, since)
@@ -732,13 +736,15 @@ def lm_finish_since(lm: dspy.LM, since: int) -> LMFinishMetadata | None:
 
 
 def lm_completion_metadata_since(
-    lm: dspy.LM,
+    lm: dspy.LM | None,
     since: int,
     *,
     output_tokens: int | None = None,
 ) -> _LMCompletionMetadata | None:
     """Extract rich completion metadata from LM history entries."""
 
+    if lm is None:
+        return None
     history = lm.history
     if not history or len(history) <= since:
         return None

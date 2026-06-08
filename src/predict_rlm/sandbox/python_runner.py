@@ -694,19 +694,21 @@ def _response(request_id: Any, result: dict[str, Any]) -> dict[str, Any]:
 
 def _exception_payload(exc: BaseException) -> dict[str, Any]:
     if isinstance(exc, _RunnerExecutionError):
-        return exc.payload
-    return {
-        "type": type(exc).__name__,
-        "message": str(exc),
-        "args": list(getattr(exc, "args", ())),
-    }
+        payload = dict(exc.payload)
+    else:
+        payload = {
+            "type": type(exc).__name__,
+            "message": str(exc),
+            "args": list(getattr(exc, "args", ())),
+        }
+    partial_output = getattr(exc, "_predict_rlm_output", "")
+    if partial_output:
+        payload["output"] = partial_output
+    return payload
 
 
 def _error(request_id: Any, exc: BaseException) -> dict[str, Any]:
-    data = {
-        "type": type(exc).__name__,
-        "args": list(getattr(exc, "args", ())),
-    }
+    data = _exception_payload(exc)
     partial_output = getattr(exc, "_predict_rlm_output", "")
     if partial_output:
         data["output"] = partial_output

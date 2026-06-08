@@ -100,6 +100,8 @@ class SbxInterpreter(PersistentJsonRpcRunnerClient, PredictRLMInterpreter):
         )
         self.extra_read_paths = extra_read_paths or []
         self.extra_write_paths = extra_write_paths or []
+        if _supervisor_command is not None and _runner_command is not None:
+            raise ValueError("Pass only one of _supervisor_command or _runner_command")
         self._supervisor_command = _supervisor_command or _runner_command
         self._direct_workspace_mounts = list(direct_workspace_mounts or [])
         self.runtime_hooks = list(runtime_hooks or [])
@@ -469,6 +471,7 @@ class SbxInterpreter(PersistentJsonRpcRunnerClient, PredictRLMInterpreter):
         if self._proc and self._proc.poll() is not None:
             raise SandboxFatalError("Sbx supervisor process exited unexpectedly")
 
+        self._log_lifecycle("sbx.runner.start")
         try:
             if self._supervisor_command is not None:
                 self._setup_direct_workspace_aliases_host_side()
@@ -499,7 +502,8 @@ class SbxInterpreter(PersistentJsonRpcRunnerClient, PredictRLMInterpreter):
             self._send_request("register_output_fields", {"fields": self.output_fields})
         if self.tools:
             self._send_request("register_tools", {"tools": list(self.tools)})
-        self._register_runtime_hooks()
+        if self.runtime_hooks:
+            self._register_runtime_hooks()
 
     def _start_stdout_reader(self) -> None:
         assert self._proc is not None

@@ -39,6 +39,7 @@ class SbxPool:
         verbose: bool = False,
         extra_read_paths: list[str] | None = None,
         extra_write_paths: list[str] | None = None,
+        _supervisor_command: list[str] | None = None,
         _runner_command: list[str] | None = None,
         _staging_root: str | Path | None = None,
     ) -> None:
@@ -55,6 +56,8 @@ class SbxPool:
             debug=True if debug else None,
             verbose=True if verbose else None,
         )
+        if _supervisor_command is not None and _runner_command is not None:
+            raise ValueError("Pass only one of _supervisor_command or _runner_command")
         self._interpreter_kwargs = {
             "config": self.config,
             "allowed_domains": allowed_domains,
@@ -66,7 +69,7 @@ class SbxPool:
             "verbose": verbose,
             "extra_read_paths": extra_read_paths,
             "extra_write_paths": extra_write_paths,
-            "_runner_command": _runner_command,
+            "_supervisor_command": _supervisor_command or _runner_command,
         }
         self._staging_root = Path(_staging_root) if _staging_root is not None else None
         self._available: queue.Queue[SbxInterpreter] = queue.Queue(maxsize=size)

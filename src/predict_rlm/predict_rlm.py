@@ -2175,8 +2175,9 @@ class PredictRLM(dspy.RLM):
         action_start_ns: int,
         lm_hist_before_action: int,
         execution_timeout: float | None = None,
-    ) -> tuple[Any, list[dict[str, Any]]]:
+    ) -> tuple[Any, Any, list[dict[str, Any]]]:
         lm_metadata = lm_completion_metadata_since(dspy.settings.lm, lm_hist_before_action)
+        lm_finish_metadata = lm_finish_since(dspy.settings.lm, lm_hist_before_action)
         lm_history = lm_history_since(dspy.settings.lm, lm_hist_before_action)
         self._write_telemetry_span(
             "rlm.action_generation.ok",
@@ -2212,7 +2213,7 @@ class PredictRLM(dspy.RLM):
                 f"Execution timeout: {timeout_label}\n"
                 f"Reasoning: {pred.reasoning}\nCode:\n{pred.code}"
             )
-        return lm_metadata, lm_history
+        return lm_metadata, lm_finish_metadata, lm_history
 
     def _prepare_iteration_execution(
         self,
@@ -2484,7 +2485,7 @@ class PredictRLM(dspy.RLM):
                 lm_metadata=lm_metadata,
             )
             raise
-        lm_metadata, lm_history = self._record_action_generation_ok(
+        _, lm_metadata, lm_history = self._record_action_generation_ok(
             pred,
             iteration=iteration,
             action_start_ns=action_start_ns,
@@ -2557,7 +2558,7 @@ class PredictRLM(dspy.RLM):
                 lm_metadata=lm_metadata,
             )
             raise
-        lm_metadata, lm_history = self._record_action_generation_ok(
+        _, lm_metadata, lm_history = self._record_action_generation_ok(
             pred,
             iteration=iteration,
             action_start_ns=action_start_ns,
