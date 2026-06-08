@@ -799,7 +799,7 @@ class PredictRLM(dspy.RLM):
         max_iterations: int = 30,
         max_llm_calls: int = 50,
         max_output_chars: int = 100_000,
-        verbose: bool = False,
+        verbose: bool = True,
         tools: dict[str, Callable[..., str]] | list[Callable] | None = None,
         interpreter: CodeInterpreter | None = None,
         sandbox_backend: SandboxBackend | str | None = None,
@@ -825,6 +825,7 @@ class PredictRLM(dspy.RLM):
             max_llm_calls: Maximum LM calls per execution.
             max_output_chars: Maximum characters to include from REPL output.
             verbose: Whether to log compact per-iteration progress.
+                  Defaults to True; pass False for quiet execution.
             tools: Additional tool functions callable from interpreter code.
                   Accepts a dict mapping names to callables, or a list of
                   callables (names inferred from __name__).

@@ -27,7 +27,7 @@ class InvoiceProcessor(dspy.Module):
         self,
         sub_lm: dspy.LM | str | None = None,
         max_iterations: int = 30,
-        verbose: bool = False,
+        verbose: bool = True,
         debug: bool = False,
     ):
         self.sub_lm = sub_lm

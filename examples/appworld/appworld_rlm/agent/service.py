@@ -20,7 +20,7 @@ class AppWorldRLM(dspy.Module):
         lm: dspy.LM | str | None = None,
         sub_lm: dspy.LM | str | None = None,
         max_iterations: int = 50,
-        verbose: bool = False,
+        verbose: bool = True,
         debug: bool = False,
         skill: Skill | None = None,
         data_root: str | Path | None = None,

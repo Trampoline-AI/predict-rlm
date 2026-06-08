@@ -3,7 +3,7 @@
 Drop PDF invoices into the `sample/input/` directory next to this script, then run:
 
     uv run examples/invoice_processing/run.py
-    uv run examples/invoice_processing/run.py --verbose
+    uv run examples/invoice_processing/run.py --quiet
     uv run examples/invoice_processing/run.py --debug
 
 Requires:
@@ -60,9 +60,9 @@ def parse_args():
         help="Print timestamped RLM and sandbox lifecycle diagnostics to stderr",
     )
     parser.add_argument(
-        "--verbose",
+        "--quiet",
         action="store_true",
-        help="Print RLM reasoning, code, output, tool calls, errors, and submit blocks to stderr",
+        help="Suppress RLM reasoning, code, output, tool calls, errors, and submit blocks",
     )
     parser.add_argument(
         "--model",
@@ -141,7 +141,7 @@ async def main():
     processor = InvoiceProcessor(
         sub_lm=sub_lm,
         max_iterations=args.max_iterations,
-        verbose=args.verbose,
+        verbose=not args.quiet,
         debug=args.debug,
     )
     start_time = time.perf_counter()

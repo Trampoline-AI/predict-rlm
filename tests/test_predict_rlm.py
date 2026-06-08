@@ -174,6 +174,41 @@ class TestSandboxBackendSelection:
 
         interpreter.shutdown.assert_not_called()
 
+    def test_default_verbose_configures_injected_interpreter_verbose(self):
+        interpreter = MagicMock()
+        interpreter.configure_verbose = MagicMock()
+        interpreter.shutdown = MagicMock()
+        rlm = PredictRLM(
+            ImageAnalysisSignature,
+            sub_lm=MagicMock(),
+            max_iterations=1,
+            interpreter=interpreter,
+        )
+
+        with rlm._interpreter_context(execution_tools={"predict": MagicMock()}) as repl:
+            assert repl is interpreter
+            interpreter.configure_verbose.assert_called_once_with(True)
+
+        interpreter.shutdown.assert_not_called()
+
+    def test_explicit_false_verbose_configures_injected_interpreter_quiet(self):
+        interpreter = MagicMock()
+        interpreter.configure_verbose = MagicMock()
+        interpreter.shutdown = MagicMock()
+        rlm = PredictRLM(
+            ImageAnalysisSignature,
+            sub_lm=MagicMock(),
+            max_iterations=1,
+            interpreter=interpreter,
+            verbose=False,
+        )
+
+        with rlm._interpreter_context(execution_tools={"predict": MagicMock()}) as repl:
+            assert repl is interpreter
+            interpreter.configure_verbose.assert_called_once_with(False)
+
+        interpreter.shutdown.assert_not_called()
+
     def test_configures_injected_interpreter_runtime_logging(self):
         class Interpreter:
             def __init__(self) -> None:
@@ -282,7 +317,7 @@ class TestSandboxBackendSelection:
         assert pool.lease_kwargs["tools"] == execution_tools
         assert pool.lease_kwargs["output_fields"] == rlm._get_output_fields_info()
         assert pool.lease_kwargs["debug"] is True
-        assert pool.lease_kwargs["verbose"] is False
+        assert pool.lease_kwargs["verbose"] is True
         mock_sbx.assert_not_called()
         leased.shutdown.assert_not_called()
 
@@ -366,6 +401,7 @@ class TestVerboseDebugLogging:
             sub_lm=MagicMock(),
             max_iterations=5,
             debug=True,
+            verbose=False,
         )
 
         mock_pred = MagicMock()

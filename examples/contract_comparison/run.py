@@ -3,7 +3,7 @@
 Drop two or more PDF contracts into the `sample/input/` directory, then run:
 
     uv run examples/contract_comparison/run.py
-    uv run examples/contract_comparison/run.py --verbose
+    uv run examples/contract_comparison/run.py --quiet
     uv run examples/contract_comparison/run.py --debug
 
 Requires:
@@ -59,9 +59,9 @@ def parse_args():
         help="Print timestamped RLM and sandbox lifecycle diagnostics to stderr",
     )
     parser.add_argument(
-        "--verbose",
+        "--quiet",
         action="store_true",
-        help="Print RLM reasoning, code, output, tool calls, errors, and submit blocks to stderr",
+        help="Suppress RLM reasoning, code, output, tool calls, errors, and submit blocks",
     )
     parser.add_argument(
         "--model",
@@ -140,7 +140,7 @@ async def main():
     comparator = ContractComparator(
         sub_lm=sub_lm,
         max_iterations=args.max_iterations,
-        verbose=args.verbose,
+        verbose=not args.quiet,
         debug=args.debug,
     )
     start_time = time.perf_counter()

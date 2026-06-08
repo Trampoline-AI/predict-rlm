@@ -15,7 +15,7 @@ rlm = PredictRLM(
     max_iterations=30,        # Max REPL iterations
     max_llm_calls=50,         # Max LM calls per execution
     max_output_chars=100_000, # Max chars from REPL output
-    verbose=False,            # Print human-readable iteration trace blocks
+    verbose=True,             # Print human-readable iteration trace blocks
     tools=None,               # Additional tool functions
     skills=None,              # List of Skill instances
     allowed_domains=None,     # Domains the sandbox can access
@@ -34,7 +34,7 @@ rlm = PredictRLM(
 | `max_iterations` | `int` | `30` | Maximum REPL interaction iterations. Each iteration is one code → output → reasoning turn. |
 | `max_llm_calls` | `int` | `50` | Maximum LM calls per execution (both outer LM and sub-LM calls count). |
 | `max_output_chars` | `int` | `100_000` | Maximum characters to include from REPL output per iteration. |
-| `verbose` | `bool` | `False` | Print human-readable RLM iteration blocks to stderr: reasoning, generated code, output, tool calls, errors, and `SUBMIT` payloads. |
+| `verbose` | `bool` | `True` | Print human-readable RLM iteration blocks to stderr: reasoning, generated code, output, tool calls, errors, and `SUBMIT` payloads. Pass `False` for quiet execution. |
 | `tools` | `dict[str, Callable] \| list[Callable] \| None` | `None` | Additional tool functions callable from the sandbox. Accepts a dict mapping names to callables, or a list of callables (names inferred from `__name__`). `predict` is added automatically. |
 | `skills` | `list[Skill] \| None` | `None` | [Skills](skills.md) providing domain-specific instructions, packages, and tools. Merged automatically. |
 | `allowed_domains` | `list[str] \| None` | `None` | Domains/IPs the sandbox can access via network. By default, no network access. Example: `["api.example.com", "192.168.1.100:8080"]` |
@@ -43,10 +43,11 @@ rlm = PredictRLM(
 
 ### Verbose, debug, and trace output
 
-`verbose=True` is for understanding the RLM's work product. It prints colored
-iteration blocks to stderr: reasoning, generated code, sandbox output, tool
-calls, errors, and `SUBMIT` payloads. The verbose stream is intentionally
-plain text without logging prefixes.
+Verbose output is enabled by default for understanding the RLM's work product.
+It prints colored iteration blocks to stderr: reasoning, generated code,
+sandbox output, tool calls, errors, and `SUBMIT` payloads. The verbose stream
+is intentionally plain text without logging prefixes. Pass `verbose=False` for
+quiet execution.
 
 `debug=True` is for diagnosing runtime behavior. It prints timestamped
 `logging` records for RLM and sandbox lifecycle events such as process startup,
@@ -56,7 +57,7 @@ Debug error records are colored red.
 These flags are independent and can be enabled together:
 
 ```python
-rlm = PredictRLM(MySignature, verbose=True, debug=True)
+rlm = PredictRLM(MySignature, debug=True)
 ```
 
 Every run also attaches a structured `RunTrace` to the returned prediction as

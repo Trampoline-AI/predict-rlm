@@ -24,8 +24,8 @@ uv run examples/contract_comparison/run.py
 uv run examples/contract_comparison/run.py v1.pdf v2.pdf
 uv run examples/contract_comparison/run.py /path/to/contracts/
 
-# With verbose RLM trace blocks
-uv run examples/contract_comparison/run.py --verbose
+# Suppress verbose RLM trace blocks
+uv run examples/contract_comparison/run.py --quiet
 
 # With timestamped lifecycle diagnostics
 uv run examples/contract_comparison/run.py --debug
@@ -38,7 +38,7 @@ uv run examples/contract_comparison/run.py --debug
 | `--model`          | `openai/gpt-5.4` | Main LM                       |
 | `--sub-lm-model`   | `openai/gpt-5.1` | Sub-LM for `predict()` calls  |
 | `--max-iterations` | `30`             | Max REPL iterations           |
-| `--verbose`        | off              | Print RLM reasoning, code, output, tool calls, errors, and submit blocks to stderr |
+| `--quiet`          | off              | Suppress RLM reasoning, code, output, tool calls, errors, and submit blocks |
 | `--debug`          | off              | Print timestamped RLM and sandbox lifecycle diagnostics to stderr |
 
 Outputs are saved to `output/{timestamp}/` inside this directory.

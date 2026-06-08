@@ -161,10 +161,9 @@ print(result.answer)
 
 Every `PredictRLM` call returns a structured `prediction.trace` with iterations,
 code, output, tool calls, `predict()` subcalls, timings, token usage, and errors.
-Use `verbose=True` for human-readable colored trace blocks on stderr. Use
-`debug=True` for timestamped RLM and sandbox lifecycle diagnostics; error-like
-debug records are colored red. The two flags are independent and can be enabled
-together.
+Human-readable colored trace blocks are printed to stderr by default; pass
+`verbose=False` for quiet execution. Use `debug=True` for timestamped RLM and
+sandbox lifecycle diagnostics; error-like debug records are colored red.
 
 ### Optional: Docker Sandboxes backend
 

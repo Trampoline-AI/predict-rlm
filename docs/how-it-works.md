@@ -19,9 +19,9 @@ iterations, so it can accumulate findings across many steps.
 
 - `prediction.trace` is the structured artifact. It records iterations, code,
   output, tool calls, `predict()` calls, token usage, timings, and errors.
-- `verbose=True` prints the same kind of execution story for humans as colored
-  stderr blocks: reasoning, generated code, output, tool calls, errors, and
-  `SUBMIT`.
+- Verbose output is enabled by default and prints the same kind of execution
+  story for humans as colored stderr blocks: reasoning, generated code, output,
+  tool calls, errors, and `SUBMIT`. Pass `verbose=False` for quiet execution.
 - `debug=True` prints timestamped lifecycle diagnostics for the RLM and sandbox:
   process startup, requests, timeouts, shutdown, and captured partial output
   before failures. Error-like debug records are colored red.
