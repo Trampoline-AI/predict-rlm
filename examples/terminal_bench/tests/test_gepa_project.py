@@ -3,7 +3,6 @@ from __future__ import annotations
 import argparse
 import ast
 import asyncio
-import hashlib
 import json
 import re
 import shlex
@@ -1711,9 +1710,6 @@ def test_default_terminal_bench_skill_includes_concurrent_timeout_snippet() -> N
     assert [skill.index(heading) for heading in headings] == sorted(
         skill.index(heading) for heading in headings
     )
-    assert hashlib.sha256(skill.encode()).hexdigest() == (
-        "cfcce3ff3ba4c293f9d3c68cc61b618befa2c2ed8727043633b37b6de255283c"
-    )
     assert "command-line tasks in a Linux environment" in skill
     assert "Terminal-Bench tasks inside a Linux task container" not in skill
     assert "inspect the filesystem before making changes" in skill
@@ -1727,73 +1723,106 @@ def test_default_terminal_bench_skill_includes_concurrent_timeout_snippet() -> N
     assert "sqlite" not in skill.lower()
     assert "unobserved verification command" in skill
     assert bad_required_verification_prefix not in skill
-    assert "@dataclass" in skill
-    assert "class Todo" in skill
-    assert "task: str" in skill
-    assert "done: bool = False" in skill
-    assert "class RequiredVerification" in skill
-    assert "requirement: str" in skill
-    assert "check: Callable[[], bool] | str" in skill
-    assert "verified: bool = False" in skill
-    assert 'evidence: str = ""' in skill
+    assert "from pydantic import BaseModel, Field" in skill
+    assert "@dataclass" not in skill
+    assert "class Todo(BaseModel)" in skill
+    assert "task: str = Field(" in skill
+    assert "done: bool = Field(default=False" in skill
+    assert "evidence: str = Field(default=\"\"" in skill
+    assert "class RequiredVerification(BaseModel)" in skill
+    assert 'state: Literal["pending", "passed", "failed"] = Field(default="pending"' in skill
+    assert "checked_iteration: int = Field(default=-1" in skill
+    assert "Iteration count when the latest check was evaluated against current task state" in skill
+    assert "-1 means this predicate is unprocessed" in skill
+    assert "processed: bool" not in skill
+    assert "predicate: str = Field(" in skill
+    assert "check: Callable[[], bool] = Field(" in skill
+    assert "expected: str = Field(" in skill
+    assert "observed: str = Field(default=\"\"" in skill
+    assert "description=" in skill
+    assert "current final-state requirement" in skill
+    assert "callable that returns True" in skill
+    assert "expected result" in normalized_skill
+    assert "Fresh observed value" in skill
+    assert "pending, passed, or failed" in skill
+    assert "active: bool" not in skill
+    assert "passed: bool" not in skill
+    assert "command_or_callable" not in skill
+    assert "Callable[[], bool] | str" not in skill
+    assert "verified: bool = False" not in skill
     assert "verification: str" not in skill
-    assert "todos and required verification" in skill
-    assert "Mark a todo done" in skill
-    assert "required checks" in skill
-    assert "both lists short" in skill
+    assert "todos and a short list of required" in skill
+    assert "required verification predicates" in normalized_skill
+    assert "machine-evaluable callable" in skill
+    assert "exact callable invocation" in skill
+    assert "wrap shell commands in callables" in normalized_skill
+    assert "expected result" in normalized_skill
+    assert "numeric threshold or spec" in normalized_skill
+    assert "observed value" in skill
+    assert "measured value" in normalized_skill
+    assert "PASS/FAIL" in skill
     assert "extracted from the task" not in skill
-    assert "callable or command check evaluates true" in skill
-    assert "passed against the current final state" in skill
-    assert "verified:" in skill
     assert "schema" not in skill.lower()
     assert "yaml" not in skill.lower()
     assert all(term not in skill for term in obsolete_schema_terms)
     assert "ledger" not in skill.lower()
-    assert "task into todos" in skill
     assert "Before SUBMIT" in skill
-    assert "fresh verifier-shaped evidence" in skill
     assert "current final state" in skill
-    assert "Any unverified required verification entry is a blocker" in normalized_skill
-    assert "file existence alone" in skill
-    assert "self-attestation" in skill
-    assert "literal paths/endpoints" in normalized_skill
-    assert "config values" in skill
-    assert "processes or services" in normalized_skill
-    assert "absolute minimum" in skill
-    assert "files, processes, services, and configs" in skill
-    assert "initial state" in skill
-    assert "no extra modified files" in skill
+    assert "final verification block" in skill
+    assert "exact callable" in skill
+    assert "Use assertions or return False" in skill
+    assert "outdated by later changes" in skill
+    assert "rewrite it as a current predicate" in skill
+    assert "reset checked_iteration to -1" in normalized_skill
+    assert 'state "pending"' in normalized_skill
+    assert "false result" in skill
+    assert "timeout" in skill
+    assert "missing file" in skill
+    assert "skipped check" in normalized_skill
+    assert "ambiguous check" in normalized_skill
+    assert "stale output" in skill
+    assert "reasoning-only support" in skill
+    assert "blocker to SUBMIT" in normalized_skill
     assert "copied artifacts" in skill
     assert "debug helpers" in skill
     assert "alternate runtime artifacts" in normalized_skill
     assert "temporary services" in skill
     assert "config side effects" in skill
-    assert "paths, endpoints, flags, and config values named by the task" in normalized_skill
-    assert "visible tests" in skill
+    assert "visible evidence" in skill
+    assert "stdout/stderr" in skill
+    assert "generated outputs" in skill
+    assert "service behavior" in skill
+    assert "exit codes" in normalized_skill
+    assert "literal paths/endpoints/flags" in normalized_skill
     assert "verifier-shaped checks" in skill
     assert "hidden tests" in skill
     assert "parse/load/exercise" in skill
     assert "semantic/reference" in skill
     assert "stdout/progress text" in skill
+    assert "numeric measurements" in normalized_skill
+    assert "thresholds or specs" in normalized_skill
     assert "command behavior" in skill
     assert "emulator, interpreter, VM, service, or wrapper tasks" in skill
     assert "named binary, program, protocol, or mechanism" in normalized_skill
     assert "shortcut or native/source-level stand-in" in skill
-    assert "negative constraints" in normalized_skill
-    assert "debug/runtime state" in skill
-    assert "stdout/stderr" in skill
-    assert "exit code" in normalized_skill or "exit codes" in normalized_skill
-    assert "service behavior" in skill
-    assert "ready_to_submit(todos, required)" in skill
+    assert "ready_to_submit(todos, required, current_iteration)" in skill
     assert "all(todo.done for todo in todos)" in skill
-    assert "all(item.verified for item in required)" in skill
+    assert 'item.state == "passed" and item.checked_iteration == current_iteration' in normalized_skill
+    assert "no required predicate is stale, invalidated, or pending" in normalized_skill
     assert "When every todo is done" in skill
+    assert "expected value and observed value" in normalized_skill
+    assert "numeric or spec predicates" in normalized_skill
+    assert "prints PASS from fresh" in normalized_skill
     assert "SUBMIT makes the result final" in skill
     assert "targeted proof is enough" not in skill
     assert "SUBMIT immediately" not in skill
     assert "SUBMIT while budget remains" not in skill
-    assert "stale debug history" in normalized_skill
     assert "Once the observable task contract is satisfied" not in skill
+    assert "/tests/test_outputs.py" not in skill
+    assert "test_outputs.py" not in skill
+    assert "Terminal-Bench" not in skill
+    assert "compiler" not in skill.lower()
+    assert "generated input" not in skill.lower()
     assert "run the verification in one iteration" not in skill
     assert "separate later iteration" not in skill
     assert "always run the full verifier" not in skill.lower()

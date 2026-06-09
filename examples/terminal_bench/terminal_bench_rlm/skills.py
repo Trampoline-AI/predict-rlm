@@ -94,67 +94,77 @@ print(result.visible_text)
 ```
 
 ## Required verification and final QA
-At the beginning, extract the task into todos and required verification. Keep
-both lists short, concrete, and current: required files, commands, literal
-paths/endpoints, processes or services, config values, artifact formats,
-semantic/reference expectations, and negative constraints.
+At the beginning, extract the task into todos and a short list of required
+verification predicates. Each predicate must name a current final-state
+requirement and a machine-evaluable callable: exact callable invocation, expected
+result, observed value, checked iteration, and PASS/FAIL. By default, wrap shell
+commands in callables that record the command, exit code, stdout/stderr, and
+parsed result.
 
 ```python
-@dataclass
-class Todo:
-    task: str
-    done: bool = False
-    evidence: str = ""
+from collections.abc import Callable
+from typing import Literal
 
-@dataclass
-class RequiredVerification:
-    requirement: str
-    check: Callable[[], bool] | str
-    verified: bool = False
-    evidence: str = ""
+from pydantic import BaseModel, Field
+
+
+class Todo(BaseModel):
+    task: str = Field(description="Concrete task step extracted from the prompt.")
+    done: bool = Field(default=False, description="True only after fresh current-state evidence.")
+    evidence: str = Field(default="", description="Brief observed evidence for marking the todo done.")
+
+
+class RequiredVerification(BaseModel):
+    predicate: str = Field(description="Named current final-state requirement being checked.")
+    check: Callable[[], bool] = Field(description="Machine-evaluable callable that returns True only when the predicate is satisfied.")
+    expected: str = Field(description="Expected result, numeric threshold or spec, or invariant for the predicate.")
+    observed: str = Field(default="", description="Fresh observed value or measured value from the latest check run.")
+    checked_iteration: int = Field(default=-1, description="Iteration count when the latest check was evaluated against current task state; -1 means this predicate is unprocessed.")
+    state: Literal["pending", "passed", "failed"] = Field(default="pending", description="Verification status: pending, passed, or failed.")
 ```
 
-Mark a todo done only after observing the current final state. Mark a requirement
-verified only after its callable or command check evaluates true against the
-current final state and you observe supporting fresh verifier-shaped evidence.
-Todo evidence and verification evidence are what to accept before SUBMIT; stale
-debug history, prior partial runs, file existence alone, plausibility, and
-self-attestation are not verification evidence. Any unverified required
-verification entry is a blocker to SUBMIT.
+Mark a todo done only after observing the current final state. If a predicate is
+outdated by later changes, rewrite it as a current predicate, reset
+checked_iteration to -1, clear stale observed evidence, and return it to state
+"pending" before continuing. Before SUBMIT, execute a final verification block
+that prints every required predicate with the exact callable, observed value,
+expected value, checked iteration, PASS/FAIL, and resulting state.
+Use assertions or return False for failed predicates. A false result, exception,
+timeout, missing file, skipped check, ambiguous check, stale output, unprocessed
+predicate, or reasoning-only support is a blocker to SUBMIT.
 
-Before SUBMIT, re-read the task and perform a final QA pass against the current
-final state, not stale debug/runtime state. Explicitly list the absolute minimum
-files, processes, services, and configs that must differ from the initial state,
-then confirm no extra modified files, copied artifacts, debug helpers, alternate
+Also confirm no extra modified files, copied artifacts, debug helpers, alternate
 runtime artifacts, temporary services, or config side effects remain unless the
 task requested them.
 
 ## Verification and final submission
-After each major change, verify still-relevant required checks with
-proportional evidence that is visible: inspect stdout/stderr, generated outputs,
-service behavior, exit codes, logs, command behavior, and other parser-visible
-effects; inspect final processes/services and literal paths, endpoints, flags,
-and config values named by the task; run visible tests or verifier-shaped checks
-when available without assuming hidden tests are visible; parse/load/exercise
-artifacts rather than only checking existence; and check semantic/reference
-quality and stdout/progress text when relevant.
+After each major change, verify still-relevant required checks with proportional
+visible evidence: stdout/stderr, generated outputs, service behavior, exit codes,
+logs, command behavior, parser-visible effects, literal paths/endpoints/flags,
+semantic/reference quality, stdout/progress text, and numeric measurements
+against thresholds or specs when relevant. Run visible tests or verifier-shaped
+checks when available without assuming hidden tests are visible;
+parse/load/exercise artifacts rather than only checking existence.
 For emulator, interpreter, VM, service, or wrapper tasks, prove the named binary,
 program, protocol, or mechanism is actually exercised rather than replaced by a
 shortcut or native/source-level stand-in.
 
 Do not rely on unobserved verification commands; inspect the returned output
-before using it. Use small verification loops: run available tests, inspect logs,
-and check command outputs before finishing. Full verifier runs are useful when
-cheap or directly requested. Before SUBMIT, use a final check that requires all
-todos and required verification entries to pass against the current final state:
+before using it. Before SUBMIT, require every todo and every required predicate
+to pass against the current final state:
 
 ```python
-def ready_to_submit(todos, required):
-    return all(todo.done for todo in todos) and all(item.verified for item in required)
+def ready_to_submit(todos, required, current_iteration):
+    return all(todo.done for todo in todos) and all(
+        item.state == "passed" and item.checked_iteration == current_iteration
+        for item in required
+    )
 ```
 
-When every todo is done and every extracted required verification entry has
-passed against the current final state, SUBMIT; SUBMIT makes the result final.
+When every todo is done, every required predicate prints PASS from fresh
+current-state evidence with its expected value and observed value, including
+numeric or spec predicates, and no required predicate is stale, invalidated, or
+pending, SUBMIT; SUBMIT makes the result final.
 """
 ).strip()
 
