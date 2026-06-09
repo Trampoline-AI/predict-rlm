@@ -54,6 +54,8 @@ def _add_project_args(parser: argparse.ArgumentParser) -> None:
     )
     parser.add_argument("--harbor-cpus", choices=("auto", "limit", "request", "guarantee", "ignore"))
     parser.add_argument("--harbor-memory", choices=("auto", "limit", "request", "guarantee", "ignore"))
+    parser.add_argument("--harbor-max-retries", type=int)
+    parser.add_argument("--harbor-retry-include-exception", action="append")
     parser.add_argument("--timeout-cleanup-grace-sec", type=int)
     parser.add_argument("--n-attempts", type=int)
     parser.add_argument("--n-concurrent-trials", type=int)
@@ -117,6 +119,10 @@ def _apply_project_args(config: OptimizeConfig, args: Any) -> TerminalBenchGepaC
         config.harbor_cpus = args.harbor_cpus
     if args.harbor_memory is not None:
         config.harbor_memory = args.harbor_memory
+    if args.harbor_max_retries is not None:
+        config.harbor_max_retries = args.harbor_max_retries
+    if args.harbor_retry_include_exception is not None:
+        config.harbor_retry_include_exceptions = tuple(args.harbor_retry_include_exception)
     if args.timeout_cleanup_grace_sec is not None:
         config.timeout_cleanup_grace_sec = args.timeout_cleanup_grace_sec
     if args.n_attempts is not None:

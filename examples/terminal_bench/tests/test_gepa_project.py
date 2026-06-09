@@ -803,6 +803,14 @@ def test_harbor_runner_builds_harbor_run_command(monkeypatch, tmp_path: Path) ->
     assert "--agent-timeout" not in cmd
     assert "--n-attempts" in cmd
     assert cmd[cmd.index("--n-attempts") + 1] == "1"
+    assert "--max-retries" in cmd
+    assert cmd[cmd.index("--max-retries") + 1] == "3"
+    assert cmd.count("--retry-include") == 2
+    retry_include_indices = [i for i, arg in enumerate(cmd) if arg == "--retry-include"]
+    assert [cmd[i + 1] for i in retry_include_indices] == [
+        "DaytonaError",
+        "DownloadVerifierDirError",
+    ]
     assert "--n-concurrent" in cmd
     assert cmd[cmd.index("--n-concurrent") + 1] == "1"
     assert "--cpus" in cmd
@@ -883,6 +891,9 @@ def test_harbor_remote_controller_allows_daytona_when_controller_is_supplied(
     assert result.error is None
     joined_commands = "\n".join(env.commands)
     assert "harbor run -d terminal-bench/terminal-bench-2-1 -e daytona" in joined_commands
+    assert "--max-retries 3" in joined_commands
+    assert "--retry-include DaytonaError" in joined_commands
+    assert "--retry-include DownloadVerifierDirError" in joined_commands
     assert env.uploads
     assert env.downloads
 

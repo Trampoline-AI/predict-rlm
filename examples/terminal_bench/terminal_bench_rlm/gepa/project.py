@@ -943,6 +943,8 @@ def _build_harbor_run_command(
         "terminal_bench_rlm.tools.tbench_agent:DaytonaRemotePredictRLMAgent",
         "--n-attempts",
         str(config.n_attempts),
+        "--max-retries",
+        str(config.harbor_max_retries),
         "--n-concurrent",
         str(config.n_concurrent_trials),
         "--cpus",
@@ -954,6 +956,8 @@ def _build_harbor_run_command(
         "--job-name",
         request.run_id,
     ]
+    for exception_type in config.harbor_retry_include_exceptions:
+        cmd.extend(["--retry-include", exception_type])
     for key, value in _agent_kwargs(request, output_dir=output_dir).items():
         cmd.extend(["--agent-kwarg", f"{key}={value}"])
     if config.no_rebuild:

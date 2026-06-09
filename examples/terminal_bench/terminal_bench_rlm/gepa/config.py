@@ -35,6 +35,11 @@ class TerminalBenchGepaConfig(OptimizeConfig):
     harbor_remote_workdir: str = "/tmp/predict_rlm_terminal_bench"
     harbor_cpus: str = "auto"
     harbor_memory: str = "auto"
+    harbor_max_retries: int = 3
+    harbor_retry_include_exceptions: tuple[str, ...] = (
+        "DaytonaError",
+        "DownloadVerifierDirError",
+    )
     timeout_cleanup_grace_sec: int = 60
     harbor_task_cache_dir: Path | None = None
     n_attempts: int = 1
@@ -55,6 +60,8 @@ class TerminalBenchGepaConfig(OptimizeConfig):
         payload["harbor_remote_workdir"] = self.harbor_remote_workdir
         payload["harbor_cpus"] = self.harbor_cpus
         payload["harbor_memory"] = self.harbor_memory
+        payload["harbor_max_retries"] = self.harbor_max_retries
+        payload["harbor_retry_include_exceptions"] = list(self.harbor_retry_include_exceptions)
         payload["train_task_ids"] = list(self.train_task_ids)
         payload["val_task_ids"] = list(self.val_task_ids)
         payload["codex_lm_exclude"] = list(self.codex_lm_exclude)
