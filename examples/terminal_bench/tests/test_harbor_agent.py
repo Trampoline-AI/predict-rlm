@@ -6,6 +6,7 @@ import json
 import logging
 import shlex
 import sys
+import tarfile
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -38,6 +39,7 @@ class FakeDaytonaRemoteEnvironment:
         self.commands: list[str] = []
         self.uploads: list[tuple[str, str]] = []
         self.upload_dirs: list[tuple[str, str]] = []
+        self.downloads: list[tuple[str, str]] = []
         self.payloads: list[dict[str, object]] = []
         self.command_timeouts: list[int | None] = []
         self.answer = answer
@@ -61,6 +63,72 @@ class FakeDaytonaRemoteEnvironment:
 
     def upload_dir(self, host_path: str, remote_path: str) -> None:
         self.upload_dirs.append((host_path, remote_path))
+
+    def download_file(self, remote_path: str, host_path: str) -> None:
+        self.downloads.append((remote_path, host_path))
+        with tarfile.open(host_path, "w:gz"):
+            pass
+
+
+def _write_remote_trace_archive(env: FakeDaytonaRemoteEnvironment, tmp_path: Path) -> None:
+    def download_file(remote_path: str, host_path: str) -> None:
+        env.downloads.append((remote_path, host_path))
+
+        with tarfile.open(host_path, "w:gz") as archive:
+            trace_path = tmp_path / "predict_rlm_trace_remote.json"
+            trace_path.write_text('{"status":"completed","cost_usd":1.23}')
+            archive.add(trace_path, arcname="predict_rlm_trace_remote.json")
+
+    env.download_file = download_file
+
+
+def test_daytona_remote_agent_downloads_remote_predict_rlm_traces(tmp_path: Path) -> None:
+    env = FakeDaytonaRemoteEnvironment(answer="remote done")
+    _write_remote_trace_archive(env, tmp_path)
+    context = SimpleNamespace()
+    agent = tbench_agent.DaytonaRemotePredictRLMAgent(logs_dir=tmp_path)
+
+    asyncio.run(agent.run("solve remotely", env, context))
+
+    assert context.answer == "remote done"
+    assert env.downloads == [
+        ("/tmp/predict_rlm_controller/logs.tar.gz", str(tmp_path / "predict_rlm_logs.tar.gz"))
+    ]
+    assert (tmp_path / "predict_rlm_trace_remote.json").read_text() == (
+        '{"status":"completed","cost_usd":1.23}'
+    )
+
+
+def test_daytona_remote_agent_downloads_remote_predict_rlm_traces_on_cancellation(
+    tmp_path: Path,
+) -> None:
+    env = FakeDaytonaRemoteEnvironment(answer="remote done")
+    _write_remote_trace_archive(env, tmp_path)
+
+    original_exec = env.exec
+
+    def exec_cancel_controller(*, command: str, timeout_sec: int | None = None):
+        if "terminal_bench_rlm.tools.remote_controller" in command:
+            raise asyncio.CancelledError
+        return original_exec(command=command, timeout_sec=timeout_sec)
+
+    env.exec = exec_cancel_controller
+    context = SimpleNamespace()
+    agent = tbench_agent.DaytonaRemotePredictRLMAgent(logs_dir=tmp_path)
+
+    try:
+        asyncio.run(agent.run("solve remotely", env, context))
+    except asyncio.CancelledError:
+        pass
+    else:
+        raise AssertionError("expected cancellation")
+
+    assert env.downloads == [
+        ("/tmp/predict_rlm_controller/logs.tar.gz", str(tmp_path / "predict_rlm_logs.tar.gz"))
+    ]
+    assert (tmp_path / "predict_rlm_trace_remote.json").read_text() == (
+        '{"status":"completed","cost_usd":1.23}'
+    )
 
 
 def test_daytona_remote_agent_payload_is_non_secret_and_uses_remote_home(tmp_path: Path) -> None:
@@ -127,6 +195,70 @@ def test_daytona_remote_agent_sentinel_parsing_sets_answer(tmp_path: Path) -> No
     asyncio.run(agent.run("solve remotely", env, context))
 
     assert context.answer == "sentinel answer"
+
+
+def test_remote_controller_writes_status_before_rlm_returns(monkeypatch, tmp_path: Path) -> None:
+    class FakeInterpreter:
+        def shutdown(self) -> None:
+            pass
+
+    class FakePredictRLM:
+        def __init__(self, _signature, **_kwargs) -> None:
+            pass
+
+        async def acall(self):
+            status_path = tmp_path / "predict_rlm_status.json"
+            assert status_path.exists()
+            status = json.loads(status_path.read_text())
+            assert status["status"] == "running"
+            return SimpleNamespace(answer="done", trace=None)
+
+    monkeypatch.setattr(remote_controller, "_local_process_interpreter_class", lambda: FakeInterpreter)
+    monkeypatch.setattr(remote_controller, "_predict_rlm_class", lambda: FakePredictRLM)
+
+    answer = remote_controller._run_predict_rlm(
+        {
+            "instruction": "solve",
+            "logging_dir": str(tmp_path),
+        }
+    )
+
+    assert answer == "done"
+    status = json.loads((tmp_path / "predict_rlm_status.json").read_text())
+    assert status["status"] == "completed"
+
+
+def test_remote_controller_writes_failed_status_without_trace(monkeypatch, tmp_path: Path) -> None:
+    class FakeInterpreter:
+        def shutdown(self) -> None:
+            pass
+
+    class FakePredictRLM:
+        def __init__(self, _signature, **_kwargs) -> None:
+            pass
+
+        async def acall(self):
+            raise RuntimeError("agent stopped before trace")
+
+    monkeypatch.setattr(remote_controller, "_local_process_interpreter_class", lambda: FakeInterpreter)
+    monkeypatch.setattr(remote_controller, "_predict_rlm_class", lambda: FakePredictRLM)
+
+    try:
+        remote_controller._run_predict_rlm(
+            {
+                "instruction": "solve",
+                "logging_dir": str(tmp_path),
+            }
+        )
+    except RuntimeError:
+        pass
+    else:
+        raise AssertionError("expected remote controller failure")
+
+    status = json.loads((tmp_path / "predict_rlm_status.json").read_text())
+    assert status["status"] == "failed"
+    assert status["error_type"] == "RuntimeError"
+    assert status["error"] == "agent stopped before trace"
 
 
 def test_remote_controller_verbose_streams_rlm_iteration_logs(monkeypatch, tmp_path: Path) -> None:

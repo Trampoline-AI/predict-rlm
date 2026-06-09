@@ -5,6 +5,7 @@ import json
 import logging
 import os
 import sys
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -84,6 +85,27 @@ def _local_process_interpreter_class() -> Any:
 
     return LocalProcessRunnerInterpreter
 
+
+def _logging_dir(payload: dict[str, Any]) -> Path | None:
+    logging_dir = payload.get("logging_dir")
+    return Path(logging_dir) if logging_dir else None
+
+
+def _write_run_status(logging_dir: Path | None, status: str, **fields: Any) -> None:
+    if logging_dir is None:
+        return
+    logging_dir.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "status": status,
+        "timestamp": datetime.now().isoformat(),
+        **fields,
+    }
+    (logging_dir / "predict_rlm_status.json").write_text(
+        json.dumps(payload, sort_keys=True),
+        encoding="utf-8",
+    )
+
+
 async def _run_predict_rlm_async(payload: dict[str, Any]) -> str:
     _set_debug_environment(payload)
     verbose_log_state = _install_verbose_rlm_log_stream(payload)
@@ -92,6 +114,8 @@ async def _run_predict_rlm_async(payload: dict[str, Any]) -> str:
 
     interpreter_kwargs = dict(payload.get("interpreter_kwargs") or {})
     interpreter = _local_process_interpreter_class()(**interpreter_kwargs)
+    logging_dir = _logging_dir(payload)
+    _write_run_status(logging_dir, "running")
     try:
         rlm_kwargs = dict(payload.get("predict_rlm_kwargs") or {})
         if "lm" in rlm_kwargs:
@@ -130,12 +154,18 @@ async def _run_predict_rlm_async(payload: dict[str, Any]) -> str:
         )
         rlm = _predict_rlm_class()(signature, **rlm_kwargs)
         result = await rlm.acall()
-        logging_dir = payload.get("logging_dir")
-        _write_trace(getattr(result, "trace", None), Path(logging_dir) if logging_dir else None)
+        _write_trace(getattr(result, "trace", None), logging_dir)
+        _write_run_status(logging_dir, "completed", has_trace=getattr(result, "trace", None) is not None)
         return _coerce_answer(result)
     except BaseException as exc:
-        logging_dir = payload.get("logging_dir")
-        _write_trace(getattr(exc, "trace", None), Path(logging_dir) if logging_dir else None)
+        _write_trace(getattr(exc, "trace", None), logging_dir)
+        _write_run_status(
+            logging_dir,
+            "failed",
+            error_type=type(exc).__name__,
+            error=str(exc),
+            has_trace=getattr(exc, "trace", None) is not None,
+        )
         raise
     finally:
         _restore_verbose_rlm_log_stream(verbose_log_state)

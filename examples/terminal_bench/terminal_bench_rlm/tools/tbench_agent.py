@@ -805,6 +805,26 @@ async def _remote_upload_dir(environment: Any, host_path: str, remote_path: str)
     await _resolve_remote_call(method(host_path, remote_path))
 
 
+async def _remote_download_file(environment: Any, remote_path: str, host_path: str) -> None:
+    for name in ("download_file", "copy_from", "get_file"):
+        method = getattr(environment, name, None)
+        if method is not None:
+            await _resolve_remote_call(method(remote_path, host_path))
+            return
+    raise TypeError("Daytona remote PredictRLM environment does not expose download_file/copy_from")
+
+
+def _extract_tar_safely(archive_path: Path, destination: Path) -> None:
+    destination.mkdir(parents=True, exist_ok=True)
+    root = destination.resolve()
+    with tarfile.open(archive_path, "r:gz") as archive:
+        for member in archive.getmembers():
+            target = (destination / member.name).resolve()
+            if target != root and root not in target.parents:
+                raise RuntimeError(f"Refusing to extract remote trace outside logs dir: {member.name}")
+        archive.extractall(destination, filter="data")
+
+
 def _remote_returncode(result: Any) -> int | None:
     for attr in ("returncode", "return_code", "exit_code"):
         value = getattr(result, attr, None)
@@ -980,8 +1000,10 @@ class DaytonaRemotePredictRLMAgent(HarborPredictRLMBaseAgent):
                 error_type = parsed.get("error_type") or "RemotePredictRLMError"
                 error = parsed.get("error") or "remote controller failed"
                 raise RuntimeError(f"Daytona remote PredictRLM failed: {error_type}: {error}")
+            await self._download_remote_logs(environment)
             answer = str(parsed.get("answer", ""))
         except BaseException:
+            await self._try_download_remote_logs(environment)
             _write_phase_event(
                 self.phase_log_path,
                 task_id=self.task_id,
@@ -1084,6 +1106,36 @@ class DaytonaRemotePredictRLMAgent(HarborPredictRLMBaseAgent):
             )
         except BaseException:
             return
+
+    async def _try_download_remote_logs(self, environment: Any) -> None:
+        try:
+            await self._download_remote_logs(environment)
+        except BaseException as exc:
+            logger.warning("Failed to download remote PredictRLM logs", exc_info=exc)
+
+    async def _download_remote_logs(self, environment: Any) -> None:
+        archive_remote_path = f"{self.remote_root}/logs.tar.gz"
+        logs_dir = f"{self.remote_root}/logs"
+        command = " ".join(
+            [
+                "sh",
+                "-lc",
+                shlex.quote(
+                    "logs_dir=$1; archive=$2; "
+                    "if [ -d \"$logs_dir\" ]; then "
+                    "tar -czf \"$archive\" -C \"$logs_dir\" .; "
+                    "else tar -czf \"$archive\" -T /dev/null; fi"
+                ),
+                "--",
+                shlex.quote(logs_dir),
+                shlex.quote(archive_remote_path),
+            ]
+        )
+        result = await _remote_exec(environment, command, timeout=60)
+        _raise_for_remote_failure(result, "archiving remote PredictRLM logs")
+        archive_local_path = self.logs_dir / "predict_rlm_logs.tar.gz"
+        await _remote_download_file(environment, archive_remote_path, str(archive_local_path))
+        _extract_tar_safely(archive_local_path, self.logs_dir)
 
     def _start_remote_log_stream(
         self,
