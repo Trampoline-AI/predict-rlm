@@ -123,6 +123,85 @@ class SequentialActions:
         return self.actions.pop(0)
 
 
+class PredictionStub:
+    def __init__(self, answer: str) -> None:
+        self.answer = answer
+
+    def keys(self) -> list[str]:
+        return ["answer"]
+
+    def __getitem__(self, key: str) -> str:
+        return getattr(self, key)
+
+
+def assert_predict_rlm_recovers_after_user_exceptions_and_tools_still_work(
+    pool: SbxPool,
+) -> None:
+    from predict_rlm import PredictRLM
+
+    async def host_echo(text: str) -> dict:
+        await asyncio.sleep(0)
+        return {"text": f"echo:{text}"}
+
+    actions = SequentialActions(
+        SimpleNamespace(
+            reasoning="raise a normal exception from inside a loop",
+            code=(
+                "for idx in range(3):\n"
+                "    print('loop idx', idx)\n"
+                "    if idx == 1:\n"
+                "        raise ValueError(f'bad loop idx {idx}')\n"
+            ),
+        ),
+        SimpleNamespace(
+            reasoning="exercise a missing variable path",
+            code="print(missing_recovery_variable)\n",
+        ),
+        SimpleNamespace(
+            reasoning="prove host callbacks still work after ordinary exceptions",
+            code=(
+                "prediction = await predict('question: str -> answer: str', "
+                "question='after exceptions')\n"
+                "echoed = await host_echo(prediction['answer'])\n"
+                "SUBMIT(answer=echoed['text'])"
+            ),
+        ),
+    )
+
+    mock_lm = MagicMock()
+    mock_predictor = MagicMock()
+    mock_predictor.acall = AsyncMock(return_value=PredictionStub("tool-ok"))
+    rlm = PredictRLM(
+        "prompt -> answer",
+        sub_lm=mock_lm,
+        max_iterations=3,
+        tools={"host_echo": host_echo},
+        sandbox_backend="sbx",
+        sbx_pool=pool,
+    )
+    rlm.generate_action = actions
+
+    with patch("predict_rlm.predict_rlm.dspy.Predict", return_value=mock_predictor):
+        prediction = rlm(prompt="exercise exception recovery")
+
+    assert prediction.answer == "echo:tool-ok"
+    assert [call["iteration"] for call in actions.calls] == ["1/3", "2/3", "3/3"]
+    assert mock_predictor.acall.await_count == 1
+    assert mock_predictor.acall.await_args.kwargs["question"] == "after exceptions"
+    assert len(prediction.trace.steps) == 3
+
+    value_error_step, name_error_step, final_step = prediction.trace.steps
+    assert "for idx in range(3)" in value_error_step.code
+    assert "raise ValueError" in value_error_step.code
+    assert "[Error]" in value_error_step.untruncated_output
+    assert "ValueError" in value_error_step.untruncated_output
+    assert "bad loop idx 1" in value_error_step.untruncated_output
+    assert "[Error]" in name_error_step.untruncated_output
+    assert "NameError" in name_error_step.untruncated_output
+    assert "missing_recovery_variable" in name_error_step.untruncated_output
+    assert final_step.output == "FINAL: {'answer': 'echo:tool-ok'}"
+
+
 @pytest.fixture
 def runner(tmp_path):
     proc = LocalRunner(tmp_path)
@@ -1131,6 +1210,21 @@ for line in sys.stdin:
             interpreter.shutdown()
 
         assert output.strip() == "5"
+
+    def test_predict_rlm_recovers_after_user_exceptions_and_tools_still_work(
+        self, tmp_path: Path
+    ):
+        pool = SbxPool(
+            size=1,
+            config=SbxConfig(name="local-test-user-exceptions"),
+            preinstall_packages=False,
+            _supervisor_command=[sys.executable, "-u", str(RUNNER_PATH)],
+            _staging_root=tmp_path / "staging",
+        )
+        try:
+            assert_predict_rlm_recovers_after_user_exceptions_and_tools_still_work(pool)
+        finally:
+            pool.shutdown()
 
     def test_host_tool_synced_file_writeback_updates_sandbox_file(self, tmp_path: Path):
         received_paths: list[str] = []
@@ -2357,3 +2451,14 @@ class TestSbxInterpreterRealSbx:
         assert "[Timeout] Iteration execution timed out after 0.2s" in timeout_step.untruncated_output
         assert "first predict: pre-timeout prediction" in timeout_step.untruncated_output
         assert final_step.output == "FINAL: {'answer': 'post-timeout prediction'}"
+
+    def test_predict_rlm_recovers_after_user_exceptions_and_tools_still_work(self):
+        pool = SbxPool(
+            size=1,
+            config=SbxConfig(name=f"predict-rlm-test-user-exceptions-{os.getpid()}"),
+            preinstall_packages=False,
+        )
+        try:
+            assert_predict_rlm_recovers_after_user_exceptions_and_tools_still_work(pool)
+        finally:
+            pool.shutdown()
