@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
+import contextlib
 import contextvars
 import inspect
 import json
@@ -104,10 +105,8 @@ class SbxInterpreter(PersistentJsonRpcRunnerClient, PredictRLMInterpreter):
         self._proc: subprocess.Popen[str] | None = None
         self._stdout_lines: queue.Queue[str] = queue.Queue()
         self._stdout_reader: threading.Thread | None = None
-        self._tool_executor = concurrent.futures.ThreadPoolExecutor(
-            max_workers=max(4, len(self.tools) or 1)
-        )
         self._pending_tool_calls: dict[concurrent.futures.Future[dict[str, Any]], int] = {}
+        self._active_execute_timeout_deadline: float | None = None
         self._execution_gate = InterpreterExecutionGate("SBX interpreter")
         self._sandbox_name: str | None = None
         self._prepared_runner_path: Path | None = None
@@ -252,10 +251,6 @@ class SbxInterpreter(PersistentJsonRpcRunnerClient, PredictRLMInterpreter):
             self.configure_verbose(verbose)
         if tools is not None and tools is not self.tools:
             self.tools = tools
-            self._tool_executor.shutdown(wait=False, cancel_futures=True)
-            self._tool_executor = concurrent.futures.ThreadPoolExecutor(
-                max_workers=max(4, len(self.tools) or 1)
-            )
         if output_fields is not None:
             self.output_fields = output_fields
         if self._proc and self._proc.poll() is None:
@@ -314,7 +309,6 @@ class SbxInterpreter(PersistentJsonRpcRunnerClient, PredictRLMInterpreter):
                     text=True,
                 )
                 self._log_lifecycle("sbx.shutdown.rm")
-        self._tool_executor.shutdown(wait=False, cancel_futures=True)
         self._cleanup_staging_root()
         self._log_lifecycle("sbx.shutdown.complete")
 
@@ -599,6 +593,12 @@ class SbxInterpreter(PersistentJsonRpcRunnerClient, PredictRLMInterpreter):
         deadline: float,
         timeout: float,
     ) -> str | None:
+        if (
+            self._active_execute_timeout_deadline is not None
+            and self._pending_tool_calls
+            and time.monotonic() >= self._active_execute_timeout_deadline
+        ):
+            return None
         return self._read_stdout_line(deadline) or ""
 
     def _resolve_execution_timeout(self, timeout: float | None) -> tuple[float, str]:
@@ -619,6 +619,8 @@ class SbxInterpreter(PersistentJsonRpcRunnerClient, PredictRLMInterpreter):
         timeout_seconds: float,
         host_timeout_seconds: float,
         timeout_failure_class: str,
+        *,
+        fatal: bool = True,
     ) -> None:
         assert self._proc is not None
         self._log_lifecycle(
@@ -627,6 +629,10 @@ class SbxInterpreter(PersistentJsonRpcRunnerClient, PredictRLMInterpreter):
             status="error",
         )
         self._proc.kill()
+        with contextlib.suppress(Exception):
+            self._proc.wait(timeout=1)
+        if not fatal:
+            return
         if timeout_failure_class == ITERATION_TIMEOUT_FAILURE_CLASS:
             raise SandboxFatalError(
                 "Sbx supervisor failed to recover from iteration timeout after "
@@ -659,22 +665,34 @@ class SbxInterpreter(PersistentJsonRpcRunnerClient, PredictRLMInterpreter):
 
     def _submit_tool_call(self, request: dict[str, Any]) -> None:
         request_id = request.get("id")
+        params = request.get("params", {})
         if self.verbose or live_tool_call_logging_enabled():
-            params = request.get("params", {})
             emit_trace_tool_call(
                 params.get("name"),
                 args=params.get("args", []),
                 kwargs=params.get("kwargs", {}),
             )
-        params = request.get("params", {})
         self._log_lifecycle(
             "sbx.tool_call.start",
             tool=params.get("name"),
             request_id=request_id,
         )
+        future: concurrent.futures.Future[dict[str, Any]] = concurrent.futures.Future()
         ctx = contextvars.copy_context()
-        future = self._tool_executor.submit(ctx.run, self._build_tool_response, request)
+
+        def run() -> None:
+            try:
+                future.set_result(ctx.run(self._build_tool_response, request))
+            except BaseException as exc:
+                future.set_exception(exc)
+
+        thread = threading.Thread(
+            target=run,
+            name="predict-rlm-sbx-host-tool",
+            daemon=True,
+        )
         self._pending_tool_calls[future] = request_id
+        thread.start()
 
     def _drain_completed_tool_calls(self) -> None:
         completed = [future for future in self._pending_tool_calls if future.done()]
@@ -844,7 +862,11 @@ class SbxInterpreter(PersistentJsonRpcRunnerClient, PredictRLMInterpreter):
         request_id: int,
         request_timeout: float,
     ) -> None:
-        timeout_seconds, _ = self._execution_timeout_metadata_from_params(params)
+        timeout_seconds, timeout_failure_class = self._execution_timeout_metadata_from_params(params)
+        if method == "execute" and timeout_failure_class == ITERATION_TIMEOUT_FAILURE_CLASS:
+            self._active_execute_timeout_deadline = time.monotonic() + timeout_seconds
+        elif method == "execute":
+            self._active_execute_timeout_deadline = None
         self._log_lifecycle(
             "sbx.request.start",
             method=method,
@@ -862,6 +884,8 @@ class SbxInterpreter(PersistentJsonRpcRunnerClient, PredictRLMInterpreter):
         request_start: float,
         response: dict[str, Any],
     ) -> None:
+        if method == "execute":
+            self._active_execute_timeout_deadline = None
         self._log_lifecycle(
             "sbx.request.ok",
             method=method,
@@ -919,6 +943,7 @@ class SbxInterpreter(PersistentJsonRpcRunnerClient, PredictRLMInterpreter):
         timeout_seconds, timeout_failure_class = self._execution_timeout_metadata_from_params(
             params
         )
+        self._active_execute_timeout_deadline = None
         self._log_lifecycle(
             "sbx.request.timeout",
             method=method,
@@ -929,11 +954,63 @@ class SbxInterpreter(PersistentJsonRpcRunnerClient, PredictRLMInterpreter):
             failure_class=timeout_failure_class,
             status="error",
         )
+        if timeout_failure_class != ITERATION_TIMEOUT_FAILURE_CLASS:
+            self._fail_timed_out_request(
+                timeout_seconds,
+                request_timeout,
+                timeout_failure_class,
+            )
+        if not self._pending_tool_calls:
+            self._fail_timed_out_request(
+                timeout_seconds,
+                request_timeout,
+                timeout_failure_class,
+            )
         self._fail_timed_out_request(
             timeout_seconds,
             request_timeout,
             timeout_failure_class,
+            fatal=False,
         )
+        stderr = self._read_stderr_for_process(process)
+        self._discard_supervisor_process()
+        restart_error: BaseException | None = None
+        try:
+            self._ensure_process_for_request(method)
+        except BaseException as exc:
+            restart_error = exc
+        if restart_error is not None:
+            raise SandboxFatalError(
+                "Sbx supervisor failed to recover from iteration timeout after "
+                f"{timeout_seconds:g}s; waited {request_timeout:g}s before "
+                "force-killing supervisor, and restart failed: "
+                f"{restart_error}"
+            ) from restart_error
+
+        diagnostic = (
+            "Sbx supervisor did not return a structured timeout before the host "
+            f"watchdog expired after {request_timeout:g}s. The supervisor process "
+            "was killed and restarted; Python globals from the timed-out supervisor "
+            "were lost, while sandbox filesystem state is preserved. Re-run setup "
+            "code before relying on in-memory variables."
+        )
+        if stderr:
+            diagnostic = f"{diagnostic}\n[supervisor stderr before restart]\n{stderr.rstrip()}"
+        return {
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "result": {
+                "timeout": {"seconds": timeout_seconds},
+                "stdout": stdout_tail,
+                "stderr": diagnostic,
+                "state": {
+                    "preserved": False,
+                    "source": "supervisor_restart",
+                    "scope": "filesystem_only",
+                    "reason": "supervisor restart after pending host tool timeout",
+                },
+            },
+        }
 
     def _handle_stale_response_limit(
         self,

@@ -284,7 +284,6 @@ def _build_sbx_request_interp(tmp_path, stdout_lines: list[str]) -> SbxInterpret
 
 def _close_sbx_request_interp(interp: SbxInterpreter) -> None:
     interp._proc = None
-    interp._tool_executor.shutdown(wait=False, cancel_futures=True)
 
 
 def test_sbx_send_request_discards_stale_top_level_response(tmp_path):
