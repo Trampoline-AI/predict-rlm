@@ -499,6 +499,7 @@ def test_runner_timeout_is_not_swallowed_by_user_exception_handler(
         "timeout": {"seconds": 0.1},
         "stdout": "",
         "stderr": "",
+        "state": {"preserved": True, "source": "live_kernel", "scope": "full_live"},
     }
     assert followup == {
         "jsonrpc": "2.0",
@@ -559,15 +560,13 @@ def test_runner_timeout_recovers_from_blocking_native_call() -> None:
         proc.wait(timeout=2)
 
     assert time.monotonic() - start < 1.5
-    assert response == {
-        "jsonrpc": "2.0",
-        "id": 1,
-        "result": {
-            "timeout": {"seconds": 0.1},
-            "stdout": "stdout before native\n",
-            "stderr": "stderr before native\n",
-        },
-    }
+    assert response["jsonrpc"] == "2.0"
+    assert response["id"] == 1
+    assert response["result"]["timeout"] == {"seconds": 0.1}
+    assert response["result"]["stdout"] == "stdout before native\n"
+    assert response["result"]["stderr"] == "stderr before native\n"
+    assert response["result"]["state"]["preserved"] is False
+    assert response["result"]["state"]["source"] == "pickle_snapshot"
     assert after == {
         "jsonrpc": "2.0",
         "id": 2,
@@ -581,6 +580,14 @@ def _process_exited(pid: int, *, timeout: float = 1.0) -> bool:
         try:
             os.kill(pid, 0)
         except ProcessLookupError:
+            return True
+        status = subprocess.run(
+            ["ps", "-o", "stat=", "-p", str(pid)],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        if status.returncode == 0 and status.stdout.strip().startswith("Z"):
             return True
         time.sleep(0.02)
     return False
@@ -642,12 +649,10 @@ def test_runner_timeout_kills_generated_code_child_process(tmp_path: Path) -> No
             proc.kill()
         proc.wait(timeout=2)
 
-    assert response == {
-        "jsonrpc": "2.0",
-        "id": 1,
-        "result": {
-            "timeout": {"seconds": 0.1},
-            "stdout": f"child={child_pid}\n",
-            "stderr": "",
-        },
-    }
+    assert response["jsonrpc"] == "2.0"
+    assert response["id"] == 1
+    assert response["result"]["timeout"] == {"seconds": 0.1}
+    assert response["result"]["stdout"] == f"child={child_pid}\n"
+    assert response["result"]["stderr"] == ""
+    assert response["result"]["state"]["preserved"] is False
+    assert response["result"]["state"]["source"] == "pickle_snapshot"

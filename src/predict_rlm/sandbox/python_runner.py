@@ -19,6 +19,7 @@ import queue
 import select
 import shutil
 import signal
+import subprocess
 import sys
 import tempfile
 import threading
@@ -652,6 +653,73 @@ def _run_kernel_coroutine(coro: Any) -> Any:
         loop.close()
 
 
+def _descendant_process_ids(parent_pid: int) -> list[int]:
+    try:
+        result = subprocess.run(
+            ["ps", "-axo", "pid=,ppid="],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=1,
+        )
+    except Exception:
+        return []
+    if result.returncode != 0:
+        return []
+
+    children_by_parent: dict[int, list[int]] = {}
+    for line in result.stdout.splitlines():
+        parts = line.split()
+        if len(parts) != 2:
+            continue
+        try:
+            pid, ppid = int(parts[0]), int(parts[1])
+        except ValueError:
+            continue
+        children_by_parent.setdefault(ppid, []).append(pid)
+
+    descendants: list[int] = []
+    pending = list(children_by_parent.get(parent_pid, []))
+    while pending:
+        pid = pending.pop()
+        descendants.append(pid)
+        pending.extend(children_by_parent.get(pid, []))
+    return descendants
+
+
+def _reap_direct_children(child_pids: set[int]) -> None:
+    deadline = time.monotonic() + 0.5
+    while child_pids and time.monotonic() < deadline:
+        for pid in tuple(child_pids):
+            try:
+                reaped, _ = os.waitpid(pid, os.WNOHANG)
+            except ChildProcessError:
+                child_pids.discard(pid)
+                continue
+            except OSError:
+                child_pids.discard(pid)
+                continue
+            if reaped:
+                child_pids.discard(pid)
+        if child_pids:
+            time.sleep(0.02)
+
+
+def _terminate_descendant_processes(parent_pid: int | None = None) -> None:
+    child_pids = set(_descendant_process_ids(parent_pid or os.getpid()))
+    if not child_pids:
+        return
+    for sig in (signal.SIGTERM, signal.SIGKILL):
+        for pid in tuple(child_pids):
+            try:
+                os.kill(pid, sig)
+            except ProcessLookupError:
+                child_pids.discard(pid)
+            except OSError:
+                child_pids.discard(pid)
+        _reap_direct_children(child_pids)
+
+
 def _persistent_kernel_runner(
     globals_dict: dict[str, Any],
     request_queue: multiprocessing.Queue,
@@ -697,6 +765,7 @@ def _persistent_kernel_runner(
                 if _has_waiting_tool_responses():
                     return
                 continue
+            _terminate_descendant_processes()
             result_queue.put({
                 "ok": True,
                 "result": {
@@ -762,11 +831,13 @@ def _terminate_runner(process: multiprocessing.Process) -> None:
         process.terminate()
     process.join(timeout=0.2)
 
-    if not _signal_runner(process, signal.SIGTERM) and process.is_alive():
+    _signal_runner_process_group(pgid, signal.SIGTERM)
+    if process.is_alive():
         process.terminate()
     process.join(timeout=0.3)
 
-    if not _signal_runner(process, signal.SIGKILL) and process.is_alive():
+    _signal_runner_process_group(pgid, signal.SIGKILL)
+    if process.is_alive():
         if hasattr(process, "kill"):
             process.kill()
         else:
@@ -996,6 +1067,8 @@ async def _execute_code_in_runner_with_timeout(
             )
             _raise_runner_error(runner_message.get("error") or {})
         result = runner_message.get("result") or {}
+        if isinstance(result, dict) and "timeout" in result:
+            _terminate_descendant_processes(process.pid)
         _debug_event(
             "sbx.python_runner.execute",
             code_hash=_code_hash(code),

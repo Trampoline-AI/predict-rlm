@@ -1732,7 +1732,7 @@ class JspiInterpreter(PythonInterpreter):
                 if temp_dir:
                     shutil.rmtree(temp_dir, ignore_errors=True)
 
-            is_json = isinstance(result, (list, dict))
+            is_json = result is None or isinstance(result, (list, dict, int, float, bool))
             response = {
                 "value": json.dumps(result) if is_json else str(result or ""),
                 "type": "json" if is_json else "string",

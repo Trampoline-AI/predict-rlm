@@ -4,7 +4,6 @@ from typing import Any
 
 __all__ = [
     "DaytonaRemotePredictRLMAgent",
-    "HarborEnvironmentInterpreter",
     "HarborPredictRLMBaseAgent",
     "TerminalBenchRLMBaseAgent",
     "TerminalBenchRLMAgent",
@@ -22,10 +21,6 @@ def __getattr__(name: str) -> Any:
         from .tools.tbench_agent import DaytonaRemotePredictRLMAgent
 
         return DaytonaRemotePredictRLMAgent
-    if name == "HarborEnvironmentInterpreter":
-        from .tools.container_runner import HarborEnvironmentInterpreter
-
-        return HarborEnvironmentInterpreter
     if name == "HarborPredictRLMBaseAgent":
         from .tools.tbench_agent import HarborPredictRLMBaseAgent
 

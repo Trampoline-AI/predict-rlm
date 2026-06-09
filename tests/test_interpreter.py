@@ -752,21 +752,20 @@ print("Timeout pattern works")
             interpreter.shutdown()
 
     def test_tool_returns_none(self):
-        """Tools that return None are converted to empty string."""
+        """Tools that return None round-trip as Python None."""
 
         def none_tool() -> None:
             return None
 
         interpreter = JspiInterpreter(preinstall_packages=False, tools={"none_tool": none_tool})
         try:
-            # None is converted to empty string by the tool bridge
             output = interpreter.execute("""
 result = await none_tool()
-print(f"Result is empty string: {result == ''}")
+print(f"Result is None: {result is None}")
 print(f"Result type: {type(result).__name__}")
 """)
-            assert "Result is empty string: True" in str(output)
-            assert "Result type: str" in str(output)
+            assert "Result is None: True" in str(output)
+            assert "Result type: NoneType" in str(output)
         finally:
             interpreter.shutdown()
 

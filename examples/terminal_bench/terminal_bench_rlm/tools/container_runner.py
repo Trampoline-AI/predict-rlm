@@ -18,7 +18,6 @@ import threading
 import time
 from pathlib import Path
 from typing import Any, Callable, Protocol
-from uuid import uuid4
 
 from dspy.primitives.code_interpreter import CodeInterpreterError
 
@@ -78,63 +77,6 @@ def _process_debug_metadata(process: Any) -> dict[str, Any]:
         if value is not None:
             metadata[f"runner_{name}"] = value
     return metadata
-
-
-def _shell_python_command(python_executable: str, args: list[str]) -> str:
-    quoted_args = " ".join(shlex.quote(arg) for arg in args)
-    if python_executable != "python3":
-        return " ".join(part for part in (shlex.quote(python_executable), quoted_args) if part)
-    resolver = (
-        "if command -v python3 >/dev/null 2>&1; then _predict_rlm_python=python3; "
-        "elif command -v python >/dev/null 2>&1; then _predict_rlm_python=python; "
-        "else echo 'PredictRLM supervisor requires python3 or python on PATH' >&2; "
-        "exit 127; fi; "
-    )
-    return f'{resolver}"$_predict_rlm_python" {quoted_args}'.rstrip()
-
-
-def _python_bootstrap_command() -> str:
-    return " ".join(
-        [
-            "if command -v python3 >/dev/null 2>&1 || command -v python >/dev/null 2>&1; then exit 0; fi;",
-            "export DEBIAN_FRONTEND=noninteractive;",
-            "if command -v apt-get >/dev/null 2>&1; then apt-get update && apt-get install -y python3;",
-            "elif command -v apk >/dev/null 2>&1; then apk add --no-cache python3;",
-            "elif command -v microdnf >/dev/null 2>&1; then microdnf install -y python3;",
-            "elif command -v dnf >/dev/null 2>&1; then dnf install -y python3;",
-            "elif command -v yum >/dev/null 2>&1; then yum install -y python3;",
-            "else echo 'PredictRLM supervisor requires python3 or python on PATH and no supported package manager was found' >&2; exit 127; fi;",
-            "command -v python3 >/dev/null 2>&1 || command -v python >/dev/null 2>&1",
-        ]
-    )
-
-
-def _docker_compose_project_name(name: str) -> str:
-    name = name.lower()
-    if not re.match(r"^[a-z0-9]", name):
-        name = "0" + name
-    return re.sub(r"[^a-z0-9_-]", "-", name)
-
-
-def _run_coroutine_on_loop(coro: Any, loop: asyncio.AbstractEventLoop) -> Any:
-    try:
-        running_loop = asyncio.get_running_loop()
-    except RuntimeError:
-        running_loop = None
-    if running_loop is loop:
-        close = getattr(coro, "close", None)
-        if close is not None:
-            close()
-        raise SandboxFatalError(
-            "HarborEnvironmentInterpreter sync methods must run outside the Harbor event loop"
-        )
-    return asyncio.run_coroutine_threadsafe(coro, loop).result()
-
-
-def _resolve_maybe_awaitable(value: Any, loop: asyncio.AbstractEventLoop) -> Any:
-    if inspect.isawaitable(value):
-        return _run_coroutine_on_loop(value, loop)
-    return value
 
 
 class ContainerProcess(Protocol):
@@ -396,400 +338,6 @@ class HarborContainerAdapter:
         )
 
 
-def _daytona_session_execute_request(command: str, *, run_async: bool) -> Any:
-    try:
-        from daytona.common.process import SessionExecuteRequest
-    except ImportError as exc:
-        raise SandboxFatalError("Daytona session execution requires the daytona SDK") from exc
-    return SessionExecuteRequest(command=command, run_async=run_async)
-
-
-class _DaytonaSessionInput:
-    def __init__(
-        self,
-        process: Any,
-        loop: asyncio.AbstractEventLoop,
-        session_id: str,
-        command_id: str,
-        echo_filter: "_DaytonaSessionEchoFilter",
-    ) -> None:
-        self.process = process
-        self.loop = loop
-        self.session_id = session_id
-        self.command_id = command_id
-        self.echo_filter = echo_filter
-        self._buffer = ""
-
-    def write(self, data: str) -> int:
-        self._buffer += data
-        return len(data)
-
-    def flush(self) -> None:
-        if not self._buffer:
-            return
-        data = self._buffer
-        self._buffer = ""
-        self.echo_filter.expect(data)
-        _run_coroutine_on_loop(
-            self.process.send_session_command_input(self.session_id, self.command_id, data),
-            self.loop,
-        )
-
-
-class _DaytonaSessionEchoFilter:
-    def __init__(self) -> None:
-        self._pending = ""
-
-    def expect(self, data: str) -> None:
-        self._pending += data
-
-    def strip(self, chunk: str) -> str:
-        while self._pending and chunk:
-            if chunk.startswith(self._pending):
-                chunk = chunk[len(self._pending) :]
-                self._pending = ""
-                break
-            if self._pending.startswith(chunk):
-                self._pending = self._pending[len(chunk) :]
-                return ""
-            break
-        return chunk
-
-
-class _DaytonaSessionOutput:
-    def __init__(
-        self,
-        process: Any,
-        loop: asyncio.AbstractEventLoop,
-        session_id: str,
-        command_id: str,
-        stream: str,
-        echo_filter: "_DaytonaSessionEchoFilter | None" = None,
-    ) -> None:
-        self.process = process
-        self.loop = loop
-        self.session_id = session_id
-        self.command_id = command_id
-        self.stream = stream
-        self.echo_filter = echo_filter
-        self._offset = 0
-        self._pending: list[str] = []
-        self._buffer = ""
-        self._closed = False
-
-    def close(self) -> None:
-        self._closed = True
-
-    def readline(self) -> str:
-        while not self._closed:
-            line = self._readline_once()
-            if line is not None:
-                return line
-            time.sleep(0.01)
-        return ""
-
-    def readline_timeout(self, timeout: float) -> str | None:
-        deadline = time.monotonic() + max(0.0, timeout)
-        while not self._closed:
-            line = self._readline_once()
-            if line is not None:
-                return line
-            if time.monotonic() >= deadline:
-                return None
-            time.sleep(min(0.01, max(0.0, deadline - time.monotonic())))
-        return ""
-
-    def _readline_once(self) -> str | None:
-        if self._pending:
-            return self._pending.pop(0)
-        logs = _run_coroutine_on_loop(
-            self.process.get_session_command_logs(self.session_id, self.command_id),
-            self.loop,
-        )
-        text = str(getattr(logs, self.stream, "") or "")
-        if len(text) > self._offset:
-            chunk = text[self._offset :]
-            self._offset = len(text)
-            self._buffer += chunk
-            self._queue_complete_lines()
-            if self._pending:
-                return self._pending.pop(0)
-        command = _run_coroutine_on_loop(
-            self.process.get_session_command(self.session_id, self.command_id),
-            self.loop,
-        )
-        if getattr(command, "exit_code", None) is not None:
-            if self._buffer:
-                self._queue_complete_lines(flush=True)
-            if self._pending:
-                return self._pending.pop(0)
-            return ""
-        return None
-
-    def _queue_complete_lines(self, *, flush: bool = False) -> None:
-        while "\n" in self._buffer:
-            index = self._buffer.find("\n") + 1
-            self._queue_line(self._buffer[:index])
-            self._buffer = self._buffer[index:]
-        if flush and self._buffer:
-            self._queue_line(self._buffer)
-            self._buffer = ""
-
-    def _queue_line(self, line: str) -> None:
-        if self.echo_filter is not None:
-            line = self.echo_filter.strip(line)
-        if line:
-            self._pending.append(line)
-
-
-class DaytonaSessionProcess:
-    def __init__(
-        self,
-        *,
-        process: Any,
-        loop: asyncio.AbstractEventLoop,
-        session_id: str,
-        command_id: str,
-    ) -> None:
-        self.process = process
-        self.loop = loop
-        self.session_id = session_id
-        self.command_id = command_id
-        stdout_echo_filter = _DaytonaSessionEchoFilter()
-        self.stdin = _DaytonaSessionInput(
-            process, loop, session_id, command_id, stdout_echo_filter
-        )
-        self.stdout = _DaytonaSessionOutput(
-            process,
-            loop,
-            session_id,
-            command_id,
-            "stdout",
-            stdout_echo_filter,
-        )
-        self.stderr = _DaytonaSessionOutput(process, loop, session_id, command_id, "stderr")
-
-    def poll(self) -> int | None:
-        command = _run_coroutine_on_loop(
-            self.process.get_session_command(self.session_id, self.command_id),
-            self.loop,
-        )
-        exit_code = getattr(command, "exit_code", None)
-        return None if exit_code is None else int(exit_code)
-
-    def wait(self, timeout: float | None = None) -> int:
-        deadline = None if timeout is None else time.monotonic() + timeout
-        while True:
-            return_code = self.poll()
-            if return_code is not None:
-                return return_code
-            if deadline is not None and time.monotonic() >= deadline:
-                raise subprocess.TimeoutExpired(self.command_id, timeout)
-            time.sleep(0.05)
-
-    def kill(self) -> None:
-        try:
-            _run_coroutine_on_loop(
-                self.process.send_session_command_input(
-                    self.session_id, self.command_id, "\x03"
-                ),
-                self.loop,
-            )
-        except Exception:
-            pass
-
-
-class HarborEnvironmentAdapter(HarborContainerAdapter):
-    """Adapter that bridges Harbor's async environment APIs into the runner protocol."""
-
-    def __init__(
-        self,
-        environment: Any,
-        *,
-        loop: asyncio.AbstractEventLoop,
-        exec_timeout: float,
-    ) -> None:
-        super().__init__(environment)
-        self.environment = environment
-        self.loop = loop
-        self.exec_timeout = exec_timeout
-
-    def _resolve(self, value: Any) -> Any:
-        return _resolve_maybe_awaitable(value, self.loop)
-
-    def copy_to(self, host_path: str, container_path: str) -> None:
-        if not self._is_docker_sdk_runtime and hasattr(self.environment, "upload_file"):
-            self._resolve(self.environment.upload_file(host_path, container_path))
-            return
-        super().copy_to(host_path, container_path)
-
-    def copy_from(self, container_path: str, host_path: str) -> None:
-        if not self._is_docker_sdk_runtime and hasattr(self.environment, "download_file"):
-            self._resolve(self.environment.download_file(container_path, host_path))
-            return
-        super().copy_from(container_path, host_path)
-
-    def exec(self, command: list[str], *, timeout: float | None = None) -> Any:
-        if self._is_docker_sdk_runtime:
-            return super().exec(command, timeout=timeout)
-        method = getattr(self.environment, "exec", None)
-        if method is None:
-            return super().exec(command, timeout=timeout)
-        return self._resolve(
-            method(
-                command=" ".join(shlex.quote(str(part)) for part in command),
-                timeout_sec=int(timeout or self.exec_timeout),
-            )
-        )
-
-    def install_runner_script(
-        self,
-        source: str,
-        runner_path: str,
-        *,
-        timeout: float | None = None,
-    ) -> None:
-        if self._is_docker_sdk_runtime or not hasattr(self.environment, "upload_file"):
-            super().install_runner_script(source, runner_path, timeout=timeout)
-            return
-        with tempfile.NamedTemporaryFile(
-            "w", encoding="utf-8", suffix=".py", delete=False
-        ) as tmp:
-            tmp.write(source)
-            tmp_path = tmp.name
-        try:
-            self.copy_to(tmp_path, runner_path)
-        finally:
-            try:
-                os.unlink(tmp_path)
-            except OSError:
-                pass
-
-    def start_exec(
-        self,
-        command: list[str],
-        *,
-        workdir: str | None = None,
-        timeout: float | None = None,
-    ) -> ContainerProcess:
-        if self._is_docker_sdk_runtime:
-            return super().start_exec(command, workdir=workdir, timeout=timeout)
-        daytona_process = self._start_daytona_session_exec(
-            command, workdir=workdir, timeout=timeout
-        )
-        if daytona_process is not None:
-            return daytona_process
-        for name in ("start_exec", "exec_stream", "popen"):
-            method = getattr(self.environment, name, None)
-            if method is None:
-                continue
-            try:
-                return self._resolve(method(command, workdir=workdir, timeout=timeout))
-            except TypeError as positional_exc:
-                try:
-                    return self._resolve(
-                        method(
-                            command=" ".join(shlex.quote(str(part)) for part in command),
-                            cwd=workdir,
-                            timeout_sec=int(timeout or self.exec_timeout),
-                        )
-                    )
-                except TypeError:
-                    raise positional_exc
-        process = self._start_docker_compose_exec(command, workdir=workdir)
-        if process is not None:
-            return process
-        raise TypeError(
-            "Harbor environment does not expose an interactive exec method and "
-            "no Docker SDK container id is available; persistent PredictRLM "
-            "supervisor execution requires start_exec/exec_stream/popen or docker exec -i"
-        )
-
-    def _start_daytona_session_exec(
-        self,
-        command: list[str],
-        *,
-        workdir: str | None = None,
-        timeout: float | None = None,
-    ) -> ContainerProcess | None:
-        sandbox = getattr(self.environment, "_sandbox", None)
-        process = getattr(sandbox, "process", None)
-        if not all(
-            callable(getattr(process, name, None))
-            for name in (
-                "create_session",
-                "execute_session_command",
-                "get_session_command",
-                "get_session_command_logs",
-                "send_session_command_input",
-            )
-        ):
-            return None
-        session_id = f"predict-rlm-{uuid4().hex}"
-        self._resolve(process.create_session(session_id))
-        shell_command = " ".join(shlex.quote(str(part)) for part in command)
-        effective_workdir = workdir or self.workdir
-        if effective_workdir:
-            shell_command = f"cd {shlex.quote(effective_workdir)} && {shell_command}"
-        request = _daytona_session_execute_request(shell_command, run_async=True)
-        response = self._resolve(
-            process.execute_session_command(
-                session_id,
-                request,
-                timeout=int(timeout or self.exec_timeout),
-            )
-        )
-        command_id = getattr(response, "cmd_id", None)
-        if not command_id:
-            raise SandboxFatalError("Daytona session command did not return a command id")
-        return DaytonaSessionProcess(
-            process=process,
-            loop=self.loop,
-            session_id=session_id,
-            command_id=str(command_id),
-        )
-
-    def _start_docker_compose_exec(
-        self,
-        command: list[str],
-        *,
-        workdir: str | None = None,
-    ) -> ContainerProcess | None:
-        compose_paths = getattr(self.environment, "_docker_compose_paths", None)
-        environment_dir = getattr(self.environment, "environment_dir", None)
-        session_id = getattr(self.environment, "session_id", None)
-        if not compose_paths or environment_dir is None or session_id is None:
-            return None
-        docker_command = [
-            "docker",
-            "compose",
-            "--project-name",
-            _docker_compose_project_name(str(session_id)),
-            "--project-directory",
-            str(Path(environment_dir).resolve().absolute()),
-        ]
-        for path in compose_paths:
-            docker_command.extend(["-f", str(Path(path).resolve().absolute())])
-        docker_command.extend(["exec", "-T"])
-        effective_workdir = workdir or self.workdir
-        if effective_workdir:
-            docker_command.extend(["-w", effective_workdir])
-        user = self._coerce_optional_string(getattr(self.environment, "default_user", None))
-        if user:
-            docker_command.extend(["-u", user])
-        docker_command.append("main")
-        docker_command.extend(command)
-        compose_env_vars = getattr(self.environment, "_compose_env_vars", None)
-        env = compose_env_vars(include_os_env=True) if compose_env_vars is not None else None
-        return subprocess.Popen(
-            docker_command,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            env=env,
-        )
-
 
 class LocalProcessRunnerAdapter:
     """Runner adapter for an agent already executing inside the task machine."""
@@ -798,20 +346,42 @@ class LocalProcessRunnerAdapter:
 
     def __init__(self, *, workdir: str | None = None) -> None:
         self.workdir = workdir
+        root = Path(workdir or os.getcwd()) / ".predict_rlm_runner_env"
+        self.runner_root = root.resolve()
+        self.sandbox_root = self.runner_root / "sandbox"
 
     def _cwd(self, workdir: str | None = None) -> str | None:
         return workdir or self.workdir
 
+    def _path_for_runtime_path(self, path: str) -> Path:
+        if path == "/sandbox" or path.startswith("/sandbox/"):
+            rel = path.removeprefix("/sandbox").lstrip("/")
+            return self.sandbox_root / rel
+        return Path(path)
+
+    def _map_command_arg(self, arg: str) -> str:
+        if arg == "/sandbox" or arg.startswith("/sandbox/"):
+            return str(self._path_for_runtime_path(arg))
+        return arg
+
+    def virtual_path_for_host_path(self, path: str) -> str:
+        candidate = Path(path)
+        try:
+            rel = candidate.resolve().relative_to(self.sandbox_root)
+        except ValueError:
+            return path
+        return "/sandbox/" + rel.as_posix()
+
     def copy_to(self, host_path: str, container_path: str) -> None:
         source = Path(host_path)
-        destination = Path(container_path)
+        destination = self._path_for_runtime_path(container_path)
         if source.resolve() == destination.resolve():
             return
         destination.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(source, destination)
 
     def copy_from(self, container_path: str, host_path: str) -> None:
-        source = Path(container_path)
+        source = self._path_for_runtime_path(container_path)
         destination = Path(host_path)
         if source.resolve() == destination.resolve():
             return
@@ -820,7 +390,7 @@ class LocalProcessRunnerAdapter:
 
     def exec(self, command: list[str], *, timeout: float | None = None) -> Any:
         return subprocess.run(
-            command,
+            [self._map_command_arg(arg) for arg in command],
             cwd=self._cwd(),
             check=False,
             text=True,
@@ -849,6 +419,8 @@ class LocalProcessRunnerAdapter:
         timeout: float | None = None,
     ) -> ContainerProcess:
         del timeout
+        env = os.environ.copy()
+        env["PREDICT_RLM_SBX_ROOT"] = str(self.runner_root)
         return subprocess.Popen(
             command,
             cwd=self._cwd(workdir),
@@ -856,6 +428,7 @@ class LocalProcessRunnerAdapter:
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
+            env=env,
         )
 
 
@@ -943,7 +516,11 @@ class TerminalBenchRunnerInterpreter(PersistentJsonRpcRunnerClient, PredictRLMIn
         )
         self._raise_for_exec_failure(result, f"listing {virtual_path}")
         stdout = getattr(result, "stdout", result if isinstance(result, str) else "")
-        return list(json.loads(stdout or "[]"))
+        paths = list(json.loads(stdout or "[]"))
+        virtualize = getattr(self.adapter, "virtual_path_for_host_path", None)
+        if virtualize is not None:
+            return [virtualize(path) for path in paths]
+        return paths
 
     def sync_file_to(self, virtual_path: str, host_path: str) -> None:
         if getattr(self.adapter, "supports_file_sync", True) is False:
@@ -1673,119 +1250,3 @@ class LocalProcessRunnerInterpreter(TerminalBenchRunnerInterpreter):
             exec_timeout=exec_timeout,
             recoverable_timeout_grace=recoverable_timeout_grace,
         )
-
-
-class HarborEnvironmentInterpreter(TerminalBenchRunnerInterpreter):
-    """PredictRLM interpreter that executes through Harbor's BaseEnvironment API."""
-
-    def __init__(
-        self,
-        environment: Any,
-        *,
-        loop: asyncio.AbstractEventLoop,
-        tools: dict[str, Callable[..., Any]] | None = None,
-        output_fields: list[dict[str, Any]] | None = None,
-        runner_path: str = "/tmp/predict_rlm_runner.py",
-        python_executable: str = "python3",
-        workdir: str | None = None,
-        exec_timeout: float = 900.0,
-        recoverable_timeout_grace: float = TERMINAL_BENCH_RECOVERABLE_TIMEOUT_GRACE_SECONDS,
-    ) -> None:
-        adapter = HarborEnvironmentAdapter(
-            environment,
-            loop=loop,
-            exec_timeout=exec_timeout,
-        )
-        super().__init__(
-            environment,
-            container_adapter=adapter,
-            tools=tools,
-            output_fields=output_fields,
-            runner_path=runner_path,
-            python_executable=python_executable,
-            workdir=workdir,
-            exec_timeout=exec_timeout,
-            recoverable_timeout_grace=recoverable_timeout_grace,
-        )
-        self.environment = environment
-        self.loop = loop
-        self._python_available = False
-
-    def mount_file_at(self, host_path: str, virtual_path: str) -> None:
-        if hasattr(self.environment, "upload_file"):
-            self._run_coro(self.environment.upload_file(host_path, virtual_path))
-            return
-        super().mount_file_at(host_path, virtual_path)
-
-    def mkdir_p(self, virtual_path: str) -> None:
-        if not hasattr(self.environment, "exec"):
-            super().mkdir_p(virtual_path)
-            return
-        result = self._run_coro(
-            self.environment.exec(
-                command=f"mkdir -p {shlex.quote(virtual_path)}",
-                timeout_sec=int(self.exec_timeout),
-            )
-        )
-        self._raise_for_harbor_exec_failure(result, f"creating {virtual_path}")
-
-    def list_dir(self, virtual_path: str) -> list[str]:
-        if not hasattr(self.environment, "exec"):
-            return super().list_dir(virtual_path)
-        self._ensure_python_available()
-        result = self._run_coro(
-            self.environment.exec(
-                command=_shell_python_command(
-                    self.python_executable,
-                    ["-c", self._LIST_DIR_SCRIPT, virtual_path],
-                ),
-                timeout_sec=int(self.exec_timeout),
-            )
-        )
-        self._raise_for_harbor_exec_failure(result, f"listing {virtual_path}")
-        return list(json.loads(getattr(result, "stdout", "") or "[]"))
-
-    def sync_file_to(self, virtual_path: str, host_path: str) -> None:
-        if not hasattr(self.environment, "download_file"):
-            super().sync_file_to(virtual_path, host_path)
-            return
-        Path(host_path).parent.mkdir(parents=True, exist_ok=True)
-        self._run_coro(self.environment.download_file(virtual_path, host_path))
-
-    def _ensure_process(self) -> None:
-        self._ensure_python_available()
-        super()._ensure_process()
-
-    def shutdown(self) -> None:
-        super().shutdown()
-
-    def _ensure_python_available(self) -> None:
-        if self._python_available or self.python_executable != "python3":
-            return
-        if getattr(self.adapter, "_is_docker_sdk_runtime", False):
-            self._python_available = True
-            return
-        if not hasattr(self.environment, "exec"):
-            self._python_available = True
-            return
-        result = self._run_coro(
-            self.environment.exec(
-                command=_python_bootstrap_command(),
-                timeout_sec=int(self.exec_timeout),
-            )
-        )
-        self._raise_for_harbor_exec_failure(result, "installing Python")
-        self._python_available = True
-
-    def _run_coro(self, coro: Any) -> Any:
-        return _resolve_maybe_awaitable(coro, self.loop)
-
-    def _raise_for_harbor_exec_failure(self, result: Any, operation: str) -> None:
-        return_code = getattr(result, "return_code", getattr(result, "returncode", 0))
-        if return_code not in (0, None):
-            stderr = getattr(result, "stderr", "")
-            stdout = getattr(result, "stdout", "")
-            raise SandboxFatalError(
-                f"Harbor environment failed while {operation}: "
-                f"exit code {return_code}; stdout: {stdout}; stderr: {stderr}"
-            )

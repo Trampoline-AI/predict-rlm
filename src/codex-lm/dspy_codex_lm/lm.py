@@ -331,8 +331,10 @@ class _StreamTiming:
             stream_total_ms=_elapsed_ms(self.start_at, self.stream_end_at),
             output_text_chars=self.output_text_chars,
             completed=bool(state.get("completed")),
-            failure_kind=failure.get("kind") or type(exc).__name__,
-            failure_code=failure.get("code"),
+            failure_kind=(
+                failure.get("kind") or getattr(exc, "failure_kind", None) or type(exc).__name__
+            ),
+            failure_code=failure.get("code") or getattr(exc, "failure_code", None),
             exception_type=type(exc).__name__,
             **(self.request_metadata or {}),
             **(self.auth_metadata or {}),
@@ -511,9 +513,18 @@ def _retry_after_seconds_from_error(error: Any) -> float | None:
 class CodexStreamError(RuntimeError):
     """Raised when the Codex response stream fails before completion."""
 
-    def __init__(self, message: str, *, retry_after_seconds: float | None = None):
+    def __init__(
+        self,
+        message: str,
+        *,
+        retry_after_seconds: float | None = None,
+        failure_kind: str | None = None,
+        failure_code: str | int | None = None,
+    ):
         super().__init__(message)
         self.retry_after_seconds = retry_after_seconds
+        self.failure_kind = failure_kind
+        self.failure_code = failure_code
 
 
 class _WaitServerRetryAfterOrRandomExponential(wait_base):
@@ -552,6 +563,8 @@ def _codex_stream_error_from_state(state: dict[str, Any]) -> CodexStreamError | 
     return CodexStreamError(
         msg,
         retry_after_seconds=failure.get("retry_after_seconds"),
+        failure_kind=failure.get("kind"),
+        failure_code=failure.get("code"),
     )
 
 
@@ -1095,19 +1108,28 @@ class _AiohttpCodexWSTransport:
             ws_headers["x-codex-turn-state"] = sticky_state["turn_state"]
 
         async with aiohttp.ClientSession() as session:
-            async with session.ws_connect(self.url, headers=ws_headers, compress=15) as ws:
-                response = getattr(ws, "_response", None)
-                turn_state = getattr(response, "headers", {}).get("x-codex-turn-state")
-                if turn_state:
-                    sticky_state["turn_state"] = turn_state
-                await ws.send_str(json.dumps(_ws_request_payload(request)))
-                async for message in ws:
-                    if message.type == aiohttp.WSMsgType.TEXT:
-                        yield json.loads(message.data)
-                    elif message.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.CLOSE):
-                        break
-                    elif message.type == aiohttp.WSMsgType.ERROR:
-                        raise CodexStreamError(f"Codex WebSocket error: {ws.exception()}")
+            try:
+                async with session.ws_connect(self.url, headers=ws_headers, compress=15) as ws:
+                    response = getattr(ws, "_response", None)
+                    turn_state = getattr(response, "headers", {}).get("x-codex-turn-state")
+                    if turn_state:
+                        sticky_state["turn_state"] = turn_state
+                    await ws.send_str(json.dumps(_ws_request_payload(request)))
+                    async for message in ws:
+                        if message.type == aiohttp.WSMsgType.TEXT:
+                            yield json.loads(message.data)
+                        elif message.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.CLOSE):
+                            break
+                        elif message.type == aiohttp.WSMsgType.ERROR:
+                            raise CodexStreamError(f"Codex WebSocket error: {ws.exception()}")
+            except aiohttp.WSServerHandshakeError as exc:
+                if exc.status == 401:
+                    raise CodexStreamError(
+                        "CodexLM auth expired: WebSocket handshake returned 401 Unauthorized",
+                        failure_kind="codex_lm_auth_expired",
+                        failure_code=401,
+                    ) from exc
+                raise
 
 
 @dataclass
