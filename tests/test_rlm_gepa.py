@@ -2760,7 +2760,7 @@ def test_render_table_compacts_fractional_decimal_columns():
     ]
 
     markdown = render_table(rows, output_format="markdown")
-    terminal = render_table(rows, output_format="terminal")
+    terminal = render_table(rows, output_format="terminal", width=120)
 
     assert ".123" in markdown
     assert "+.045" in markdown
