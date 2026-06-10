@@ -38,6 +38,7 @@ class SbxPool:
         verbose: bool = False,
         extra_read_paths: list[str] | None = None,
         extra_write_paths: list[str] | None = None,
+        _supervisor_command: list[str] | None = None,
         _runner_command: list[str] | None = None,
         _staging_root: str | Path | None = None,
     ) -> None:
@@ -65,6 +66,7 @@ class SbxPool:
             "verbose": verbose,
             "extra_read_paths": extra_read_paths,
             "extra_write_paths": extra_write_paths,
+            "_supervisor_command": _supervisor_command,
             "_runner_command": _runner_command,
         }
         self._staging_root = Path(_staging_root) if _staging_root is not None else None

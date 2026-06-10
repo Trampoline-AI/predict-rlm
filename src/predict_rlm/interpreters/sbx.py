@@ -33,6 +33,7 @@ from predict_rlm._logging import (
 from predict_rlm._shared import strip_code_fences
 from predict_rlm.execution_timeout import (
     ITERATION_TIMEOUT_FAILURE_CLASS,
+    format_recoverable_timeout_result,
     recoverable_timeout_host_deadline_seconds,
     resolve_execution_timeout,
 )
@@ -46,8 +47,8 @@ from .base import (
     SandboxExecutionError,
     SbxConfig,
 )
-from .sbx_logging import log_interpreter_lifecycle, log_partial_output
 from .persistent_runner import PersistentJsonRpcRunnerClient, PersistentSupervisorProcess
+from .sbx_logging import log_interpreter_lifecycle, log_partial_output
 
 RUNNER_PATH = Path(__file__).parents[1] / "sandbox" / "python_runner.py"
 DEFAULT_PACKAGE_DOMAINS = ["pypi.org", "files.pythonhosted.org"]
@@ -121,24 +122,22 @@ class SbxInterpreter(PersistentJsonRpcRunnerClient, PredictRLMInterpreter):
         configure_predict_rlm_logging(verbose=enabled)
 
     def _log_lifecycle(self, event: str, **fields: Any) -> None:
-        process_pid = getattr(self._proc, "pid", None) if self._proc else None
+        fields.setdefault("sandbox_name", getattr(self, "_sandbox_name", None))
+        fields.setdefault("process_pid", getattr(self._proc, "pid", None) if self._proc else None)
+        fields.setdefault("staging_root", getattr(self, "_staging_root", None))
         log_interpreter_lifecycle(
             enabled=getattr(self, "debug", False),
             event=event,
-            sandbox_name=getattr(self, "_sandbox_name", None),
-            process_pid=process_pid,
-            staging_root=getattr(self, "_staging_root", None),
             **fields,
         )
 
     def _log_partial_output(self, output: str, **fields: Any) -> None:
-        process_pid = getattr(self._proc, "pid", None) if self._proc else None
+        fields.setdefault("sandbox_name", getattr(self, "_sandbox_name", None))
+        fields.setdefault("process_pid", getattr(self._proc, "pid", None) if self._proc else None)
+        fields.setdefault("staging_root", getattr(self, "_staging_root", None))
         log_partial_output(
             enabled=getattr(self, "debug", False),
             output=output,
-            sandbox_name=getattr(self, "_sandbox_name", None),
-            process_pid=process_pid,
-            staging_root=getattr(self, "_staging_root", None),
             **fields,
         )
 

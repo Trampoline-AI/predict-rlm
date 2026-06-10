@@ -629,12 +629,21 @@ async def _execute_code_to_capture_files(
     defer_final_output: bool = False,
 ) -> dict[str, Any]:
     with _redirect_process_stdio_to_files(stdout_path, stderr_path) as capture:
-        result = await _execute_code(
-            code,
-            globals_dict,
-            capture,
-            defer_final_output=defer_final_output,
-        )
+        try:
+            result = await _execute_code(
+                code,
+                globals_dict,
+                capture,
+                defer_final_output=defer_final_output,
+            )
+        except BaseException as exc:
+            setattr(
+                exc,
+                "_predict_rlm_output",
+                _read_capture_file(pathlib.Path(stdout_path))
+                + _read_capture_file(pathlib.Path(stderr_path)),
+            )
+            raise
     if isinstance(result, dict) and "output" in result:
         result = dict(result)
         result["output"] = _read_capture_file(pathlib.Path(stdout_path)) + _read_capture_file(
@@ -778,7 +787,13 @@ def _persistent_kernel_runner(
             if _has_waiting_tool_responses():
                 return
         except BaseException as exc:
-            result_queue.put({"ok": False, "error": _exception_payload(exc)})
+            error = _exception_payload(exc)
+            output = _read_capture_file(pathlib.Path(request["stdout_path"])) + _read_capture_file(
+                pathlib.Path(request["stderr_path"])
+            )
+            if output:
+                error["output"] = output
+            result_queue.put({"ok": False, "error": error})
             if _has_waiting_tool_responses():
                 return
 
