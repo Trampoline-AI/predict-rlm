@@ -23,6 +23,7 @@ import os
 import select
 import shutil
 import tempfile
+import threading
 import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -67,6 +68,16 @@ if TYPE_CHECKING:
 
 
 logger = logging.getLogger(__name__)
+
+
+def _set_future_result(future: asyncio.Future[Any], value: Any) -> None:
+    if not future.done():
+        future.set_result(value)
+
+
+def _set_future_exception(future: asyncio.Future[Any], exc: BaseException) -> None:
+    if not future.done():
+        future.set_exception(exc)
 
 
 class SandboxFatalError(RuntimeError):
@@ -387,11 +398,17 @@ class JspiInterpreter(PythonInterpreter):
         *,
         debug: bool | None = None,
         verbose: bool | None = None,
+        tools: dict[str, Callable[..., Any]] | None = None,
+        output_fields: list[dict] | None = None,
     ) -> None:
         if debug is not None:
             self.configure_debug(debug)
         if verbose is not None:
             self.configure_verbose(verbose)
+        if tools is not None:
+            self.tools = tools
+        if output_fields is not None:
+            self.output_fields = output_fields
 
     def _log_lifecycle(self, event: str, **fields: Any) -> None:
         if not getattr(self, "_debug", False):
@@ -488,6 +505,9 @@ class JspiInterpreter(PythonInterpreter):
 
         prev = self.deno_process
         if prev is None or prev.poll() is not None:
+            self._stdin_fd = -1
+            self._stdout_fd = -1
+            self._read_buf = ""
             self._log_lifecycle("jspi.deno.starting")
         super()._ensure_deno_process()
         if self.deno_process is not None and self.deno_process is not prev:
@@ -524,10 +544,16 @@ class JspiInterpreter(PythonInterpreter):
             except (BrokenPipeError, OSError):
                 pass
             try:
-                self.deno_process.wait(timeout=5)
+                shutdown_wait_timeout = (
+                    0.2
+                    if isinstance(process, subprocess.Popen)
+                    or getattr(self, "_prefer_fast_shutdown", False)
+                    else 5
+                )
+                process.wait(timeout=shutdown_wait_timeout)
             except subprocess.TimeoutExpired:
                 try:
-                    self.deno_process.kill()
+                    process.kill()
                     killed = True
                     self._write_telemetry_span(
                         "sandbox.shutdown.kill",
@@ -545,7 +571,7 @@ class JspiInterpreter(PythonInterpreter):
                         status="error",
                         error_type=type(exc).__name__,
                     )
-                self.deno_process.wait()
+                process.wait()
             self._write_telemetry_span(
                 "sandbox.shutdown.complete",
                 attributes={"process.kill_result": "killed" if killed else "not_needed"},
@@ -998,8 +1024,19 @@ class JspiInterpreter(PythonInterpreter):
             timeout_failure_class,
         )
         try:
+            execute_async = self._execute_async
+            execute_async_params = inspect.signature(execute_async).parameters
+            execute_coro = (
+                execute_async(
+                    execute_request_id,
+                    timeout_seconds=timeout_seconds,
+                    timeout_failure_class=timeout_failure_class,
+                )
+                if "timeout_seconds" in execute_async_params
+                else execute_async(execute_request_id)
+            )
             result = await asyncio.wait_for(
-                self._execute_async(execute_request_id),
+                execute_coro,
                 timeout=host_timeout,
             )
             if isinstance(result, RecoverableExecutionTimeout):
@@ -1131,7 +1168,7 @@ class JspiInterpreter(PythonInterpreter):
             except Exception:
                 kill_result = "error"
             try:
-                self.deno_process.wait(timeout=2)
+                self.deno_process.wait(timeout=0.2)
             except Exception:
                 pass
             self._write_telemetry_span(
@@ -1150,6 +1187,9 @@ class JspiInterpreter(PythonInterpreter):
                 status="ok" if kill_result == "sent" else "error",
             )
         self.deno_process = None
+        self._stdin_fd = -1
+        self._stdout_fd = -1
+        self._read_buf = ""
         # Cancel any pending file-sync futures; they can't complete now.
         for fut in list(self._pending_file_ops.values()):
             if not fut.done():
@@ -1239,13 +1279,54 @@ class JspiInterpreter(PythonInterpreter):
             )
         )
 
-    async def _execute_async(self, execute_request_id: int) -> Any:
+    async def _execute_async(
+        self,
+        execute_request_id: int,
+        *,
+        timeout_seconds: float | None = None,
+        timeout_failure_class: str = "sandbox_exec_timeout",
+    ) -> Any:
         """Read messages and handle tool calls concurrently using asyncio."""
         pending_tasks: dict[str, asyncio.Task] = {}  # request_id -> Task
         stale_discards = 0
+        pending_tool_deadline = (
+            time.monotonic() + timeout_seconds
+            if timeout_failure_class == ITERATION_TIMEOUT_FAILURE_CLASS
+            and timeout_seconds is not None
+            else None
+        )
 
         while True:
             self._active_tool_count = len(pending_tasks)
+            if (
+                pending_tasks
+                and pending_tool_deadline is not None
+                and time.monotonic() >= pending_tool_deadline
+            ):
+                for request_id, task in list(pending_tasks.items()):
+                    task.cancel()
+                    response = _jsonrpc_error(
+                        JSONRPC_APP_ERRORS["RuntimeError"],
+                        "iteration timed out while awaiting host tool callback",
+                        request_id,
+                    )
+                    await self._write_stdin_async(response + "\n")
+                pending_tasks.clear()
+                self._active_tool_count = 0
+                return self._format_recoverable_timeout_result({
+                    "timeout": {"seconds": timeout_seconds},
+                    "stdout": "",
+                    "stderr": (
+                        "Deno/Pyodide was awaiting host tool callbacks when the "
+                        "iteration timeout elapsed. Pending host callbacks were "
+                        "rejected so the live sandbox can continue."
+                    ),
+                    "state": {
+                        "preserved": True,
+                        "source": "live_pyodide",
+                        "scope": "full_live",
+                    },
+                })
             # Check for completed tool calls and send responses
             await self._send_completed_responses(pending_tasks)
             self._active_tool_count = len(pending_tasks)
@@ -1301,6 +1382,11 @@ class JspiInterpreter(PythonInterpreter):
             # JSON-RPC request from sandbox (tool call)
             if "method" in result:
                 if result["method"] == "tool_call":
+                    if (
+                        pending_tool_deadline is not None
+                        and time.monotonic() >= pending_tool_deadline
+                    ):
+                        continue
                     request_id = result["id"]
                     params = result.get("params", {})
                     task = asyncio.create_task(
@@ -1364,6 +1450,15 @@ class JspiInterpreter(PythonInterpreter):
                 )
                 continue
 
+            if "result" in result:
+                res = result["result"]
+                if isinstance(res, dict) and "timeout" in res:
+                    for task in pending_tasks.values():
+                        task.cancel()
+                    pending_tasks.clear()
+                    self._active_tool_count = 0
+                    return self._format_recoverable_timeout_result(res)
+
             # Before returning, ensure all pending tool calls complete
             await self._wait_and_send_all_responses(pending_tasks)
             self._active_tool_count = len(pending_tasks)
@@ -1372,8 +1467,6 @@ class JspiInterpreter(PythonInterpreter):
             if "result" in result:
                 res = result["result"]
                 self._sync_files()
-                if isinstance(res, dict) and "timeout" in res:
-                    return self._format_recoverable_timeout_result(res)
                 if interpreter_result_logging_enabled(getattr(self, "_verbose", False)):
                     emit_trace_result(res)
                 if "final" in res:
@@ -1705,11 +1798,22 @@ class JspiInterpreter(PythonInterpreter):
                     with self._execution_gate.tool_callback():
                         return tool_fn(*args, **kwargs)
 
-                future = loop.run_in_executor(
-                    self._executor,
-                    ctx.run,
-                    call_tool,
+                future: asyncio.Future[Any] = loop.create_future()
+
+                def run_tool() -> None:
+                    try:
+                        value = ctx.run(call_tool)
+                    except BaseException as exc:
+                        loop.call_soon_threadsafe(_set_future_exception, future, exc)
+                    else:
+                        loop.call_soon_threadsafe(_set_future_result, future, value)
+
+                thread = threading.Thread(
+                    target=run_tool,
+                    name="predict-rlm-jspi-host-tool",
+                    daemon=True,
                 )
+                thread.start()
                 try:
                     result = await asyncio.wait_for(
                         future,
@@ -1717,8 +1821,6 @@ class JspiInterpreter(PythonInterpreter):
                     )
                 except asyncio.TimeoutError as e:
                     future.cancel()
-                    self._executor.shutdown(wait=False, cancel_futures=True)
-                    self._executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
                     raise TimeoutError(
                         f"tool {tool_name!r} timed out after "
                         f"{TOOL_CALL_TIMEOUT_SEC}s (per-call budget)"
