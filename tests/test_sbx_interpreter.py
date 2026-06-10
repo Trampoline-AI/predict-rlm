@@ -1,4 +1,4 @@
-"""Tests for the Docker Sandboxes interpreter backend."""
+"""Tests for the Docker Sandboxes client adapter."""
 
 from __future__ import annotations
 
@@ -24,7 +24,7 @@ from dspy.primitives.code_interpreter import CodeInterpreterError, FinalOutput
 
 from predict_rlm.files import SyncedFile
 from predict_rlm.interpreter import SandboxFatalError
-from predict_rlm.interpreters import DEFAULT_SBX_TEMPLATE, SbxConfig, SbxInterpreter, SbxPool
+from predict_rlm.interpreters import DEFAULT_SBX_TEMPLATE, SbxClientAdapter, SbxConfig, SbxPool
 
 RUNNER_PATH = Path(__file__).parents[1] / "src" / "predict_rlm" / "sandbox" / "python_runner.py"
 
@@ -733,7 +733,7 @@ class TestPythonRunnerProtocol:
         assert response["result"]["output"] == "desktop\nyes\n"
 
 
-class TestSbxInterpreterLocalRunner:
+class TestSbxClientAdapterLocalRunner:
     def make_interpreter(
         self,
         tmp_path: Path,
@@ -741,8 +741,8 @@ class TestSbxInterpreterLocalRunner:
         debug: bool = False,
         verbose: bool = False,
         tools: dict | None = None,
-    ) -> SbxInterpreter:
-        return SbxInterpreter(
+    ) -> SbxClientAdapter:
+        return SbxClientAdapter(
             config=SbxConfig(name="local-test"),
             tools=tools,
             preinstall_packages=False,
@@ -955,7 +955,7 @@ for line in sys.stdin:
 """.lstrip(),
             encoding="utf-8",
         )
-        interpreter = SbxInterpreter(
+        interpreter = SbxClientAdapter(
             config=SbxConfig(name="local-test", exec_timeout=3),
             preinstall_packages=False,
             _supervisor_command=[sys.executable, "-u", str(runner_script)],
@@ -1015,7 +1015,7 @@ for line in sys.stdin:
 """.lstrip(),
             encoding="utf-8",
         )
-        interpreter = SbxInterpreter(
+        interpreter = SbxClientAdapter(
             config=SbxConfig(name="local-test", exec_timeout=3),
             preinstall_packages=False,
             _supervisor_command=[sys.executable, "-u", str(runner_script)],
@@ -1053,7 +1053,7 @@ for line in sys.stdin:
             "DEFAULT_RECOVERABLE_EXECUTION_TIMEOUT_GRACE_SECONDS",
             0.2,
         )
-        interpreter = SbxInterpreter(
+        interpreter = SbxClientAdapter(
             config=SbxConfig(name="silent-test", exec_timeout=30),
             preinstall_packages=False,
             _supervisor_command=[
@@ -1099,7 +1099,7 @@ for line in sys.stdin:
         assert output.read_text(encoding="utf-8") == "hello sbx"
 
     def test_file_helpers_are_host_side_and_do_not_start_runner(self, tmp_path: Path):
-        interpreter = SbxInterpreter(
+        interpreter = SbxClientAdapter(
             config=SbxConfig(name="file-only-test"),
             preinstall_packages=False,
             _supervisor_command=[sys.executable, "-c", "raise SystemExit(99)"],
@@ -1136,7 +1136,7 @@ for line in sys.stdin:
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ):
         monkeypatch.chdir(tmp_path)
-        interpreter = SbxInterpreter(
+        interpreter = SbxClientAdapter(
             config=SbxConfig(name="local-test"),
             preinstall_packages=False,
             _supervisor_command=[sys.executable, "-u", str(RUNNER_PATH)],
@@ -1155,7 +1155,7 @@ for line in sys.stdin:
 
     def test_shutdown_preserves_caller_owned_staging_root(self, tmp_path: Path):
         staging_root = tmp_path / "staging"
-        interpreter = SbxInterpreter(
+        interpreter = SbxClientAdapter(
             config=SbxConfig(name="local-test"),
             preinstall_packages=False,
             _supervisor_command=[sys.executable, "-u", str(RUNNER_PATH)],
@@ -1178,7 +1178,7 @@ for line in sys.stdin:
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ):
         monkeypatch.chdir(tmp_path)
-        interpreter = SbxInterpreter(
+        interpreter = SbxClientAdapter(
             config=SbxConfig(name="local-test", persist=True),
             preinstall_packages=False,
             _supervisor_command=[sys.executable, "-u", str(RUNNER_PATH)],
@@ -1197,7 +1197,7 @@ for line in sys.stdin:
             await asyncio.sleep(0)
             return {"total": a + b}
 
-        interpreter = SbxInterpreter(
+        interpreter = SbxClientAdapter(
             config=SbxConfig(name="local-test"),
             tools={"add": add},
             preinstall_packages=False,
@@ -1236,7 +1236,7 @@ for line in sys.stdin:
             file_path.write_text(original + " + host", encoding="utf-8")
             return file_path.read_text(encoding="utf-8")
 
-        interpreter = SbxInterpreter(
+        interpreter = SbxClientAdapter(
             config=SbxConfig(name="local-test"),
             tools={"mutate": mutate},
             preinstall_packages=False,
@@ -1269,7 +1269,7 @@ for line in sys.stdin:
             file_path.write_text("host only", encoding="utf-8")
             return file_path.read_text(encoding="utf-8")
 
-        interpreter = SbxInterpreter(
+        interpreter = SbxClientAdapter(
             config=SbxConfig(name="local-test"),
             tools={"mutate": mutate},
             preinstall_packages=False,
@@ -1308,7 +1308,7 @@ for line in sys.stdin:
 
         mutate.__annotations__["path"] = Annotated[str, SyncedFile(host_dir=str(host_dir))]
 
-        interpreter = SbxInterpreter(
+        interpreter = SbxClientAdapter(
             config=SbxConfig(name="local-test"),
             tools={"mutate": mutate},
             preinstall_packages=False,
@@ -1384,7 +1384,7 @@ while True:
 """.lstrip(),
             encoding="utf-8",
         )
-        interpreter = SbxInterpreter(
+        interpreter = SbxClientAdapter(
             config=SbxConfig(name="local-test", exec_timeout=2),
             preinstall_packages=False,
             _supervisor_command=[sys.executable, "-u", str(runner_script)],
@@ -1423,7 +1423,7 @@ while True:
             await asyncio.sleep(0.35)
             return value
 
-        interpreter = SbxInterpreter(
+        interpreter = SbxClientAdapter(
             config=SbxConfig(name="local-test", exec_timeout=3),
             tools={"slow": slow},
             preinstall_packages=False,
@@ -1455,7 +1455,7 @@ while True:
             observed_errors.append(str(exc_info.value))
             return "blocked"
 
-        interpreter = SbxInterpreter(
+        interpreter = SbxClientAdapter(
             config=SbxConfig(name="local-test", exec_timeout=3),
             tools={"reenter": reenter},
             preinstall_packages=False,
@@ -1471,7 +1471,7 @@ while True:
         assert len(observed_errors) == 1
 
     def test_request_timeout_fires_when_runner_stays_silent(self, tmp_path: Path):
-        interpreter = SbxInterpreter(
+        interpreter = SbxClientAdapter(
             config=SbxConfig(name="silent-test", exec_timeout=0.2),
             preinstall_packages=False,
             _supervisor_command=[
@@ -1519,7 +1519,7 @@ class TestSbxCommandConstruction:
 
         monkeypatch.setattr(shutil, "which", lambda name: "/usr/local/bin/sbx")
         monkeypatch.setattr(subprocess, "run", fake_run)
-        interpreter = SbxInterpreter(
+        interpreter = SbxClientAdapter(
             config=SbxConfig(name="created-name"),
             preinstall_packages=False,
             _staging_root=tmp_path / "staging",
@@ -1540,7 +1540,7 @@ class TestSbxCommandConstruction:
 
         monkeypatch.setattr(shutil, "which", lambda name: "/usr/local/bin/sbx")
         monkeypatch.setattr(subprocess, "run", fake_run)
-        interpreter = SbxInterpreter(
+        interpreter = SbxClientAdapter(
             config=SbxConfig(
                 name="created-name",
                 template="docker.io/example/custom-template:latest",
@@ -1565,7 +1565,7 @@ class TestSbxCommandConstruction:
 
         monkeypatch.setattr(shutil, "which", lambda name: "/usr/local/bin/sbx")
         monkeypatch.setattr(subprocess, "run", fake_run)
-        interpreter = SbxInterpreter(
+        interpreter = SbxClientAdapter(
             config=SbxConfig(name="created-name", template=None),
             preinstall_packages=False,
             _staging_root=tmp_path / "staging",
@@ -1584,7 +1584,7 @@ class TestSbxCommandConstruction:
 
         monkeypatch.setattr(shutil, "which", lambda name: "/usr/local/bin/sbx")
         monkeypatch.setattr(subprocess, "run", fake_run)
-        interpreter = SbxInterpreter(
+        interpreter = SbxClientAdapter(
             config=SbxConfig(name="created-name", persist=True),
             preinstall_packages=False,
             _staging_root=tmp_path / "staging",
@@ -1607,7 +1607,7 @@ class TestSbxCommandConstruction:
             return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
 
         monkeypatch.setattr(subprocess, "run", fake_run)
-        interpreter = SbxInterpreter(
+        interpreter = SbxClientAdapter(
             config=SbxConfig(name="created-name"),
             preinstall_packages=False,
             _staging_root=tmp_path / "staging",
@@ -1631,7 +1631,7 @@ class TestSbxCommandConstruction:
 
         monkeypatch.setattr(shutil, "which", lambda name: "/usr/local/bin/sbx")
         monkeypatch.setattr(subprocess, "run", fake_run)
-        interpreter = SbxInterpreter(
+        interpreter = SbxClientAdapter(
             config=SbxConfig(
                 name="created-name",
                 workspace_read_only=True,
@@ -1657,7 +1657,7 @@ class TestSbxCommandConstruction:
 
         monkeypatch.setattr(shutil, "which", lambda name: "/usr/local/bin/sbx")
         monkeypatch.setattr(subprocess, "run", fake_run)
-        interpreter = SbxInterpreter(
+        interpreter = SbxClientAdapter(
             config=SbxConfig(name="created-name"),
             preinstall_packages=False,
             _staging_root=tmp_path / "staging",
@@ -1676,7 +1676,7 @@ class TestSbxCommandConstruction:
 
         monkeypatch.setattr(shutil, "which", lambda name: "/usr/local/bin/sbx")
         monkeypatch.setattr(subprocess, "run", fake_run)
-        interpreter = SbxInterpreter(
+        interpreter = SbxClientAdapter(
             config=SbxConfig(name="created-name"),
             preinstall_packages=False,
             _staging_root=tmp_path / "staging",
@@ -1702,7 +1702,7 @@ class TestSbxCommandConstruction:
 
         monkeypatch.setattr(shutil, "which", lambda name: "/usr/local/bin/sbx")
         monkeypatch.setattr(subprocess, "run", fake_run)
-        interpreter = SbxInterpreter(
+        interpreter = SbxClientAdapter(
             config=SbxConfig(name="created-name"),
             preinstall_packages=False,
             _staging_root=tmp_path / "staging",
@@ -1725,7 +1725,7 @@ class TestSbxCommandConstruction:
             )
 
         monkeypatch.setattr(subprocess, "run", fake_run)
-        interpreter = SbxInterpreter(
+        interpreter = SbxClientAdapter(
             config=SbxConfig(exec_timeout=1),
             skill_packages=["missing-package"],
             preinstall_packages=False,
@@ -1744,7 +1744,7 @@ class TestSbxCommandConstruction:
             return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
 
         monkeypatch.setattr(subprocess, "run", fake_run)
-        interpreter = SbxInterpreter(
+        interpreter = SbxClientAdapter(
             preinstall_packages=True,
             _staging_root=tmp_path / "staging",
         )
@@ -2294,9 +2294,9 @@ class TestSbxPool:
     not _real_sbx_available(),
     reason="real Docker Sandboxes tests require PREDICT_RLM_RUN_SBX_TESTS=1, sbx CLI, and sbx login",
 )
-class TestSbxInterpreterRealSbx:
+class TestSbxClientAdapterRealSbx:
     def test_real_sbx_executes_basic_python(self):
-        interpreter = SbxInterpreter(
+        interpreter = SbxClientAdapter(
             config=SbxConfig(name=f"predict-rlm-test-{os.getpid()}"),
             preinstall_packages=False,
         )
@@ -2308,7 +2308,7 @@ class TestSbxInterpreterRealSbx:
         assert output.strip() == "5"
 
     def test_real_sbx_timeout_is_recoverable_and_runner_survives(self):
-        interpreter = SbxInterpreter(
+        interpreter = SbxClientAdapter(
             config=SbxConfig(name=f"predict-rlm-test-timeout-{os.getpid()}"),
             preinstall_packages=False,
         )

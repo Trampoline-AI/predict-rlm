@@ -42,7 +42,7 @@ from predict_rlm.execution_timeout import (
 )
 from predict_rlm.interpreters.base import (
     STALE_RESPONSE_DISCARD_LIMIT,
-    InterpreterExecutionGate,
+    ClientAdapterExecutionGate,
     SandboxExecutionError,
 )
 
@@ -186,7 +186,7 @@ def _needs_jspi_flag() -> bool:
     return True
 
 
-class JspiInterpreter(PythonInterpreter):
+class JspiClientAdapter(PythonInterpreter):
     """PythonInterpreter with JSPI and concurrent async tool execution.
 
     JSPI (JavaScript Promise Integration) allows Python code running in the
@@ -218,7 +218,7 @@ class JspiInterpreter(PythonInterpreter):
 
     Example:
         ```python
-        interpreter = JspiInterpreter(
+        interpreter = JspiClientAdapter(
             tools={"my_tool": my_tool_func},
             allowed_domains=["api.example.com"],
             skill_packages=["pdfplumber", "openpyxl"],
@@ -383,7 +383,7 @@ class JspiInterpreter(PythonInterpreter):
         self._active_tool_count = 0
         # Per-execute wall-clock timeout (see __init__ docstring).
         self._exec_timeout = exec_timeout
-        self._execution_gate = InterpreterExecutionGate("JSPI interpreter")
+        self._execution_gate = ClientAdapterExecutionGate("JSPI client adapter")
 
     def configure_debug(self, enabled: bool) -> None:
         self._debug = enabled
@@ -1671,7 +1671,7 @@ class JspiInterpreter(PythonInterpreter):
         from .trace import ToolCall, ms_since, record_tool_call
 
         if not hasattr(self, "_execution_gate"):
-            self._execution_gate = InterpreterExecutionGate("JSPI interpreter")
+            self._execution_gate = ClientAdapterExecutionGate("JSPI client adapter")
 
         if getattr(self, "_verbose", False) or live_tool_call_logging_enabled():
             emit_trace_tool_call(

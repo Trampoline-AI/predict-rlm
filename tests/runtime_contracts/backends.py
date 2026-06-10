@@ -10,8 +10,8 @@ from typing import Any, Callable, Literal, Protocol
 
 import pytest
 
-from predict_rlm.interpreter import JspiInterpreter
-from predict_rlm.interpreters import SbxConfig, SbxInterpreter
+from predict_rlm.interpreter import JspiClientAdapter
+from predict_rlm.interpreters import SbxClientAdapter, SbxConfig
 
 ROOT = Path(__file__).resolve().parents[2]
 TERMINAL_BENCH_DIR = ROOT / "examples" / "terminal_bench"
@@ -20,7 +20,7 @@ if str(TERMINAL_BENCH_DIR) not in sys.path:
 
 container_runner = importlib.import_module("terminal_bench_rlm.tools.container_runner")
 runner_module = importlib.import_module("terminal_bench_rlm.tools.runner")
-LocalProcessRunnerInterpreter = container_runner.LocalProcessRunnerInterpreter
+LocalProcessRunnerClientAdapter = container_runner.LocalProcessRunnerClientAdapter
 runner_script_path = runner_module.runner_script_path
 
 
@@ -212,7 +212,7 @@ def _make_jspi(tmp_path: Path, spec: RuntimeSpec) -> RuntimeHandle:
         pytest.skip("JSPI contracts require Deno")
     return InterpreterRuntimeHandle(
         spec,
-        JspiInterpreter(
+        JspiClientAdapter(
             tools=_default_tools(),
             preinstall_packages=False,
             exec_timeout=10,
@@ -223,7 +223,7 @@ def _make_jspi(tmp_path: Path, spec: RuntimeSpec) -> RuntimeHandle:
 def _make_direct_process(tmp_path: Path, spec: RuntimeSpec) -> RuntimeHandle:
     return InterpreterRuntimeHandle(
         spec,
-        LocalProcessRunnerInterpreter(
+        LocalProcessRunnerClientAdapter(
             tools=_default_tools(),
             runner_path=str(tmp_path / "predict_rlm_runner.py"),
             workdir=str(tmp_path),
@@ -243,7 +243,7 @@ def _make_sbx(tmp_path: Path, spec: RuntimeSpec) -> RuntimeHandle:
         pytest.skip("real SBX runtime contracts require the sbx CLI")
     return InterpreterRuntimeHandle(
         spec,
-        SbxInterpreter(
+        SbxClientAdapter(
             config=SbxConfig(name="runtime-contract-sbx", exec_timeout=10),
             tools=_default_tools(),
             preinstall_packages=False,
@@ -255,7 +255,7 @@ def _make_sbx(tmp_path: Path, spec: RuntimeSpec) -> RuntimeHandle:
 def _make_internal_jsonrpc(tmp_path: Path, spec: RuntimeSpec) -> RuntimeHandle:
     return InterpreterRuntimeHandle(
         spec,
-        SbxInterpreter(
+        SbxClientAdapter(
             config=SbxConfig(name="runtime-contract-local-supervisor", exec_timeout=10),
             tools=_default_tools(),
             preinstall_packages=False,

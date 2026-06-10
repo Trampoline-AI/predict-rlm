@@ -20,8 +20,8 @@ if str(_EXAMPLE_DIR) not in sys.path:
 
 from terminal_bench_rlm.tools.container_runner import (  # noqa: E402
     HarborContainerAdapter,
-    LocalProcessRunnerInterpreter,
-    TerminalBenchRunnerInterpreter,
+    LocalProcessRunnerClientAdapter,
+    TerminalBenchRunnerClientAdapter,
 )
 from terminal_bench_rlm.tools.runner import runner_source  # noqa: E402
 
@@ -136,8 +136,8 @@ class FakeAdapter:
 
 
 @pytest.fixture
-def local_runner_interpreter(tmp_path: Path) -> LocalProcessRunnerInterpreter:
-    interpreter = LocalProcessRunnerInterpreter(
+def local_runner_interpreter(tmp_path: Path) -> LocalProcessRunnerClientAdapter:
+    interpreter = LocalProcessRunnerClientAdapter(
         runner_path=str(tmp_path / "predict_rlm_runner.py"),
         workdir=str(tmp_path),
         exec_timeout=10,
@@ -158,7 +158,7 @@ def test_execute_reset_shutdown_requests_and_maps_success() -> None:
         ]
     )
     adapter = FakeAdapter(process)
-    interpreter = TerminalBenchRunnerInterpreter(
+    interpreter = TerminalBenchRunnerClientAdapter(
         object(),
         container_adapter=adapter,
         runner_path="/tmp/predict_rlm_runner.py",
@@ -183,7 +183,7 @@ def test_execute_reset_shutdown_requests_and_maps_success() -> None:
 
 
 def test_shutdown_kills_original_process_if_wait_races_with_process_clear() -> None:
-    interpreter: TerminalBenchRunnerInterpreter | None = None
+    interpreter: TerminalBenchRunnerClientAdapter | None = None
 
     def clear_process_then_timeout() -> None:
         assert interpreter is not None
@@ -197,7 +197,7 @@ def test_shutdown_kills_original_process_if_wait_races_with_process_clear() -> N
         ],
         wait_callback=clear_process_then_timeout,
     )
-    interpreter = TerminalBenchRunnerInterpreter(
+    interpreter = TerminalBenchRunnerClientAdapter(
         object(),
         container_adapter=FakeAdapter(process),
         runner_path="/tmp/predict_rlm_runner.py",
@@ -214,7 +214,7 @@ def test_execute_accepts_lm_selected_execution_timeout() -> None:
     process = FakeProcess(
         [{"id": 1, "ok": True, "result": {"output": "bounded\n"}}]
     )
-    interpreter = TerminalBenchRunnerInterpreter(
+    interpreter = TerminalBenchRunnerClientAdapter(
         object(),
         container_adapter=FakeAdapter(process),
         runner_path="/tmp/predict_rlm_runner.py",
@@ -236,7 +236,7 @@ def test_execute_debug_logs_empty_output_diagnostic(monkeypatch, tmp_path: Path)
     monkeypatch.setenv("PREDICT_RLM_DEBUG_LOG", str(log_path))
     reset_debug_logger_for_tests()
     process = FakeProcess([{"id": 1, "ok": True, "result": {"output": ""}}])
-    interpreter = TerminalBenchRunnerInterpreter(
+    interpreter = TerminalBenchRunnerClientAdapter(
         object(),
         container_adapter=FakeAdapter(process),
         runner_path="/tmp/predict_rlm_runner.py",
@@ -274,7 +274,7 @@ def test_execute_strips_python_and_repl_fences_before_runner_request() -> None:
             {"id": 2, "ok": True, "result": {"output": "repl\n"}},
         ]
     )
-    interpreter = TerminalBenchRunnerInterpreter(
+    interpreter = TerminalBenchRunnerClientAdapter(
         object(),
         container_adapter=FakeAdapter(process),
         runner_path="/tmp/predict_rlm_runner.py",
@@ -288,7 +288,7 @@ def test_execute_strips_python_and_repl_fences_before_runner_request() -> None:
 
 
 def test_local_runner_preserves_stdout_from_repl_fenced_code(
-    local_runner_interpreter: LocalProcessRunnerInterpreter,
+    local_runner_interpreter: LocalProcessRunnerClientAdapter,
 ) -> None:
     result = local_runner_interpreter.execute(
         "```repl\nprint('local stdout survives')\n```"
@@ -298,7 +298,7 @@ def test_local_runner_preserves_stdout_from_repl_fenced_code(
 
 
 def test_local_runner_recoverable_timeout_preserves_streams_and_live_state(
-    local_runner_interpreter: LocalProcessRunnerInterpreter,
+    local_runner_interpreter: LocalProcessRunnerClientAdapter,
 ) -> None:
     assert local_runner_interpreter.execute("state = 'survived'\nprint('set')") == "set\n"
 
@@ -328,7 +328,7 @@ def test_local_runner_recoverable_timeout_preserves_streams_and_live_state(
 
 
 def test_local_runner_surfaces_subprocess_failure_and_survives(
-    local_runner_interpreter: LocalProcessRunnerInterpreter,
+    local_runner_interpreter: LocalProcessRunnerClientAdapter,
 ) -> None:
     with pytest.raises(CodeInterpreterError) as exc_info:
         local_runner_interpreter.execute(
@@ -350,7 +350,7 @@ def test_local_runner_surfaces_subprocess_failure_and_survives(
 
 
 def test_local_runner_unbounded_runner_exit_returns_error_and_supervisor_survives(
-    local_runner_interpreter: LocalProcessRunnerInterpreter,
+    local_runner_interpreter: LocalProcessRunnerClientAdapter,
 ) -> None:
     with pytest.raises(CodeInterpreterError) as exc_info:
         local_runner_interpreter.execute("import os\nos._exit(7)")
@@ -364,7 +364,7 @@ def test_local_runner_unbounded_runner_exit_returns_error_and_supervisor_survive
 
 
 def test_local_runner_protocol_stdin_is_isolated_from_user_subprocesses(
-    local_runner_interpreter: LocalProcessRunnerInterpreter,
+    local_runner_interpreter: LocalProcessRunnerClientAdapter,
 ) -> None:
     local_runner_interpreter.execute("sentinel = 123")
 
@@ -400,7 +400,7 @@ def test_execute_maps_structured_timeout_as_recoverable_observation() -> None:
             {"id": 2, "ok": True, "result": {"output": "still alive\n"}},
         ]
     )
-    interpreter = TerminalBenchRunnerInterpreter(
+    interpreter = TerminalBenchRunnerClientAdapter(
         object(),
         container_adapter=FakeAdapter(process),
         runner_path="/tmp/predict_rlm_runner.py",
@@ -447,7 +447,7 @@ def test_user_subprocess_stdin_is_isolated_from_terminal_bench_runner_protocol()
             processes.append(process)
             return process
 
-    interpreter = TerminalBenchRunnerInterpreter(
+    interpreter = TerminalBenchRunnerClientAdapter(
         object(),
         container_adapter=LocalAdapter(),
         runner_path="/tmp/predict_rlm_runner.py",
@@ -483,7 +483,7 @@ def test_aexecute_accepts_lm_selected_execution_timeout() -> None:
         process = FakeProcess(
             [{"id": 1, "ok": True, "result": {"output": "bounded async\n"}}]
         )
-        interpreter = TerminalBenchRunnerInterpreter(
+        interpreter = TerminalBenchRunnerClientAdapter(
             object(),
             container_adapter=FakeAdapter(process),
             runner_path="/tmp/predict_rlm_runner.py",
@@ -541,7 +541,7 @@ def test_lm_selected_silent_runner_timeout_is_recoverable_and_restarts() -> None
             processes.append(process)
             return process
 
-    interpreter = TerminalBenchRunnerInterpreter(
+    interpreter = TerminalBenchRunnerClientAdapter(
         object(),
         container_adapter=SilentAdapter(),
         runner_path="/tmp/predict_rlm_runner.py",
@@ -587,7 +587,7 @@ def test_execute_after_structured_timeout_restarts_dead_runner_with_diagnostic()
     )
     restarted_process = FakeProcess([])
     adapter = FakeAdapter([first_process, restarted_process])
-    interpreter = TerminalBenchRunnerInterpreter(
+    interpreter = TerminalBenchRunnerClientAdapter(
         object(),
         container_adapter=adapter,
         runner_path="/tmp/predict_rlm_runner.py",
@@ -628,7 +628,7 @@ def test_execute_after_structured_error_restarts_dead_runner_with_diagnostic() -
     )
     restarted_process = FakeProcess([])
     adapter = FakeAdapter([first_process, restarted_process])
-    interpreter = TerminalBenchRunnerInterpreter(
+    interpreter = TerminalBenchRunnerClientAdapter(
         object(),
         container_adapter=adapter,
         runner_path="/tmp/predict_rlm_runner.py",
@@ -657,7 +657,7 @@ def test_execute_maps_runner_errors() -> None:
             }
         ]
     )
-    interpreter = TerminalBenchRunnerInterpreter(
+    interpreter = TerminalBenchRunnerClientAdapter(
         object(),
         container_adapter=FakeAdapter(process),
         runner_path="/tmp/predict_rlm_runner.py",
@@ -678,7 +678,7 @@ def test_file_ops_use_container_adapter_not_host_filesystem(tmp_path: Path) -> N
             returncode=0,
         )
     )
-    interpreter = TerminalBenchRunnerInterpreter(object(), container_adapter=adapter)
+    interpreter = TerminalBenchRunnerClientAdapter(object(), container_adapter=adapter)
 
     source = tmp_path / "source.txt"
     target = tmp_path / "target.txt"
@@ -788,7 +788,7 @@ def test_terminal_bench_minimal_adapter_rejects_file_sync_operations() -> None:
     container = SimpleNamespace(id="container-123")
     session = SimpleNamespace(container=container)
     adapter = HarborContainerAdapter(session)
-    interpreter = TerminalBenchRunnerInterpreter(session, container_adapter=adapter)
+    interpreter = TerminalBenchRunnerClientAdapter(session, container_adapter=adapter)
 
     with pytest.raises(NotImplementedError, match="minimal smoke adapter.*file sync"):
         interpreter.mount_file_at("/host/input.txt", "/container/input.txt")
@@ -815,7 +815,7 @@ def test_host_tool_call_timeout_returns_bounded_tool_error() -> None:
             {"id": 2, "ok": True, "result": {"output": "handled timeout\n"}},
         ]
     )
-    interpreter = TerminalBenchRunnerInterpreter(
+    interpreter = TerminalBenchRunnerClientAdapter(
         object(),
         container_adapter=FakeAdapter(process),
         tools={"predict": slow_predict},

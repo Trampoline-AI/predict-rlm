@@ -1,4 +1,4 @@
-"""Thread-safe pool for SBX interpreters."""
+"""Thread-safe pool for SBX client adapters."""
 
 from __future__ import annotations
 
@@ -18,7 +18,7 @@ from .base import SbxConfig
 from .sbx_logging import log_pool_lifecycle
 
 if TYPE_CHECKING:
-    from .sbx import SbxInterpreter
+    from .sbx import SbxClientAdapter
 
 
 class SbxPool:
@@ -70,8 +70,8 @@ class SbxPool:
             "_runner_command": _runner_command,
         }
         self._staging_root = Path(_staging_root) if _staging_root is not None else None
-        self._available: queue.Queue[SbxInterpreter] = queue.Queue(maxsize=size)
-        self._all_interpreters: list[SbxInterpreter] = []
+        self._available: queue.Queue[SbxClientAdapter] = queue.Queue(maxsize=size)
+        self._all_interpreters: list[SbxClientAdapter] = []
         self._lock = threading.Lock()
         self._state_changed = threading.Condition(self._lock)
         self._started = False
@@ -145,7 +145,7 @@ class SbxPool:
             return True
 
     def _finish_start(self) -> None:
-        interpreters: list[SbxInterpreter] = []
+        interpreters: list[SbxClientAdapter] = []
         self._log_lifecycle("sbx.pool.start", size=self.size)
         try:
             for index in range(self.size):
@@ -269,7 +269,7 @@ class SbxPool:
             if self._is_stopping_locked() or not self._started:
                 raise RuntimeError("SbxPool is shut down")
 
-    def _acquire_interpreter(self) -> SbxInterpreter:
+    def _acquire_interpreter(self) -> SbxClientAdapter:
         with self._state_changed:
             while True:
                 if self._is_stopping_locked() or not self._started:
@@ -282,8 +282,8 @@ class SbxPool:
     def _is_stopping_locked(self) -> bool:
         return self._shutdown or self._shutdown_requested or self._shutting_down
 
-    def _create_interpreter(self, index: int) -> SbxInterpreter:
-        from .sbx import SbxInterpreter
+    def _create_interpreter(self, index: int) -> SbxClientAdapter:
+        from .sbx import SbxClientAdapter
 
         kwargs = dict(self._interpreter_kwargs)
         if self.size > 1:
@@ -292,7 +292,7 @@ class SbxPool:
             )
         if self._staging_root is not None:
             kwargs["_staging_root"] = self._staging_root / f"runner-{index}"
-        return SbxInterpreter(**kwargs)
+        return SbxClientAdapter(**kwargs)
 
     def _drain_available_locked(self) -> None:
         while True:
@@ -303,7 +303,7 @@ class SbxPool:
 
     def _shutdown_interpreters(
         self,
-        interpreters: list[SbxInterpreter],
+        interpreters: list[SbxClientAdapter],
         *,
         suppress_errors: bool = False,
     ) -> None:

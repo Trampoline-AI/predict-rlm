@@ -1,4 +1,4 @@
-"""Logging helpers for SBX interpreter backends."""
+"""Logging helpers for SBX client adapter backends."""
 
 from __future__ import annotations
 

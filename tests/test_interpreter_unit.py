@@ -13,7 +13,7 @@ from dspy.primitives.code_interpreter import CodeInterpreterError
 
 from predict_rlm.interpreter import (
     RUNNER_PATH,
-    JspiInterpreter,
+    JspiClientAdapter,
     SandboxFatalError,
     _needs_jspi_flag,
 )
@@ -61,11 +61,11 @@ class TestNeedsJspiFlag:
 
 
 def _make_interpreter():
-    """Create a JspiInterpreter without running __init__ (no Deno subprocess)."""
-    return JspiInterpreter.__new__(JspiInterpreter)
+    """Create a JspiClientAdapter without running __init__ (no Deno subprocess)."""
+    return JspiClientAdapter.__new__(JspiClientAdapter)
 
 
-def _attach_telemetry(interp: JspiInterpreter) -> ListTelemetrySink:
+def _attach_telemetry(interp: JspiClientAdapter) -> ListTelemetrySink:
     sink = ListTelemetrySink()
     interp._telemetry_context = TelemetryContext(sink=sink, trace_id="trace-1")
     interp._interpreter_id = "jspi-test"

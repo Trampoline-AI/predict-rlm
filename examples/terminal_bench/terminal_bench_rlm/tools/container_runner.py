@@ -31,7 +31,7 @@ from predict_rlm.execution_timeout import (
     validate_execution_timeout,
 )
 from predict_rlm.interpreter import SandboxFatalError
-from predict_rlm.interpreters.base import InterpreterExecutionGate, PredictRLMInterpreter
+from predict_rlm.interpreters.base import ClientAdapterExecutionGate, PredictRLMClientAdapter
 from predict_rlm.interpreters.persistent_runner import (
     PersistentJsonRpcRunnerClient,
     PersistentSupervisorProcess,
@@ -432,7 +432,7 @@ class LocalProcessRunnerAdapter:
         )
 
 
-class TerminalBenchRunnerInterpreter(PersistentJsonRpcRunnerClient, PredictRLMInterpreter):
+class TerminalBenchRunnerClientAdapter(PersistentJsonRpcRunnerClient, PredictRLMClientAdapter):
     _LIST_DIR_SCRIPT = (
         "import json, pathlib, sys; "
         "root = pathlib.Path(sys.argv[1]); "
@@ -472,7 +472,7 @@ class TerminalBenchRunnerInterpreter(PersistentJsonRpcRunnerClient, PredictRLMIn
         self._tools_registered = False
         self._output_fields_registered = False
         self._stdout_reader: _TimeoutLineReader | None = None
-        self._execution_gate = InterpreterExecutionGate("Terminal-Bench supervisor")
+        self._execution_gate = ClientAdapterExecutionGate("Terminal-Bench supervisor")
         self._debug_request_context: dict[int, dict[str, Any]] = {}
         self._defer_next_submit_finalization = False
 
@@ -1225,7 +1225,7 @@ class TerminalBenchRunnerInterpreter(PersistentJsonRpcRunnerClient, PredictRLMIn
             )
 
 
-class LocalProcessRunnerInterpreter(TerminalBenchRunnerInterpreter):
+class LocalProcessRunnerClientAdapter(TerminalBenchRunnerClientAdapter):
     """PredictRLM interpreter that runs the persistent supervisor locally."""
 
     def __init__(

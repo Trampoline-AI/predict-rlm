@@ -13,7 +13,7 @@ from typing import Annotated
 import pytest
 
 from predict_rlm.files import SyncedFile, get_synced_file_params
-from predict_rlm.interpreter import JspiInterpreter
+from predict_rlm.interpreter import JspiClientAdapter
 
 # ─── Unit tests ───────────────────────────────────────────────────────────────
 
@@ -132,7 +132,7 @@ class TestSyncedFileIntegration:
                 f.write("modified by host tool")
             return "ok"
 
-        interpreter = JspiInterpreter(
+        interpreter = JspiClientAdapter(
             preinstall_packages=False, tools={"modify_file": modify_file}
         )
         try:
@@ -161,7 +161,7 @@ print(f"content after tool: {content}")
             with open(file_path, "r") as f:
                 return f.read().strip()
 
-        interpreter = JspiInterpreter(
+        interpreter = JspiClientAdapter(
             preinstall_packages=False, tools={"read_file": read_file}
         )
         try:
@@ -185,7 +185,7 @@ print(f"got: {result}")
                 f.write(bytes(b ^ 0xFF for b in data))
             return "ok"
 
-        interpreter = JspiInterpreter(
+        interpreter = JspiClientAdapter(
             preinstall_packages=False, tools={"flip_bytes": flip_bytes}
         )
         try:
@@ -217,7 +217,7 @@ print("binary roundtrip ok")
         def plain_tool(msg: str) -> str:
             return f"echo: {msg}"
 
-        interpreter = JspiInterpreter(
+        interpreter = JspiClientAdapter(
             preinstall_packages=False,
             tools={"synced_tool": synced_tool, "plain_tool": plain_tool},
         )
@@ -236,7 +236,7 @@ print(result)
             with open(file_path) as f:
                 return f.read()
 
-        interpreter = JspiInterpreter(
+        interpreter = JspiClientAdapter(
             preinstall_packages=False, tools={"read_it": read_it}
         )
         try:
@@ -258,7 +258,7 @@ except Exception as e:
                 f.write("\nextra line from host")
             return "ok"
 
-        interpreter = JspiInterpreter(
+        interpreter = JspiClientAdapter(
             preinstall_packages=False, tools={"append_data": append_data}
         )
         try:
@@ -290,7 +290,7 @@ print(f"last line: {lines[-1].strip()}")
                 f.write(str(val + 1))
             return str(val + 1)
 
-        interpreter = JspiInterpreter(
+        interpreter = JspiClientAdapter(
             preinstall_packages=False, tools={"increment_file": increment_file}
         )
         try:
@@ -324,7 +324,7 @@ print(f"final: {final}")
             with open(file_path, "r") as f:
                 return f.read().strip()
 
-        interpreter = JspiInterpreter(
+        interpreter = JspiClientAdapter(
             preinstall_packages=False, tools={"maybe_fail": maybe_fail}
         )
         try:
@@ -357,7 +357,7 @@ print(f"after error: {result}")
         def compute(x: int, y: int) -> int:
             return x + y
 
-        interpreter = JspiInterpreter(
+        interpreter = JspiClientAdapter(
             preinstall_packages=False,
             tools={"transform_file": transform_file, "compute": compute},
         )
@@ -387,7 +387,7 @@ print(f"transformed: {result}")
                 f.write(" [stamped]")
             return "ok"
 
-        interpreter = JspiInterpreter(
+        interpreter = JspiClientAdapter(
             preinstall_packages=False, tools={"stamp_file": stamp_file}
         )
         try:
@@ -422,7 +422,7 @@ print(f"result: {result}")
                 f.write(content[::-1])
             return "ok"
 
-        interpreter = JspiInterpreter(
+        interpreter = JspiClientAdapter(
             preinstall_packages=False, tools={"async_transform": async_transform}
         )
         try:
@@ -448,7 +448,7 @@ print(f"reversed: {result}")
             temp_dirs.append(os.path.dirname(file_path))
             return "ok"
 
-        interpreter = JspiInterpreter(
+        interpreter = JspiClientAdapter(
             preinstall_packages=False, tools={"capture_dir": capture_dir}
         )
         try:
@@ -471,7 +471,7 @@ await capture_dir(file_path="/tmp/cleanup_test.txt")
                 content = f.read()
             return {"length": len(content), "lines": content.count("\n") + 1}
 
-        interpreter = JspiInterpreter(
+        interpreter = JspiClientAdapter(
             preinstall_packages=False, tools={"analyze_file": analyze_file}
         )
         try:
@@ -496,7 +496,7 @@ print(f"length: {result['length']}, lines: {result['lines']}")
                 f.write("modified on host")
             return "ok"
 
-        interpreter = JspiInterpreter(
+        interpreter = JspiClientAdapter(
             preinstall_packages=False,
             tools={"modify_but_readonly": modify_but_readonly},
         )
@@ -527,7 +527,7 @@ print(f"content: {content}")
             received_paths.append(str(file_path))
             return "ok"
 
-        interpreter = JspiInterpreter(
+        interpreter = JspiClientAdapter(
             preinstall_packages=False, tools={"check_dir": check_dir}
         )
         try:
@@ -551,7 +551,7 @@ await check_dir(file_path="/tmp/hostdir_test.txt")
         ) -> str:
             return f"path={file_path}, data={data}"
 
-        interpreter = JspiInterpreter(
+        interpreter = JspiClientAdapter(
             preinstall_packages=False, tools={"flexible_tool": flexible_tool}
         )
         try:

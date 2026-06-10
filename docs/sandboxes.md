@@ -35,7 +35,7 @@ The project currently has two execution families:
 ### JSPI/Deno/Pyodide
 
 ```text
-host `JspiInterpreter`
+host `JspiClientAdapter`
   -> persistent Deno process running `sandbox/runner.js`
        -> one live Pyodide Python VM
 ```

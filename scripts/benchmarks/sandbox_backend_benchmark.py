@@ -185,15 +185,15 @@ def check_backend_available(backend: str) -> str | None:
 
 def make_interpreter(backend: str):
     if backend == "jspi":
-        from predict_rlm.interpreter import JspiInterpreter
+        from predict_rlm.interpreter import JspiClientAdapter
 
-        return JspiInterpreter(tools={}, preinstall_packages=False)
+        return JspiClientAdapter(tools={}, preinstall_packages=False)
     if backend == "sbx":
-        from predict_rlm.interpreters import SbxConfig, SbxInterpreter
+        from predict_rlm.interpreters import SbxClientAdapter, SbxConfig
 
         config = SbxConfig(name=f"predict-rlm-bench-{uuid.uuid4().hex[:12]}")
-        return SbxInterpreter(config=config, tools={}, preinstall_packages=False)
-    raise ValueError(f"Unsupported interpreter backend: {backend}")
+        return SbxClientAdapter(config=config, tools={}, preinstall_packages=False)
+    raise ValueError(f"Unsupported client adapter backend: {backend}")
 
 
 def make_pool(size: int):
@@ -204,10 +204,10 @@ def make_pool(size: int):
 
 
 def make_sbx_pool_interpreter(prefix: str, index: int):
-    from predict_rlm.interpreters import SbxConfig, SbxInterpreter
+    from predict_rlm.interpreters import SbxClientAdapter, SbxConfig
 
     config = SbxConfig(name=f"{prefix}-{index}")
-    return SbxInterpreter(config=config, tools={}, preinstall_packages=False)
+    return SbxClientAdapter(config=config, tools={}, preinstall_packages=False)
 
 
 def execute_file_io(interpreter: Any, source: Path, synced_output: Path) -> None:

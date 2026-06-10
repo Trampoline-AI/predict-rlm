@@ -19,8 +19,8 @@ from .files import File, LocalDir, LocalFile, OutputDir, OutputFile, SyncedFile
 from .interpreters import (
     DEFAULT_SBX_TEMPLATE,
     SandboxBackend,
+    SbxClientAdapter,
     SbxConfig,
-    SbxInterpreter,
     SbxPool,
 )
 from .predict_rlm import PredictRLM, SubmitConfirmationContext
@@ -41,7 +41,7 @@ __all__ = [
     "SandboxBackend",
     "Skill",
     "SbxConfig",
-    "SbxInterpreter",
+    "SbxClientAdapter",
     "SbxPool",
     "SyncedFile",
 ]

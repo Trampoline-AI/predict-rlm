@@ -1,4 +1,4 @@
-"""Shared interpreter backend types."""
+"""Shared execution client-adapter types."""
 
 from __future__ import annotations
 
@@ -21,8 +21,8 @@ _TOOL_CALLBACK_GATES: contextvars.ContextVar[frozenset[int]] = (
 _THREAD_LOCAL_TOOL_CALLBACKS = threading.local()
 
 
-class InterpreterExecutionGate:
-    """Serialize top-level interpreter execution and reject tool reentry."""
+class ClientAdapterExecutionGate:
+    """Serialize top-level client-adapter execution and reject tool reentry."""
 
     def __init__(self, interpreter_name: str) -> None:
         self._interpreter_name = interpreter_name
@@ -141,8 +141,8 @@ class SbxConfig(BaseModel):
     exec_timeout: float = 300.0
 
 
-class PredictRLMInterpreter(Protocol):
-    """Runtime methods PredictRLM needs from a sandbox interpreter."""
+class PredictRLMClientAdapter(Protocol):
+    """Runtime methods PredictRLM needs from an execution client adapter."""
 
     def execute(
         self,

@@ -53,12 +53,12 @@ from ._logging import (
 from ._shared import build_rlm_signatures, format_tool_docs_full, strip_code_fences
 from .execution_timeout import validate_execution_timeout
 from .files import File, build_file_plan, scan_file_fields
-from .interpreter import JspiInterpreter, SandboxFatalError
+from .interpreter import JspiClientAdapter, SandboxFatalError
 from .interpreters import (
-    PredictRLMInterpreter,
+    PredictRLMClientAdapter,
     SandboxBackend,
+    SbxClientAdapter,
     SbxConfig,
-    SbxInterpreter,
     SbxPool,
 )
 from .rlm_skills import Skill, merge_skills
@@ -900,14 +900,14 @@ class PredictRLM(dspy.RLM):
                   Accepts a dict mapping names to callables, or a list of
                   callables (names inferred from __name__).
                   predict is added automatically if not already provided.
-            interpreter: CodeInterpreter implementation to use. Defaults to
-                        JSPI-enabled JspiInterpreter.
+            interpreter: CodeInterpreter-compatible client adapter to use.
+                        Defaults to JSPI-enabled JspiClientAdapter.
             sandbox_backend: Named sandbox backend to create when interpreter
                             is not provided. Defaults to "jspi"; pass "sbx"
                             to opt into Docker Sandboxes.
             sbx_config: Docker Sandboxes backend configuration.
-            sbx_pool: Prewarmed Docker Sandboxes interpreter pool. Requires
-                      ``sandbox_backend="sbx"`` and owns its interpreter config.
+            sbx_pool: Prewarmed Docker Sandboxes client-adapter pool. Requires
+                      ``sandbox_backend="sbx"`` and owns its adapter config.
             allowed_domains: Domains/IPs the sandbox can access via network.
                             By default, no network access is allowed.
                             Example: ["api.example.com", "192.168.1.100:8080"]
@@ -1442,7 +1442,7 @@ class PredictRLM(dspy.RLM):
         self,
         execution_tools: dict[str, Callable],
         file_plan: dict[str, Any] | None = None,
-    ) -> Iterator[PredictRLMInterpreter]:
+    ) -> Iterator[PredictRLMClientAdapter]:
         """Yield interpreter, creating the configured backend if none provided."""
         if self._interpreter is not None:
             self._inject_execution_context(self._interpreter, execution_tools)
@@ -1521,7 +1521,7 @@ class PredictRLM(dspy.RLM):
                     allowed_domains=len(self._allowed_domains or []),
                     skill_packages=len(self._skill_packages or []),
                 )
-                repl = SbxInterpreter(config=self._sbx_config, **interpreter_kwargs)
+                repl = SbxClientAdapter(config=self._sbx_config, **interpreter_kwargs)
             else:
                 self._log_lifecycle(
                     "interpreter.create",
@@ -1531,7 +1531,7 @@ class PredictRLM(dspy.RLM):
                     allowed_domains=len(self._allowed_domains or []),
                     skill_packages=len(self._skill_packages or []),
                 )
-                repl = JspiInterpreter(
+                repl = JspiClientAdapter(
                     **interpreter_kwargs,
                     telemetry_context=self._current_telemetry_context,
                 )
@@ -1710,9 +1710,9 @@ class PredictRLM(dspy.RLM):
             logger.debug("%s%s", event, format_log_fields(fields))
 
     def _interpreter_backend_label(self, repl: Any) -> str:
-        if isinstance(SbxInterpreter, type) and isinstance(repl, SbxInterpreter):
+        if isinstance(SbxClientAdapter, type) and isinstance(repl, SbxClientAdapter):
             return "sbx"
-        if isinstance(JspiInterpreter, type) and isinstance(repl, JspiInterpreter):
+        if isinstance(JspiClientAdapter, type) and isinstance(repl, JspiClientAdapter):
             return "jspi"
         return type(repl).__name__
 
@@ -2619,7 +2619,7 @@ class PredictRLM(dspy.RLM):
 
         The parent calls repl.execute() synchronously which blocks the event
         loop, serializing all concurrent rollouts. This override uses
-        repl.aexecute() (available on JspiInterpreter) so the event loop
+        repl.aexecute() (available on JspiClientAdapter) so the event loop
         stays free for other coroutines.
         """
         variables_info, action_start_ns = self._begin_action_generation(
@@ -2729,7 +2729,7 @@ class PredictRLM(dspy.RLM):
         return file_plan, transformed
 
     def _setup_sandbox_files(
-        self, repl: PredictRLMInterpreter, file_plan: dict[str, Any]
+        self, repl: PredictRLMClientAdapter, file_plan: dict[str, Any]
     ) -> None:
         """Mount input files, skill modules, and create output dirs in the sandbox."""
         self._log_lifecycle(
@@ -2777,7 +2777,7 @@ class PredictRLM(dspy.RLM):
 
     def _sync_output_files(
         self,
-        repl: PredictRLMInterpreter,
+        repl: PredictRLMClientAdapter,
         prediction: dspy.Prediction,
         output_file_fields: dict[str, str],
         file_plan: dict[str, Any],

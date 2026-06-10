@@ -11,7 +11,7 @@ import pytest
 from dspy.primitives.code_interpreter import CodeInterpreterError
 
 import predict_rlm.interpreter as rlm_interpreter
-from predict_rlm.interpreter import JSONRPC_APP_ERRORS, JspiInterpreter
+from predict_rlm.interpreter import JSONRPC_APP_ERRORS, JspiClientAdapter
 
 
 class _BlockingStdin:
@@ -54,7 +54,7 @@ class _BufferingStdout:
 
 
 def test_execute_recovers_when_stdin_blocks(monkeypatch):
-    interpreter = JspiInterpreter(preinstall_packages=False)
+    interpreter = JspiClientAdapter(preinstall_packages=False)
 
     read_fd, write_fd = os.pipe()
     try:
@@ -113,7 +113,7 @@ def test_execute_recovers_when_stdin_blocks(monkeypatch):
 
 
 def test_send_request_falls_back_before_fd_ready(monkeypatch):
-    interpreter = JspiInterpreter(preinstall_packages=False)
+    interpreter = JspiClientAdapter(preinstall_packages=False)
     stdin = _BufferingStdin()
 
     interpreter.deno_process = types.SimpleNamespace(
@@ -136,7 +136,7 @@ def test_send_request_falls_back_before_fd_ready(monkeypatch):
 
 
 def test_read_with_timeout_falls_back(monkeypatch):
-    interpreter = JspiInterpreter(preinstall_packages=False)
+    interpreter = JspiClientAdapter(preinstall_packages=False)
     expected_line = json.dumps({"result": {"output": "hello"}, "id": 1}) + "\n"
     stdout = _BufferingStdout([expected_line])
 
@@ -165,14 +165,14 @@ def test_read_with_timeout_falls_back(monkeypatch):
 def test_get_semaphore_creates_on_first_call():
     """First call creates an asyncio.Semaphore; second call returns the same one."""
     # Reset class-level state so the test is isolated
-    JspiInterpreter._sandbox_semaphore = None
+    JspiClientAdapter._sandbox_semaphore = None
     try:
-        sem1 = JspiInterpreter._get_semaphore()
-        sem2 = JspiInterpreter._get_semaphore()
+        sem1 = JspiClientAdapter._get_semaphore()
+        sem2 = JspiClientAdapter._get_semaphore()
         assert isinstance(sem1, asyncio.Semaphore)
         assert sem1 is sem2
     finally:
-        JspiInterpreter._sandbox_semaphore = None
+        JspiClientAdapter._sandbox_semaphore = None
 
 
 # ---------------------------------------------------------------------------
@@ -182,7 +182,7 @@ def test_get_semaphore_creates_on_first_call():
 
 def test_shutdown_clean_exit():
     """shutdown() sends shutdown message and waits; process exits cleanly."""
-    interpreter = JspiInterpreter(preinstall_packages=False)
+    interpreter = JspiClientAdapter(preinstall_packages=False)
     wait_calls = []
     close_called = {"value": False}
 
@@ -211,7 +211,7 @@ def test_shutdown_clean_exit():
 
 def test_shutdown_timeout_kills_process():
     """shutdown() kills process when wait() raises TimeoutExpired."""
-    interpreter = JspiInterpreter(preinstall_packages=False)
+    interpreter = JspiClientAdapter(preinstall_packages=False)
     stdin = _BufferingStdin()
     killed = {"value": False}
     final_wait_calls = []
@@ -248,7 +248,7 @@ def test_shutdown_timeout_kills_process():
 
 def test_shutdown_noop_when_process_already_exited():
     """shutdown() is a no-op if deno_process is None."""
-    interpreter = JspiInterpreter(preinstall_packages=False)
+    interpreter = JspiClientAdapter(preinstall_packages=False)
     interpreter.deno_process = None
     interpreter.shutdown()  # should not raise
     assert interpreter.deno_process is None
@@ -261,7 +261,7 @@ def test_shutdown_noop_when_process_already_exited():
 
 def test_sync_files_sends_messages():
     """_sync_files sends a sync_file JSON-RPC message for each write path."""
-    interpreter = JspiInterpreter(preinstall_packages=False)
+    interpreter = JspiClientAdapter(preinstall_packages=False)
     stdin = _BufferingStdin()
 
     interpreter.deno_process = types.SimpleNamespace(
@@ -285,7 +285,7 @@ def test_sync_files_sends_messages():
 
 def test_sync_files_skips_when_disabled():
     """_sync_files is a no-op when sync_files is False."""
-    interpreter = JspiInterpreter(preinstall_packages=False)
+    interpreter = JspiClientAdapter(preinstall_packages=False)
     stdin = _BufferingStdin()
 
     interpreter.deno_process = types.SimpleNamespace(
@@ -302,7 +302,7 @@ def test_sync_files_skips_when_disabled():
 
 def test_sync_files_skips_when_no_write_paths():
     """_sync_files is a no-op when enable_write_paths is empty."""
-    interpreter = JspiInterpreter(preinstall_packages=False)
+    interpreter = JspiClientAdapter(preinstall_packages=False)
     stdin = _BufferingStdin()
 
     interpreter.deno_process = types.SimpleNamespace(
@@ -324,7 +324,7 @@ def test_sync_files_skips_when_no_write_paths():
 
 def test_send_request_deno_exit_detection():
     """_send_request raises CodeInterpreterError when Deno has exited."""
-    interpreter = JspiInterpreter(preinstall_packages=False)
+    interpreter = JspiClientAdapter(preinstall_packages=False)
     stdin = _BufferingStdin()
 
     # poll() returns None during _write_stdin (process alive), then 1 after
@@ -352,7 +352,7 @@ def test_send_request_response_id_mismatch():
     exhausting its safety cap — ensuring that a runaway wrong-id stream
     doesn't hang the caller forever.
     """
-    interpreter = JspiInterpreter(preinstall_packages=False)
+    interpreter = JspiClientAdapter(preinstall_packages=False)
     stdin = _BufferingStdin()
 
     interpreter.deno_process = types.SimpleNamespace(
@@ -372,7 +372,7 @@ def test_send_request_response_id_mismatch():
 
 def test_send_request_error_in_response():
     """_send_request raises CodeInterpreterError when response contains an error."""
-    interpreter = JspiInterpreter(preinstall_packages=False)
+    interpreter = JspiClientAdapter(preinstall_packages=False)
     stdin = _BufferingStdin()
 
     interpreter.deno_process = types.SimpleNamespace(
@@ -397,7 +397,7 @@ def test_send_request_error_in_response():
 
 
 def test_execute_serializes_concurrent_calls_without_real_deno(monkeypatch):
-    interpreter = JspiInterpreter(preinstall_packages=False)
+    interpreter = JspiClientAdapter(preinstall_packages=False)
     interpreter.deno_process = types.SimpleNamespace(
         stdin=_BufferingStdin(),
         stderr=_SilentStderr(),
@@ -463,9 +463,9 @@ def test_execute_serializes_concurrent_calls_without_real_deno(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_aexecute_serializes_concurrent_calls_without_real_deno():
-    JspiInterpreter._sandbox_semaphore = None
+    JspiClientAdapter._sandbox_semaphore = None
     try:
-        interpreter = JspiInterpreter(preinstall_packages=False)
+        interpreter = JspiClientAdapter(preinstall_packages=False)
         active = 0
         max_active = 0
 
@@ -491,12 +491,12 @@ async def test_aexecute_serializes_concurrent_calls_without_real_deno():
         assert max_active == 1
         assert time.monotonic() - start >= 0.18
     finally:
-        JspiInterpreter._sandbox_semaphore = None
+        JspiClientAdapter._sandbox_semaphore = None
 
 
 @pytest.mark.asyncio
 async def test_aexecute_from_tool_callback_context_raises_runtimeerror():
-    interpreter = JspiInterpreter(preinstall_packages=False)
+    interpreter = JspiClientAdapter(preinstall_packages=False)
 
     with interpreter._execution_gate.async_tool_callback():
         with pytest.raises(RuntimeError, match="host tool callback"):
@@ -511,10 +511,10 @@ async def test_aexecute_from_tool_callback_context_raises_runtimeerror():
 @pytest.mark.asyncio
 async def test_aexecute_acquires_and_releases_semaphore():
     """aexecute acquires the semaphore before running and releases it after."""
-    JspiInterpreter._sandbox_semaphore = None
+    JspiClientAdapter._sandbox_semaphore = None
     try:
-        interpreter = JspiInterpreter(preinstall_packages=False)
-        sem = JspiInterpreter._get_semaphore()
+        interpreter = JspiClientAdapter(preinstall_packages=False)
+        sem = JspiClientAdapter._get_semaphore()
 
         acquire_count = {"value": 0}
         release_count = {"value": 0}
@@ -543,16 +543,16 @@ async def test_aexecute_acquires_and_releases_semaphore():
         assert acquire_count["value"] == 1
         assert release_count["value"] == 1
     finally:
-        JspiInterpreter._sandbox_semaphore = None
+        JspiClientAdapter._sandbox_semaphore = None
 
 
 @pytest.mark.asyncio
 async def test_aexecute_releases_semaphore_on_error():
     """aexecute releases the semaphore even when _aexecute_inner raises."""
-    JspiInterpreter._sandbox_semaphore = None
+    JspiClientAdapter._sandbox_semaphore = None
     try:
-        interpreter = JspiInterpreter(preinstall_packages=False)
-        sem = JspiInterpreter._get_semaphore()
+        interpreter = JspiClientAdapter(preinstall_packages=False)
+        sem = JspiClientAdapter._get_semaphore()
 
         release_count = {"value": 0}
         original_release = sem.release
@@ -573,7 +573,7 @@ async def test_aexecute_releases_semaphore_on_error():
 
         assert release_count["value"] == 1
     finally:
-        JspiInterpreter._sandbox_semaphore = None
+        JspiClientAdapter._sandbox_semaphore = None
 
 
 # ---------------------------------------------------------------------------
@@ -584,7 +584,7 @@ async def test_aexecute_releases_semaphore_on_error():
 @pytest.mark.asyncio
 async def test_write_stdin_async_normal_write(monkeypatch):
     """_write_stdin_async writes data via os.write in a single pass."""
-    interpreter = JspiInterpreter(preinstall_packages=False)
+    interpreter = JspiClientAdapter(preinstall_packages=False)
     written_chunks = []
 
     interpreter.deno_process = types.SimpleNamespace(poll=lambda: None)
@@ -605,7 +605,7 @@ async def test_write_stdin_async_normal_write(monkeypatch):
 @pytest.mark.asyncio
 async def test_write_stdin_async_blocking_retry(monkeypatch):
     """_write_stdin_async retries via add_writer when BlockingIOError occurs."""
-    interpreter = JspiInterpreter(preinstall_packages=False)
+    interpreter = JspiClientAdapter(preinstall_packages=False)
 
     interpreter.deno_process = types.SimpleNamespace(poll=lambda: None)
     interpreter._stdin_fd = 42
@@ -645,7 +645,7 @@ async def test_write_stdin_async_blocking_retry(monkeypatch):
 @pytest.mark.asyncio
 async def test_write_stdin_async_raises_when_process_dead():
     """_write_stdin_async raises CodeInterpreterError when process has exited."""
-    interpreter = JspiInterpreter(preinstall_packages=False)
+    interpreter = JspiClientAdapter(preinstall_packages=False)
     interpreter.deno_process = types.SimpleNamespace(poll=lambda: 1)
     interpreter._stdin_fd = 42
 
@@ -661,7 +661,7 @@ async def test_write_stdin_async_raises_when_process_dead():
 @pytest.mark.asyncio
 async def test_send_completed_responses_sends_one_result(monkeypatch):
     """_send_completed_responses sends at most one response for a completed task."""
-    interpreter = JspiInterpreter(preinstall_packages=False)
+    interpreter = JspiClientAdapter(preinstall_packages=False)
     sent_messages = []
 
     async def fake_write(data):
@@ -690,7 +690,7 @@ async def test_send_completed_responses_sends_one_result(monkeypatch):
 @pytest.mark.asyncio
 async def test_send_completed_responses_error_task(monkeypatch):
     """_send_completed_responses sends a JSON-RPC error for a failed task."""
-    interpreter = JspiInterpreter(preinstall_packages=False)
+    interpreter = JspiClientAdapter(preinstall_packages=False)
     sent_messages = []
 
     async def fake_write(data):
@@ -717,7 +717,7 @@ async def test_send_completed_responses_error_task(monkeypatch):
 @pytest.mark.asyncio
 async def test_send_completed_responses_exception_in_task():
     """_send_completed_responses handles an exception raised by the task."""
-    interpreter = JspiInterpreter(preinstall_packages=False)
+    interpreter = JspiClientAdapter(preinstall_packages=False)
     sent_messages = []
 
     async def fake_write(data):
@@ -746,7 +746,7 @@ async def test_send_completed_responses_exception_in_task():
 @pytest.mark.asyncio
 async def test_wait_and_send_all_responses_sends_all():
     """_wait_and_send_all_responses waits for all tasks and sends responses."""
-    interpreter = JspiInterpreter(preinstall_packages=False)
+    interpreter = JspiClientAdapter(preinstall_packages=False)
     sent_messages = []
 
     async def fake_write(data):
@@ -770,7 +770,7 @@ async def test_wait_and_send_all_responses_sends_all():
 @pytest.mark.asyncio
 async def test_wait_and_send_all_responses_error_path():
     """_wait_and_send_all_responses sends error for a task that raises."""
-    interpreter = JspiInterpreter(preinstall_packages=False)
+    interpreter = JspiClientAdapter(preinstall_packages=False)
     sent_messages = []
 
     async def fake_write(data):
@@ -800,7 +800,7 @@ async def test_wait_and_send_all_responses_error_path():
 @pytest.mark.asyncio
 async def test_execute_async_syntax_error_formatting():
     """_execute_async formats SyntaxError with line/col/text from args tuple."""
-    interpreter = JspiInterpreter(preinstall_packages=False)
+    interpreter = JspiClientAdapter(preinstall_packages=False)
 
     # Build a JSON-RPC error response with SyntaxError args format
     error_response = json.dumps({
@@ -848,7 +848,7 @@ async def test_execute_async_syntax_error_formatting():
 @pytest.mark.asyncio
 async def test_execute_async_syntax_error_minimal_args():
     """_execute_async handles SyntaxError with minimal args (just message)."""
-    interpreter = JspiInterpreter(preinstall_packages=False)
+    interpreter = JspiClientAdapter(preinstall_packages=False)
 
     error_response = json.dumps({
         "jsonrpc": "2.0",
@@ -890,7 +890,7 @@ async def test_execute_async_syntax_error_minimal_args():
 
 def test_read_with_timeout_uses_stdout_fileno_when_fd_negative(monkeypatch):
     """_read_with_timeout uses stdout.fileno() when _stdout_fd < 0."""
-    interpreter = JspiInterpreter(preinstall_packages=False)
+    interpreter = JspiClientAdapter(preinstall_packages=False)
     expected_line = json.dumps({"result": "ok", "id": 1}) + "\n"
 
     # _BufferingStdout.fileno() returns 999 by default
@@ -927,7 +927,7 @@ def test_read_with_timeout_uses_stdout_fileno_when_fd_negative(monkeypatch):
 
 def test_read_with_timeout_returns_none_when_no_stdout(monkeypatch):
     """_read_with_timeout returns None when stdout is None and fd < 0."""
-    interpreter = JspiInterpreter(preinstall_packages=False)
+    interpreter = JspiClientAdapter(preinstall_packages=False)
 
     interpreter.deno_process = types.SimpleNamespace(
         stdin=None,

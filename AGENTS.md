@@ -121,7 +121,7 @@ small.
   builds action/extract signatures, manages LM contexts. The
   `_create_predict_tool()` method handles signature parsing, Pydantic model
   reconstruction from JSON schemas, and `dspy.Image` type coercion.
-- **`interpreter.py`** -- `JspiInterpreter`. Manages the Deno subprocess running
+- **`interpreter.py`** -- `JspiClientAdapter`. Manages the Deno subprocess running
   `sandbox/runner.js`. Handles JSPI flag detection, concurrent tool execution
   via `asyncio.gather()`, package installation, and network permissions.
 - **`rlm_skills.py`** -- `Skill` dataclass and `merge_skills()`. Skills bundle

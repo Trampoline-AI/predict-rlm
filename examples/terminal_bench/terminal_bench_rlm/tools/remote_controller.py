@@ -81,9 +81,9 @@ def _restore_verbose_rlm_log_stream(state: tuple[logging.Logger, int, bool, logg
 
 
 def _local_process_interpreter_class() -> Any:
-    from .container_runner import LocalProcessRunnerInterpreter
+    from .container_runner import LocalProcessRunnerClientAdapter
 
-    return LocalProcessRunnerInterpreter
+    return LocalProcessRunnerClientAdapter
 
 
 def _logging_dir(payload: dict[str, Any]) -> Path | None:

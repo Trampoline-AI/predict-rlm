@@ -1,4 +1,4 @@
-"""Docker Sandboxes interpreter backend."""
+"""Docker Sandboxes client adapter."""
 
 from __future__ import annotations
 
@@ -43,8 +43,8 @@ from predict_rlm.interpreter import SandboxFatalError
 from predict_rlm.trace import ToolCall, ms_since, record_tool_call
 
 from .base import (
-    InterpreterExecutionGate,
-    PredictRLMInterpreter,
+    ClientAdapterExecutionGate,
+    PredictRLMClientAdapter,
     SandboxExecutionError,
     SbxConfig,
 )
@@ -56,10 +56,10 @@ DEFAULT_PACKAGE_DOMAINS = ["pypi.org", "files.pythonhosted.org"]
 SBX_PYTHON_EXECUTABLE = "python3"
 
 
-class SbxInterpreter(PersistentJsonRpcRunnerClient, PredictRLMInterpreter):
-    """Interpreter backend powered by Docker Sandboxes.
+class SbxClientAdapter(PersistentJsonRpcRunnerClient, PredictRLMClientAdapter):
+    """Client adapter backed by Docker Sandboxes.
 
-    The backend starts a Python JSON-RPC supervisor inside a Docker Sandbox and
+    The adapter starts a Python JSON-RPC supervisor inside a Docker Sandbox and
     maps predict-rlm virtual paths under a per-run workspace staging root.
     """
 
@@ -109,7 +109,7 @@ class SbxInterpreter(PersistentJsonRpcRunnerClient, PredictRLMInterpreter):
         self._stdout_reader: threading.Thread | None = None
         self._pending_tool_calls: dict[concurrent.futures.Future[dict[str, Any]], int] = {}
         self._active_execute_timeout_deadline: float | None = None
-        self._execution_gate = InterpreterExecutionGate("SBX interpreter")
+        self._execution_gate = ClientAdapterExecutionGate("SBX client adapter")
         self._sandbox_name: str | None = None
         self._prepared_runner_path: Path | None = None
         self._shutdown = False
@@ -1180,8 +1180,8 @@ class SbxPool:
             "_supervisor_command": _supervisor_command or _runner_command,
         }
         self._staging_root = Path(_staging_root) if _staging_root is not None else None
-        self._available: queue.Queue[SbxInterpreter] = queue.Queue(maxsize=size)
-        self._all_interpreters: list[SbxInterpreter] = []
+        self._available: queue.Queue[SbxClientAdapter] = queue.Queue(maxsize=size)
+        self._all_interpreters: list[SbxClientAdapter] = []
         self._lock = threading.Lock()
         self._state_changed = threading.Condition(self._lock)
         self._started = False
@@ -1224,7 +1224,7 @@ class SbxPool:
             return True
 
     def _finish_start(self) -> None:
-        interpreters: list[SbxInterpreter] = []
+        interpreters: list[SbxClientAdapter] = []
         try:
             for index in range(self.size):
                 interpreters.append(self._create_interpreter(index))
@@ -1320,7 +1320,7 @@ class SbxPool:
             if self._is_stopping_locked() or not self._started:
                 raise RuntimeError("SbxPool is shut down")
 
-    def _acquire_interpreter(self) -> SbxInterpreter:
+    def _acquire_interpreter(self) -> SbxClientAdapter:
         with self._state_changed:
             while True:
                 if self._is_stopping_locked() or not self._started:
@@ -1333,7 +1333,7 @@ class SbxPool:
     def _is_stopping_locked(self) -> bool:
         return self._shutdown or self._shutdown_requested or self._shutting_down
 
-    def _create_interpreter(self, index: int) -> SbxInterpreter:
+    def _create_interpreter(self, index: int) -> SbxClientAdapter:
         kwargs = dict(self._interpreter_kwargs)
         if self.size > 1:
             kwargs["config"] = self.config.model_copy(
@@ -1341,7 +1341,7 @@ class SbxPool:
             )
         if self._staging_root is not None:
             kwargs["_staging_root"] = self._staging_root / f"runner-{index}"
-        return SbxInterpreter(**kwargs)
+        return SbxClientAdapter(**kwargs)
 
     def _drain_available_locked(self) -> None:
         while True:
@@ -1352,7 +1352,7 @@ class SbxPool:
 
     def _shutdown_interpreters(
         self,
-        interpreters: list[SbxInterpreter],
+        interpreters: list[SbxClientAdapter],
         *,
         suppress_errors: bool = False,
     ) -> None:

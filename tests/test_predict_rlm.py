@@ -134,7 +134,7 @@ class TestSandboxBackendSelection:
         rlm = PredictRLM(ImageAnalysisSignature, sub_lm=MagicMock(), max_iterations=1)
         execution_tools = {"predict": MagicMock()}
 
-        with patch("predict_rlm.predict_rlm.JspiInterpreter") as mock_jspi:
+        with patch("predict_rlm.predict_rlm.JspiClientAdapter") as mock_jspi:
             mock_repl = MagicMock()
             mock_jspi.return_value = mock_repl
 
@@ -156,7 +156,7 @@ class TestSandboxBackendSelection:
         )
         execution_tools = {"predict": MagicMock()}
 
-        with patch("predict_rlm.predict_rlm.SbxInterpreter") as mock_sbx:
+        with patch("predict_rlm.predict_rlm.SbxClientAdapter") as mock_sbx:
             mock_repl = MagicMock()
             mock_sbx.return_value = mock_repl
 
@@ -348,7 +348,7 @@ class TestSandboxBackendSelection:
         )
         execution_tools = {"predict": MagicMock()}
 
-        with patch("predict_rlm.predict_rlm.SbxInterpreter") as mock_sbx:
+        with patch("predict_rlm.predict_rlm.SbxClientAdapter") as mock_sbx:
             with rlm._interpreter_context(execution_tools=execution_tools) as repl:
                 assert repl is leased
 
@@ -2177,18 +2177,18 @@ class TestPredictRLMTelemetry:
         )
         created_kwargs = {}
 
-        class FakeJspiInterpreter:
+        class FakeJspiClientAdapter:
             def __init__(self, **kwargs):
                 created_kwargs.update(kwargs)
 
             def shutdown(self):
                 created_kwargs["shutdown_called"] = True
 
-        with patch("predict_rlm.predict_rlm.JspiInterpreter", FakeJspiInterpreter):
+        with patch("predict_rlm.predict_rlm.JspiClientAdapter", FakeJspiClientAdapter):
             rlm._begin_telemetry_execution()
             try:
                 with rlm._interpreter_context(execution_tools={}) as repl:
-                    assert isinstance(repl, FakeJspiInterpreter)
+                    assert isinstance(repl, FakeJspiClientAdapter)
             finally:
                 rlm._clear_telemetry_execution()
 

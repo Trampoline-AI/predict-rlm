@@ -349,12 +349,12 @@ class TestCallbacksIntegration:
     """
 
     def test_iteration_end_receives_real_sandbox_output(self):
-        from predict_rlm.interpreter import JspiInterpreter
+        from predict_rlm.interpreter import JspiClientAdapter
 
         cb = RecordingCallback()
 
         # Real interpreter — preinstall_packages=False keeps it fast.
-        interpreter = JspiInterpreter(tools={}, preinstall_packages=False)
+        interpreter = JspiClientAdapter(tools={}, preinstall_packages=False)
         try:
             rlm = PredictRLM(
                 "query -> answer",

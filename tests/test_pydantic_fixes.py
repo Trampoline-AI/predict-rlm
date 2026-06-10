@@ -364,7 +364,7 @@ class TestListDictInInterpreter(unittest.TestCase):
     def test_predict_with_list_dict_output(self):
         """Test that predict with list[dict] output works through the sandbox."""
         from predict_rlm.interpreter import (
-            JspiInterpreter,
+            JspiClientAdapter,
         )
 
         # Track calls to predict
@@ -382,7 +382,7 @@ class TestListDictInInterpreter(unittest.TestCase):
                 ]
             }
 
-        interpreter = JspiInterpreter(
+        interpreter = JspiClientAdapter(
             tools={"predict": mock_predict},
             preinstall_packages=False,
         )
@@ -419,7 +419,7 @@ print("Serialized OK:", len(serialized), "chars")
     def test_predict_with_list_dict_containing_none_values(self):
         """Test that predict with list[dict] containing None values works correctly."""
         from predict_rlm.interpreter import (
-            JspiInterpreter,
+            JspiClientAdapter,
         )
 
         def mock_predict(signature: str, **kwargs):
@@ -443,7 +443,7 @@ print("Serialized OK:", len(serialized), "chars")
                 ]
             }
 
-        interpreter = JspiInterpreter(
+        interpreter = JspiClientAdapter(
             tools={"predict": mock_predict},
             preinstall_packages=False,
         )
@@ -481,7 +481,7 @@ print("Parsed priority is None:", parsed[0]["priority"] is None)
     def test_predict_with_list_dict_complex_nested_values(self):
         """Test that predict handles list[dict] with complex nested structures."""
         from predict_rlm.interpreter import (
-            JspiInterpreter,
+            JspiClientAdapter,
         )
 
         def mock_predict(signature: str, **kwargs):
@@ -500,7 +500,7 @@ print("Parsed priority is None:", parsed[0]["priority"] is None)
                 ]
             }
 
-        interpreter = JspiInterpreter(
+        interpreter = JspiClientAdapter(
             tools={"predict": mock_predict},
             preinstall_packages=False,
         )
@@ -914,7 +914,7 @@ class TestSchemaExtractionFromCallStack(unittest.TestCase):
         immediate caller's globals, not the full call stack.
         """
         from predict_rlm.interpreter import (
-            JspiInterpreter,
+            JspiClientAdapter,
         )
 
         # Track what schemas are extracted and passed to predict
@@ -929,7 +929,7 @@ class TestSchemaExtractionFromCallStack(unittest.TestCase):
             )
             return {"tasks": []}
 
-        interpreter = JspiInterpreter(
+        interpreter = JspiClientAdapter(
             tools={"predict": mock_predict},
             preinstall_packages=False,
         )

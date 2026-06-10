@@ -1,7 +1,7 @@
 """RED-GREEN repro for the Response-ID desync bomb.
 
 Background:
-    ``JspiInterpreter._send_request`` increments ``self._request_id``,
+    ``JspiClientAdapter._send_request`` increments ``self._request_id``,
     writes a JSON-RPC message to deno's stdin, then reads one line from
     stdout and asserts the response's ``id`` matches the request. If it
     doesn't, the helper raises ``Response ID mismatch``.
@@ -40,16 +40,16 @@ import types
 import pytest
 
 import predict_rlm.interpreter as rlm_interpreter
-from predict_rlm.interpreter import CodeInterpreterError, JspiInterpreter
-from predict_rlm.interpreters import SbxConfig, SbxInterpreter
+from predict_rlm.interpreter import CodeInterpreterError, JspiClientAdapter
+from predict_rlm.interpreters import SbxClientAdapter, SbxConfig
 from predict_rlm.interpreters.base import STALE_RESPONSE_DISCARD_LIMIT
 
 
 def _build_interp(stdout_lines: list[str]):
-    """Build a JspiInterpreter whose ``_read_with_timeout`` is mocked
+    """Build a JspiClientAdapter whose ``_read_with_timeout`` is mocked
     to pop from a scripted queue. Avoids real fd/select plumbing.
     """
-    interp = JspiInterpreter.__new__(JspiInterpreter)
+    interp = JspiClientAdapter.__new__(JspiClientAdapter)
     interp._stdout_fd = -1
     interp._read_buf = ""
     interp._use_jspi = False
@@ -162,7 +162,7 @@ def test_matching_response_passes_through_unchanged():
 
 
 def _build_execute_loop_interp(stdout_lines: list[str]):
-    interp = JspiInterpreter.__new__(JspiInterpreter)
+    interp = JspiClientAdapter.__new__(JspiClientAdapter)
     interp._pending_file_ops = {}
     interp._debug = False
     interp._sync_files = lambda: None
@@ -262,8 +262,8 @@ class _BufferingStdin:
         return None
 
 
-def _build_sbx_request_interp(tmp_path, stdout_lines: list[str]) -> SbxInterpreter:
-    interp = SbxInterpreter(
+def _build_sbx_request_interp(tmp_path, stdout_lines: list[str]) -> SbxClientAdapter:
+    interp = SbxClientAdapter(
         config=SbxConfig(name="resync-test", exec_timeout=1),
         preinstall_packages=False,
         _runner_command=["unused"],
@@ -282,7 +282,7 @@ def _build_sbx_request_interp(tmp_path, stdout_lines: list[str]) -> SbxInterpret
     return interp
 
 
-def _close_sbx_request_interp(interp: SbxInterpreter) -> None:
+def _close_sbx_request_interp(interp: SbxClientAdapter) -> None:
     interp._proc = None
 
 

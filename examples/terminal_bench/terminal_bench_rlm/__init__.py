@@ -7,7 +7,7 @@ __all__ = [
     "HarborPredictRLMBaseAgent",
     "TerminalBenchRLMBaseAgent",
     "TerminalBenchRLMAgent",
-    "TerminalBenchRunnerInterpreter",
+    "TerminalBenchRunnerClientAdapter",
     "feedback",
     "hard_score",
     "score_details",
@@ -25,10 +25,10 @@ def __getattr__(name: str) -> Any:
         from .tools.tbench_agent import HarborPredictRLMBaseAgent
 
         return HarborPredictRLMBaseAgent
-    if name == "TerminalBenchRunnerInterpreter":
-        from .tools.container_runner import TerminalBenchRunnerInterpreter
+    if name == "TerminalBenchRunnerClientAdapter":
+        from .tools.container_runner import TerminalBenchRunnerClientAdapter
 
-        return TerminalBenchRunnerInterpreter
+        return TerminalBenchRunnerClientAdapter
     if name == "TerminalBenchRLMBaseAgent":
         from .tools.tbench_agent import TerminalBenchRLMBaseAgent
 
