@@ -1752,11 +1752,18 @@ class PredictRLM(dspy.RLM):
     def _begin_iteration_log(self, *, iteration: int, pred: Any, code: str) -> bool:
         if not self._iteration_logging_enabled():
             return False
+        configure_predict_rlm_logging(verbose=True)
+        execution_timeout = getattr(pred, "execution_timeout_seconds", None)
+        if isinstance(execution_timeout, bool) or not isinstance(
+            execution_timeout, (int, float)
+        ):
+            execution_timeout = None
         emit_trace_iteration_start(
             iteration=iteration + 1,
             max_iterations=self.max_iterations,
             reasoning=getattr(pred, "reasoning", "") or "",
             code=code,
+            execution_timeout_seconds=execution_timeout,
         )
         return True
 
@@ -2213,7 +2220,6 @@ class PredictRLM(dspy.RLM):
         lm_hist_before_action: int,
         execution_timeout: float | None,
     ) -> Any:
-        lm_metadata = lm_completion_metadata_since(dspy.settings.lm, lm_hist_before_action)
         self._write_telemetry_span(
             "rlm.action_generation.ok",
             iteration=iteration + 1,
@@ -2236,7 +2242,7 @@ class PredictRLM(dspy.RLM):
             reasoning_chars=len(getattr(pred, "reasoning", "") or ""),
             execution_timeout_seconds=execution_timeout,
         )
-        return lm_metadata
+        return lm_finish_since(dspy.settings.lm, lm_hist_before_action)
 
     def _prepare_iteration_execution(self, pred: Any, iteration: int) -> tuple[str, bool]:
         code = pred.code or ""

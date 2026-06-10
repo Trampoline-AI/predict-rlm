@@ -345,8 +345,19 @@ def emit_trace_iteration_start(
     max_iterations: int,
     reasoning: str,
     code: str,
+    execution_timeout_seconds: float | None = None,
 ) -> None:
     _emit_trace("\n" + _render_trace_header(iteration, max_iterations))
+    _emit_trace(
+        _render_runtime_event(
+            "Execution timeout: "
+            + (
+                "null"
+                if execution_timeout_seconds is None
+                else f"{execution_timeout_seconds:g}s"
+            )
+        )
+    )
     if reasoning.strip():
         _emit_trace(_render_reasoning(reasoning))
     _emit_trace(_render_trace_detail("code:", code, syntax="python"))
