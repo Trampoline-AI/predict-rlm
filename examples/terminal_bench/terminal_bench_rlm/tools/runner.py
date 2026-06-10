@@ -1,4 +1,4 @@
-"""Shared Python runner payload helpers for Terminal-Bench containers."""
+"""Shared Python runner payload helpers for Terminal-Bench environments."""
 
 from __future__ import annotations
 

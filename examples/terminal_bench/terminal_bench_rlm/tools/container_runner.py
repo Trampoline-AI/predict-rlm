@@ -9,7 +9,6 @@ import os
 import queue
 import re
 import select
-import shlex
 import shutil
 import subprocess
 import sys
@@ -180,15 +179,12 @@ class _TimeoutLineReader:
             time.sleep(0.01)
 
 
-class HarborContainerAdapter:
-    """Small adapter around the container object supplied by Terminal-Bench/Harbor."""
+class TerminalBenchEnvironmentAdapter:
+    """Adapter around the public Terminal-Bench environment/container API."""
 
     def __init__(self, runtime: Any) -> None:
         self.runtime = runtime
         self.container = getattr(runtime, "container", runtime)
-        self.user = self._coerce_optional_string(
-            getattr(runtime, "_user", None) or getattr(runtime, "user", None)
-        )
         self.workdir = self._coerce_optional_string(
             getattr(runtime, "workdir", None) or getattr(runtime, "_workdir", None)
         )
@@ -200,34 +196,7 @@ class HarborContainerAdapter:
         value = str(value)
         return value or None
 
-    @property
-    def _docker_container_id(self) -> str | None:
-        container_id = getattr(self.container, "id", None)
-        if container_id:
-            return str(container_id)
-        attrs = getattr(self.container, "attrs", None)
-        if isinstance(attrs, dict) and attrs.get("Id"):
-            return str(attrs["Id"])
-        return None
-
-    @property
-    def _is_docker_sdk_runtime(self) -> bool:
-        return self._docker_container_id is not None
-
-    @property
-    def supports_file_sync(self) -> bool:
-        return not self._is_docker_sdk_runtime
-
-    def _unsupported_minimal(self, operation: str) -> NotImplementedError:
-        return NotImplementedError(
-            "Terminal-Bench minimal smoke adapter does not support "
-            f"{operation} yet; this smoke path only installs and starts the "
-            "persistent supervisor."
-        )
-
     def copy_to(self, host_path: str, container_path: str) -> None:
-        if self._is_docker_sdk_runtime:
-            raise self._unsupported_minimal("file sync")
         if hasattr(self.container, "copy_to"):
             self.container.copy_to(host_path, container_path)
             return
@@ -237,8 +206,6 @@ class HarborContainerAdapter:
         raise TypeError("Terminal-Bench container does not expose copy_to/put_file")
 
     def copy_from(self, container_path: str, host_path: str) -> None:
-        if self._is_docker_sdk_runtime:
-            raise self._unsupported_minimal("file sync")
         if hasattr(self.container, "copy_from"):
             self.container.copy_from(container_path, host_path)
             return
@@ -248,8 +215,6 @@ class HarborContainerAdapter:
         raise TypeError("Terminal-Bench container does not expose copy_from/get_file")
 
     def exec(self, command: list[str], *, timeout: float | None = None) -> Any:
-        if self._is_docker_sdk_runtime:
-            raise self._unsupported_minimal("list_dir/mkdir_p one-shot exec operations")
         if hasattr(self.container, "exec"):
             return self.container.exec(command, timeout=timeout)
         if hasattr(self.container, "run"):
@@ -263,46 +228,22 @@ class HarborContainerAdapter:
         *,
         timeout: float | None = None,
     ) -> None:
-        container_id = self._docker_container_id
-        if container_id is None:
-            with tempfile.NamedTemporaryFile(
-                "w",
-                encoding="utf-8",
-                suffix=".py",
-                delete=False,
-            ) as tmp:
-                tmp.write(source)
-                tmp_path = tmp.name
+        del timeout
+        with tempfile.NamedTemporaryFile(
+            "w",
+            encoding="utf-8",
+            suffix=".py",
+            delete=False,
+        ) as tmp:
+            tmp.write(source)
+            tmp_path = tmp.name
+        try:
+            self.copy_to(tmp_path, runner_path)
+        finally:
             try:
-                self.copy_to(tmp_path, runner_path)
-            finally:
-                try:
-                    os.unlink(tmp_path)
-                except OSError:
-                    pass
-            return
-        result = subprocess.run(
-            [
-                "docker",
-                "exec",
-                "-i",
-                container_id,
-                "sh",
-                "-c",
-                f"cat > {shlex.quote(runner_path)}",
-            ],
-            input=source,
-            text=True,
-            capture_output=True,
-            check=False,
-            timeout=timeout,
-        )
-        if result.returncode != 0:
-            raise SandboxFatalError(
-                "Terminal-Bench minimal smoke adapter failed to install runner "
-                f"script: exit code {result.returncode}; stdout: {result.stdout}; "
-                f"stderr: {result.stderr}"
-            )
+                os.unlink(tmp_path)
+            except OSError:
+                pass
 
     def start_exec(
         self,
@@ -311,23 +252,6 @@ class HarborContainerAdapter:
         workdir: str | None = None,
         timeout: float | None = None,
     ) -> ContainerProcess:
-        container_id = self._docker_container_id
-        if container_id is not None:
-            docker_command = ["docker", "exec", "-i"]
-            effective_workdir = workdir or self.workdir
-            if effective_workdir:
-                docker_command.extend(["-w", effective_workdir])
-            if self.user:
-                docker_command.extend(["-u", self.user])
-            docker_command.append(container_id)
-            docker_command.extend(command)
-            return subprocess.Popen(
-                docker_command,
-                stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-            )
         for name in ("start_exec", "exec_stream", "popen"):
             method = getattr(self.container, name, None)
             if method is not None:
@@ -457,7 +381,7 @@ class TerminalBenchRunnerClientAdapter(PersistentJsonRpcRunnerClient, PredictRLM
             supervisor_name="Terminal-Bench supervisor",
         )
         self.container = container
-        self.adapter = container_adapter or HarborContainerAdapter(container)
+        self.adapter = container_adapter or TerminalBenchEnvironmentAdapter(container)
         self.tools = tools or {}
         self.output_fields = output_fields or []
         self.runner_path = runner_path

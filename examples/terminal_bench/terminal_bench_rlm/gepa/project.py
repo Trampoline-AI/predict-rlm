@@ -777,7 +777,7 @@ def select_harbor_controller_locality(
         if not _supports_interactive_exec(controller_environment):
             raise RuntimeError(
                 "Harbor local-controller requires persistent interactive exec "
-                "(start_exec/exec_stream/popen or docker exec -i)."
+                "(start_exec/exec_stream/popen)."
             )
         return HarborControllerSelection(
             HarborControllerLocality.LOCAL_CONTROLLER,

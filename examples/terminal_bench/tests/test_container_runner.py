@@ -19,8 +19,8 @@ if str(_EXAMPLE_DIR) not in sys.path:
     sys.path.insert(0, str(_EXAMPLE_DIR))
 
 from terminal_bench_rlm.tools.container_runner import (  # noqa: E402
-    HarborContainerAdapter,
     LocalProcessRunnerClientAdapter,
+    TerminalBenchEnvironmentAdapter,
     TerminalBenchRunnerClientAdapter,
 )
 from terminal_bench_rlm.tools.runner import runner_source  # noqa: E402
@@ -697,105 +697,46 @@ def test_file_ops_use_container_adapter_not_host_filesystem(tmp_path: Path) -> N
     assert not target.exists()
 
 
-def test_terminal_bench_adapter_writes_runner_source_with_docker_exec(
-    monkeypatch,
-) -> None:
-    calls: list[dict[str, object]] = []
-    container = SimpleNamespace(id="container-123")
-    session = SimpleNamespace(container=container)
+def test_terminal_bench_environment_adapter_uses_public_runtime_methods(tmp_path: Path) -> None:
+    calls: list[tuple[str, object]] = []
+    process = SimpleNamespace(stdin=object(), stdout=object(), stderr=object())
 
-    def fake_run(cmd, **kwargs):
-        calls.append({"cmd": cmd, "kwargs": kwargs})
-        return subprocess.CompletedProcess(cmd, 0, "", "")
+    class Runtime:
+        def copy_to(self, host_path: str, container_path: str) -> None:
+            calls.append(("copy_to", (host_path, container_path)))
 
-    monkeypatch.setattr(subprocess, "run", fake_run)
+        def copy_from(self, container_path: str, host_path: str) -> None:
+            calls.append(("copy_from", (container_path, host_path)))
 
-    adapter = HarborContainerAdapter(session)
-    adapter.install_runner_script(runner_source(), "/tmp/predict_rlm_runner.py")
+        def exec(self, command: list[str], *, timeout: float | None = None):
+            calls.append(("exec", (command, timeout)))
+            return SimpleNamespace(returncode=0, stdout="[]", stderr="")
+
+        def start_exec(
+            self,
+            command: list[str],
+            *,
+            workdir: str | None = None,
+            timeout: float | None = None,
+        ):
+            calls.append(("start_exec", (command, workdir, timeout)))
+            return process
+
+    adapter = TerminalBenchEnvironmentAdapter(Runtime())
+    source = tmp_path / "runner.py"
+    source.write_text("print('runner')", encoding="utf-8")
+
+    adapter.copy_to(str(source), "/tmp/runner.py")
+    adapter.copy_from("/tmp/out.txt", str(tmp_path / "out.txt"))
+    adapter.exec(["python3", "-V"], timeout=1)
+    assert adapter.start_exec(["python3", "-u", "/tmp/runner.py"], workdir="/workspace") is process
 
     assert calls == [
-        {
-            "cmd": [
-                "docker",
-                "exec",
-                "-i",
-                "container-123",
-                "sh",
-                "-c",
-                "cat > /tmp/predict_rlm_runner.py",
-            ],
-            "kwargs": {
-                "input": runner_source(),
-                "text": True,
-                "capture_output": True,
-                "check": False,
-                "timeout": None,
-            },
-        }
+        ("copy_to", (str(source), "/tmp/runner.py")),
+        ("copy_from", ("/tmp/out.txt", str(tmp_path / "out.txt"))),
+        ("exec", (["python3", "-V"], 1)),
+        ("start_exec", (["python3", "-u", "/tmp/runner.py"], "/workspace", None)),
     ]
-
-
-def test_terminal_bench_adapter_starts_jsonl_runner_with_docker_exec(
-    monkeypatch,
-) -> None:
-    popen_calls: list[dict[str, object]] = []
-    process = SimpleNamespace(stdin=object(), stdout=object(), stderr=object())
-    container = SimpleNamespace(id="container-123")
-    session = SimpleNamespace(container=container, _user="bench-user")
-
-    def fake_popen(cmd, **kwargs):
-        popen_calls.append({"cmd": cmd, "kwargs": kwargs})
-        return process
-
-    monkeypatch.setattr(subprocess, "Popen", fake_popen)
-
-    adapter = HarborContainerAdapter(session)
-    assert (
-        adapter.start_exec(
-            ["python3", "-u", "/tmp/predict_rlm_runner.py"],
-            workdir="/workspace",
-            timeout=123,
-        )
-        is process
-    )
-
-    assert popen_calls == [
-        {
-            "cmd": [
-                "docker",
-                "exec",
-                "-i",
-                "-w",
-                "/workspace",
-                "-u",
-                "bench-user",
-                "container-123",
-                "python3",
-                "-u",
-                "/tmp/predict_rlm_runner.py",
-            ],
-            "kwargs": {
-                "stdin": subprocess.PIPE,
-                "stdout": subprocess.PIPE,
-                "stderr": subprocess.PIPE,
-                "text": True,
-            },
-        }
-    ]
-
-
-def test_terminal_bench_minimal_adapter_rejects_file_sync_operations() -> None:
-    container = SimpleNamespace(id="container-123")
-    session = SimpleNamespace(container=container)
-    adapter = HarborContainerAdapter(session)
-    interpreter = TerminalBenchRunnerClientAdapter(session, container_adapter=adapter)
-
-    with pytest.raises(NotImplementedError, match="minimal smoke adapter.*file sync"):
-        interpreter.mount_file_at("/host/input.txt", "/container/input.txt")
-    with pytest.raises(NotImplementedError, match="minimal smoke adapter.*file sync"):
-        interpreter.sync_file_to("/container/output.txt", "/host/output.txt")
-    with pytest.raises(NotImplementedError, match="minimal smoke adapter.*list_dir"):
-        interpreter.list_dir("/container")
 
 
 def test_host_tool_call_timeout_returns_bounded_tool_error() -> None:
