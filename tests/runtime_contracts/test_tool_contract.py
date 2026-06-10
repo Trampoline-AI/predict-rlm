@@ -55,6 +55,41 @@ def test_host_tool_round_trip(runtime: RuntimeHandle) -> None:
     assert runtime.output(result) == "4\n"
 
 
+# Sized to greatly exceed the ~64KB OS pipe buffer while staying under the 1MB
+# host-tool payload cap. Mirrors a real image `predict` tool-call request, which
+# is hundreds of KB.
+_LARGE_TOOL_REQUEST_BYTES = 950_000
+# The stall is intermittent per message, so repeat enough times that it is
+# virtually certain to surface on the affected transport.
+_LARGE_TOOL_REQUEST_ATTEMPTS = 12
+
+
+def test_large_host_tool_request_round_trips(runtime: RuntimeHandle) -> None:
+    """A large host-tool request must survive the host<->runner channel.
+
+    The runner sends tool-call requests (e.g. an image `predict`) inline over the
+    host<->runner JSON-RPC channel. On the real Docker `sbx exec` backend that
+    channel is a multiplexed exec stream driven by blocking, unchunked pipe I/O,
+    and a single inline message far larger than the ~64KB pipe buffer
+    intermittently wedges it: the host never receives the request, the iteration
+    hits its watchdog, and the container-restart recovery fails ("container
+    started but not ready for exec"). The direct-pipe local and Deno backends
+    drain via separate pipes plus a reader thread, so they round-trip the same
+    payload fine. Repeated to make the intermittent stall reliably reproduce.
+    """
+    runtime.require("host_tools")
+
+    for attempt in range(_LARGE_TOOL_REQUEST_ATTEMPTS):
+        result = runtime.execute(
+            f"payload = 'x' * {_LARGE_TOOL_REQUEST_BYTES}\n"
+            "res = await predict('text: str -> answer: str', text=payload)\n"
+            "print(res['answer'])"
+        )
+        assert runtime.output(result) == "4\n", (
+            f"large host-tool request stalled on attempt {attempt}"
+        )
+
+
 def test_basic_host_tool_result_shapes(runtime: RuntimeHandle) -> None:
     runtime.require("host_tools")
 
