@@ -53,7 +53,7 @@ def _set_debug_environment(payload: dict[str, Any]) -> None:
 def _install_verbose_rlm_log_stream(payload: dict[str, Any]) -> tuple[logging.Logger, int, bool, logging.Handler] | None:
     if not dict(payload.get("predict_rlm_kwargs") or {}).get("verbose"):
         return None
-    logger = logging.getLogger("dspy.predict.rlm")
+    logger = logging.getLogger("predict_rlm.trace")
     old_level = logger.level
     old_propagate = logger.propagate
     log_path = os.environ.get("PREDICT_RLM_DEBUG_LOG")

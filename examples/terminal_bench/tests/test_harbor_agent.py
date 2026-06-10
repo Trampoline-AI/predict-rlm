@@ -274,7 +274,7 @@ def test_remote_controller_verbose_streams_rlm_iteration_logs(monkeypatch, tmp_p
             raise AssertionError("remote controller must use PredictRLM.acall")
 
         async def acall(self):
-            logging.getLogger("dspy.predict.rlm").info("RLM iteration 1/2\nCode:\nprint(1)")
+            logging.getLogger("predict_rlm.trace").info("RLM turn 1/2\nCode:\nprint(1)")
             return SimpleNamespace(answer="done", trace=None)
 
     log_path = tmp_path / "predict_rlm_debug.jsonl"
@@ -290,7 +290,7 @@ def test_remote_controller_verbose_streams_rlm_iteration_logs(monkeypatch, tmp_p
     )
 
     assert answer == "done"
-    assert "RLM iteration 1/2" in log_path.read_text()
+    assert "RLM turn 1/2" in log_path.read_text()
 
 
 def test_daytona_remote_agent_payload_carries_submit_confirmation_mode(tmp_path: Path) -> None:
