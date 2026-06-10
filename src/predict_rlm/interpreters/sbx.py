@@ -971,6 +971,7 @@ class SbxInterpreter(PersistentJsonRpcRunnerClient, PredictRLMInterpreter):
             timeout_failure_class,
             fatal=False,
         )
+        self._pending_tool_calls.clear()
         stderr = self._read_stderr_for_process(process)
         self._discard_supervisor_process()
         restart_error: BaseException | None = None
