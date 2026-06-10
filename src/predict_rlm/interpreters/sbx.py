@@ -10,6 +10,7 @@ import inspect
 import json
 import os
 import queue
+import select
 import shutil
 import subprocess
 import tempfile
@@ -1077,14 +1078,46 @@ class SbxInterpreter(PersistentJsonRpcRunnerClient, PredictRLMInterpreter):
         self._stdout_reader = None
         self._pending_tool_calls.clear()
 
-    def _read_stderr_for_process(self, process: PersistentSupervisorProcess) -> str:
+    def _read_stderr_for_process(
+        self,
+        process: PersistentSupervisorProcess,
+        *,
+        max_wait_seconds: float = 0.5,
+    ) -> str:
+        # Best-effort diagnostic drain. A blocking ``stderr.read()`` to EOF can
+        # hang forever during timeout recovery: the force-killed supervisor may
+        # have a forked kernel child that ``setsid()``'d into its own session
+        # (so it survives ``self._proc.kill()``) and keeps the stderr pipe's
+        # write end open. Drain only what is already buffered, bounded by a
+        # short deadline, so recovery never blocks on a stray descendant.
         stderr = process.stderr
         if stderr is None:
             return ""
         try:
-            return stderr.read() or ""
-        except Exception:
+            fd = stderr.fileno()
+        except (ValueError, OSError):
             return ""
+        deadline = time.monotonic() + max_wait_seconds
+        chunks: list[bytes] = []
+        try:
+            os.set_blocking(fd, False)
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                ready, _, _ = select.select([fd], [], [], remaining)
+                if not ready:
+                    break
+                try:
+                    chunk = os.read(fd, 65536)
+                except (BlockingIOError, OSError):
+                    break
+                if not chunk:  # EOF: write end fully closed
+                    break
+                chunks.append(chunk)
+        except Exception:
+            pass
+        return b"".join(chunks).decode("utf-8", errors="replace")
 
     def _format_supervisor_restart_diagnostic(
         self,

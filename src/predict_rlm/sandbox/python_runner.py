@@ -729,6 +729,38 @@ def _terminate_descendant_processes(parent_pid: int | None = None) -> None:
         _reap_direct_children(child_pids)
 
 
+def _start_parent_death_watchdog(poll_seconds: float = 0.25) -> None:
+    """Force-exit this kernel child if its supervisor parent dies.
+
+    The kernel child ``setsid()``'s into its own session so it can manage its
+    own subprocess descendants; that also means a force-kill of the supervisor
+    (for example host-side iteration-timeout recovery) does not reach it.
+    Without this watchdog an orphaned kernel child blocked awaiting tool
+    responses that will never arrive would live forever, leaking a process per
+    recovery. Polling ``getppid()`` lets the orphan self-terminate promptly.
+    """
+    initial_ppid = os.getppid()
+
+    def _watch() -> None:
+        while True:
+            time.sleep(poll_seconds)
+            try:
+                current_ppid = os.getppid()
+            except OSError:
+                continue
+            if current_ppid != initial_ppid:
+                with contextlib.suppress(Exception):
+                    _terminate_descendant_processes()
+                os._exit(1)
+
+    thread = threading.Thread(
+        target=_watch,
+        name="predict-rlm-kernel-parent-watchdog",
+        daemon=True,
+    )
+    thread.start()
+
+
 def _persistent_kernel_runner(
     globals_dict: dict[str, Any],
     request_queue: multiprocessing.Queue,
@@ -737,6 +769,7 @@ def _persistent_kernel_runner(
 ) -> None:
     with contextlib.suppress(OSError):
         os.setsid()
+    _start_parent_death_watchdog()
     global PROTOCOL_STDIN, PROTOCOL_STDOUT
     PROTOCOL_STDIN = os.fdopen(stdin_fd, "r", encoding="utf-8", buffering=1)
     PROTOCOL_STDOUT = os.fdopen(os.dup(1), "w", encoding="utf-8", buffering=1)
