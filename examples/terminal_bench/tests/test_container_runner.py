@@ -8,21 +8,18 @@ import threading
 import time
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Iterator
 
 import pytest
 from dspy.primitives.code_interpreter import CodeInterpreterError
 
 from predict_rlm.debug import reset_debug_logger_for_tests
+from predict_rlm.interpreters import DirectProcessRunnerClientAdapter, PythonRunnerClientAdapter
 
 _EXAMPLE_DIR = Path(__file__).resolve().parent.parent
 if str(_EXAMPLE_DIR) not in sys.path:
     sys.path.insert(0, str(_EXAMPLE_DIR))
 
-from terminal_bench_rlm.tools.container_runner import (  # noqa: E402
-    LocalProcessRunnerClientAdapter,
-    TerminalBenchEnvironmentAdapter,
-    TerminalBenchRunnerClientAdapter,
-)
 from terminal_bench_rlm.tools.runner import runner_source  # noqa: E402
 
 
@@ -136,8 +133,8 @@ class FakeAdapter:
 
 
 @pytest.fixture
-def local_runner_interpreter(tmp_path: Path) -> LocalProcessRunnerClientAdapter:
-    interpreter = LocalProcessRunnerClientAdapter(
+def local_runner_interpreter(tmp_path: Path) -> Iterator[DirectProcessRunnerClientAdapter]:
+    interpreter = DirectProcessRunnerClientAdapter(
         runner_path=str(tmp_path / "predict_rlm_runner.py"),
         workdir=str(tmp_path),
         exec_timeout=10,
@@ -149,6 +146,12 @@ def local_runner_interpreter(tmp_path: Path) -> LocalProcessRunnerClientAdapter:
         interpreter.shutdown()
 
 
+def _fake_python_runner(adapter, **kwargs) -> PythonRunnerClientAdapter:
+    kwargs.setdefault("runner_path", "/tmp/predict_rlm_runner.py")
+    kwargs.setdefault("python_executable", "python3")
+    return PythonRunnerClientAdapter(adapter, **kwargs)
+
+
 def test_execute_reset_shutdown_requests_and_maps_success() -> None:
     process = FakeProcess(
         [
@@ -158,11 +161,7 @@ def test_execute_reset_shutdown_requests_and_maps_success() -> None:
         ]
     )
     adapter = FakeAdapter(process)
-    interpreter = TerminalBenchRunnerClientAdapter(
-        object(),
-        container_adapter=adapter,
-        runner_path="/tmp/predict_rlm_runner.py",
-    )
+    interpreter = _fake_python_runner(adapter)
 
     assert interpreter.execute("print('hi')") == "hi\n"
     interpreter.reset()
@@ -183,7 +182,7 @@ def test_execute_reset_shutdown_requests_and_maps_success() -> None:
 
 
 def test_shutdown_kills_original_process_if_wait_races_with_process_clear() -> None:
-    interpreter: TerminalBenchRunnerClientAdapter | None = None
+    interpreter: PythonRunnerClientAdapter | None = None
 
     def clear_process_then_timeout() -> None:
         assert interpreter is not None
@@ -197,11 +196,7 @@ def test_shutdown_kills_original_process_if_wait_races_with_process_clear() -> N
         ],
         wait_callback=clear_process_then_timeout,
     )
-    interpreter = TerminalBenchRunnerClientAdapter(
-        object(),
-        container_adapter=FakeAdapter(process),
-        runner_path="/tmp/predict_rlm_runner.py",
-    )
+    interpreter = _fake_python_runner(FakeAdapter(process))
 
     assert interpreter.execute("print('hi')") == "hi\n"
     interpreter.shutdown()
@@ -214,11 +209,7 @@ def test_execute_accepts_lm_selected_execution_timeout() -> None:
     process = FakeProcess(
         [{"id": 1, "ok": True, "result": {"output": "bounded\n"}}]
     )
-    interpreter = TerminalBenchRunnerClientAdapter(
-        object(),
-        container_adapter=FakeAdapter(process),
-        runner_path="/tmp/predict_rlm_runner.py",
-    )
+    interpreter = _fake_python_runner(FakeAdapter(process))
 
     assert interpreter.execute("print('bounded')", timeout=2.5) == "bounded\n"
 
@@ -236,11 +227,7 @@ def test_execute_debug_logs_empty_output_diagnostic(monkeypatch, tmp_path: Path)
     monkeypatch.setenv("PREDICT_RLM_DEBUG_LOG", str(log_path))
     reset_debug_logger_for_tests()
     process = FakeProcess([{"id": 1, "ok": True, "result": {"output": ""}}])
-    interpreter = TerminalBenchRunnerClientAdapter(
-        object(),
-        container_adapter=FakeAdapter(process),
-        runner_path="/tmp/predict_rlm_runner.py",
-    )
+    interpreter = _fake_python_runner(FakeAdapter(process))
 
     try:
         assert interpreter.execute("print('expected output')") == ""
@@ -255,7 +242,7 @@ def test_execute_debug_logs_empty_output_diagnostic(monkeypatch, tmp_path: Path)
     empty_events = [
         record
         for record in records
-        if record.get("event") == "terminal_bench.runner.empty_execute_output"
+        if record.get("event") == "python_runner.runner.empty_execute_output"
     ]
 
     assert empty_events
@@ -274,11 +261,7 @@ def test_execute_strips_python_and_repl_fences_before_runner_request() -> None:
             {"id": 2, "ok": True, "result": {"output": "repl\n"}},
         ]
     )
-    interpreter = TerminalBenchRunnerClientAdapter(
-        object(),
-        container_adapter=FakeAdapter(process),
-        runner_path="/tmp/predict_rlm_runner.py",
-    )
+    interpreter = _fake_python_runner(FakeAdapter(process))
 
     assert interpreter.execute("```python\nprint('python')\n```") == "python\n"
     assert interpreter.execute("```repl\nprint('repl')\n```") == "repl\n"
@@ -288,7 +271,7 @@ def test_execute_strips_python_and_repl_fences_before_runner_request() -> None:
 
 
 def test_local_runner_preserves_stdout_from_repl_fenced_code(
-    local_runner_interpreter: LocalProcessRunnerClientAdapter,
+    local_runner_interpreter: DirectProcessRunnerClientAdapter,
 ) -> None:
     result = local_runner_interpreter.execute(
         "```repl\nprint('local stdout survives')\n```"
@@ -298,7 +281,7 @@ def test_local_runner_preserves_stdout_from_repl_fenced_code(
 
 
 def test_local_runner_recoverable_timeout_preserves_streams_and_live_state(
-    local_runner_interpreter: LocalProcessRunnerClientAdapter,
+    local_runner_interpreter: DirectProcessRunnerClientAdapter,
 ) -> None:
     assert local_runner_interpreter.execute("state = 'survived'\nprint('set')") == "set\n"
 
@@ -328,7 +311,7 @@ def test_local_runner_recoverable_timeout_preserves_streams_and_live_state(
 
 
 def test_local_runner_surfaces_subprocess_failure_and_survives(
-    local_runner_interpreter: LocalProcessRunnerClientAdapter,
+    local_runner_interpreter: DirectProcessRunnerClientAdapter,
 ) -> None:
     with pytest.raises(CodeInterpreterError) as exc_info:
         local_runner_interpreter.execute(
@@ -350,7 +333,7 @@ def test_local_runner_surfaces_subprocess_failure_and_survives(
 
 
 def test_local_runner_unbounded_runner_exit_returns_error_and_supervisor_survives(
-    local_runner_interpreter: LocalProcessRunnerClientAdapter,
+    local_runner_interpreter: DirectProcessRunnerClientAdapter,
 ) -> None:
     with pytest.raises(CodeInterpreterError) as exc_info:
         local_runner_interpreter.execute("import os\nos._exit(7)")
@@ -364,7 +347,7 @@ def test_local_runner_unbounded_runner_exit_returns_error_and_supervisor_survive
 
 
 def test_local_runner_protocol_stdin_is_isolated_from_user_subprocesses(
-    local_runner_interpreter: LocalProcessRunnerClientAdapter,
+    local_runner_interpreter: DirectProcessRunnerClientAdapter,
 ) -> None:
     local_runner_interpreter.execute("sentinel = 123")
 
@@ -400,11 +383,7 @@ def test_execute_maps_structured_timeout_as_recoverable_observation() -> None:
             {"id": 2, "ok": True, "result": {"output": "still alive\n"}},
         ]
     )
-    interpreter = TerminalBenchRunnerClientAdapter(
-        object(),
-        container_adapter=FakeAdapter(process),
-        runner_path="/tmp/predict_rlm_runner.py",
-    )
+    interpreter = _fake_python_runner(FakeAdapter(process))
 
     timeout_result = interpreter.execute("while True: pass", timeout=0.2)
     followup = interpreter.execute("print('still alive')")
@@ -417,7 +396,7 @@ def test_execute_maps_structured_timeout_as_recoverable_observation() -> None:
     assert process.killed is False
 
 
-def test_user_subprocess_stdin_is_isolated_from_terminal_bench_runner_protocol() -> None:
+def test_user_subprocess_stdin_is_isolated_from_python_runner_protocol() -> None:
     processes: list[subprocess.Popen[str]] = []
 
     class LocalAdapter:
@@ -447,12 +426,7 @@ def test_user_subprocess_stdin_is_isolated_from_terminal_bench_runner_protocol()
             processes.append(process)
             return process
 
-    interpreter = TerminalBenchRunnerClientAdapter(
-        object(),
-        container_adapter=LocalAdapter(),
-        runner_path="/tmp/predict_rlm_runner.py",
-        exec_timeout=30,
-    )
+    interpreter = _fake_python_runner(LocalAdapter(), exec_timeout=30)
     try:
         interpreter.execute("sentinel = 123\nprint('set')")
         result = interpreter.execute(
@@ -483,11 +457,7 @@ def test_aexecute_accepts_lm_selected_execution_timeout() -> None:
         process = FakeProcess(
             [{"id": 1, "ok": True, "result": {"output": "bounded async\n"}}]
         )
-        interpreter = TerminalBenchRunnerClientAdapter(
-            object(),
-            container_adapter=FakeAdapter(process),
-            runner_path="/tmp/predict_rlm_runner.py",
-        )
+        interpreter = _fake_python_runner(FakeAdapter(process))
 
         result = await interpreter.aexecute("print('bounded async')", timeout=3)
 
@@ -541,10 +511,8 @@ def test_lm_selected_silent_runner_timeout_is_recoverable_and_restarts() -> None
             processes.append(process)
             return process
 
-    interpreter = TerminalBenchRunnerClientAdapter(
-        object(),
-        container_adapter=SilentAdapter(),
-        runner_path="/tmp/predict_rlm_runner.py",
+    interpreter = _fake_python_runner(
+        SilentAdapter(),
         exec_timeout=30,
         recoverable_timeout_grace=0.1,
     )
@@ -563,8 +531,8 @@ def test_lm_selected_silent_runner_timeout_is_recoverable_and_restarts() -> None
     assert len(processes) >= 2
     assert processes[0].poll() is not None
     assert "[Timeout] Iteration execution timed out after 0.2s" in timeout_result
-    assert "Terminal-Bench supervisor request timed out after 0.3s" in timeout_result
-    assert "copied supervisor process was killed and restarted" in timeout_result
+    assert "Python runner supervisor request timed out after 0.3s" in timeout_result
+    assert "supervisor process was killed and restarted" in timeout_result
     assert "Python globals from the timed-out supervisor were lost" in timeout_result
     assert timeout_result.timeout_seconds == 0.2
     assert followup == "fresh runner\n"
@@ -587,11 +555,7 @@ def test_execute_after_structured_timeout_restarts_dead_runner_with_diagnostic()
     )
     restarted_process = FakeProcess([])
     adapter = FakeAdapter([first_process, restarted_process])
-    interpreter = TerminalBenchRunnerClientAdapter(
-        object(),
-        container_adapter=adapter,
-        runner_path="/tmp/predict_rlm_runner.py",
-    )
+    interpreter = _fake_python_runner(adapter)
 
     timeout_result = interpreter.execute("run_slow_command()", timeout=0.2)
     first_process.returncode = 137
@@ -600,8 +564,8 @@ def test_execute_after_structured_timeout_restarts_dead_runner_with_diagnostic()
     assert "[Timeout] Iteration execution timed out after 0.2s" in timeout_result
     assert len(adapter.started) == 2
     assert restarted_process.requests == []
-    assert "Terminal-Bench supervisor exited after the previous execute response" in restart_result
-    assert "The copied supervisor process was restarted" in restart_result
+    assert "Python runner supervisor exited after the previous execute response" in restart_result
+    assert "The supervisor process was restarted" in restart_result
     assert "Python globals from the prior supervisor were lost" in restart_result
     assert "supervisor_returncode=137" in restart_result
     assert "previous_request_id=1" in restart_result
@@ -628,11 +592,7 @@ def test_execute_after_structured_error_restarts_dead_runner_with_diagnostic() -
     )
     restarted_process = FakeProcess([])
     adapter = FakeAdapter([first_process, restarted_process])
-    interpreter = TerminalBenchRunnerClientAdapter(
-        object(),
-        container_adapter=adapter,
-        runner_path="/tmp/predict_rlm_runner.py",
-    )
+    interpreter = _fake_python_runner(adapter)
 
     with pytest.raises(CodeInterpreterError, match="node /app/vm.js"):
         interpreter.execute("run_node()", timeout=45)
@@ -641,7 +601,7 @@ def test_execute_after_structured_error_restarts_dead_runner_with_diagnostic() -
 
     assert len(adapter.started) == 2
     assert restarted_process.requests == []
-    assert "Terminal-Bench supervisor exited after the previous execute response" in restart_result
+    assert "Python runner supervisor exited after the previous execute response" in restart_result
     assert "previous_response=structured_error" in restart_result
     assert "previous_execution_timeout_seconds=45" in restart_result
     assert "supervisor_returncode=0" in restart_result
@@ -657,17 +617,13 @@ def test_execute_maps_runner_errors() -> None:
             }
         ]
     )
-    interpreter = TerminalBenchRunnerClientAdapter(
-        object(),
-        container_adapter=FakeAdapter(process),
-        runner_path="/tmp/predict_rlm_runner.py",
-    )
+    interpreter = _fake_python_runner(FakeAdapter(process))
 
     with pytest.raises(CodeInterpreterError, match="NameError: missing_name"):
         interpreter.execute("print(missing_name)")
 
 
-def test_file_ops_use_container_adapter_not_host_filesystem(tmp_path: Path) -> None:
+def test_file_ops_use_runner_backend_not_host_filesystem(tmp_path: Path) -> None:
     process = FakeProcess([])
     adapter = FakeAdapter(process)
     adapter.exec_results.append(SimpleNamespace(stdout="", stderr="", returncode=0))
@@ -678,7 +634,7 @@ def test_file_ops_use_container_adapter_not_host_filesystem(tmp_path: Path) -> N
             returncode=0,
         )
     )
-    interpreter = TerminalBenchRunnerClientAdapter(object(), container_adapter=adapter)
+    interpreter = _fake_python_runner(adapter)
 
     source = tmp_path / "source.txt"
     target = tmp_path / "target.txt"
@@ -695,49 +651,6 @@ def test_file_ops_use_container_adapter_not_host_filesystem(tmp_path: Path) -> N
     assert adapter.exec_calls[1][3] == "/sandbox/output"
     assert adapter.copied_from == [("/sandbox/output/result.txt", str(target))]
     assert not target.exists()
-
-
-def test_terminal_bench_environment_adapter_uses_public_runtime_methods(tmp_path: Path) -> None:
-    calls: list[tuple[str, object]] = []
-    process = SimpleNamespace(stdin=object(), stdout=object(), stderr=object())
-
-    class Runtime:
-        def copy_to(self, host_path: str, container_path: str) -> None:
-            calls.append(("copy_to", (host_path, container_path)))
-
-        def copy_from(self, container_path: str, host_path: str) -> None:
-            calls.append(("copy_from", (container_path, host_path)))
-
-        def exec(self, command: list[str], *, timeout: float | None = None):
-            calls.append(("exec", (command, timeout)))
-            return SimpleNamespace(returncode=0, stdout="[]", stderr="")
-
-        def start_exec(
-            self,
-            command: list[str],
-            *,
-            workdir: str | None = None,
-            timeout: float | None = None,
-        ):
-            calls.append(("start_exec", (command, workdir, timeout)))
-            return process
-
-    adapter = TerminalBenchEnvironmentAdapter(Runtime())
-    source = tmp_path / "runner.py"
-    source.write_text("print('runner')", encoding="utf-8")
-
-    adapter.copy_to(str(source), "/tmp/runner.py")
-    adapter.copy_from("/tmp/out.txt", str(tmp_path / "out.txt"))
-    adapter.exec(["python3", "-V"], timeout=1)
-    assert adapter.start_exec(["python3", "-u", "/tmp/runner.py"], workdir="/workspace") is process
-
-    assert calls == [
-        ("copy_to", (str(source), "/tmp/runner.py")),
-        ("copy_from", ("/tmp/out.txt", str(tmp_path / "out.txt"))),
-        ("exec", (["python3", "-V"], 1)),
-        ("start_exec", (["python3", "-u", "/tmp/runner.py"], "/workspace", None)),
-    ]
-
 
 def test_host_tool_call_timeout_returns_bounded_tool_error() -> None:
     def slow_predict() -> str:
@@ -756,11 +669,9 @@ def test_host_tool_call_timeout_returns_bounded_tool_error() -> None:
             {"id": 2, "ok": True, "result": {"output": "handled timeout\n"}},
         ]
     )
-    interpreter = TerminalBenchRunnerClientAdapter(
-        object(),
-        container_adapter=FakeAdapter(process),
+    interpreter = _fake_python_runner(
+        FakeAdapter(process),
         tools={"predict": slow_predict},
-        runner_path="/tmp/predict_rlm_runner.py",
         recoverable_timeout_grace=0.2,
     )
 

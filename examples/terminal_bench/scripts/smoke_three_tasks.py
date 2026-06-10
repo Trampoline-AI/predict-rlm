@@ -91,8 +91,8 @@ def _print_table(rows: list[dict[str, Any]]) -> None:
 def _real_smoke_unavailable() -> str:
     return (
         "Real Terminal-Bench smoke is environment-specific. "
-        "Install terminal_bench and run its harness with the "
-        "terminal_bench_rlm.tools.tbench_agent.terminal_bench_agent_class() adapter "
+        "Install terminal_bench and run its Harbor/Daytona harness with the "
+        "terminal_bench_rlm.tools.tbench_agent.DaytonaRemotePredictRLMAgent adapter "
         "against three selected task IDs. The default mode is a hermetic fake smoke "
         "to avoid LLM calls and external harness work."
     )

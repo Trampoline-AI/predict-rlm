@@ -1900,7 +1900,7 @@ def test_seed_candidate_skill_is_passed_to_terminal_bench_agent(monkeypatch) -> 
             pass
 
     monkeypatch.setattr(tbench_agent, "PredictRLM", FakePredictRLM)
-    monkeypatch.setattr(tbench_agent, "TerminalBenchRunnerClientAdapter", FakeInterpreter)
+    monkeypatch.setattr(tbench_agent, "DirectProcessRunnerClientAdapter", FakeInterpreter)
 
     agent = tbench_agent.TerminalBenchRLMBaseAgent(
         skill_instructions=(
@@ -2197,7 +2197,7 @@ def test_agent_builds_low_effort_lms_from_agent_kwargs(monkeypatch) -> None:
                 self.kwargs = kwargs
 
     monkeypatch.setattr(tbench_agent, "PredictRLM", FakePredictRLM)
-    monkeypatch.setattr(tbench_agent, "TerminalBenchRunnerClientAdapter", FakeInterpreter)
+    monkeypatch.setattr(tbench_agent, "DirectProcessRunnerClientAdapter", FakeInterpreter)
     monkeypatch.setattr(tbench_agent, "dspy", FakeDspy)
 
     agent = tbench_agent.TerminalBenchRLMBaseAgent(

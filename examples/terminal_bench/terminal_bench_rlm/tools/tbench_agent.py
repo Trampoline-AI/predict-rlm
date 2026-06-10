@@ -31,7 +31,7 @@ TERMINAL_WRAPPER_TOOL_NAMES = frozenset(
     {"run_terminal_command", "send_terminal_keys", "read_terminal"}
 )
 PredictRLM: Any | None = None
-TerminalBenchRunnerClientAdapter: Any | None = None
+DirectProcessRunnerClientAdapter: Any | None = None
 DAYTONA_REMOTE_ROOT = "/tmp/predict_rlm_controller"
 DAYTONA_REMOTE_HOME = "/tmp/predict_rlm_home"
 DAYTONA_REMOTE_RESULT_SENTINEL = "PREDICT_RLM_REMOTE_RESULT_JSON="
@@ -294,20 +294,6 @@ def _build_submit_confirmation(
     raise ValueError(f"Unsupported submit_confirmation_mode: {mode}")
 
 
-def _get_runtime(task: Any = None, session: Any = None, **kwargs: Any) -> Any:
-    if "container" in kwargs and kwargs["container"] is not None:
-        return kwargs["container"]
-    if session is not None and getattr(session, "container", None) is not None:
-        return session
-    if task is not None:
-        task_session = getattr(task, "session", None)
-        if task_session is not None and getattr(task_session, "container", None) is not None:
-            return task_session
-        if getattr(task, "container", None) is not None:
-            return task.container
-    raise ValueError("Could not locate Terminal-Bench session container")
-
-
 def _coerce_answer(result: Any) -> str:
     if isinstance(result, str):
         return result
@@ -394,13 +380,13 @@ def _with_terminal_bench_skill(
 
 
 def _interpreter_class() -> Any:
-    global TerminalBenchRunnerClientAdapter
-    if TerminalBenchRunnerClientAdapter is None:
-        TerminalBenchRunnerClientAdapter = getattr(
-            importlib.import_module(".container_runner", __package__),
-            "TerminalBenchRunnerClientAdapter",
+    global DirectProcessRunnerClientAdapter
+    if DirectProcessRunnerClientAdapter is None:
+        DirectProcessRunnerClientAdapter = getattr(
+            importlib.import_module("predict_rlm.interpreters"),
+            "DirectProcessRunnerClientAdapter",
         )
-    return TerminalBenchRunnerClientAdapter
+    return DirectProcessRunnerClientAdapter
 
 
 
@@ -472,7 +458,7 @@ def _make_agent_result(
 
 
 class _TerminalBenchRLMBaseAgentMixin:
-    """Terminal-Bench agent adapter that runs PredictRLM code inside the task container."""
+    """Terminal-Bench agent adapter that runs PredictRLM through a direct runner."""
 
     @staticmethod
     def name() -> str:
@@ -545,7 +531,7 @@ class _TerminalBenchRLMBaseAgentMixin:
         **kwargs: Any,
     ) -> Any:
         if session is None:
-            session = kwargs.pop("session", None)
+            kwargs.pop("session", None)
         task = kwargs.pop("task", None)
         if isinstance(instruction, str):
             task_instruction = instruction or kwargs.pop("instruction", "")
@@ -554,10 +540,10 @@ class _TerminalBenchRLMBaseAgentMixin:
         else:
             task = instruction
             task_instruction = kwargs.pop("instruction", None) or _get_task_instruction(task)
-        runtime = _get_runtime(task=task, session=session, **kwargs)
+        kwargs.pop("container", None)
         if self.codex_lm:
             _install_codex_lm_monkeypatch(self.codex_lm_exclude)
-        interpreter = _interpreter_class()(runtime, **self.interpreter_kwargs)
+        interpreter = _interpreter_class()(**self.interpreter_kwargs)
         try:
             rlm_kwargs = dict(self.predict_rlm_kwargs)
             if "lm" in rlm_kwargs:

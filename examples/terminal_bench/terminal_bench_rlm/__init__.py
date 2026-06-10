@@ -5,10 +5,8 @@ from typing import Any
 __all__ = [
     "DaytonaRemotePredictRLMAgent",
     "HarborPredictRLMBaseAgent",
-    "TerminalBenchEnvironmentAdapter",
     "TerminalBenchRLMBaseAgent",
     "TerminalBenchRLMAgent",
-    "TerminalBenchRunnerClientAdapter",
     "feedback",
     "hard_score",
     "score_details",
@@ -26,14 +24,6 @@ def __getattr__(name: str) -> Any:
         from .tools.tbench_agent import HarborPredictRLMBaseAgent
 
         return HarborPredictRLMBaseAgent
-    if name == "TerminalBenchEnvironmentAdapter":
-        from .tools.container_runner import TerminalBenchEnvironmentAdapter
-
-        return TerminalBenchEnvironmentAdapter
-    if name == "TerminalBenchRunnerClientAdapter":
-        from .tools.container_runner import TerminalBenchRunnerClientAdapter
-
-        return TerminalBenchRunnerClientAdapter
     if name == "TerminalBenchRLMBaseAgent":
         from .tools.tbench_agent import TerminalBenchRLMBaseAgent
 
