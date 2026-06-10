@@ -210,7 +210,7 @@ class ProposerRunTrace(BaseModel):
     and durations.
     """
 
-    status: Literal["completed", "max_iterations", "error"] = Field(
+    status: Literal["in_progress", "completed", "max_iterations", "error"] = Field(
         description="Run completion status"
     )
     model: str = Field(description="Main LM model identifier")
@@ -271,8 +271,9 @@ class RunTrace(BaseModel):
     .. warning:: This schema is experimental and may change in future versions.
     """
 
-    status: Literal["completed", "max_iterations", "error"] = Field(
+    status: Literal["in_progress", "completed", "max_iterations", "error"] = Field(
         description=(
+            "'in_progress' if exported while the run is still active, "
             "'completed' if SUBMIT was called, "
             "'max_iterations' if extract fallback was used, "
             "'error' if the run failed"

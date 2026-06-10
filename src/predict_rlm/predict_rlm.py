@@ -92,6 +92,16 @@ class _IterationCallbackState:
     exception: Exception | None = None
 
 
+@dataclass
+class _TraceExportContext:
+    steps: list[IterationStep]
+    lm: Any
+    sub_lm: Any
+    lm_hist_start: int
+    sub_hist_start: int
+    run_start: float
+
+
 # Capture the real dspy.Image class at import time so type comparisons
 # work even when tests patch predict_rlm.dspy.Image to a mock.
 _ImageType = dspy.Image
@@ -869,6 +879,7 @@ class PredictRLM(dspy.RLM):
         output_dir: str | Path | None = None,
         telemetry_context: TelemetryContext | None = None,
         submit_confirmation: Callable[[SubmitConfirmationContext], str | None] | None = None,
+        trace_export_path: str | Path | None = None,
     ):
         """
         Args:
@@ -916,6 +927,9 @@ class PredictRLM(dspy.RLM):
                        SUBMIT. It receives SubmitConfirmationContext and may
                        return a message to feed back as the next observation.
                        Returning None or "" preserves normal immediate submit.
+            trace_export_path: Optional path for best-effort atomic RunTrace
+                       snapshots while the run is in progress. The file is
+                       replaced in place and trace export failures are ignored.
         """
         if interpreter is not None and sbx_pool is not None:
             raise ValueError(
@@ -981,6 +995,8 @@ class PredictRLM(dspy.RLM):
         self._current_telemetry_context: TelemetryContext | None = None
         self._current_predictor_id: str | None = None
         self._submit_confirmation = submit_confirmation
+        self._trace_export_path = Path(trace_export_path) if trace_export_path else None
+        self._trace_export_context: _TraceExportContext | None = None
 
         # Merge skills into instructions, packages, modules, and tools
         self._skill_instructions = ""
@@ -2002,7 +2018,7 @@ class PredictRLM(dspy.RLM):
 
     def _build_run_trace(
         self,
-        status: Literal["completed", "max_iterations", "error"],
+        status: Literal["in_progress", "completed", "max_iterations", "error"],
         steps: list[IterationStep],
         lm: Any,
         sub_lm: Any,
@@ -2012,7 +2028,7 @@ class PredictRLM(dspy.RLM):
     ) -> RunTrace:
         trace_steps = steps
         pending_entry = getattr(self, "_partial_pending_entry", None)
-        if status == "error" and pending_entry is not None:
+        if status in {"in_progress", "error"} and pending_entry is not None:
             trace_steps = list(steps)
             pending_start = getattr(self, "_partial_pending_start", None)
             trace_steps.append(
@@ -2053,6 +2069,53 @@ class PredictRLM(dspy.RLM):
             telemetry_ref=self._telemetry_ref() if status == "error" else None,
             steps=trace_steps,
         )
+
+    def _export_current_trace(
+        self,
+        status: Literal["in_progress", "completed", "max_iterations", "error"],
+    ) -> None:
+        context = getattr(self, "_trace_export_context", None)
+        if context is None:
+            return
+        self._export_run_trace(
+            self._build_run_trace(
+                status=status,
+                steps=context.steps,
+                lm=context.lm,
+                sub_lm=context.sub_lm,
+                lm_hist_start=context.lm_hist_start,
+                sub_hist_start=context.sub_hist_start,
+                run_start=context.run_start,
+            )
+        )
+
+    def _export_run_trace(self, trace: RunTrace) -> None:
+        path = getattr(self, "_trace_export_path", None)
+        if path is None:
+            return
+        tmp_path: Path | None = None
+        try:
+            path = Path(path)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp_path = path.with_name(f".{path.name}.{os.getpid()}.{time.time_ns()}.tmp")
+            tmp_path.write_text(trace.to_exportable_json(), encoding="utf-8")
+            os.replace(tmp_path, path)
+            tmp_path = None
+        except Exception as exc:
+            try:
+                self._log_lifecycle(
+                    "rlm.trace_export.error",
+                    error_type=type(exc).__name__,
+                    path=str(path),
+                )
+            except Exception:
+                pass
+        finally:
+            if tmp_path is not None:
+                try:
+                    tmp_path.unlink(missing_ok=True)
+                except Exception:
+                    pass
 
     def _history_from_prediction(self, prediction: dspy.Prediction, fallback_history: Any):
         from dspy.primitives.repl_types import REPLEntry, REPLHistory
@@ -2262,6 +2325,7 @@ class PredictRLM(dspy.RLM):
             output="",
         )
         self._partial_pending_start = time.perf_counter()
+        self._export_current_trace("in_progress")
         return code, iteration_log_open
 
     def _log_iteration_execute_start(self, repl: Any, *, iteration: int, code: str) -> float:
@@ -2927,6 +2991,15 @@ class PredictRLM(dspy.RLM):
                     self._partial_history = history
                     self._partial_pending_entry = None
                     self._partial_pending_start = None
+                    self._trace_export_context = _TraceExportContext(
+                        steps=steps,
+                        lm=lm,
+                        sub_lm=sub_lm,
+                        lm_hist_start=lm_hist_start,
+                        sub_hist_start=sub_hist_start,
+                        run_start=run_start,
+                    )
+                    self._export_current_trace("in_progress")
                     call_id = ACTIVE_CALL_ID.get()
 
                     for iteration in range(self.max_iterations):
@@ -2975,6 +3048,7 @@ class PredictRLM(dspy.RLM):
                                 action_lm_metadata,
                             )
                             steps.append(state.step)
+                            self._export_current_trace("in_progress")
 
                         if state.is_final:
                             status = "completed"
@@ -3003,13 +3077,14 @@ class PredictRLM(dspy.RLM):
                         sub_hist_start=sub_hist_start,
                         run_start=run_start,
                     )
+                    self._export_run_trace(prediction.trace)
                     return prediction
                 finally:
                     reset_tool_call_collector(tool_token)
                     reset_predict_call_collector(predict_token)
         except BaseException as exc:
             try:
-                exc.trace = self._build_run_trace(
+                trace = self._build_run_trace(
                     status="error",
                     steps=steps,
                     lm=lm,
@@ -3018,11 +3093,14 @@ class PredictRLM(dspy.RLM):
                     sub_hist_start=sub_hist_start,
                     run_start=run_start,
                 )
+                setattr(exc, "trace", trace)
+                self._export_run_trace(trace)
             except Exception:
                 pass
             raise
         finally:
             self._clear_telemetry_execution()
+            self._trace_export_context = None
             if file_plan:
                 self.generate_action, self.extract = orig_action, orig_extract
 
@@ -3083,6 +3161,15 @@ class PredictRLM(dspy.RLM):
                     self._partial_history = history
                     self._partial_pending_entry = None
                     self._partial_pending_start = None
+                    self._trace_export_context = _TraceExportContext(
+                        steps=steps,
+                        lm=lm,
+                        sub_lm=sub_lm,
+                        lm_hist_start=lm_hist_start,
+                        sub_hist_start=sub_hist_start,
+                        run_start=run_start,
+                    )
+                    self._export_current_trace("in_progress")
                     call_id = ACTIVE_CALL_ID.get()
 
                     for iteration in range(self.max_iterations):
@@ -3133,6 +3220,7 @@ class PredictRLM(dspy.RLM):
                                 action_lm_metadata,
                             )
                             steps.append(state.step)
+                            self._export_current_trace("in_progress")
 
                         if state.is_final:
                             status = "completed"
@@ -3161,13 +3249,14 @@ class PredictRLM(dspy.RLM):
                         sub_hist_start=sub_hist_start,
                         run_start=run_start,
                     )
+                    self._export_run_trace(prediction.trace)
                     return prediction
                 finally:
                     reset_tool_call_collector(tool_token)
                     reset_predict_call_collector(predict_token)
         except BaseException as exc:
             try:
-                exc.trace = self._build_run_trace(
+                trace = self._build_run_trace(
                     status="error",
                     steps=steps,
                     lm=lm,
@@ -3176,11 +3265,14 @@ class PredictRLM(dspy.RLM):
                     sub_hist_start=sub_hist_start,
                     run_start=run_start,
                 )
+                setattr(exc, "trace", trace)
+                self._export_run_trace(trace)
             except Exception:
                 pass
             raise
         finally:
             self._clear_telemetry_execution()
+            self._trace_export_context = None
             if file_plan:
                 self.generate_action, self.extract = orig_action, orig_extract
 

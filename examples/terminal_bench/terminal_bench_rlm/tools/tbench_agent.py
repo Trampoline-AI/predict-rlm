@@ -318,15 +318,15 @@ def _coerce_answer(result: Any) -> str:
     return str(result)
 
 
-def _write_trace(trace: Any, logging_dir: Path | None) -> None:
+def _write_trace(trace: Any, logging_dir: Path | None, *, path: Path | None = None) -> None:
     if trace is None or logging_dir is None:
         return
     logging_dir.mkdir(parents=True, exist_ok=True)
-    path = logging_dir / f"predict_rlm_trace_{uuid.uuid4().hex[:8]}.json"
+    trace_path = path or logging_dir / f"predict_rlm_trace_{uuid.uuid4().hex[:8]}.json"
     if hasattr(trace, "to_exportable_json"):
-        path.write_text(trace.to_exportable_json(), encoding="utf-8")
+        trace_path.write_text(trace.to_exportable_json(), encoding="utf-8")
     else:
-        path.write_text(str(trace), encoding="utf-8")
+        trace_path.write_text(str(trace), encoding="utf-8")
 
 
 def _write_phase_event(

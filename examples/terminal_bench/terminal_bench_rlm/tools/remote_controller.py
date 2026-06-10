@@ -115,9 +115,12 @@ async def _run_predict_rlm_async(payload: dict[str, Any]) -> str:
     interpreter_kwargs = dict(payload.get("interpreter_kwargs") or {})
     interpreter = _local_process_interpreter_class()(**interpreter_kwargs)
     logging_dir = _logging_dir(payload)
+    trace_export_path = logging_dir / "predict_rlm_trace.json" if logging_dir else None
     _write_run_status(logging_dir, "running")
     try:
         rlm_kwargs = dict(payload.get("predict_rlm_kwargs") or {})
+        if trace_export_path is not None:
+            rlm_kwargs.setdefault("trace_export_path", trace_export_path)
         if "lm" in rlm_kwargs:
             rlm_kwargs["lm"] = _build_lm(
                 rlm_kwargs["lm"],
@@ -154,11 +157,11 @@ async def _run_predict_rlm_async(payload: dict[str, Any]) -> str:
         )
         rlm = _predict_rlm_class()(signature, **rlm_kwargs)
         result = await rlm.acall()
-        _write_trace(getattr(result, "trace", None), logging_dir)
+        _write_trace(getattr(result, "trace", None), logging_dir, path=trace_export_path)
         _write_run_status(logging_dir, "completed", has_trace=getattr(result, "trace", None) is not None)
         return _coerce_answer(result)
     except BaseException as exc:
-        _write_trace(getattr(exc, "trace", None), logging_dir)
+        _write_trace(getattr(exc, "trace", None), logging_dir, path=trace_export_path)
         _write_run_status(
             logging_dir,
             "failed",

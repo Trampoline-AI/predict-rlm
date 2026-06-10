@@ -1,6 +1,7 @@
 """Tests for structured trace output."""
 
 import contextvars
+import json
 import time
 from unittest.mock import MagicMock
 
@@ -227,12 +228,42 @@ class TestRunTrace:
         assert trace.usage.sub.input_tokens == 0
 
     def test_status_literals(self):
-        for status in ("completed", "max_iterations", "error"):
+        for status in ("in_progress", "completed", "max_iterations", "error"):
             trace = RunTrace(
                 status=status, model="openai/gpt-5",
                 iterations=1, max_iterations=5, duration_ms=100,
             )
             assert trace.status == status
+
+    def test_atomic_export_replaces_in_progress_trace(self, tmp_path):
+        from predict_rlm.predict_rlm import PredictRLM
+
+        path = tmp_path / "predict_rlm_trace.json"
+        rlm = PredictRLM.__new__(PredictRLM)
+        rlm._trace_export_path = path
+        rlm._debug = False
+
+        first = RunTrace(
+            status="in_progress",
+            model="openai/gpt-5",
+            iterations=1,
+            max_iterations=5,
+            duration_ms=100,
+        )
+        second = RunTrace(
+            status="completed",
+            model="openai/gpt-5",
+            iterations=2,
+            max_iterations=5,
+            duration_ms=200,
+        )
+
+        rlm._export_run_trace(first)
+        assert json.loads(path.read_text())["status"] == "in_progress"
+
+        rlm._export_run_trace(second)
+        assert json.loads(path.read_text())["status"] == "completed"
+        assert not list(tmp_path.glob("*.tmp"))
 
     def test_to_exportable_json_returns_string(self):
         trace = RunTrace(

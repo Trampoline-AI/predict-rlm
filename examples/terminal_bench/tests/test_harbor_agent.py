@@ -293,6 +293,37 @@ def test_remote_controller_verbose_streams_rlm_iteration_logs(monkeypatch, tmp_p
     assert "RLM turn 1/2" in log_path.read_text()
 
 
+def test_remote_controller_wires_live_trace_export_path(monkeypatch, tmp_path: Path) -> None:
+    captured: dict[str, object] = {}
+
+    class FakeInterpreter:
+        def shutdown(self) -> None:
+            pass
+
+    class FakePredictRLM:
+        def __init__(self, _signature, **kwargs) -> None:
+            captured["rlm_kwargs"] = kwargs
+
+        async def acall(self):
+            return SimpleNamespace(answer="done", trace=None)
+
+    monkeypatch.setattr(remote_controller, "_local_process_interpreter_class", lambda: FakeInterpreter)
+    monkeypatch.setattr(remote_controller, "_predict_rlm_class", lambda: FakePredictRLM)
+
+    answer = remote_controller._run_predict_rlm(
+        {
+            "instruction": "solve",
+            "logging_dir": str(tmp_path),
+            "predict_rlm_kwargs": {},
+        }
+    )
+
+    assert answer == "done"
+    rlm_kwargs = captured["rlm_kwargs"]
+    assert isinstance(rlm_kwargs, dict)
+    assert rlm_kwargs["trace_export_path"] == tmp_path / "predict_rlm_trace.json"
+
+
 def test_daytona_remote_agent_payload_carries_submit_confirmation_mode(tmp_path: Path) -> None:
     env = FakeDaytonaRemoteEnvironment(answer="remote done")
     agent = tbench_agent.DaytonaRemotePredictRLMAgent(
