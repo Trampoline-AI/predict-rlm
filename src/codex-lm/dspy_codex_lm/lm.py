@@ -1,4 +1,5 @@
 import asyncio
+import inspect
 import json
 import logging
 import os
@@ -1083,11 +1084,18 @@ class _AiohttpCodexWSTransport:
         async def collect() -> list[Any]:
             events = []
             stream = self.astream_turn(**kwargs)
-            async for event in _aiter_stream_with_heartbeat(stream):
-                events.append(event)
-                event_type = _g(event, "type")
-                if event_type in {"response.completed", "response.failed"}:
-                    break
+            try:
+                async for event in _aiter_stream_with_heartbeat(stream):
+                    events.append(event)
+                    event_type = _g(event, "type")
+                    if event_type in {"response.completed", "response.failed"}:
+                        break
+            finally:
+                close_stream = getattr(stream, "aclose", None)
+                if callable(close_stream):
+                    maybe_awaitable = close_stream()
+                    if inspect.isawaitable(maybe_awaitable):
+                        await maybe_awaitable
             return events
 
         return iter(asyncio.run(collect()))
@@ -1326,11 +1334,18 @@ class CodexWSLM(CodexHTTPLM):
                     timing.emit_start()
                     try:
                         stream = await turn.astream()
-                        async for event in _aiter_stream_with_heartbeat(stream):
-                            timing.observe_event(event)
-                            self._handle_event(event, state)
-                            if state["completed"] or state["failure"] is not None:
-                                break
+                        try:
+                            async for event in _aiter_stream_with_heartbeat(stream):
+                                timing.observe_event(event)
+                                self._handle_event(event, state)
+                                if state["completed"] or state["failure"] is not None:
+                                    break
+                        finally:
+                            close_stream = getattr(stream, "aclose", None)
+                            if callable(close_stream):
+                                maybe_awaitable = close_stream()
+                                if inspect.isawaitable(maybe_awaitable):
+                                    await maybe_awaitable
                         timing.mark_stream_end()
                         self._raise_if_failed(state)
                         result = self._assemble(
