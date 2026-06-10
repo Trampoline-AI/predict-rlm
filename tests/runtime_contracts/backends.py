@@ -11,16 +11,18 @@ from typing import Any, Callable, Literal, Protocol
 import pytest
 
 from predict_rlm.interpreter import JspiClientAdapter
-from predict_rlm.interpreters import SbxClientAdapter, SbxConfig
+from predict_rlm.interpreters import (
+    DirectProcessRunnerClientAdapter,
+    SbxClientAdapter,
+    SbxConfig,
+)
 
 ROOT = Path(__file__).resolve().parents[2]
 TERMINAL_BENCH_DIR = ROOT / "examples" / "terminal_bench"
 if str(TERMINAL_BENCH_DIR) not in sys.path:
     sys.path.insert(0, str(TERMINAL_BENCH_DIR))
 
-container_runner = importlib.import_module("terminal_bench_rlm.tools.container_runner")
 runner_module = importlib.import_module("terminal_bench_rlm.tools.runner")
-LocalProcessRunnerClientAdapter = container_runner.LocalProcessRunnerClientAdapter
 runner_script_path = runner_module.runner_script_path
 
 
@@ -223,7 +225,7 @@ def _make_jspi(tmp_path: Path, spec: RuntimeSpec) -> RuntimeHandle:
 def _make_direct_process(tmp_path: Path, spec: RuntimeSpec) -> RuntimeHandle:
     return InterpreterRuntimeHandle(
         spec,
-        LocalProcessRunnerClientAdapter(
+        DirectProcessRunnerClientAdapter(
             tools=_default_tools(),
             runner_path=str(tmp_path / "predict_rlm_runner.py"),
             workdir=str(tmp_path),

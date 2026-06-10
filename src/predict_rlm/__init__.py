@@ -18,6 +18,8 @@ Lifecycle callbacks:
 from .files import File, LocalDir, LocalFile, OutputDir, OutputFile, SyncedFile
 from .interpreters import (
     DEFAULT_SBX_TEMPLATE,
+    DirectProcessRunnerClientAdapter,
+    PythonRunnerClientAdapter,
     SandboxBackend,
     SbxClientAdapter,
     SbxConfig,
@@ -29,12 +31,14 @@ from .trace import IterationStep, RunTrace
 
 __all__ = [
     "File",
+    "DirectProcessRunnerClientAdapter",
     "IterationStep",
     "LocalDir",
     "LocalFile",
     "OutputDir",
     "OutputFile",
     "PredictRLM",
+    "PythonRunnerClientAdapter",
     "RunTrace",
     "SubmitConfirmationContext",
     "DEFAULT_SBX_TEMPLATE",
