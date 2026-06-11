@@ -59,6 +59,12 @@ def _real_sbx_available() -> bool:
     )
 
 
+def _free_local_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        return int(sock.getsockname()[1])
+
+
 class LocalRunner:
     def __init__(self, tmp_path: Path) -> None:
         env_root = tmp_path / "runner-root"
@@ -1507,6 +1513,140 @@ while True:
             interpreter.shutdown()
 
 
+class TestSbxClientAdapterLocalWebSocketRunner:
+    def make_interpreter(
+        self,
+        tmp_path: Path,
+        *,
+        tools: dict | None = None,
+        path: str | None = None,
+        url_path: str | None = None,
+        startup_timeout: float = 3,
+    ) -> SbxClientAdapter:
+        port = _free_local_port()
+        websocket_path = path or f"/predict-rlm-test-{os.getpid()}-{time.time_ns()}"
+        command = [
+            sys.executable,
+            "-u",
+            str(RUNNER_PATH),
+            "--websocket-host",
+            "127.0.0.1",
+            "--websocket-port",
+            str(port),
+            "--websocket-path",
+            websocket_path,
+            "--websocket-max-message-bytes",
+            str(32 * 1024 * 1024),
+        ]
+        return SbxClientAdapter(
+            config=SbxConfig(
+                name="local-websocket-test",
+                exec_timeout=5,
+                websocket_startup_timeout=startup_timeout,
+                websocket_max_message_bytes=32 * 1024 * 1024,
+            ),
+            tools=tools,
+            preinstall_packages=False,
+            _websocket_supervisor_command=command,
+            _websocket_url=f"ws://127.0.0.1:{port}{url_path or websocket_path}",
+            _staging_root=tmp_path / "ws-staging",
+        )
+
+    def test_websocket_execute_and_state_persistence(self, tmp_path: Path):
+        interpreter = self.make_interpreter(tmp_path)
+        try:
+            assert interpreter.execute("x = 7\nprint(x)") == "7\n"
+            assert interpreter.execute("x += 1\nprint(x)") == "8\n"
+        finally:
+            interpreter.shutdown()
+
+    def test_websocket_host_tool_round_trip(self, tmp_path: Path):
+        def add(a: int, b: int) -> dict:
+            return {"total": a + b}
+
+        interpreter = self.make_interpreter(tmp_path, tools={"add": add})
+        try:
+            output = interpreter.execute("result = await add(2, 3)\nprint(result['total'])")
+        finally:
+            interpreter.shutdown()
+
+        assert output == "5\n"
+
+    def test_websocket_concurrent_host_tool_timeout_recovers_and_shutdowns(
+        self, tmp_path: Path
+    ):
+        def slow_tool() -> str:
+            time.sleep(5)
+            return "slow"
+
+        interpreter = self.make_interpreter(tmp_path, tools={"slow_tool": slow_tool})
+        shutdown_duration = None
+        try:
+            timeout_result = interpreter.execute(
+                "import asyncio\n"
+                "await asyncio.gather(slow_tool(), slow_tool())\n",
+                timeout=0.1,
+            )
+            output = interpreter.execute("print('still alive')")
+            shutdown_start = time.perf_counter()
+            interpreter.shutdown()
+            shutdown_duration = time.perf_counter() - shutdown_start
+        finally:
+            interpreter.shutdown()
+
+        assert "[Timeout] Iteration execution timed out after 0.1s" in timeout_result
+        assert output == "still alive\n"
+        assert interpreter._pending_tool_calls == {}
+        assert shutdown_duration is not None and shutdown_duration < 2
+
+    def test_websocket_large_host_tool_payload_round_trips(self, tmp_path: Path):
+        seen_lengths: list[int] = []
+
+        def predict(signature: str, **kwargs) -> dict:
+            seen_lengths.append(len(kwargs["text"]))
+            return {"answer": "4"}
+
+        interpreter = self.make_interpreter(tmp_path, tools={"predict": predict})
+        try:
+            output = interpreter.execute(
+                "payload = 'x' * 950000\n"
+                "result = await predict('text: str -> answer: str', text=payload)\n"
+                "print(result['answer'])"
+            )
+        finally:
+            interpreter.shutdown()
+
+        assert output == "4\n"
+        assert seen_lengths == [950000]
+
+    def test_websocket_reset_and_shutdown(self, tmp_path: Path):
+        interpreter = self.make_interpreter(tmp_path)
+        try:
+            assert interpreter.execute("x = 7\nprint(x)") == "7\n"
+            interpreter.reset()
+            assert interpreter.execute("print('x' in globals())") == "False\n"
+            proc = interpreter._proc
+            interpreter.shutdown()
+        finally:
+            interpreter.shutdown()
+
+        assert proc is not None
+        assert proc.poll() is not None
+
+    def test_websocket_auth_path_failure_is_reported(self, tmp_path: Path):
+        interpreter = self.make_interpreter(
+            tmp_path,
+            path="/predict-rlm-good",
+            url_path="/predict-rlm-bad",
+            startup_timeout=0.5,
+        )
+        try:
+            with pytest.raises(SandboxFatalError, match="Timed out connecting"):
+                interpreter.prewarm()
+        finally:
+            interpreter.shutdown()
+
+
 class TestSbxCommandConstruction:
     def test_default_template_uses_explicit_non_docker_shell_template(
         self, monkeypatch, tmp_path: Path
@@ -1598,6 +1738,123 @@ class TestSbxCommandConstruction:
         assert "--persist" not in create_cmd
         assert command[:4] == ["sbx", "exec", "-i", "-w"]
         assert not any(cmd[:2] == ["sbx", "rm"] for cmd in commands)
+
+    def test_websocket_supervisor_starts_detached_and_publishes_port(
+        self, monkeypatch, tmp_path: Path
+    ):
+        commands: list[list[str]] = []
+
+        def fake_run(command, **kwargs):
+            commands.append(command)
+            return subprocess.CompletedProcess(command, 0, stdout="created-name\n", stderr="")
+
+        monkeypatch.setattr(shutil, "which", lambda name: "/usr/local/bin/sbx")
+        monkeypatch.setattr(subprocess, "run", fake_run)
+        interpreter = SbxClientAdapter(
+            config=SbxConfig(
+                name="created-name",
+                websocket_port=8766,
+                websocket_max_message_bytes=32 * 1024 * 1024,
+            ),
+            preinstall_packages=False,
+            _staging_root=tmp_path / "staging",
+        )
+        monkeypatch.setattr(
+            interpreter,
+            "_publish_websocket_port",
+            lambda: "ws://127.0.0.1:49152/test",
+        )
+
+        interpreter._start_sbx_websocket_supervisor()
+
+        detached_exec = next(cmd for cmd in commands if cmd[:3] == ["sbx", "exec", "-d"])
+        assert detached_exec[:5] == ["sbx", "exec", "-d", "-w", str(tmp_path / "staging")]
+        assert "-i" not in detached_exec
+        assert "--websocket-host" in detached_exec
+        assert detached_exec[detached_exec.index("--websocket-port") + 1] == "8766"
+        assert detached_exec[detached_exec.index("--websocket-max-message-bytes") + 1] == str(
+            32 * 1024 * 1024
+        )
+
+    def test_websocket_recovery_restarts_detached_supervisor_after_kill(
+        self, monkeypatch, tmp_path: Path
+    ):
+        commands: list[list[str]] = []
+
+        def fake_run(command, **kwargs):
+            commands.append(command)
+            return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+        monkeypatch.setattr(subprocess, "run", fake_run)
+        interpreter = SbxClientAdapter(
+            config=SbxConfig(name="created-name"),
+            preinstall_packages=False,
+            _staging_root=tmp_path / "staging",
+        )
+        interpreter._sandbox_name = "created-name"
+        interpreter._prepared_runner_path = tmp_path / "staging" / ".predict_rlm_runner" / "python_runner.py"
+        interpreter._websocket_url = "ws://127.0.0.1:49152/predict-rlm/old"
+        interpreter._published_websocket_url = interpreter._websocket_url
+
+        started: list[bool] = []
+        connected: list[str] = []
+
+        def fake_start_sbx_websocket_supervisor():
+            started.append(True)
+            interpreter._websocket_url = "ws://127.0.0.1:49153/predict-rlm/new"
+
+        def fake_connect_websocket_supervisor(url: str):
+            connected.append(url)
+            interpreter._ws = object()
+
+        monkeypatch.setattr(
+            interpreter,
+            "_start_sbx_websocket_supervisor",
+            fake_start_sbx_websocket_supervisor,
+        )
+        monkeypatch.setattr(
+            interpreter,
+            "_connect_websocket_supervisor",
+            fake_connect_websocket_supervisor,
+        )
+
+        interpreter._kill_websocket_supervisor()
+        interpreter._ensure_websocket_supervisor()
+
+        assert interpreter._published_websocket_url is None
+        assert started == [True]
+        assert connected == ["ws://127.0.0.1:49153/predict-rlm/new"]
+        assert any(
+            cmd[:5] == ["sbx", "exec", "-w", str(tmp_path / "staging"), "created-name"]
+            for cmd in commands
+        )
+
+    def test_published_websocket_endpoint_parses_localhost_port(self, tmp_path: Path):
+        interpreter = SbxClientAdapter(
+            preinstall_packages=False,
+            _staging_root=tmp_path / "staging",
+        )
+        interpreter._websocket_path = "/predict-rlm/token"
+
+        assert (
+            interpreter._parse_published_websocket_endpoint(
+                "Published 8765/tcp to localhost:49152\n"
+            )
+            == "ws://localhost:49152/predict-rlm/token"
+        )
+        assert (
+            interpreter._parse_published_websocket_endpoint("http://127.0.0.1:49153")
+            == "ws://127.0.0.1:49153/predict-rlm/token"
+        )
+
+    def test_published_websocket_endpoint_parse_failure_is_fatal(self, tmp_path: Path):
+        interpreter = SbxClientAdapter(
+            preinstall_packages=False,
+            _staging_root=tmp_path / "staging",
+        )
+
+        with pytest.raises(SandboxFatalError, match="published WebSocket endpoint"):
+            interpreter._parse_published_websocket_endpoint("no ports here")
 
     def test_shutdown_forces_sbx_removal_without_confirmation(self, monkeypatch, tmp_path: Path):
         commands: list[list[str]] = []
@@ -1764,6 +2021,7 @@ class TestSbxCommandConstruction:
                 "pip",
                 "install",
                 "--break-system-packages",
+                "websockets",
                 "pydantic",
                 "pandas",
             ]

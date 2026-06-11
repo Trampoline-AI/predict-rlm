@@ -139,6 +139,9 @@ class SbxConfig(BaseModel):
     workspace_read_only: bool = False
     create_timeout: float = 120.0
     exec_timeout: float = 300.0
+    websocket_port: int = 8765
+    websocket_startup_timeout: float = 30.0
+    websocket_max_message_bytes: int = 32 * 1024 * 1024
 
 
 class PredictRLMClientAdapter(Protocol):

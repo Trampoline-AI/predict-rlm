@@ -57,9 +57,7 @@ from .interpreter import JspiClientAdapter, SandboxFatalError
 from .interpreters import (
     PredictRLMClientAdapter,
     SandboxBackend,
-    SbxClientAdapter,
     SbxConfig,
-    SbxPool,
 )
 from .rlm_skills import Skill, merge_skills
 from .telemetry import TelemetryContext, make_span_id
@@ -196,6 +194,8 @@ def _sha256_text(value: str) -> str:
 
 if TYPE_CHECKING:
     from dspy.signatures.signature import Signature
+
+    from .interpreters import SbxPool
 
 
 @dataclass(frozen=True)
@@ -1513,6 +1513,8 @@ class PredictRLM(dspy.RLM):
                         )
                 return
             if self._sandbox_backend is SandboxBackend.SBX:
+                from .interpreters.sbx import SbxClientAdapter
+
                 self._log_lifecycle(
                     "interpreter.create",
                     backend="sbx",
@@ -1710,7 +1712,7 @@ class PredictRLM(dspy.RLM):
             logger.debug("%s%s", event, format_log_fields(fields))
 
     def _interpreter_backend_label(self, repl: Any) -> str:
-        if isinstance(SbxClientAdapter, type) and isinstance(repl, SbxClientAdapter):
+        if type(repl).__name__ == "SbxClientAdapter":
             return "sbx"
         if isinstance(JspiClientAdapter, type) and isinstance(repl, JspiClientAdapter):
             return "jspi"

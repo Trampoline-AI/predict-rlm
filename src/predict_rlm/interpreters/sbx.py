@@ -10,6 +10,8 @@ import inspect
 import json
 import os
 import queue
+import re
+import secrets
 import select
 import shutil
 import subprocess
@@ -22,6 +24,17 @@ from pathlib import Path
 from typing import Any, Callable
 
 from dspy.primitives.code_interpreter import CodeInterpreterError, FinalOutput
+
+try:
+    from websockets.exceptions import ConnectionClosed
+    from websockets.sync.client import ClientConnection
+    from websockets.sync.client import connect as websocket_connect
+except ImportError as exc:  # pragma: no cover - exercised by optional-dep import tests
+    raise ImportError(
+        "The SBX backend requires optional dependency `predict-rlm[sbx]`. "
+        "Install with `pip install 'predict-rlm[sbx]'` or "
+        "`uv pip install 'predict-rlm[sbx]'`."
+    ) from exc
 
 from predict_rlm._logging import (
     configure_predict_rlm_logging,
@@ -54,6 +67,19 @@ from .sbx_logging import log_interpreter_lifecycle, log_partial_output
 RUNNER_PATH = Path(__file__).parents[1] / "sandbox" / "python_runner.py"
 DEFAULT_PACKAGE_DOMAINS = ["pypi.org", "files.pythonhosted.org"]
 SBX_PYTHON_EXECUTABLE = "python3"
+SBX_TRANSPORT_PACKAGES = ["websockets"]
+_LOCALHOST_ENDPOINT_RE = re.compile(
+    r"(?:(?P<scheme>https?)://)?(?P<host>localhost|127\.0\.0\.1|\[::1\])(?::(?P<port>\d+))"
+)
+
+
+class _DetachedWebSocketSupervisorProcess:
+    stdin = None
+    stdout = None
+    stderr = None
+
+    def poll(self) -> int | None:
+        return None
 
 
 class SbxClientAdapter(PersistentJsonRpcRunnerClient, PredictRLMClientAdapter):
@@ -78,6 +104,8 @@ class SbxClientAdapter(PersistentJsonRpcRunnerClient, PredictRLMClientAdapter):
         extra_write_paths: list[str] | None = None,
         _supervisor_command: list[str] | None = None,
         _runner_command: list[str] | None = None,
+        _websocket_supervisor_command: list[str] | None = None,
+        _websocket_url: str | None = None,
         _staging_root: str | Path | None = None,
     ) -> None:
         PersistentJsonRpcRunnerClient.__init__(self, supervisor_name="Sbx supervisor")
@@ -96,6 +124,9 @@ class SbxClientAdapter(PersistentJsonRpcRunnerClient, PredictRLMClientAdapter):
         self.extra_read_paths = extra_read_paths or []
         self.extra_write_paths = extra_write_paths or []
         self._supervisor_command = _supervisor_command or _runner_command
+        self._websocket_supervisor_command = _websocket_supervisor_command
+        self._websocket_url = _websocket_url
+        self._websocket_path = f"/predict-rlm/{secrets.token_urlsafe(32)}"
         self._host_workspace = Path.cwd()
         self._owns_staging_root = _staging_root is None
         self._staging_root = (
@@ -107,11 +138,13 @@ class SbxClientAdapter(PersistentJsonRpcRunnerClient, PredictRLMClientAdapter):
         self._proc: subprocess.Popen[str] | None = None
         self._stdout_lines: queue.Queue[str] = queue.Queue()
         self._stdout_reader: threading.Thread | None = None
+        self._ws: ClientConnection | None = None
         self._pending_tool_calls: dict[concurrent.futures.Future[dict[str, Any]], int] = {}
         self._active_execute_timeout_deadline: float | None = None
         self._execution_gate = ClientAdapterExecutionGate("SBX client adapter")
         self._sandbox_name: str | None = None
         self._prepared_runner_path: Path | None = None
+        self._published_websocket_url: str | None = None
         self._shutdown = False
 
     def configure_debug(self, enabled: bool) -> None:
@@ -141,6 +174,14 @@ class SbxClientAdapter(PersistentJsonRpcRunnerClient, PredictRLMClientAdapter):
             output=output,
             **fields,
         )
+
+    def _uses_websocket_transport(self) -> bool:
+        return self._supervisor_command is None
+
+    def _transport_running(self) -> bool:
+        if self._uses_websocket_transport():
+            return self._ws is not None
+        return bool(self._proc and self._proc.poll() is None)
 
     def execute(
         self,
@@ -253,7 +294,7 @@ class SbxClientAdapter(PersistentJsonRpcRunnerClient, PredictRLMClientAdapter):
             self.tools = tools
         if output_fields is not None:
             self.output_fields = output_fields
-        if self._proc and self._proc.poll() is None:
+        if self._transport_running():
             if self.output_fields:
                 self._send_request("register_output_fields", {"fields": self.output_fields})
             if self.tools:
@@ -283,7 +324,30 @@ class SbxClientAdapter(PersistentJsonRpcRunnerClient, PredictRLMClientAdapter):
             return
         self._shutdown = True
         self._log_lifecycle("sbx.shutdown.start")
-        if self._proc and self._proc.poll() is None:
+        if self._uses_websocket_transport():
+            sent_shutdown = False
+            if self._ws is not None:
+                try:
+                    self._send_websocket_request("shutdown", {})
+                    sent_shutdown = True
+                except Exception:
+                    pass
+                with contextlib.suppress(Exception):
+                    self._ws.close()
+                self._ws = None
+            if self._proc and self._proc.poll() is None:
+                if not sent_shutdown:
+                    self._proc.kill()
+                    self._proc.wait(timeout=5)
+                    self._log_lifecycle("sbx.shutdown.kill", kill_result="sent")
+                else:
+                    try:
+                        self._proc.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        self._proc.kill()
+                        self._proc.wait(timeout=5)
+                        self._log_lifecycle("sbx.shutdown.kill", kill_result="sent")
+        elif self._proc and self._proc.poll() is None:
             try:
                 self._send_request("shutdown", {})
             except Exception:
@@ -322,6 +386,9 @@ class SbxClientAdapter(PersistentJsonRpcRunnerClient, PredictRLMClientAdapter):
             pass
 
     def _ensure_process(self) -> None:
+        if self._uses_websocket_transport():
+            self._ensure_websocket_supervisor()
+            return
         if self._proc and self._proc.poll() is None:
             return
         if self._proc and self._proc.poll() is not None:
@@ -386,7 +453,191 @@ class SbxClientAdapter(PersistentJsonRpcRunnerClient, PredictRLMClientAdapter):
         )
         self._stdout_reader.start()
 
+    def _ensure_websocket_supervisor(self) -> None:
+        if self._ws is not None:
+            return
+        if self._proc and self._proc.poll() is not None:
+            raise SandboxFatalError("Sbx supervisor process exited unexpectedly")
+
+        start = time.perf_counter()
+        try:
+            if self._websocket_supervisor_command is not None and self._proc is None:
+                self._start_local_websocket_supervisor()
+            if self._websocket_url is None:
+                self._start_sbx_websocket_supervisor()
+            assert self._websocket_url is not None
+            self._connect_websocket_supervisor(self._websocket_url)
+            if self.output_fields:
+                self._send_websocket_request(
+                    "register_output_fields",
+                    {"fields": self.output_fields},
+                )
+            if self.tools:
+                self._send_websocket_request("register_tools", {"tools": list(self.tools)})
+        except BaseException as exc:
+            self._log_lifecycle(
+                "sbx.runner.error",
+                status="error",
+                error_type=type(exc).__name__,
+                duration_ms=round((time.perf_counter() - start) * 1000),
+            )
+            raise
+        self._log_lifecycle(
+            "sbx.runner.started",
+            status="ok",
+            transport="websocket",
+            duration_ms=round((time.perf_counter() - start) * 1000),
+            sandbox_name=self._sandbox_name,
+            process_pid=getattr(self._proc, "pid", None),
+        )
+
+    def _start_local_websocket_supervisor(self) -> None:
+        assert self._websocket_supervisor_command is not None
+        env = os.environ.copy()
+        env["PREDICT_RLM_SBX_ROOT"] = str(self._staging_root)
+        self._log_lifecycle(
+            "sbx.runner.start",
+            command=self._websocket_supervisor_command[0],
+            transport="websocket",
+        )
+        self._proc = subprocess.Popen(
+            self._websocket_supervisor_command,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            env=env,
+            bufsize=1,
+        )
+
+    def _start_sbx_websocket_supervisor(self) -> None:
+        runner_path = self._start_sbx_and_prepare_runner()
+        assert self._sandbox_name is not None
+        runner_root = self._staging_root
+        runner_root.mkdir(parents=True, exist_ok=True)
+        command = [
+            "sbx",
+            "exec",
+            "-d",
+            "-w",
+            str(self._staging_root),
+            self._sandbox_name,
+            "env",
+            f"PREDICT_RLM_SBX_ROOT={runner_root}",
+            SBX_PYTHON_EXECUTABLE,
+            "-u",
+            str(runner_path),
+            "--websocket-host",
+            "0.0.0.0",
+            "--websocket-port",
+            str(self.config.websocket_port),
+            "--websocket-path",
+            self._websocket_path,
+            "--websocket-max-message-bytes",
+            str(self.config.websocket_max_message_bytes),
+        ]
+        self._log_lifecycle(
+            "sbx.runner.start",
+            command=command[0],
+            transport="websocket",
+        )
+        start_result = subprocess.run(
+            command,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=self.config.exec_timeout,
+        )
+        if start_result.returncode != 0:
+            raise SandboxFatalError(
+                "Failed to start sbx WebSocket supervisor: "
+                f"exit code {start_result.returncode}; "
+                f"stdout: {start_result.stdout.strip()}; "
+                f"stderr: {start_result.stderr.strip()}"
+            )
+        self._websocket_url = self._publish_websocket_port()
+
+    def _connect_websocket_supervisor(self, url: str) -> None:
+        deadline = time.monotonic() + self.config.websocket_startup_timeout
+        last_error: BaseException | None = None
+        while True:
+            try:
+                self._ws = websocket_connect(
+                    url,
+                    open_timeout=min(2.0, max(0.1, deadline - time.monotonic())),
+                    max_size=self.config.websocket_max_message_bytes,
+                    max_queue=32,
+                    proxy=None,
+                )
+                self._log_lifecycle("sbx.websocket.connected", endpoint=url)
+                return
+            except BaseException as exc:
+                last_error = exc
+                if time.monotonic() >= deadline:
+                    raise SandboxFatalError(
+                        "Timed out connecting to sbx WebSocket supervisor at "
+                        f"{url}: {last_error}"
+                    ) from last_error
+                time.sleep(0.1)
+
+    def _publish_websocket_port(self) -> str:
+        assert self._sandbox_name is not None
+        result = subprocess.run(
+            [
+                "sbx",
+                "ports",
+                self._sandbox_name,
+                "--publish",
+                str(self.config.websocket_port),
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=self.config.exec_timeout,
+        )
+        if result.returncode != 0:
+            raise SandboxFatalError(
+                "Failed to publish sbx WebSocket supervisor port "
+                f"{self.config.websocket_port}: exit code {result.returncode}; "
+                f"stdout: {result.stdout.strip()}; stderr: {result.stderr.strip()}"
+            )
+        endpoint = self._parse_published_websocket_endpoint(result.stdout)
+        self._published_websocket_url = endpoint
+        self._log_lifecycle("sbx.websocket.published", endpoint=endpoint)
+        return endpoint
+
+    def _parse_published_websocket_endpoint(self, stdout: str) -> str:
+        match = _LOCALHOST_ENDPOINT_RE.search(stdout)
+        if not match:
+            raise SandboxFatalError(
+                "Could not determine sbx published WebSocket endpoint from "
+                f"`sbx ports` output: {stdout.strip()}"
+            )
+        scheme = "wss" if match.group("scheme") == "https" else "ws"
+        host = match.group("host")
+        port = match.group("port")
+        return f"{scheme}://{host}:{port}{self._websocket_path}"
+
     def _start_sbx_and_build_supervisor_command(self) -> list[str]:
+        runner_path = self._start_sbx_and_prepare_runner()
+        assert self._sandbox_name is not None
+        runner_root = self._staging_root
+        runner_root.mkdir(parents=True, exist_ok=True)
+        return [
+            "sbx",
+            "exec",
+            "-i",
+            "-w",
+            str(self._staging_root),
+            self._sandbox_name,
+            "env",
+            f"PREDICT_RLM_SBX_ROOT={runner_root}",
+            SBX_PYTHON_EXECUTABLE,
+            "-u",
+            str(runner_path),
+        ]
+
+    def _start_sbx_and_prepare_runner(self) -> Path:
         if shutil.which("sbx") is None:
             self._log_lifecycle("sbx.create.missing_cli", status="error")
             raise SandboxFatalError(
@@ -454,22 +705,7 @@ class SbxClientAdapter(PersistentJsonRpcRunnerClient, PredictRLMClientAdapter):
         else:
             runner_path = self._prepared_runner_path or self._prepare_runner_script()
 
-        assert self._sandbox_name is not None
-        runner_root = self._staging_root
-        runner_root.mkdir(parents=True, exist_ok=True)
-        return [
-            "sbx",
-            "exec",
-            "-i",
-            "-w",
-            str(self._staging_root),
-            self._sandbox_name,
-            "env",
-            f"PREDICT_RLM_SBX_ROOT={runner_root}",
-            SBX_PYTHON_EXECUTABLE,
-            "-u",
-            str(runner_path),
-        ]
+        return runner_path
 
     def _start_sbx_and_build_runner_command(self) -> list[str]:
         return self._start_sbx_and_build_supervisor_command()
@@ -489,7 +725,7 @@ class SbxClientAdapter(PersistentJsonRpcRunnerClient, PredictRLMClientAdapter):
         raise SandboxFatalError("Could not determine created sbx sandbox name")
 
     def _apply_network_policy(self) -> None:
-        domains = list(DEFAULT_PACKAGE_DOMAINS) if self.preinstall_packages else []
+        domains = list(DEFAULT_PACKAGE_DOMAINS)
         domains.extend(self.allowed_domains or [])
         self._log_lifecycle("sbx.network_policy.start", domains=len(domains))
         for domain in domains:
@@ -508,13 +744,10 @@ class SbxClientAdapter(PersistentJsonRpcRunnerClient, PredictRLMClientAdapter):
         self._log_lifecycle("sbx.network_policy.complete", domains=len(domains))
 
     def _bootstrap_packages(self) -> None:
-        packages = []
+        packages = list(SBX_TRANSPORT_PACKAGES)
         if self.preinstall_packages:
             packages.extend(["pydantic", "pandas"])
         packages.extend(self.skill_packages)
-        if not packages:
-            self._log_lifecycle("sbx.bootstrap.skip", packages=0)
-            return
         assert self._sandbox_name is not None
         command = [
             "sbx",
@@ -622,6 +855,25 @@ class SbxClientAdapter(PersistentJsonRpcRunnerClient, PredictRLMClientAdapter):
         *,
         fatal: bool = True,
     ) -> None:
+        if self._uses_websocket_transport():
+            self._log_lifecycle(
+                "sbx.request.timeout",
+                timeout_seconds=self.config.exec_timeout,
+                status="error",
+            )
+            self._kill_websocket_supervisor()
+            if not fatal:
+                return
+            if timeout_failure_class == ITERATION_TIMEOUT_FAILURE_CLASS:
+                raise SandboxFatalError(
+                    "Sbx supervisor failed to recover from iteration timeout after "
+                    f"{timeout_seconds:g}s; waited {host_timeout_seconds:g}s before "
+                    "force-killing supervisor"
+                )
+            raise SandboxFatalError(
+                f"Sbx supervisor request timed out after {host_timeout_seconds:g}s"
+            )
+
         assert self._proc is not None
         self._log_lifecycle(
             "sbx.request.timeout",
@@ -642,6 +894,38 @@ class SbxClientAdapter(PersistentJsonRpcRunnerClient, PredictRLMClientAdapter):
         raise SandboxFatalError(
             f"Sbx supervisor request timed out after {host_timeout_seconds:g}s"
         )
+
+    def _kill_websocket_supervisor(self) -> None:
+        if self._ws is not None:
+            with contextlib.suppress(Exception):
+                self._ws.close()
+            self._ws = None
+        if self._proc and self._proc.poll() is None:
+            self._proc.kill()
+            with contextlib.suppress(Exception):
+                self._proc.wait(timeout=1)
+            self._proc = None
+            return
+        if self._sandbox_name and self._prepared_runner_path is not None:
+            subprocess.run(
+                [
+                    "sbx",
+                    "exec",
+                    "-w",
+                    str(self._staging_root),
+                    self._sandbox_name,
+                    "pkill",
+                    "-f",
+                    str(self._prepared_runner_path),
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=min(self.config.exec_timeout, 5),
+            )
+            if self._websocket_supervisor_command is None:
+                self._websocket_url = None
+                self._published_websocket_url = None
 
     def _get_supervisor_process(self) -> subprocess.Popen[str] | None:
         return self._proc
@@ -840,6 +1124,11 @@ class SbxClientAdapter(PersistentJsonRpcRunnerClient, PredictRLMClientAdapter):
         return args, kwargs, synced_entries, temp_dir
 
     def _write_tool_response(self, response: dict[str, Any]) -> None:
+        if self._uses_websocket_transport():
+            if self._ws is None:
+                raise SandboxFatalError("Sbx WebSocket supervisor is not connected")
+            self._ws.send(json.dumps(response))
+            return
         assert self._proc is not None
         assert self._proc.stdin is not None
         self._proc.stdin.write(json.dumps(response) + "\n")
@@ -852,7 +1141,141 @@ class SbxClientAdapter(PersistentJsonRpcRunnerClient, PredictRLMClientAdapter):
         *,
         timeout: float | None = None,
     ) -> dict:
+        if self._uses_websocket_transport():
+            return self._send_websocket_request(method, params, timeout=timeout)
         return self._send_json_rpc_request(method, params, timeout=timeout)
+
+    def _send_websocket_request(
+        self,
+        method: str,
+        params: dict[str, Any] | None = None,
+        *,
+        timeout: float | None = None,
+    ) -> dict[str, Any]:
+        recovered = self._recover_dead_supervisor_after_structured_execute(method)
+        if recovered is not None:
+            return recovered
+        self._ensure_process_for_request(method)
+        ws = self._require_websocket()
+        params = params or {}
+        request_timeout = self._request_timeout_seconds(method, params, timeout)
+        request_id = self._next_request_id()
+        payload = {
+            "jsonrpc": "2.0",
+            "method": method,
+            "params": params,
+            "id": request_id,
+        }
+        try:
+            ws.send(self._serialize_supervisor_message(payload))
+        except Exception as exc:
+            self._handle_supervisor_send_error(method, request_id, BrokenPipeError(str(exc)))
+
+        deadline = time.monotonic() + request_timeout
+        request_start = time.perf_counter()
+        stale_discards = 0
+        stdout_tail: list[str] = []
+        self._on_supervisor_request_start(
+            method,
+            params,
+            request_id=request_id,
+            request_timeout=request_timeout,
+        )
+        while True:
+            self._drain_completed_supervisor_work()
+            self._raise_if_websocket_supervisor_exited(
+                method,
+                request_id=request_id,
+                request_start=request_start,
+            )
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return self._handle_supervisor_request_timeout(
+                    method,
+                    params,
+                    self._websocket_process_for_diagnostics(),
+                    request_id=request_id,
+                    request_timeout=request_timeout,
+                    request_start=request_start,
+                    stdout_tail="".join(stdout_tail)[-4000:],
+                )
+            try:
+                raw = ws.recv(timeout=min(remaining, 0.05))
+            except TimeoutError:
+                continue
+            except ConnectionClosed as exc:
+                raise SandboxFatalError(
+                    f"Sbx WebSocket supervisor connection closed during {method}: {exc}"
+                ) from exc
+            if isinstance(raw, bytes):
+                raw = raw.decode("utf-8", errors="replace")
+            if not raw:
+                continue
+            try:
+                message = json.loads(raw)
+            except json.JSONDecodeError:
+                stdout_tail.append(str(raw))
+                continue
+            if not isinstance(message, dict):
+                stdout_tail.append(str(raw))
+                continue
+            if self._handle_supervisor_control_message(message, deadline=deadline):
+                continue
+            if message.get("id") == request_id:
+                self._record_supervisor_response(
+                    method,
+                    params,
+                    request_id=request_id,
+                    request_timeout=request_timeout,
+                    response=message,
+                )
+                self._on_supervisor_request_response(
+                    method,
+                    request_id=request_id,
+                    request_start=request_start,
+                    response=message,
+                )
+                return message
+            self._on_supervisor_stale_response(
+                method,
+                expected_request_id=request_id,
+                stale_response=message,
+                stale_discards=stale_discards + 1,
+            )
+            stale_discards += 1
+            if stale_discards > self._stale_response_discard_limit:
+                self._handle_stale_response_limit(
+                    method,
+                    request_id=request_id,
+                    request_start=request_start,
+                )
+
+    def _require_websocket(self) -> ClientConnection:
+        if self._ws is None:
+            raise SandboxFatalError("Sbx WebSocket supervisor is not connected")
+        return self._ws
+
+    def _websocket_process_for_diagnostics(self) -> PersistentSupervisorProcess:
+        process = self._proc
+        if process is not None:
+            return process
+        return _DetachedWebSocketSupervisorProcess()
+
+    def _raise_if_websocket_supervisor_exited(
+        self,
+        method: str,
+        *,
+        request_id: int,
+        request_start: float,
+    ) -> None:
+        if self._proc is None or self._proc.poll() is None:
+            return
+        self._handle_supervisor_exit_during_request(
+            method,
+            request_id=request_id,
+            request_start=request_start,
+            process=self._proc,
+        )
 
     def _on_supervisor_request_start(
         self,
@@ -886,6 +1309,9 @@ class SbxClientAdapter(PersistentJsonRpcRunnerClient, PredictRLMClientAdapter):
     ) -> None:
         if method == "execute":
             self._active_execute_timeout_deadline = None
+            result = response.get("result")
+            if isinstance(result, dict) and "timeout" in result:
+                self._pending_tool_calls.clear()
         self._log_lifecycle(
             "sbx.request.ok",
             method=method,
@@ -1073,6 +1499,10 @@ class SbxClientAdapter(PersistentJsonRpcRunnerClient, PredictRLMClientAdapter):
         self._ensure_process_for_method(method)
 
     def _discard_supervisor_process(self) -> None:
+        if self._ws is not None:
+            with contextlib.suppress(Exception):
+                self._ws.close()
+            self._ws = None
         self._proc = None
         self._stdout_lines = queue.Queue()
         self._stdout_reader = None

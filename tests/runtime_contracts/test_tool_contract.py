@@ -1,12 +1,18 @@
 from __future__ import annotations
 
 import multiprocessing
+import os
+import queue as queue_module
+import shutil
+import subprocess
 import time
 from pathlib import Path
 
 import pytest
 
 from .backends import RuntimeHandle
+
+_REAL_SBX_RUNTIME_SANDBOX = "runtime-contract-sbx"
 
 
 def _slow_tool() -> str:
@@ -28,6 +34,8 @@ def _run_concurrent_host_tool_timeout_repro(
         runtime.require("host_tools")
         runtime.require("recoverable_iteration_timeout")
         runtime.configure(tools={"slow_tool": _slow_tool})
+        runtime.execute("pass")
+        queue.put(("ready",))
         timeout_result = runtime.execute(
             "import asyncio\n"
             "await asyncio.gather(slow_tool(), slow_tool())\n",
@@ -42,6 +50,42 @@ def _run_concurrent_host_tool_timeout_repro(
     finally:
         if runtime is not None:
             runtime.shutdown()
+
+
+def _cleanup_real_sbx_runtime_sandbox(runtime: RuntimeHandle) -> None:
+    if runtime.spec.name != "sbx":
+        return
+    if os.environ.get("PREDICT_RLM_RUN_SBX_TESTS") != "1" or shutil.which("sbx") is None:
+        return
+    subprocess.run(
+        ["sbx", "rm", "-f", _REAL_SBX_RUNTIME_SANDBOX],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+
+
+def _get_repro_message(
+    *,
+    process: multiprocessing.Process,
+    result_queue: multiprocessing.Queue,
+    timeout: float,
+    runtime: RuntimeHandle,
+    failure_message: str,
+) -> tuple:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        remaining = deadline - time.monotonic()
+        try:
+            return result_queue.get(timeout=min(0.05, max(0.0, remaining)))
+        except queue_module.Empty:
+            if not process.is_alive():
+                break
+    process.kill()
+    process.join(timeout=2)
+    _cleanup_real_sbx_runtime_sandbox(runtime)
+    pytest.fail(failure_message)
 
 
 def test_host_tool_round_trip(runtime: RuntimeHandle) -> None:
@@ -128,25 +172,42 @@ def test_timeout_during_concurrent_host_tool_calls_is_recoverable(
 ) -> None:
     runtime.require("host_tools")
     runtime.require("recoverable_iteration_timeout")
+    _cleanup_real_sbx_runtime_sandbox(runtime)
     queue: multiprocessing.Queue = multiprocessing.Queue()
     process = multiprocessing.Process(
         target=_run_concurrent_host_tool_timeout_repro,
         args=(runtime.spec.name, str(tmp_path / "staging"), queue),
     )
     process.start()
-    process.join(timeout=6)
+    status, *payload = _get_repro_message(
+        process=process,
+        result_queue=queue,
+        timeout=30,
+        runtime=runtime,
+        failure_message="SBX runtime did not finish startup before timeout recovery repro",
+    )
+    if status == "skip":
+        pytest.skip(payload[0])
+    assert status == "ready", payload
+
+    status, *payload = _get_repro_message(
+        process=process,
+        result_queue=queue,
+        timeout=6,
+        runtime=runtime,
+        failure_message=(
+            "SBX supervisor hung after iteration timeout while awaiting "
+            "concurrent host tool calls"
+        ),
+    )
+
+    process.join(timeout=20)
     if process.is_alive():
         process.kill()
         process.join(timeout=2)
-        pytest.fail(
-            "SBX supervisor hung after iteration timeout while awaiting "
-            "concurrent host tool calls"
-        )
+        _cleanup_real_sbx_runtime_sandbox(runtime)
+        pytest.fail("SBX runtime cleanup hung after timeout recovery succeeded")
 
-    assert not queue.empty()
-    status, *payload = queue.get_nowait()
-    if status == "skip":
-        pytest.skip(payload[0])
     assert status == "ok", payload
     timeout_result, output = payload
     assert "[Timeout] Iteration execution timed out after 0.1s" in timeout_result

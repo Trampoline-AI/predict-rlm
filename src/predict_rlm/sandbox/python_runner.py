@@ -24,6 +24,7 @@ import sys
 import tempfile
 import threading
 import time
+from argparse import ArgumentParser
 from typing import Any
 
 PROTOCOL_STDIN = sys.stdin
@@ -44,6 +45,8 @@ TOOL_RESPONSE_READER_THREAD: threading.Thread | None = None
 TOOL_RESPONSE_READER_ERROR: BaseException | None = None
 TOOL_RESPONSE_READ_BUFFER = ""
 WAITING_TOOL_RESPONSE_IDS: set[int] = set()
+HOST_TOOL_REQUEST_QUEUE: multiprocessing.Queue | None = None
+HOST_TOOL_RESPONSE_QUEUE: multiprocessing.Queue | None = None
 _TRUE_VALUES = {"1", "true", "yes", "on"}
 _KERNEL_PROCESS: multiprocessing.Process | None = None
 _KERNEL_REQUEST_QUEUE: multiprocessing.Queue | None = None
@@ -218,11 +221,19 @@ def _submit(**kwargs: Any) -> None:
 
 
 def _send_protocol(message: dict[str, Any]) -> None:
+    if HOST_TOOL_REQUEST_QUEUE is not None:
+        HOST_TOOL_REQUEST_QUEUE.put(message)
+        return
     PROTOCOL_STDOUT.write(json.dumps(message, default=str) + "\n")
     PROTOCOL_STDOUT.flush()
 
 
 def _read_protocol_response_line(timeout: float | None = None) -> dict[str, Any] | None:
+    if HOST_TOOL_RESPONSE_QUEUE is not None:
+        try:
+            return HOST_TOOL_RESPONSE_QUEUE.get(timeout=timeout)
+        except queue.Empty:
+            return None
     global TOOL_RESPONSE_READ_BUFFER
     fd = PROTOCOL_STDIN.fileno()
     while True:
@@ -767,13 +778,17 @@ def _persistent_kernel_runner(
     request_queue: multiprocessing.Queue,
     result_queue: multiprocessing.Queue,
     stdin_fd: int,
+    host_tool_request_queue: multiprocessing.Queue | None = None,
+    host_tool_response_queue: multiprocessing.Queue | None = None,
 ) -> None:
     with contextlib.suppress(OSError):
         os.setsid()
     _start_parent_death_watchdog()
-    global PROTOCOL_STDIN, PROTOCOL_STDOUT
+    global HOST_TOOL_REQUEST_QUEUE, HOST_TOOL_RESPONSE_QUEUE, PROTOCOL_STDIN, PROTOCOL_STDOUT
     PROTOCOL_STDIN = os.fdopen(stdin_fd, "r", encoding="utf-8", buffering=1)
     PROTOCOL_STDOUT = os.fdopen(os.dup(1), "w", encoding="utf-8", buffering=1)
+    HOST_TOOL_REQUEST_QUEUE = host_tool_request_queue
+    HOST_TOOL_RESPONSE_QUEUE = host_tool_response_queue
     _reset_tool_protocol_state()
 
     while True:
@@ -908,7 +923,41 @@ def _discard_kernel() -> None:
     _KERNEL_RESULT_QUEUE = None
 
 
-def _ensure_kernel(globals_dict: dict[str, Any]) -> multiprocessing.Process:
+class _HostToolBridge:
+    def __init__(
+        self,
+        connection: Any,
+        request_queue: multiprocessing.Queue,
+        response_queue: multiprocessing.Queue,
+    ) -> None:
+        self.connection = connection
+        self.request_queue = request_queue
+        self.response_queue = response_queue
+
+    async def drain_requests(self) -> None:
+        while True:
+            try:
+                request = self.request_queue.get_nowait()
+            except queue.Empty:
+                return
+            await self.connection.send(json.dumps(request, default=str))
+
+    def deliver_response(self, response: dict[str, Any]) -> None:
+        self.response_queue.put(response)
+
+    def clear(self) -> None:
+        for message_queue in (self.request_queue, self.response_queue):
+            while True:
+                try:
+                    message_queue.get_nowait()
+                except queue.Empty:
+                    break
+
+
+def _ensure_kernel(
+    globals_dict: dict[str, Any],
+    host_tool_bridge: _HostToolBridge | None = None,
+) -> multiprocessing.Process:
     global _KERNEL_PROCESS, _KERNEL_REQUEST_QUEUE, _KERNEL_RESULT_QUEUE
     if _KERNEL_PROCESS is not None and _KERNEL_PROCESS.is_alive():
         return _KERNEL_PROCESS
@@ -924,6 +973,8 @@ def _ensure_kernel(globals_dict: dict[str, Any]) -> multiprocessing.Process:
             _KERNEL_REQUEST_QUEUE,
             _KERNEL_RESULT_QUEUE,
             protocol_stdin_fd,
+            host_tool_bridge.request_queue if host_tool_bridge is not None else None,
+            host_tool_bridge.response_queue if host_tool_bridge is not None else None,
         ),
     )
     _KERNEL_PROCESS.start()
@@ -960,8 +1011,9 @@ async def _execute_code_in_runner_with_timeout(
     timeout_interrupt_grace_seconds: float,
     *,
     defer_final_output: bool = False,
+    host_tool_bridge: _HostToolBridge | None = None,
 ) -> dict[str, Any]:
-    process = _ensure_kernel(globals_dict)
+    process = _ensure_kernel(globals_dict, host_tool_bridge)
     assert _KERNEL_REQUEST_QUEUE is not None
     assert _KERNEL_RESULT_QUEUE is not None
     pre_timeout_snapshot: dict[str, Any] | None = None
@@ -984,6 +1036,8 @@ async def _execute_code_in_runner_with_timeout(
     runner_message: dict[str, Any] | None = None
     try:
         while True:
+            if host_tool_bridge is not None:
+                await host_tool_bridge.drain_requests()
             now = time.monotonic()
             try:
                 runner_message = _KERNEL_RESULT_QUEUE.get_nowait()
@@ -1045,6 +1099,8 @@ async def _execute_code_in_runner_with_timeout(
                     "state": _pickle_snapshot_state(snapshot, reason),
                 }
             await asyncio.sleep(0.01)
+        if host_tool_bridge is not None:
+            await host_tool_bridge.drain_requests()
 
         if runner_message is None:
             exitcode = process.exitcode
@@ -1154,6 +1210,7 @@ async def _execute_code_with_timeout(
     timeout_interrupt_grace_seconds: float,
     *,
     defer_final_output: bool = False,
+    host_tool_bridge: _HostToolBridge | None = None,
 ) -> dict[str, Any]:
     return await _execute_code_in_runner_with_timeout(
         code,
@@ -1161,6 +1218,7 @@ async def _execute_code_with_timeout(
         timeout_seconds,
         timeout_interrupt_grace_seconds,
         defer_final_output=defer_final_output,
+        host_tool_bridge=host_tool_bridge,
     )
 
 
@@ -1198,7 +1256,9 @@ def _sync_file(params: dict[str, Any]) -> dict[str, Any]:
 
 
 async def _handle_request(
-    request: dict[str, Any], globals_dict: dict[str, Any]
+    request: dict[str, Any],
+    globals_dict: dict[str, Any],
+    host_tool_bridge: _HostToolBridge | None = None,
 ) -> dict[str, Any] | None:
     request_id = request.get("id")
     method = request.get("method")
@@ -1214,6 +1274,7 @@ async def _handle_request(
                     _execution_timeout_seconds(params),
                     _timeout_interrupt_grace_seconds(params),
                     defer_final_output=bool(params.get("defer_final_output")),
+                    host_tool_bridge=host_tool_bridge,
                 ),
             )
         if method == "register_output_fields":
@@ -1237,7 +1298,7 @@ async def _handle_request(
         return _error(request_id, exc)
 
 
-async def _main() -> None:
+async def _stdio_main() -> None:
     globals_dict = _new_globals()
 
     for line in sys.stdin:
@@ -1265,5 +1326,124 @@ async def _main() -> None:
             break
 
 
+class _WebSocketSupervisorSession:
+    def __init__(self, connection: Any, stop_event: asyncio.Event) -> None:
+        self.connection = connection
+        self.stop_event = stop_event
+        ctx = multiprocessing.get_context("fork")
+        self.host_tool_bridge = _HostToolBridge(
+            connection,
+            ctx.Queue(),
+            ctx.Queue(),
+        )
+        self.requests: asyncio.Queue[dict[str, Any] | None] = asyncio.Queue()
+
+    async def run(self) -> None:
+        globals_dict = _new_globals()
+        receiver = asyncio.create_task(self._receive_messages())
+        try:
+            while True:
+                request = await self.requests.get()
+                if request is None:
+                    break
+                if request.get("method") == "reset":
+                    _discard_kernel()
+                    self.host_tool_bridge.clear()
+                    globals_dict = _new_globals()
+                    await self.connection.send(json.dumps(_response(request.get("id"), {})))
+                    continue
+
+                response = await _handle_request(
+                    request,
+                    globals_dict,
+                    self.host_tool_bridge,
+                )
+                await self.host_tool_bridge.drain_requests()
+                if response is not None:
+                    await self.connection.send(json.dumps(response, default=str))
+                if request.get("method") == "shutdown":
+                    if (request.get("params") or {}).get("preserve_kernel_process"):
+                        os._exit(0)
+                    _discard_kernel()
+                    self.stop_event.set()
+                    break
+        finally:
+            receiver.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await receiver
+
+    async def _receive_messages(self) -> None:
+        try:
+            async for raw in self.connection:
+                try:
+                    message = json.loads(raw)
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(message, dict):
+                    continue
+                if message.get("method"):
+                    await self.requests.put(message)
+                elif "id" in message:
+                    self.host_tool_bridge.deliver_response(message)
+        finally:
+            await self.requests.put(None)
+
+
+async def _websocket_main(
+    *,
+    host: str,
+    port: int,
+    path: str,
+    max_message_bytes: int,
+) -> None:
+    from websockets.asyncio.server import serve
+    from websockets.datastructures import Headers
+    from websockets.http11 import Request, Response
+
+    def authorize(connection: Any, request: Request) -> Response | None:
+        if request.path == path:
+            return None
+        return Response(404, "Not Found", Headers(), b"Not Found")
+
+    stop_event = asyncio.Event()
+
+    async def handler(connection: Any) -> None:
+        await _WebSocketSupervisorSession(connection, stop_event).run()
+
+    async with serve(
+        handler,
+        host,
+        port,
+        process_request=authorize,
+        max_size=max_message_bytes,
+        max_queue=32,
+    ) as server:
+        await stop_event.wait()
+        server.close()
+        await server.wait_closed()
+
+
+def _parse_args() -> Any:
+    parser = ArgumentParser()
+    parser.add_argument("--websocket-host")
+    parser.add_argument("--websocket-port", type=int)
+    parser.add_argument("--websocket-path")
+    parser.add_argument("--websocket-max-message-bytes", type=int, default=32 * 1024 * 1024)
+    return parser.parse_args()
+
+
 if __name__ == "__main__":
-    asyncio.run(_main())
+    args = _parse_args()
+    if args.websocket_host is not None or args.websocket_port is not None:
+        if args.websocket_host is None or args.websocket_port is None or not args.websocket_path:
+            raise SystemExit("websocket host, port, and path are required together")
+        asyncio.run(
+            _websocket_main(
+                host=args.websocket_host,
+                port=args.websocket_port,
+                path=args.websocket_path,
+                max_message_bytes=args.websocket_max_message_bytes,
+            )
+        )
+    else:
+        asyncio.run(_stdio_main())

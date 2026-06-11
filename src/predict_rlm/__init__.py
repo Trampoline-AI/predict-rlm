@@ -21,13 +21,30 @@ from .interpreters import (
     DirectProcessRunnerClientAdapter,
     PythonRunnerClientAdapter,
     SandboxBackend,
-    SbxClientAdapter,
     SbxConfig,
     SbxPool,
 )
 from .predict_rlm import PredictRLM, SubmitConfirmationContext
 from .rlm_skills import Skill
 from .trace import IterationStep, RunTrace
+
+_SBX_EXTRA_INSTALL_HINT = (
+    "SbxClientAdapter requires the optional SBX dependencies. "
+    "Install them with `pip install 'predict-rlm[sbx]'` or "
+    "`uv pip install 'predict-rlm[sbx]'`."
+)
+
+
+def __getattr__(name: str):
+    if name == "SbxClientAdapter":
+        try:
+            from .interpreters.sbx import SbxClientAdapter
+        except ImportError as exc:
+            raise ImportError(_SBX_EXTRA_INSTALL_HINT) from exc
+
+        return SbxClientAdapter
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
 
 __all__ = [
     "File",
