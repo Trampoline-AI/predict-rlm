@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+import atexit
 import concurrent.futures
 import contextlib
 import contextvars
+import hashlib
 import inspect
 import json
 import os
@@ -51,8 +53,10 @@ from predict_rlm.execution_timeout import (
     resolve_execution_timeout,
 )
 from predict_rlm.files import get_synced_file_params
+from predict_rlm.runtime_hooks import RuntimeHook, RuntimeHookEvent
 from predict_rlm.serialization import to_plain_data
 from predict_rlm.trace import ToolCall, ms_since, record_tool_call
+from predict_rlm.workspace import DirectWorkspaceMount, WorkspaceFileInfo
 
 from ..base import (
     BackendExecutionGate,
@@ -72,6 +76,20 @@ SBX_TRANSPORT_PACKAGES = ["websockets"]
 _LOCALHOST_ENDPOINT_RE = re.compile(
     r"(?:(?P<scheme>https?)://)?(?P<host>localhost|127\.0\.0\.1|\[::1\])(?::(?P<port>\d+))"
 )
+
+_owned_staging_roots_pending_cleanup: set[str] = set()
+
+
+def _cleanup_pending_staging_roots() -> None:
+    for path in list(_owned_staging_roots_pending_cleanup):
+        shutil.rmtree(path, ignore_errors=True)
+        try:
+            Path(path).parent.rmdir()
+        except OSError:
+            pass
+
+
+atexit.register(_cleanup_pending_staging_roots)
 
 
 class _DetachedWebSocketSupervisorProcess:
@@ -104,6 +122,9 @@ class SbxBackend(SupervisorClient, ExecutionBackend):
         extra_read_paths: list[str] | None = None,
         extra_write_paths: list[str] | None = None,
         _supervisor_command: list[str] | None = None,
+        direct_workspace_mounts: list[DirectWorkspaceMount] | None = None,
+        runtime_hooks: list[RuntimeHook] | None = None,
+        on_runtime_hook_event: Callable[[RuntimeHookEvent], Any] | None = None,
         _runner_command: list[str] | None = None,
         _websocket_supervisor_command: list[str] | None = None,
         _websocket_url: str | None = None,
@@ -128,6 +149,9 @@ class SbxBackend(SupervisorClient, ExecutionBackend):
         self._websocket_supervisor_command = _websocket_supervisor_command
         self._websocket_url = _websocket_url
         self._websocket_path = f"/predict-rlm/{secrets.token_urlsafe(32)}"
+        self._direct_workspace_mounts = list(direct_workspace_mounts or [])
+        self.runtime_hooks = list(runtime_hooks or [])
+        self.on_runtime_hook_event = on_runtime_hook_event
         self._host_workspace = Path.cwd()
         self._owns_staging_root = _staging_root is None
         self._staging_root = (
@@ -136,6 +160,8 @@ class SbxBackend(SupervisorClient, ExecutionBackend):
             else (self._host_workspace / ".predict_rlm_sbx" / uuid.uuid4().hex)
         )
         self._staging_root.mkdir(parents=True, exist_ok=True)
+        if self._owns_staging_root and not self.config.persist:
+            _owned_staging_roots_pending_cleanup.add(str(self._staging_root))
         self._proc: subprocess.Popen[str] | None = None
         self._stdout_lines: queue.Queue[str] = queue.Queue()
         self._stdout_reader: threading.Thread | None = None
@@ -147,6 +173,9 @@ class SbxBackend(SupervisorClient, ExecutionBackend):
         self._prepared_supervisor_path: Path | None = None
         self._published_websocket_url: str | None = None
         self._shutdown = False
+        self._post_execute_hooks: list[Callable[[Any], Any]] = []
+        self._owned_direct_aliases: list[Path] = []
+        self._relocate_owned_staging_root_if_nested_in_direct_workspace()
 
     def configure_debug(self, enabled: bool) -> None:
         self.debug = enabled
@@ -192,7 +221,10 @@ class SbxBackend(SupervisorClient, ExecutionBackend):
         timeout: float | None = None,
     ) -> Any:
         with self._execution_gate.top_level():
-            return self._execute_top_level(code, variables, timeout=timeout)
+            try:
+                return self._execute_top_level(code, variables, timeout=timeout)
+            finally:
+                self._run_post_execute_hooks()
 
     def _execute_top_level(
         self,
@@ -228,32 +260,62 @@ class SbxBackend(SupervisorClient, ExecutionBackend):
 
     def mount_file_at(self, host_path: str, virtual_path: str) -> None:
         source = Path(host_path)
-        target = self._host_path_for_virtual_path(virtual_path)
+        target = self._host_path_for_sandbox_path(virtual_path)
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(source, target)
 
     def mkdir_p(self, virtual_path: str) -> None:
-        self._host_path_for_virtual_path(virtual_path).mkdir(parents=True, exist_ok=True)
+        self._host_path_for_sandbox_path(virtual_path).mkdir(parents=True, exist_ok=True)
 
     def list_dir(self, virtual_path: str) -> list[str]:
-        root = self._host_path_for_virtual_path(virtual_path)
+        root = self._host_path_for_sandbox_path(virtual_path)
         if not root.exists():
             return []
         return [
-            self._virtual_path_for_host_path(path)
+            self._sandbox_path_for_host_path(path)
             for path in sorted(root.rglob("*"))
             if path.is_file()
         ]
 
+    def workspace_manifest(self, virtual_path: str) -> dict[str, WorkspaceFileInfo]:
+        root = self._host_path_for_sandbox_path(virtual_path)
+        if not root.exists():
+            raise FileNotFoundError(f"Workspace mount does not exist: {virtual_path}")
+        if not root.is_dir():
+            raise NotADirectoryError(f"Workspace mount is not a directory: {virtual_path}")
+        files: dict[str, WorkspaceFileInfo] = {}
+        for path in sorted(root.rglob("*")):
+            if not path.is_file():
+                continue
+            rel_path = path.relative_to(root).as_posix()
+            files[rel_path] = WorkspaceFileInfo(
+                type="file",
+                sha256=self._sha256_file(path),
+                size=path.stat().st_size,
+            )
+        return files
+
+    def add_post_execute_hook(self, hook: Callable[[Any], Any]) -> None:
+        self._post_execute_hooks.append(hook)
+
+    def _run_post_execute_hooks(self) -> None:
+        for hook in self._post_execute_hooks:
+            hook(self)
+
     def sync_file_to(self, virtual_path: str, host_path: str) -> None:
-        source = self._host_path_for_virtual_path(virtual_path)
+        source = self._host_path_for_sandbox_path(virtual_path)
         target = Path(host_path)
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(source, target)
 
+    def _sha256_file(self, path: Path) -> str:
+        digest = hashlib.sha256()
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                digest.update(chunk)
+        return digest.hexdigest()
+
     def _host_path_for_virtual_path(self, virtual_path: str) -> Path:
-        if virtual_path != "/sandbox" and not virtual_path.startswith("/sandbox/"):
-            raise ValueError(f"Sbx virtual path must be under /sandbox: {virtual_path}")
         sandbox_root = (self._staging_root / "sandbox").resolve()
         rel = virtual_path.removeprefix("/sandbox").lstrip("/")
         host_path = (sandbox_root / rel).resolve()
@@ -262,6 +324,18 @@ class SbxBackend(SupervisorClient, ExecutionBackend):
         except ValueError as exc:
             raise ValueError(f"Sbx virtual path escapes /sandbox: {virtual_path}") from exc
         return host_path
+
+    def _host_path_for_sandbox_path(self, sandbox_path: str) -> Path:
+        for mount in self._direct_workspace_mounts:
+            rel_path = self._relative_to_prefix(sandbox_path, mount.sandbox_path)
+            if rel_path is not None:
+                return Path(mount.host_path, *rel_path.parts)
+        if sandbox_path == "/sandbox" or sandbox_path.startswith("/sandbox/"):
+            return self._host_path_for_virtual_path(sandbox_path)
+        raise ValueError(
+            "Sbx path must be under /sandbox or a direct workspace mount: "
+            f"{sandbox_path}"
+        )
 
     def _map_variable_value(self, value: Any) -> Any:
         # Normalize rich objects (pydantic models, dataclasses, sets) to plain data
@@ -284,6 +358,82 @@ class SbxBackend(SupervisorClient, ExecutionBackend):
         rel = host_path.resolve().relative_to(sandbox_root)
         return "/sandbox/" + rel.as_posix()
 
+    def _sandbox_path_for_host_path(self, host_path: Path) -> str:
+        for mount in self._direct_workspace_mounts:
+            try:
+                rel = host_path.resolve().relative_to(Path(mount.host_path).resolve())
+            except ValueError:
+                continue
+            if rel.as_posix() == ".":
+                return mount.sandbox_path
+            return f"{mount.sandbox_path.rstrip('/')}/{rel.as_posix()}"
+        return self._virtual_path_for_host_path(host_path)
+
+    def _relative_to_prefix(self, path: str, prefix: str) -> Path | None:
+        try:
+            rel = Path(path).relative_to(Path(prefix))
+        except ValueError:
+            return None
+        return Path() if rel.as_posix() == "." else rel
+
+    def configure_direct_workspace_mounts(
+        self, mounts: list[DirectWorkspaceMount]
+    ) -> None:
+        mounts = list(mounts)
+        if self._same_direct_workspace_mounts(mounts):
+            return
+        if self._transport_running():
+            raise RuntimeError(
+                "Direct workspace mounts must be configured before the SBX runner starts"
+            )
+        self._direct_workspace_mounts = mounts
+        self._relocate_owned_staging_root_if_nested_in_direct_workspace()
+
+    def _relocate_owned_staging_root_if_nested_in_direct_workspace(self) -> None:
+        """Move an owned staging root out of any direct workspace mount.
+
+        The default staging root lives under the invoking cwd. When a direct
+        workspace mount covers that cwd, the staging root would be nested inside
+        the user's mounted workspace (polluting it and its sync-back manifest),
+        so relocate it to a private system-temp dir instead.
+        """
+        if not self._owns_staging_root:
+            return
+        staging_root = self._staging_root.resolve()
+        for mount in self._direct_workspace_mounts:
+            direct_root = Path(mount.host_path).resolve()
+            try:
+                staging_root.relative_to(direct_root)
+            except ValueError:
+                continue
+            old_staging_root = self._staging_root
+            _owned_staging_roots_pending_cleanup.discard(str(old_staging_root))
+            self._staging_root = Path(tempfile.mkdtemp(prefix="predict-rlm-sbx-"))
+            if not self.config.persist:
+                _owned_staging_roots_pending_cleanup.add(str(self._staging_root))
+            shutil.rmtree(old_staging_root, ignore_errors=True)
+            try:
+                old_staging_root.parent.rmdir()
+            except OSError:
+                pass
+            return
+
+    def _same_direct_workspace_mounts(self, mounts: list[DirectWorkspaceMount]) -> bool:
+        return self._direct_workspace_mount_keys(mounts) == self._direct_workspace_mount_keys(
+            self._direct_workspace_mounts
+        )
+
+    def _direct_workspace_mount_keys(
+        self, mounts: list[DirectWorkspaceMount]
+    ) -> list[tuple[str, str]]:
+        return [
+            (
+                os.path.abspath(mount.host_path),
+                os.path.normpath(mount.sandbox_path),
+            )
+            for mount in mounts
+        ]
+
     def configure_runtime(
         self,
         *,
@@ -291,6 +441,8 @@ class SbxBackend(SupervisorClient, ExecutionBackend):
         output_fields: list[dict] | None = None,
         debug: bool | None = None,
         verbose: bool | None = None,
+        runtime_hooks: list[RuntimeHook] | None = None,
+        on_runtime_hook_event: Callable[[RuntimeHookEvent], Any] | None = None,
     ) -> None:
         if debug is not None:
             self.configure_debug(debug)
@@ -300,16 +452,27 @@ class SbxBackend(SupervisorClient, ExecutionBackend):
             self.tools = tools
         if output_fields is not None:
             self.output_fields = output_fields
+        if runtime_hooks is not None:
+            self.runtime_hooks = list(runtime_hooks)
+            self.on_runtime_hook_event = on_runtime_hook_event
         if self._transport_running():
             if self.output_fields:
                 self._send_request("register_output_fields", {"fields": self.output_fields})
             if self.tools:
                 self._send_request("register_tools", {"tools": list(self.tools)})
+            if runtime_hooks is not None or self.runtime_hooks:
+                self._register_runtime_hooks()
         self._log_lifecycle(
             "sbx.runtime.configured",
             tools=len(self.tools),
             output_fields=len(self.output_fields),
             process_running=bool(self._proc and self._proc.poll() is None),
+        )
+
+    def _register_runtime_hooks(self) -> None:
+        self._send_request(
+            "register_runtime_hooks",
+            {"hooks": [hook.model_dump(mode="json") for hook in self.runtime_hooks]},
         )
 
     def prewarm(self) -> None:
@@ -379,10 +542,12 @@ class SbxBackend(SupervisorClient, ExecutionBackend):
                     text=True,
                 )
                 self._log_lifecycle("sbx.shutdown.rm")
+        self._cleanup_direct_workspace_aliases_host_side()
         self._cleanup_staging_root()
         self._log_lifecycle("sbx.shutdown.complete")
 
     def _cleanup_staging_root(self) -> None:
+        _owned_staging_roots_pending_cleanup.discard(str(self._staging_root))
         if not self._owns_staging_root or self.config.persist:
             return
         shutil.rmtree(self._staging_root, ignore_errors=True)
@@ -403,6 +568,7 @@ class SbxBackend(SupervisorClient, ExecutionBackend):
         start = time.perf_counter()
         try:
             if self._supervisor_command is not None:
+                self._setup_direct_workspace_aliases_host_side()
                 command = self._supervisor_command
             else:
                 command = self._start_sbx_and_build_supervisor_command()
@@ -426,6 +592,8 @@ class SbxBackend(SupervisorClient, ExecutionBackend):
                 self._send_request("register_output_fields", {"fields": self.output_fields})
             if self.tools:
                 self._send_request("register_tools", {"tools": list(self.tools)})
+            if self.runtime_hooks:
+                self._register_runtime_hooks()
         except BaseException as exc:
             self._log_lifecycle(
                 "sbx.runner.error",
@@ -468,6 +636,7 @@ class SbxBackend(SupervisorClient, ExecutionBackend):
         start = time.perf_counter()
         try:
             if self._websocket_supervisor_command is not None and self._proc is None:
+                self._setup_direct_workspace_aliases_host_side()
                 self._start_local_websocket_supervisor()
             if self._websocket_url is None:
                 self._start_sbx_websocket_supervisor()
@@ -480,6 +649,11 @@ class SbxBackend(SupervisorClient, ExecutionBackend):
                 )
             if self.tools:
                 self._send_websocket_request("register_tools", {"tools": list(self.tools)})
+            if self.runtime_hooks:
+                self._send_websocket_request(
+                    "register_runtime_hooks",
+                    {"hooks": [hook.model_dump(mode="json") for hook in self.runtime_hooks]},
+                )
         except BaseException as exc:
             self._log_lifecycle(
                 "sbx.runner.error",
@@ -650,12 +824,14 @@ class SbxBackend(SupervisorClient, ExecutionBackend):
             primary_workspace = str(self._staging_root)
             if self.config.workspace_read_only:
                 primary_workspace = f"{primary_workspace}:ro"
+            direct_workspaces = self._direct_workspace_args()
             create_cmd = [
                 "sbx",
                 "create",
                 "shell",
                 primary_workspace,
                 *self.config.extra_workspaces,
+                *direct_workspaces,
             ]
             if self.config.name:
                 create_cmd.extend(["--name", self.config.name])
@@ -701,10 +877,91 @@ class SbxBackend(SupervisorClient, ExecutionBackend):
             )
             self._apply_network_policy()
             self._bootstrap_packages()
+            self._setup_direct_workspace_aliases_in_sandbox()
         else:
             supervisor_path = self._prepared_supervisor_path or self._prepare_supervisor_script()
 
         return supervisor_path
+
+    def _direct_workspace_args(self) -> list[str]:
+        seen = {str(self._staging_root)}
+        args: list[str] = []
+        for mount in self._direct_workspace_mounts:
+            if mount.host_path in seen:
+                continue
+            seen.add(mount.host_path)
+            args.append(mount.host_path)
+        return args
+
+    def _direct_workspace_aliases(self) -> list[tuple[str, str]]:
+        return [
+            (mount.host_path, mount.sandbox_path)
+            for mount in self._direct_workspace_mounts
+            if mount.host_path != mount.sandbox_path
+        ]
+
+    def _setup_direct_workspace_aliases_in_sandbox(self) -> None:
+        aliases = self._direct_workspace_aliases()
+        if not aliases:
+            return
+        assert self._sandbox_name is not None
+        script = (
+            "import json, os, pathlib, sys\n"
+            "for source, target in json.loads(sys.argv[1]):\n"
+            "    source_path = pathlib.Path(source)\n"
+            "    target_path = pathlib.Path(target)\n"
+            "    if target_path.exists() or target_path.is_symlink():\n"
+            "        if target_path.is_symlink() and os.readlink(target_path) == str(source_path):\n"
+            "            continue\n"
+            "        raise FileExistsError(f'Direct workspace alias already exists: {target}')\n"
+            "    target_path.parent.mkdir(parents=True, exist_ok=True)\n"
+            "    target_path.symlink_to(source_path, target_is_directory=True)\n"
+        )
+        result = subprocess.run(
+            [
+                "sbx",
+                "exec",
+                "-w",
+                str(self._staging_root),
+                "-u",
+                "root",
+                self._sandbox_name,
+                SBX_PYTHON_EXECUTABLE,
+                "-c",
+                script,
+                json.dumps(aliases),
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=self.config.exec_timeout,
+        )
+        if result.returncode != 0:
+            raise SandboxFatalError(
+                "Failed to configure direct workspace aliases: "
+                f"stdout: {result.stdout.strip()}; stderr: {result.stderr.strip()}"
+            )
+
+    def _setup_direct_workspace_aliases_host_side(self) -> None:
+        for source, target in self._direct_workspace_aliases():
+            source_path = Path(source)
+            target_path = Path(target)
+            if target_path.exists() or target_path.is_symlink():
+                if target_path.is_symlink() and os.readlink(target_path) == str(source_path):
+                    continue
+                raise FileExistsError(f"Direct workspace alias already exists: {target}")
+            target_path.parent.mkdir(parents=True, exist_ok=True)
+            target_path.symlink_to(source_path, target_is_directory=True)
+            self._owned_direct_aliases.append(target_path)
+
+    def _cleanup_direct_workspace_aliases_host_side(self) -> None:
+        for path in reversed(self._owned_direct_aliases):
+            try:
+                if path.is_symlink():
+                    path.unlink()
+            except OSError:
+                pass
+        self._owned_direct_aliases.clear()
 
     def _start_sbx_and_build_runner_command(self) -> list[str]:
         return self._start_sbx_and_build_supervisor_command()
@@ -992,10 +1249,22 @@ class SbxBackend(SupervisorClient, ExecutionBackend):
         *,
         deadline: float,
     ) -> bool:
-        if message.get("method") != "tool_call":
-            return False
-        self._submit_tool_call(message)
-        return True
+        if message.get("method") == "tool_call":
+            self._submit_tool_call(message)
+            return True
+        if message.get("method") == "runtime_hook_event":
+            self._handle_runtime_hook_event(message)
+            return True
+        return False
+
+    def _handle_runtime_hook_event(self, request: dict[str, Any]) -> None:
+        if self.on_runtime_hook_event is None:
+            return
+        try:
+            event = RuntimeHookEvent.model_validate(request.get("params") or {})
+            self.on_runtime_hook_event(event)
+        except Exception:
+            return
 
     def _build_tool_response(self, request: dict[str, Any]) -> dict[str, Any]:
         request_id = request.get("id")
@@ -1023,6 +1292,7 @@ class SbxBackend(SupervisorClient, ExecutionBackend):
             for sandbox_path, host_path, writeback in synced_entries:
                 if writeback and os.path.isfile(host_path):
                     self.mount_file_at(host_path, sandbox_path)
+            result = to_plain_data(result)
             is_json = result is None or isinstance(result, (dict, list, int, float, bool))
             response = {
                 "jsonrpc": "2.0",

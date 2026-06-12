@@ -7,6 +7,7 @@ Core classes:
 File I/O:
     File — Unified file type for inputs (mount into sandbox) and outputs
            (sync from sandbox). Use ``list[File]`` for multiple files.
+    Workspace — Mutable input directory mounted into the sandbox and synced back.
 
 Lifecycle callbacks:
     IterationStep — payload passed to ``on_rlm_iteration_end`` callbacks.
@@ -21,6 +22,8 @@ from .backends import (
     PythonSupervisor,
 )
 from .files import File, LocalDir, LocalFile, OutputDir, OutputFile, SyncedFile
+from .runtime_hooks import RuntimeHook, RuntimeHookEvent
+from .workspace import Workspace, WorkspaceMode
 from .predict_rlm import PredictRLM, SubmitConfirmationContext
 from .rlm_skills import Skill
 from .trace import IterationStep, RunTrace
@@ -74,4 +77,8 @@ __all__ = [
     "SbxBackend",
     "SbxPool",
     "SyncedFile",
+    "RuntimeHook",
+    "RuntimeHookEvent",
+    "Workspace",
+    "WorkspaceMode",
 ]

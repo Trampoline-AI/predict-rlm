@@ -61,6 +61,7 @@ from predict_rlm.telemetry import (
     reset_current_telemetry_context,
     set_current_telemetry_context,
 )
+from predict_rlm.workspace import WorkspaceFileInfo
 
 if TYPE_CHECKING:
     from os import PathLike
@@ -356,6 +357,7 @@ class JspiBackend(PythonInterpreter):
         # Per-execute wall-clock timeout (see __init__ docstring).
         self._exec_timeout = exec_timeout
         self._execution_gate = BackendExecutionGate("JSPI backend")
+        self._post_execute_hooks: list[Callable[[Any], Any]] = []
 
     def configure_debug(self, enabled: bool) -> None:
         self._debug = enabled
@@ -791,6 +793,32 @@ class JspiBackend(PythonInterpreter):
         )
         return response.get("result", {}).get("files", [])
 
+    def workspace_manifest(self, virtual_path: str) -> dict[str, WorkspaceFileInfo]:
+        """Return a recursive file manifest under a sandbox workspace path."""
+        self._ensure_deno_process()
+        response = self._send_request(
+            "workspace_manifest",
+            {"path": virtual_path},
+            f"building workspace manifest for {virtual_path}",
+        )
+        files = response.get("result", {}).get("files", {})
+        return {
+            rel_path: WorkspaceFileInfo(
+                type=info["type"],
+                sha256=info["sha256"],
+                size=info["size"],
+            )
+            for rel_path, info in files.items()
+        }
+
+    def add_post_execute_hook(self, hook: Callable[[Any], Any]) -> None:
+        """Register a hook called after each completed sandbox execution."""
+        self._post_execute_hooks.append(hook)
+
+    def _run_post_execute_hooks(self) -> None:
+        for hook in getattr(self, "_post_execute_hooks", ()):
+            hook(self)
+
     def sync_file_to(self, virtual_path: str, host_path: str) -> None:
         """Sync a single file from the sandbox MEMFS back to the host."""
         self._ensure_deno_process()
@@ -875,6 +903,7 @@ class JspiBackend(PythonInterpreter):
             finally:
                 self._last_semaphore_attrs = {}
                 sem.release()
+                self._run_post_execute_hooks()
 
     def _resolve_execution_timeout(self, timeout: float | None) -> tuple[float, str]:
         return resolve_execution_timeout(timeout, default_timeout=self._exec_timeout)
@@ -1181,7 +1210,10 @@ class JspiBackend(PythonInterpreter):
         are executed concurrently on the host side.
         """
         with self._execution_gate.top_level():
-            return self._execute_top_level(code, variables, timeout=timeout)
+            try:
+                return self._execute_top_level(code, variables, timeout=timeout)
+            finally:
+                self._run_post_execute_hooks()
 
     def _execute_top_level(
         self,

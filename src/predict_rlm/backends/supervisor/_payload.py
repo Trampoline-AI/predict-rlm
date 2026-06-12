@@ -9,6 +9,7 @@ import collections.abc
 import contextlib
 import dataclasses
 import hashlib
+import importlib
 import inspect
 import io
 import json
@@ -33,6 +34,7 @@ PROTOCOL_STDIN = sys.stdin
 PROTOCOL_STDOUT = sys.stdout
 REAL_OPEN = builtins.open
 REAL_PATH = type(pathlib.Path())
+ORIGINAL_PATH = pathlib.Path
 SANDBOX_ROOT = REAL_PATH(
     os.environ.get("PREDICT_RLM_RUNNER_ROOT")
     or os.environ.get("PREDICT_RLM_SBX_ROOT")
@@ -58,6 +60,9 @@ _INTERNAL_GLOBAL_NAMES = {
     "SUBMIT",
     "__predict_rlm_tool_names__",
 }
+RUNTIME_HOOK_ORIGINALS: dict[str, tuple[Any, str, Any]] = {}
+RUNTIME_HOOK_SPECS: dict[str, set[str]] = {}
+RUNTIME_HOOKS_ENABLED = False
 
 
 def _debug_enabled() -> bool:
@@ -218,8 +223,203 @@ def _open(path: Any, *args: Any, **kwargs: Any):
     return REAL_OPEN(_map_virtual_path(path), *args, **kwargs)
 
 
+class _SandboxPath(REAL_PATH):
+    def __new__(cls, *args: Any, **kwargs: Any):
+        if args:
+            args = (_map_virtual_path(args[0]), *args[1:])
+        current_path = pathlib.Path
+        pathlib.Path = ORIGINAL_PATH  # type: ignore[assignment]
+        try:
+            return super().__new__(cls, *args, **kwargs)
+        finally:
+            pathlib.Path = current_path  # type: ignore[assignment]
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        if sys.version_info < (3, 12):
+            return
+        if args:
+            args = (_map_virtual_path(args[0]), *args[1:])
+        current_path = pathlib.Path
+        pathlib.Path = ORIGINAL_PATH  # type: ignore[assignment]
+        try:
+            super().__init__(*args, **kwargs)
+        finally:
+            pathlib.Path = current_path  # type: ignore[assignment]
+
+
 def _submit(**kwargs: Any) -> None:
     raise _FinalOutputError(_to_jsonable(kwargs))
+
+
+def _short_repr(value: Any) -> str:
+    text = repr(value)
+    return text if len(text) <= 500 else text[:500] + f"... ({len(text)} chars)"
+
+
+def _summarize_hook_value(value: Any, *, depth: int = 0) -> Any:
+    if depth > 2:
+        return {"type": type(value).__name__, "repr": _short_repr(value)}
+    if value is None or isinstance(value, (bool, int, float, str)):
+        if isinstance(value, str) and len(value) > 500:
+            return value[:500] + f"... ({len(value)} chars)"
+        return value
+    if isinstance(value, os.PathLike):
+        return os.fspath(value)
+    if type(value).__name__ == "CompletedProcess":
+        return {
+            "type": "CompletedProcess",
+            "args": _summarize_hook_value(getattr(value, "args", None), depth=depth + 1),
+            "returncode": getattr(value, "returncode", None),
+            "stdout_chars": len(getattr(value, "stdout", "") or ""),
+            "stderr_chars": len(getattr(value, "stderr", "") or ""),
+        }
+    if isinstance(value, bytes):
+        if len(value) > 128:
+            return {"type": "bytes", "len": len(value), "preview": value[:128].hex()}
+        return {"type": "bytes", "len": len(value), "preview": value.hex()}
+    if isinstance(value, (list, tuple)):
+        return [_summarize_hook_value(item, depth=depth + 1) for item in list(value)[:20]]
+    if isinstance(value, dict):
+        return {
+            str(key): _summarize_hook_value(val, depth=depth + 1)
+            for key, val in list(value.items())[:20]
+        }
+    if isinstance(value, BaseException):
+        return {"type": type(value).__name__, "message": str(value)}
+    return {"type": type(value).__name__, "repr": _short_repr(value)}
+
+
+def _emit_runtime_hook_event(
+    target: str,
+    phase: str,
+    args: tuple[Any, ...],
+    kwargs: dict[str, Any],
+    *,
+    result: Any = None,
+    error: BaseException | None = None,
+    duration_ms: int | None = None,
+) -> None:
+    if not RUNTIME_HOOKS_ENABLED:
+        return
+    if phase not in RUNTIME_HOOK_SPECS.get(target, set()):
+        return
+    params = {
+        "target": target,
+        "phase": phase,
+        "args": [_summarize_hook_value(arg) for arg in args],
+        "kwargs": _summarize_hook_value(kwargs),
+        "result": _summarize_hook_value(result),
+        "error": str(error) if error is not None else None,
+        "duration_ms": duration_ms,
+        "timestamp": time.time(),
+    }
+    _send_protocol({"jsonrpc": "2.0", "method": "runtime_hook_event", "params": params})
+
+
+def _runtime_hook_owner(target: str) -> tuple[Any, str]:
+    if target == "builtins.open":
+        return builtins, "open"
+    if target.startswith("pathlib.Path."):
+        return REAL_PATH, target.rsplit(".", 1)[1]
+    return _resolve_dotted_runtime_hook_owner(target)
+
+
+def _resolve_dotted_runtime_hook_owner(target: str) -> tuple[Any, str]:
+    parts = target.split(".")
+    if len(parts) < 2 or any(not part for part in parts):
+        raise ValueError(f"Runtime hook target must be a dotted path: {target}")
+    for module_end in range(len(parts) - 1, 0, -1):
+        module_name = ".".join(parts[:module_end])
+        try:
+            owner = importlib.import_module(module_name)
+        except ModuleNotFoundError as exc:
+            if exc.name == module_name or module_name.startswith(f"{exc.name}."):
+                continue
+            raise ValueError(
+                f"Runtime hook target module import failed: {module_name}"
+            ) from exc
+        except Exception as exc:
+            raise ValueError(
+                f"Runtime hook target module import failed: {module_name}"
+            ) from exc
+        for attr in parts[module_end:-1]:
+            try:
+                owner = getattr(owner, attr)
+            except AttributeError as exc:
+                raise ValueError(f"Runtime hook target does not exist: {target}") from exc
+        return owner, parts[-1]
+    raise ValueError(f"Unsupported runtime hook target: {target}")
+
+
+def _runtime_hook_callable(target: str) -> tuple[Any, str, Any]:
+    owner, attr = _runtime_hook_owner(target)
+    try:
+        original = getattr(owner, attr)
+    except AttributeError as exc:
+        raise ValueError(f"Runtime hook target does not exist: {target}") from exc
+    if not callable(original):
+        raise ValueError(f"Runtime hook target is not callable: {target}")
+    return owner, attr, original
+
+
+def _restore_runtime_hooks() -> None:
+    for target, (owner, attr, original) in reversed(list(RUNTIME_HOOK_ORIGINALS.items())):
+        setattr(owner, attr, original)
+    RUNTIME_HOOK_ORIGINALS.clear()
+    RUNTIME_HOOK_SPECS.clear()
+
+
+def _make_runtime_hook_wrapper(target: str, original: Any) -> Any:
+    def _wrapped(*args: Any, **kwargs: Any) -> Any:
+        _emit_runtime_hook_event(target, "before", args, kwargs)
+        started = time.perf_counter()
+        try:
+            result = original(*args, **kwargs)
+        except BaseException as exc:
+            _emit_runtime_hook_event(
+                target,
+                "error",
+                args,
+                kwargs,
+                error=exc,
+                duration_ms=int((time.perf_counter() - started) * 1000),
+            )
+            raise
+        _emit_runtime_hook_event(
+            target,
+            "after",
+            args,
+            kwargs,
+            result=result,
+            duration_ms=int((time.perf_counter() - started) * 1000),
+        )
+        return result
+
+    return _wrapped
+
+
+def _runtime_hook_specs_by_target(params: dict[str, Any]) -> dict[str, set[str]]:
+    specs_by_target: dict[str, set[str]] = {}
+    for hook in params.get("hooks", []):
+        target = hook.get("target")
+        if not isinstance(target, str):
+            continue
+        phases = hook.get("phases") or ["before"]
+        specs_by_target.setdefault(target, set()).update(str(phase) for phase in phases)
+    return specs_by_target
+
+
+def _register_runtime_hooks(params: dict[str, Any]) -> dict[str, Any]:
+    _restore_runtime_hooks()
+    planned_hooks = []
+    for target, phases in _runtime_hook_specs_by_target(params).items():
+        owner, attr, original = _runtime_hook_callable(target)
+        planned_hooks.append((target, phases, owner, attr, original))
+    for target, phases, owner, attr, original in planned_hooks:
+        RUNTIME_HOOK_SPECS[target] = phases
+        RUNTIME_HOOK_ORIGINALS[target] = (owner, attr, original)
+        setattr(owner, attr, _make_runtime_hook_wrapper(target, original))
+    return {}
 
 
 def _send_protocol(message: dict[str, Any]) -> None:
@@ -488,6 +688,7 @@ def _register_tools(params: dict[str, Any], globals_dict: dict[str, Any]) -> dic
 
 def _install_virtual_filesystem(globals_dict: dict[str, Any]) -> None:
     builtins.open = _open
+    pathlib.Path = _SandboxPath  # type: ignore[assignment]
     globals_dict.setdefault("SUBMIT", _submit)
 
 
@@ -838,7 +1039,9 @@ async def _execute_code_to_capture_files(
     *,
     defer_final_output: bool = False,
 ) -> dict[str, Any]:
+    global RUNTIME_HOOKS_ENABLED
     with _redirect_process_stdio_to_files(stdout_path, stderr_path) as capture:
+        RUNTIME_HOOKS_ENABLED = True
         try:
             result = await _execute_code(
                 code,
@@ -854,6 +1057,8 @@ async def _execute_code_to_capture_files(
                 + _read_capture_file(pathlib.Path(stderr_path)),
             )
             raise
+        finally:
+            RUNTIME_HOOKS_ENABLED = False
     if isinstance(result, dict) and "output" in result:
         result = dict(result)
         result["output"] = _read_capture_file(pathlib.Path(stdout_path)) + _read_capture_file(
@@ -1016,6 +1221,11 @@ def _persistent_kernel_runner(
                     "ok": True,
                     "snapshot": _pickleable_globals_snapshot(globals_dict),
                 })
+                continue
+            if request.get("op") == "register_runtime_hooks":
+                result_queue.put(
+                    {"ok": True, "result": _register_runtime_hooks(request["params"])}
+                )
                 continue
             if request.get("timeout_seconds") is not None:
                 signal.signal(signal.SIGINT, signal.default_int_handler)
@@ -1217,6 +1427,26 @@ async def _kernel_pickle_snapshot(
             }
         _raise_runner_error(message.get("error") or {})
     return {"globals": {}, "restored_globals": [], "lost_globals": []}
+
+
+async def _register_runtime_hooks_in_runner(
+    params: dict[str, Any], globals_dict: dict[str, Any]
+) -> dict[str, Any]:
+    process = _ensure_kernel(globals_dict)
+    assert _KERNEL_REQUEST_QUEUE is not None
+    assert _KERNEL_RESULT_QUEUE is not None
+    _KERNEL_REQUEST_QUEUE.put({"op": "register_runtime_hooks", "params": params})
+    while process.is_alive():
+        try:
+            message = _KERNEL_RESULT_QUEUE.get_nowait()
+        except queue.Empty:
+            await asyncio.sleep(0.01)
+            continue
+        if message.get("ok"):
+            return message.get("result") or {}
+        _raise_runner_error(message.get("error") or {})
+    _discard_kernel()
+    raise RuntimeError("execution runner exited while registering runtime hooks")
 
 
 async def _execute_code_in_runner_with_timeout(
@@ -1496,6 +1726,10 @@ async def _handle_request(
             return _response(request_id, {})
         if method == "register_tools":
             return _response(request_id, _register_tools(params, globals_dict))
+        if method == "register_runtime_hooks":
+            return _response(
+                request_id, await _register_runtime_hooks_in_runner(params, globals_dict)
+            )
         if method == "mount_file":
             return _response(request_id, _mount_file(params))
         if method == "mkdir_p":

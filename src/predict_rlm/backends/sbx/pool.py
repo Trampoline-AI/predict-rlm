@@ -182,6 +182,8 @@ class SbxPool:
         output_fields: list[dict] | None = None,
         debug: bool | None = None,
         verbose: bool | None = None,
+        runtime_hooks: list[Any] | None = None,
+        on_runtime_hook_event: Callable[..., Any] | None = None,
     ):
         effective_debug = self.debug if debug is None else debug
         effective_verbose = self.verbose if verbose is None else verbose
@@ -200,6 +202,8 @@ class SbxPool:
                 output_fields=output_fields,
                 debug=effective_debug,
                 verbose=effective_verbose,
+                runtime_hooks=runtime_hooks,
+                on_runtime_hook_event=on_runtime_hook_event,
             )
             yield interpreter
         finally:

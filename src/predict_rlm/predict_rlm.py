@@ -58,8 +58,9 @@ from .backends import (
 from .backends.base import SandboxFatalError
 from .backends.jspi import JspiBackend
 from .execution_timeout import validate_execution_timeout
-from .files import File, build_file_plan, scan_file_fields
+from .files import File, build_file_plan, scan_file_fields, scan_workspace_fields
 from .rlm_skills import Skill, merge_skills
+from .runtime_hooks import RuntimeHook, RuntimeHookEvent
 from .telemetry import TelemetryContext, make_span_id
 from .trace import (
     IterationStep,
@@ -920,6 +921,8 @@ class PredictRLM(dspy.RLM):
         telemetry_context: TelemetryContext | None = None,
         submit_confirmation: Callable[[SubmitConfirmationContext], str | None] | None = None,
         trace_export_path: str | Path | None = None,
+        runtime_hooks: list[RuntimeHook] | None = None,
+        on_runtime_hook_event: Callable[[RuntimeHookEvent], Any] | None = None,
     ):
         """
         Args:
@@ -986,6 +989,16 @@ class PredictRLM(dspy.RLM):
             raise ValueError("sbx_pool requires sandbox_backend='sbx'.")
         if sbx_pool is not None and sbx_config is not None:
             raise ValueError("Pass sbx_config to SbxPool when using sbx_pool.")
+        runtime_hooks = list(runtime_hooks or [])
+        if (
+            runtime_hooks
+            and interpreter is None
+            and sbx_pool is None
+            and self._sandbox_backend is not BackendName.SBX
+        ):
+            raise ValueError("runtime_hooks require the SBX backend in PredictRLM v1")
+        self._runtime_hooks = runtime_hooks
+        self._on_runtime_hook_event = on_runtime_hook_event
         self._sbx_pool = sbx_pool
         self._sbx_config = sbx_config
 
@@ -1485,7 +1498,24 @@ class PredictRLM(dspy.RLM):
     ) -> Iterator[ExecutionBackend]:
         """Yield interpreter, creating the configured backend if none provided."""
         if self._interpreter is not None:
-            self._inject_execution_context(self._interpreter, execution_tools)
+            if self._runtime_hooks:
+                configure_runtime = self._declared_callable(
+                    self._interpreter, "configure_runtime"
+                )
+                runtime_kwargs: dict[str, Any] = {}
+                if configure_runtime is not None:
+                    runtime_kwargs = self._accepted_kwargs(
+                        configure_runtime,
+                        tools=execution_tools,
+                        output_fields=self._get_output_fields_info(),
+                        runtime_hooks=self._runtime_hooks,
+                        on_runtime_hook_event=self._on_runtime_hook_event,
+                    )
+                if configure_runtime is None or "runtime_hooks" not in runtime_kwargs:
+                    raise ValueError("runtime_hooks require an SBX-compatible interpreter")
+                configure_runtime(**runtime_kwargs)
+            else:
+                self._inject_execution_context(self._interpreter, execution_tools)
             backend = self._interpreter_backend_label(self._interpreter)
             configured = self._configure_interpreter_debug(self._interpreter)
             self._log_lifecycle(
@@ -1537,6 +1567,8 @@ class PredictRLM(dspy.RLM):
                     output_fields=self._get_output_fields_info(),
                     debug=self._debug,
                     verbose=self._iteration_logging_enabled(),
+                    runtime_hooks=self._runtime_hooks,
+                    on_runtime_hook_event=self._on_runtime_hook_event,
                 ) as repl:
                     self._log_lifecycle(
                         "sbx.pool.lease.acquired",
@@ -1565,6 +1597,8 @@ class PredictRLM(dspy.RLM):
                 )
                 repl = SbxBackend(
                     config=self._sbx_config or SbxConfig(),
+                    runtime_hooks=self._runtime_hooks,
+                    on_runtime_hook_event=self._on_runtime_hook_event,
                     **interpreter_kwargs,
                 )
             else:
@@ -2727,14 +2761,20 @@ class PredictRLM(dspy.RLM):
         no file fields are present.
         """
         input_file_fields, output_file_fields = scan_file_fields(self.signature)
-        if not input_file_fields and not output_file_fields:
+        input_workspace_fields = scan_workspace_fields(self.signature)
+        if not input_file_fields and not output_file_fields and not input_workspace_fields:
             return None, input_args
 
         file_plan = build_file_plan(
-            input_args, input_file_fields, output_file_fields, self._output_dir
+            input_args,
+            input_file_fields,
+            output_file_fields,
+            self._output_dir,
+            input_workspace_fields=input_workspace_fields,
         )
         if not file_plan:
             return None, input_args
+        self._validate_file_plan_backend(file_plan)
 
         # Validate input files exist, then replace File values with sandbox path strings
         transformed = dict(input_args)
@@ -2767,11 +2807,49 @@ class PredictRLM(dspy.RLM):
                     )
                 transformed[field_name] = f"/sandbox/input/{field_name}"
 
+        for field_name, kind in input_workspace_fields.items():
+            value = transformed.get(field_name)
+            if value is None:
+                continue
+            if kind == "list_workspace":
+                for workspace in value:
+                    if not os.path.isdir(workspace.path):
+                        raise FileNotFoundError(
+                            f"Workspace for field '{field_name}' not found: {workspace.path}"
+                        )
+                transformed[field_name] = file_plan["workspace_mounts_for_instructions"][
+                    field_name
+                ]
+            elif kind == "workspace":
+                if not os.path.isdir(value.path):
+                    raise FileNotFoundError(
+                        f"Workspace for field '{field_name}' not found: {value.path}"
+                    )
+                transformed[field_name] = file_plan["workspace_mounts_for_instructions"][
+                    field_name
+                ]
+
         # Remove output file fields from input_args (they aren't RLM inputs)
         for field_name in output_file_fields:
             transformed.pop(field_name, None)
 
         return file_plan, transformed
+
+    def _validate_file_plan_backend(self, file_plan: dict[str, Any]) -> None:
+        direct_mounts = file_plan.get("direct_workspace_mounts") or []
+        if not direct_mounts:
+            return
+        if self._sbx_pool is not None:
+            raise ValueError(
+                "Workspace(mode='direct') requires a per-call SBX interpreter; "
+                "prewarmed SbxPool instances cannot add workspace mounts after creation."
+            )
+        if self._interpreter is not None:
+            if not hasattr(self._interpreter, "configure_direct_workspace_mounts"):
+                raise ValueError("Workspace(mode='direct') requires the SBX backend.")
+            return
+        if self._sandbox_backend is not BackendName.SBX:
+            raise ValueError("Workspace(mode='direct') requires the SBX backend.")
 
     def _setup_sandbox_files(
         self, repl: ExecutionBackend, file_plan: dict[str, Any]
@@ -2784,6 +2862,12 @@ class PredictRLM(dspy.RLM):
             output_dirs=len(file_plan["output_dirs"]),
             skill_modules=len(self._skill_modules),
         )
+        direct_mounts = file_plan.get("direct_workspace_mounts") or []
+        if direct_mounts:
+            if not hasattr(repl, "configure_direct_workspace_mounts"):
+                raise ValueError("Workspace(mode='direct') requires the SBX backend.")
+            repl.configure_direct_workspace_mounts(direct_mounts)
+
         if hasattr(repl, "_ensure_deno_process"):
             repl._ensure_deno_process()
 
@@ -2794,6 +2878,22 @@ class PredictRLM(dspy.RLM):
                 backend=self._interpreter_backend_label(repl),
                 virtual_path=virtual_path,
             )
+
+        for state in file_plan.get("workspace_states", []):
+            repl.mkdir_p(state.workspace.mount_path)
+            self._log_lifecycle(
+                "sandbox.files.workspace.mkdir",
+                backend=self._interpreter_backend_label(repl),
+                virtual_path=state.workspace.mount_path,
+            )
+            for host_path, virtual_path in state.iter_mounts():
+                repl.mount_file_at(host_path, virtual_path)
+                self._log_lifecycle(
+                    "sandbox.files.workspace.mount",
+                    backend=self._interpreter_backend_label(repl),
+                    virtual_path=virtual_path,
+                )
+            repl.add_post_execute_hook(state.sync_from_sandbox)
 
         for virtual_dir in file_plan["output_dirs"]:
             repl.mkdir_p(virtual_dir)
