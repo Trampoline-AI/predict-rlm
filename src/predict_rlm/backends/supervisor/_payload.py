@@ -670,8 +670,25 @@ def _run_kernel_coroutine(coro: Any) -> Any:
         asyncio.set_event_loop(loop)
         return loop.run_until_complete(coro)
     finally:
-        asyncio.set_event_loop(None)
-        loop.close()
+        # Cancel any tasks the code block left pending (e.g. predict() calls
+        # orphaned when an asyncio.gather() raised early on a sibling). Without
+        # this they leak across executes — their in-flight tool calls desync the
+        # host<->kernel protocol and the next predict() hangs. Mirrors what
+        # asyncio.run() does via _cancel_all_tasks before closing the loop.
+        try:
+            _cancel_all_kernel_tasks(loop)
+        finally:
+            asyncio.set_event_loop(None)
+            loop.close()
+
+
+def _cancel_all_kernel_tasks(loop: Any) -> None:
+    to_cancel = [t for t in asyncio.all_tasks(loop) if not t.done()]
+    if not to_cancel:
+        return
+    for task in to_cancel:
+        task.cancel()
+    loop.run_until_complete(asyncio.gather(*to_cancel, return_exceptions=True))
 
 
 def _descendant_process_ids(parent_pid: int) -> list[int]:

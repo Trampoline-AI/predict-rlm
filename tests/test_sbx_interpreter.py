@@ -1619,6 +1619,43 @@ class TestSbxBackendLocalWebSocketRunner:
         assert output == "4\n"
         assert seen_lengths == [950000]
 
+    def test_predicts_orphaned_by_gather_failure_do_not_hang_next_execute(
+        self, tmp_path: Path
+    ):
+        """A gather() that raises early orphans its other predict() calls.
+
+        Those tasks are left pending on the kernel loop with tool calls already
+        in flight. If the loop is closed without cancelling them, they desync the
+        host<->kernel protocol and the *next* predict() hangs to the watchdog.
+        The kernel must cancel orphans between executes so the follow-up works.
+        """
+        async def predict(signature: str, **kwargs) -> dict:
+            await asyncio.sleep(0.5)
+            return {"a": "ok"}
+
+        interpreter = self.make_interpreter(tmp_path, tools={"predict": predict})
+        try:
+            # gather raises on boom(); the 6 slow predict() calls get orphaned.
+            first = interpreter.execute(
+                "import asyncio\n"
+                "async def boom(): raise ValueError('expected')\n"
+                "async def slow(i):\n"
+                "    r = await predict('t: str -> a: str', t='x')\n"
+                "    return r['a']\n"
+                "try:\n"
+                "    await asyncio.gather(boom(), *[slow(i) for i in range(6)])\n"
+                "except ValueError:\n"
+                "    print('caught')"
+            )
+            assert first == "caught\n"
+            # A fresh predict() on the next execute must not hang.
+            second = interpreter.execute(
+                "r = await predict('t: str -> a: str', t='y')\nprint(r['a'])"
+            )
+            assert second == "ok\n"
+        finally:
+            interpreter.shutdown()
+
     def test_websocket_reset_and_shutdown(self, tmp_path: Path):
         interpreter = self.make_interpreter(tmp_path)
         try:
