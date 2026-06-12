@@ -1739,17 +1739,32 @@ class TestSbxCommandConstruction:
         assert command[:4] == ["sbx", "exec", "-i", "-w"]
         assert not any(cmd[:2] == ["sbx", "rm"] for cmd in commands)
 
-    def test_websocket_supervisor_starts_detached_and_publishes_port(
+    def test_websocket_supervisor_starts_foreground_sentinel_and_publishes_port(
         self, monkeypatch, tmp_path: Path
     ):
-        commands: list[list[str]] = []
+        run_commands: list[list[str]] = []
+        popen_commands: list[list[str]] = []
+
+        class FakeProcess:
+            stdout = None
+            stderr = None
+            stdin = None
+            pid = 12345
+
+            def poll(self):
+                return None
 
         def fake_run(command, **kwargs):
-            commands.append(command)
+            run_commands.append(command)
             return subprocess.CompletedProcess(command, 0, stdout="created-name\n", stderr="")
+
+        def fake_popen(command, **kwargs):
+            popen_commands.append(command)
+            return FakeProcess()
 
         monkeypatch.setattr(shutil, "which", lambda name: "/usr/local/bin/sbx")
         monkeypatch.setattr(subprocess, "run", fake_run)
+        monkeypatch.setattr(subprocess, "Popen", fake_popen)
         interpreter = SbxBackend(
             config=SbxConfig(
                 name="created-name",
@@ -1767,14 +1782,18 @@ class TestSbxCommandConstruction:
 
         interpreter._start_sbx_websocket_supervisor()
 
-        detached_exec = next(cmd for cmd in commands if cmd[:3] == ["sbx", "exec", "-d"])
-        assert detached_exec[:5] == ["sbx", "exec", "-d", "-w", str(tmp_path / "staging")]
-        assert "-i" not in detached_exec
-        assert "--websocket-host" in detached_exec
-        assert detached_exec[detached_exec.index("--websocket-port") + 1] == "8766"
-        assert detached_exec[detached_exec.index("--websocket-max-message-bytes") + 1] == str(
+        assert len(popen_commands) == 1
+        supervisor_exec = popen_commands[0]
+        assert supervisor_exec[:4] == ["sbx", "exec", "-w", str(tmp_path / "staging")]
+        assert "-d" not in supervisor_exec
+        assert "-i" not in supervisor_exec
+        assert "--websocket-host" in supervisor_exec
+        assert supervisor_exec[supervisor_exec.index("--websocket-port") + 1] == "8766"
+        assert supervisor_exec[supervisor_exec.index("--websocket-max-message-bytes") + 1] == str(
             32 * 1024 * 1024
         )
+        assert interpreter._proc is not None
+        assert not any(cmd[:3] == ["sbx", "exec", "-d"] for cmd in run_commands)
 
     def test_websocket_recovery_restarts_detached_supervisor_after_kill(
         self, monkeypatch, tmp_path: Path

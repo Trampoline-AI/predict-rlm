@@ -518,7 +518,6 @@ class SbxBackend(SupervisorClient, ExecutionBackend):
         command = [
             "sbx",
             "exec",
-            "-d",
             "-w",
             str(self._staging_root),
             self._sandbox_name,
@@ -541,20 +540,14 @@ class SbxBackend(SupervisorClient, ExecutionBackend):
             command=command[0],
             transport="websocket",
         )
-        start_result = subprocess.run(
+        self._proc = subprocess.Popen(
             command,
-            check=False,
-            capture_output=True,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
             text=True,
-            timeout=self.config.exec_timeout,
+            bufsize=1,
         )
-        if start_result.returncode != 0:
-            raise SandboxFatalError(
-                "Failed to start sbx WebSocket supervisor: "
-                f"exit code {start_result.returncode}; "
-                f"stdout: {start_result.stdout.strip()}; "
-                f"stderr: {start_result.stderr.strip()}"
-            )
         self._websocket_url = self._publish_websocket_port()
 
     def _connect_websocket_supervisor(self, url: str) -> None:
@@ -1169,7 +1162,11 @@ class SbxBackend(SupervisorClient, ExecutionBackend):
         try:
             ws.send(self._serialize_supervisor_message(payload))
         except Exception as exc:
-            self._handle_supervisor_send_error(method, request_id, BrokenPipeError(str(exc)))
+            self._handle_supervisor_send_error(
+                method,
+                request_id,
+                BrokenPipeError(str(exc)),
+            )
 
         deadline = time.monotonic() + request_timeout
         request_start = time.perf_counter()
