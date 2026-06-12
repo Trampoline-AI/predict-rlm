@@ -942,9 +942,23 @@ class TestPredictRLMConfiguration:
         assert "llm_query" not in instructions
         assert "sub_lm_query" not in instructions
 
-    def test_action_instructions_steer_iteration_execution_timeout(self):
-        """PredictRLM action prompt explains when and how to use timeouts."""
+    def test_action_instructions_omit_timeout_guidance_by_default(self):
+        """Model-chosen execution timeouts are off by default: no field, no prompt."""
         rlm = PredictRLM(ImageAnalysisSignature, sub_lm=None, max_iterations=5)
+        action = rlm.generate_action.signature
+        instructions = " ".join(str(action.instructions).split())
+        assert "execution_timeout_seconds" not in action.output_fields
+        assert "execution_timeout_seconds" not in instructions
+        assert "Execution timeouts" not in instructions
+
+    def test_action_instructions_steer_iteration_execution_timeout(self):
+        """With model_execution_timeout=True the prompt explains when/how to use timeouts."""
+        rlm = PredictRLM(
+            ImageAnalysisSignature,
+            sub_lm=None,
+            max_iterations=5,
+            model_execution_timeout=True,
+        )
         instructions = " ".join(str(rlm.generate_action.signature.instructions).split())
 
         assert "execution_timeout_seconds" in instructions

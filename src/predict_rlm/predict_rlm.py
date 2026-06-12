@@ -651,12 +651,7 @@ Use `predict()` whenever you need the model to read content and produce structur
 ### Execution model
 The REPL runs inside an async event loop — use `await` directly, not `asyncio.run()`.
 
-### Execution timeouts
-For every iteration, deliberately choose `execution_timeout_seconds` for the current code block. Use `null` for ordinary short, safe blocks. Set a positive timeout when work could hang or run long: loops, scans over many files/items, network or tool fanout, batch `predict()` calls, tests/subprocesses, or data/model processing.
-
-Use lightweight caps: short probes are usually ~1-5 seconds, normal bounded work is usually ~10-60 seconds, and longer caps are only for clearly heavy bounded work. If a timeout fires, stdout/stderr printed before the timeout are preserved and the next iteration can continue. Before risky work, store important partial results in variables; simple pickleable variables can be restored after hard-kill fallback.
-
-## Managing state & output
+{execution_timeout_instructions}## Managing state & output
 
 Each iteration's printed output is captured and shown to you in subsequent iterations, but **truncated to ~5000 characters**. This is a hard limit — output beyond 5K chars is cut off.
 
@@ -924,6 +919,7 @@ class PredictRLM(dspy.RLM):
         trace_export_path: str | Path | None = None,
         runtime_hooks: list[RuntimeHook] | None = None,
         on_runtime_hook_event: Callable[[RuntimeHookEvent], Any] | None = None,
+        model_execution_timeout: bool = False,
     ):
         """
         Args:
@@ -974,6 +970,14 @@ class PredictRLM(dspy.RLM):
             trace_export_path: Optional path for best-effort atomic RunTrace
                        snapshots while the run is in progress. The file is
                        replaced in place and trace export failures are ignored.
+            model_execution_timeout: Whether the action LM may set a per-iteration
+                       ``execution_timeout_seconds`` to soft-cap (recoverably
+                       interrupt) its own code blocks. Off by default — models
+                       tend to under-set it and kill legitimately slow work (e.g.
+                       30s-2min predict() calls). When off, the host watchdog
+                       (``SbxConfig.exec_timeout`` / JSPI ``exec_timeout``, default
+                       300s) remains as the hang guard. Set True to restore the
+                       model-chosen timeout knob.
         """
         if interpreter is not None and sbx_pool is not None:
             raise ValueError(
@@ -1000,6 +1004,7 @@ class PredictRLM(dspy.RLM):
             raise ValueError("runtime_hooks require the SBX backend in PredictRLM v1")
         self._runtime_hooks = runtime_hooks
         self._on_runtime_hook_event = on_runtime_hook_event
+        self._model_execution_timeout = model_execution_timeout
         self._sbx_pool = sbx_pool
         self._sbx_config = sbx_config
 
@@ -3479,6 +3484,7 @@ class PredictRLM(dspy.RLM):
             self._format_tool_docs,
             skill_instructions=self._skill_instructions,
             file_instructions=file_instructions,
+            model_execution_timeout=self._model_execution_timeout,
         )
         return dspy.Predict(action_sig), dspy.Predict(extract_sig)
 
@@ -3491,4 +3497,5 @@ class PredictRLM(dspy.RLM):
             raw_tools,
             self._format_tool_docs,
             skill_instructions=self._skill_instructions,
+            model_execution_timeout=self._model_execution_timeout,
         )

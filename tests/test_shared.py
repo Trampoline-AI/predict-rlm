@@ -127,6 +127,19 @@ class TestBuildRlmSignatures:
         assert "stdout/stderr" in desc
         assert "next iteration can continue" in desc
 
+    def test_action_signature_omits_execution_timeout_when_disabled(self):
+        sig = dspy.Signature("question -> answer")
+        action, _ = build_rlm_signatures(
+            sig,
+            self.ACTION_TEMPLATE,
+            {},
+            format_tool_docs_full,
+            model_execution_timeout=False,
+        )
+
+        assert "execution_timeout_seconds" not in action.output_fields
+        assert "code" in action.output_fields  # other output fields unaffected
+
     def test_action_signature_keeps_code_field_description_narrow(self):
         sig = dspy.Signature("question -> answer")
         action, _ = build_rlm_signatures(

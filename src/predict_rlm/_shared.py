@@ -88,6 +88,14 @@ def format_tool_docs_full(tools: dict[str, Callable]) -> str:
     return "\n".join(lines)
 
 
+EXECUTION_TIMEOUT_INSTRUCTIONS = """### Execution timeouts
+For every iteration, deliberately choose `execution_timeout_seconds` for the current code block. Use `null` for ordinary short, safe blocks. Set a positive timeout when work could hang or run long: loops, scans over many files/items, network or tool fanout, batch `predict()` calls, tests/subprocesses, or data/model processing.
+
+Use lightweight caps: short probes are usually ~1-5 seconds, normal bounded work is usually ~10-60 seconds, and longer caps are only for clearly heavy bounded work. If a timeout fires, stdout/stderr printed before the timeout are preserved and the next iteration can continue. Before risky work, store important partial results in variables; simple pickleable variables can be restored after hard-kill fallback.
+
+"""
+
+
 def build_rlm_signatures(
     signature: Signature,
     instructions_template: str,
@@ -95,6 +103,7 @@ def build_rlm_signatures(
     format_tool_docs: Callable[[dict[str, Callable]], str],
     skill_instructions: str = "",
     file_instructions: str = "",
+    model_execution_timeout: bool = True,
 ) -> tuple[Signature, Signature]:
     """Build action and extract signatures for RLM subclasses.
 
@@ -122,6 +131,9 @@ def build_rlm_signatures(
             inputs=inputs_str,
             final_output_names=final_output_names,
             output_fields=output_fields,
+            execution_timeout_instructions=(
+                EXECUTION_TIMEOUT_INSTRUCTIONS if model_execution_timeout else ""
+            ),
         )
         + tool_docs
     )
@@ -153,21 +165,22 @@ def build_rlm_signatures(
         ),
         type_=str,
     )
-    action_sig = action_sig.append(
-        "execution_timeout_seconds",
-        dspy.OutputField(
-            desc=(
-                "Optional per-iteration execution cap. Use null for ordinary "
-                "short, safe code. Use a positive number of seconds when this "
-                "iteration may hang or run long, such as loops, large scans, "
-                "tool/network fanout, batch predict() calls, tests/subprocesses, "
-                "or data/model processing. Printed stdout/stderr before a timeout "
-                "are preserved so the next iteration can continue."
+    if model_execution_timeout:
+        action_sig = action_sig.append(
+            "execution_timeout_seconds",
+            dspy.OutputField(
+                desc=(
+                    "Optional per-iteration execution cap. Use null for ordinary "
+                    "short, safe code. Use a positive number of seconds when this "
+                    "iteration may hang or run long, such as loops, large scans, "
+                    "tool/network fanout, batch predict() calls, tests/subprocesses, "
+                    "or data/model processing. Printed stdout/stderr before a timeout "
+                    "are preserved so the next iteration can continue."
+                ),
+                default=None,
             ),
-            default=None,
-        ),
-        type_=float | None,
-    )
+            type_=float | None,
+        )
     action_sig = action_sig.append(
         "code",
         # ``min_length=1`` gives PredictRLM's validating adapter a concrete
