@@ -1,0 +1,254 @@
+# predict-rlm Architecture
+
+This document describes the implemented execution architecture for PredictRLM
+execution backends.
+
+## Execution backend feature matrix
+
+| Mode | Boundary | Payload | Transport | State owner |
+| --- | --- | --- | --- | --- |
+| JSPI | Deno proc | `jspi/payload.js` | stdio JSON-RPC | Pyodide VM |
+| Direct | local proc | `_payload.py` | stdio | CPython kernel |
+| SBX | `sbx` box | copied `_payload.py` | WS | CPython kernel |
+
+Implementation names:
+
+- **JSPI** is `JspiBackend`.
+- **Direct** is `DirectPythonBackend`.
+- **SBX** is `SbxBackend`.
+
+`PythonSupervisor` is not a backend. It is shared host-side implementation for
+native CPython backends such as Direct. It owns common JSON-RPC client behavior
+for `_payload.py`-based runtimes.
+
+Tests also use an injected local supervisor command to exercise the shared
+native protocol without real SBX. That seam is not a production backend.
+
+## Key components and classes
+
+Code map:
+
+```text
+src/predict_rlm/
+├── predict_rlm.py             PredictRLM
+├── _shared.py                 build_rlm_signatures()
+├── rlm_skills.py              Skill, merge_skills()
+├── files.py                   File, SyncedFile
+├── trace.py                   IterationStep, RunTrace
+├── backends/
+│   ├── base.py                BackendName, ExecutionBackend
+│   │                          SupervisorClient, SupervisorProcess
+│   ├── jspi/
+│   │   ├── __init__.py        public JSPI reexports
+│   │   ├── backend.py         JspiBackend
+│   │   └── payload.js         JSPI / Pyodide supervisor bridge
+│   ├── supervisor/
+│   │   ├── __init__.py        public native supervisor reexports
+│   │   ├── runner.py          PythonSupervisor, DirectPythonBackend
+│   │   │                      SupervisorTransport
+│   │   └── _payload.py        native Python supervisor payload
+│   └── sbx/
+│       ├── __init__.py        public SBX reexports
+│       ├── config.py          DEFAULT_SBX_TEMPLATE, SbxConfig
+│       ├── backend.py         SbxBackend
+│       ├── pool.py            SbxPool
+│       └── logging.py         SBX logging helpers
+```
+
+### Orchestration
+
+- `PredictRLM` (`predict_rlm.py`) is the main DSPy module. It builds the RLM
+  action loop, exposes `predict()` to generated code, creates or leases the
+  configured execution backend, and records trace output.
+- `build_rlm_signatures()` (`_shared.py`) builds the action/extract signatures
+  shown to the outer LM, including tool docs and skill instructions.
+- `Skill` and `merge_skills()` (`rlm_skills.py`) bundle reusable instructions,
+  PyPI packages, Python modules, and tools for the sandbox.
+
+### Backend contract and selection
+
+- `BackendName` (`backends/base.py`) is the public runtime selector used by
+  `sandbox_backend`; currently `jspi` and `sbx`.
+- `ExecutionBackend` (`backends/base.py`) is the protocol PredictRLM needs:
+  execute code, mount/list/sync files, and shut down.
+- `SbxConfig` (`backends/sbx/config.py`) carries Docker Sandboxes
+  configuration such as name, resources, template, persistence, and WebSocket
+  settings.
+
+### Shared native supervisor
+
+- `_payload.py` (`backends/supervisor/_payload.py`) is the shared Python
+  JSON-RPC payload copied into native CPython backends.
+- It owns common runtime behavior: `execute`, `reset`, `shutdown`, stdout/stderr
+  capture, host-tool callbacks, `SUBMIT`, virtual-file helpers, and timeout
+  response metadata.
+- Successful native executions run through a persistent CPython kernel process
+  owned by the supervisor. That kernel owns user globals and REPL state.
+- The split lets the supervisor interrupt or restart stuck user code while
+  preserving the transport when possible.
+
+### Backend implementations
+
+- `JspiBackend` (`backends/jspi/backend.py`) runs the default Deno/Pyodide
+  backend via `backends/jspi/payload.js`. It does not use the native
+  supervisor.
+- `PythonSupervisor` (`backends/supervisor/runner.py`) is shared host-side
+  JSON-RPC implementation for native supervisor backends. It is not a runtime
+  mode by itself.
+- `DirectPythonBackend` (`backends/supervisor/runner.py`) launches the native
+  supervisor as a local Python subprocess.
+- `SbxBackend` (`backends/sbx/backend.py`) creates or reuses an `sbx`
+  sandbox, copies `_payload.py`, launches it, publishes the WebSocket
+  port, and sends repeated JSON-RPC requests over WebSocket.
+- `SupervisorTransport` (`backends/supervisor/runner.py`) is the low-level
+  process/file transport protocol used by native supervisor backends.
+- `SupervisorClient` (`backends/base.py`) owns shared request-id framing and
+  response handling for long-lived supervisors.
+- `SbxPool` (`backends/sbx/pool.py`) leases prewarmed `SbxBackend`
+  instances. It is a pooling wrapper, not a separate backend mode.
+
+### Data, files, and traces
+
+- `File` and `SyncedFile` (`files.py`) describe host/sandbox file movement for
+  RLM inputs, outputs, and host-tool file writeback.
+- `IterationStep` and `RunTrace` (`trace.py`) are the structured record of an
+  RLM run: generated code, observations, tool calls, timing, and usage metadata.
+
+## Default JSPI / Deno / Pyodide path
+
+```text
+┌──────────────────────────────┐  stdio JSON-RPC  ┌────────────────────────────┐
+│ host process                 │ ───────────────▶ │ Deno subprocess            │
+│ - JspiBackend                │                  │ - JS supervisor / bridge   │
+│ - host tool implementations  │                  │ - file: jspi/payload.js    │
+│ - file sync bookkeeping      │                  │ - live Pyodide VM          │
+│                              │                  │ - user code in Pyodide     │
+└──────────────────────────────┘                  └────────────────────────────┘
+```
+
+`JspiBackend` starts Deno, sends `execute` requests over stdio, and handles
+host-tool callbacks. The live Python state is the Pyodide VM inside the Deno
+process. If Deno dies, the interpreter is fatal because the live VM and mounted
+state are gone.
+
+## Shared native Python supervisor shape
+
+```text
+┌──────────────────────────────┐  backend RPC     ┌────────────────────────────┐
+│ host process                 │ ───────────────▶ │ runtime boundary           │
+│ - execution backend          │                  │ - local proc / sbx / ctr   │
+│ - host tool implementations  │                  │ - supervisor process       │
+│ - request/response handling  │                  │ - file: _payload.py        │
+│ - backend lifecycle hooks    │                  │ - JSON-RPC server          │
+│                              │                  │ - host-tool bridge         │
+│                              │                  │ - optional kernel process  │
+└──────────────────────────────┘                  └────────────────────────────┘
+```
+
+The native path has two layers inside the runtime boundary. The supervisor is
+the protocol endpoint. The persistent kernel process owns successful-iteration
+REPL state. This split lets the supervisor interrupt or restart a stuck kernel
+while keeping the transport alive when possible.
+
+## Direct local Python backend
+
+```text
+┌──────────────────────────────┐  stdio JSON-RPC  ┌────────────────────────────┐
+│ host process                 │ ───────────────▶ │ local Python subprocess    │
+│ - DirectPythonBackend        │                  │ - supervisor process       │
+│ - local copy/start/sync      │                  │ - file: _payload.py        │
+│ - host tool implementations  │                  │ - JSON-RPC server          │
+│                              │                  │ - optional kernel process  │
+└──────────────────────────────┘                  └────────────────────────────┘
+```
+
+This is the simplest native supervisor path: the backend boundary is just a
+local Python subprocess. It is useful for local execution and for testing the
+native supervisor contract without Deno or SBX.
+
+## SBX backend
+
+```text
+┌──────────────────────────────┐  sbx lifecycle   ┌────────────────────────────┐
+│ host process                 │ ───────────────▶ │ SBX sandbox                │
+│ - SbxBackend                 │                  │ - copied supervisor        │
+│ - create/reuse sandbox       │  WS JSON-RPC     │ - .predict_rlm_supervisor  │
+│ - copy supervisor payload    │ ───────────────▶ │ - WebSocket server         │
+│ - launch via `sbx exec -d`   │                  │ - JSON-RPC server          │
+│ - publish WebSocket port     │                  │ - optional kernel process  │
+└──────────────────────────────┘                  └────────────────────────────┘
+```
+
+SBX startup uses the `sbx` CLI to prepare the runtime before any `execute`
+request is sent:
+
+1. create or reuse the SBX sandbox;
+2. copy `_payload.py` under `.predict_rlm_supervisor/`;
+3. launch the supervisor with `sbx exec -d`;
+4. publish the supervisor WebSocket port to localhost.
+
+After startup, `SbxBackend` sends repeated `execute` requests to the supervisor
+over WebSocket JSON-RPC.
+
+`SbxPool` is a pooling wrapper around prewarmed `SbxBackend` instances. It does
+not change the SBX runtime shape.
+
+Tests cover `SbxPool` as pool behavior and as a `PredictRLM` SBX integration
+path, but it is not part of the runtime-contract backend matrix.
+
+## State and timeout behavior
+
+Each RLM action may set `execution_timeout_seconds`. A timeout should return an
+observation to the RLM, not silently erase state or masquerade as a normal
+Python error.
+
+### JSPI / Deno / Pyodide
+
+- Successful execute: same live Pyodide VM; full globals persist.
+- Cooperative timeout: Pyodide is interrupted by trace deadline and JS interrupt
+  buffer; stdout/stderr are returned and the VM remains live.
+- Hard timeout or crash: the host watchdog kills Deno and raises
+  `SandboxFatalError`; the interpreter is dead and no state is recovered.
+
+### Native supervisor backends
+
+- Successful execute: same live CPython kernel; full globals persist.
+- Cooperative timeout: host sends `SIGINT`; if the kernel returns a structured
+  timeout, full live state persists and `state.preserved=true`.
+- Hard timeout or crash: the supervisor kills/restarts the kernel, restores the
+  pre-timeout pickleable globals snapshot, and reports `state.preserved=false`,
+  restored names, and lost globals/imports.
+
+Snapshot restore is intentionally a downgrade from REPL persistence. It can
+restore simple pickleable values that existed before timed execution, but it
+cannot restore arbitrary live objects such as modules, function definitions,
+open handles, or mutations made during the killed execution.
+
+## Shared contracts
+
+Native supervisor backends share:
+
+- the copied Python supervisor payload (`_payload.py`);
+- JSON-RPC response shapes for normal output, errors, `SUBMIT`, and timeouts;
+- the persistent-kernel REPL contract;
+- cooperative-interrupt then hard-kill timeout policy;
+- pickle-snapshot fallback metadata.
+
+Backend implementations own only substrate-specific operations: starting Deno,
+Docker Sandboxes, local processes, or containers; copying/mounting files;
+low-level process signaling; and resource cleanup.
+
+## Naming conventions
+
+- **Execution backend**: host-side controller implementing the PredictRLM
+  runtime contract.
+- **Runtime boundary**: the process/container/sandbox that contains executing
+  user code.
+- **Supervisor**: long-lived protocol endpoint inside a runtime boundary. It
+  receives JSON-RPC, dispatches execution, and bridges host tool calls.
+- **JSPI supervisor**: `src/predict_rlm/backends/jspi/payload.js`; hosts
+  Pyodide and runs user code in the Pyodide VM.
+- **Native supervisor**: `src/predict_rlm/backends/supervisor/_payload.py`; may
+  spawn a persistent CPython kernel process for user code and globals.
+- **Kernel process**: persistent CPython process that owns user globals for
+  native supervisor backends.

@@ -1,4 +1,4 @@
-"""Thread-safe pool for SBX client adapters."""
+"""Thread-safe pool for Docker Sandboxes backends."""
 
 from __future__ import annotations
 
@@ -9,20 +9,18 @@ import time
 import uuid
 from contextlib import contextmanager
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Callable
+from typing import Any, Callable
 
 from predict_rlm._logging import configure_predict_rlm_logging
 from predict_rlm.trace import ms_since
 
-from .base import SbxConfig
-from .sbx_logging import log_pool_lifecycle
-
-if TYPE_CHECKING:
-    from .sbx import SbxClientAdapter
+from .backend import SbxBackend
+from .config import SbxConfig
+from .logging import log_pool_lifecycle
 
 
 class SbxPool:
-    """Thread-safe pool of prewarmed Docker Sandboxes interpreters."""
+    """Thread-safe pool of prewarmed Docker Sandboxes backends."""
 
     def __init__(
         self,
@@ -70,8 +68,8 @@ class SbxPool:
             "_runner_command": _runner_command,
         }
         self._staging_root = Path(_staging_root) if _staging_root is not None else None
-        self._available: queue.Queue[SbxClientAdapter] = queue.Queue(maxsize=size)
-        self._all_interpreters: list[SbxClientAdapter] = []
+        self._available: queue.Queue[SbxBackend] = queue.Queue(maxsize=size)
+        self._all_interpreters: list[SbxBackend] = []
         self._lock = threading.Lock()
         self._state_changed = threading.Condition(self._lock)
         self._started = False
@@ -145,7 +143,7 @@ class SbxPool:
             return True
 
     def _finish_start(self) -> None:
-        interpreters: list[SbxClientAdapter] = []
+        interpreters: list[SbxBackend] = []
         self._log_lifecycle("sbx.pool.start", size=self.size)
         try:
             for index in range(self.size):
@@ -269,7 +267,7 @@ class SbxPool:
             if self._is_stopping_locked() or not self._started:
                 raise RuntimeError("SbxPool is shut down")
 
-    def _acquire_interpreter(self) -> SbxClientAdapter:
+    def _acquire_interpreter(self) -> SbxBackend:
         with self._state_changed:
             while True:
                 if self._is_stopping_locked() or not self._started:
@@ -282,9 +280,7 @@ class SbxPool:
     def _is_stopping_locked(self) -> bool:
         return self._shutdown or self._shutdown_requested or self._shutting_down
 
-    def _create_interpreter(self, index: int) -> SbxClientAdapter:
-        from .sbx import SbxClientAdapter
-
+    def _create_interpreter(self, index: int) -> SbxBackend:
         kwargs = dict(self._interpreter_kwargs)
         if self.size > 1:
             kwargs["config"] = self.config.model_copy(
@@ -292,7 +288,7 @@ class SbxPool:
             )
         if self._staging_root is not None:
             kwargs["_staging_root"] = self._staging_root / f"runner-{index}"
-        return SbxClientAdapter(**kwargs)
+        return SbxBackend(**kwargs)
 
     def _drain_available_locked(self) -> None:
         while True:
@@ -303,7 +299,7 @@ class SbxPool:
 
     def _shutdown_interpreters(
         self,
-        interpreters: list[SbxClientAdapter],
+        interpreters: list[SbxBackend],
         *,
         suppress_errors: bool = False,
     ) -> None:

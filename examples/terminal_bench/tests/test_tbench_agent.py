@@ -72,7 +72,7 @@ def test_agent_constructs_predict_rlm_with_direct_process_interpreter(monkeypatc
             events.append(("acall", kwargs))
             return SimpleNamespace(answer="done")
 
-    monkeypatch.setattr(tbench_agent, "DirectProcessRunnerClientAdapter", FakeInterpreter)
+    monkeypatch.setattr(tbench_agent, "DirectPythonBackend", FakeInterpreter)
     monkeypatch.setattr(tbench_agent, "PredictRLM", FakePredictRLM)
 
     agent = tbench_agent.TerminalBenchRLMBaseAgent(
@@ -123,7 +123,7 @@ def test_agent_preserves_custom_signature_instructions(monkeypatch) -> None:
             captured["call_kwargs"] = kwargs
             return SimpleNamespace(answer="done")
 
-    monkeypatch.setattr(tbench_agent, "DirectProcessRunnerClientAdapter", FakeInterpreter)
+    monkeypatch.setattr(tbench_agent, "DirectPythonBackend", FakeInterpreter)
     monkeypatch.setattr(tbench_agent, "PredictRLM", FakePredictRLM)
 
     base_signature = tbench_agent.dspy.Signature(
@@ -157,7 +157,7 @@ def test_agent_terminal_bench_submit_confirmation_mode_passes_callback(monkeypat
         async def acall(self, **_kwargs):
             return SimpleNamespace(answer="done")
 
-    monkeypatch.setattr(tbench_agent, "DirectProcessRunnerClientAdapter", FakeInterpreter)
+    monkeypatch.setattr(tbench_agent, "DirectPythonBackend", FakeInterpreter)
     monkeypatch.setattr(tbench_agent, "PredictRLM", FakePredictRLM)
 
     agent = tbench_agent.TerminalBenchRLMBaseAgent(
@@ -217,7 +217,7 @@ def test_agent_installs_codex_lm_before_constructing_predict_rlm(monkeypatch) ->
         captured_env["OPENAI_API_KEY"] = tbench_agent.os.environ.get("OPENAI_API_KEY")
 
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
-    monkeypatch.setattr(tbench_agent, "DirectProcessRunnerClientAdapter", FakeInterpreter)
+    monkeypatch.setattr(tbench_agent, "DirectPythonBackend", FakeInterpreter)
     monkeypatch.setattr(tbench_agent, "PredictRLM", FakePredictRLM)
     monkeypatch.setitem(sys.modules, "dspy_codex_lm", types.ModuleType("dspy_codex_lm"))
     cli_module = types.ModuleType("dspy_codex_lm.cli")
@@ -262,7 +262,7 @@ def test_agent_raises_clear_error_when_codex_lm_dependency_missing(monkeypatch) 
         return real_import_module(name, package)
 
     real_import_module = tbench_agent.importlib.import_module
-    monkeypatch.setattr(tbench_agent, "DirectProcessRunnerClientAdapter", FakeInterpreter)
+    monkeypatch.setattr(tbench_agent, "DirectPythonBackend", FakeInterpreter)
     monkeypatch.setattr(tbench_agent, "PredictRLM", FakePredictRLM)
     monkeypatch.setattr(tbench_agent.importlib, "import_module", fake_import_module)
 
@@ -295,7 +295,7 @@ def test_agent_exports_predict_rlm_trace_to_logging_dir(monkeypatch, tmp_path: P
         async def acall(self, **_kwargs):
             return SimpleNamespace(answer="done", trace=FakeTrace())
 
-    monkeypatch.setattr(tbench_agent, "DirectProcessRunnerClientAdapter", FakeInterpreter)
+    monkeypatch.setattr(tbench_agent, "DirectPythonBackend", FakeInterpreter)
     monkeypatch.setattr(tbench_agent, "PredictRLM", FakePredictRLM)
 
     agent = tbench_agent.TerminalBenchRLMBaseAgent()

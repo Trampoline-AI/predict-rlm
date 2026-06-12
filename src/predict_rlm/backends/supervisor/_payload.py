@@ -1,4 +1,4 @@
-"""Python JSON-RPC runner used by the Docker Sandboxes backend."""
+"""Executable Python JSON-RPC supervisor payload for native backends."""
 
 from __future__ import annotations
 

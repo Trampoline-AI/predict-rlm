@@ -22,6 +22,13 @@ from typing import Any, Callable, Protocol
 from dspy.primitives.code_interpreter import CodeInterpreterError
 
 from predict_rlm._shared import strip_code_fences
+from predict_rlm.backends.base import (
+    BackendExecutionGate,
+    ExecutionBackend,
+    SandboxFatalError,
+    SupervisorClient,
+    SupervisorProcess,
+)
 from predict_rlm.debug import debug_event
 from predict_rlm.debug import is_enabled as predict_rlm_debug_enabled
 from predict_rlm.execution_timeout import (
@@ -29,12 +36,6 @@ from predict_rlm.execution_timeout import (
     ITERATION_TIMEOUT_FAILURE_CLASS,
     recoverable_timeout_host_deadline_seconds,
     validate_execution_timeout,
-)
-from predict_rlm.interpreter import SandboxFatalError
-from predict_rlm.interpreters.base import ClientAdapterExecutionGate, PredictRLMClientAdapter
-from predict_rlm.interpreters.persistent_runner import (
-    PersistentJsonRpcRunnerClient,
-    PersistentSupervisorProcess,
 )
 
 PYTHON_RUNNER_RECOVERABLE_TIMEOUT_GRACE_SECONDS = (
@@ -47,9 +48,9 @@ _SECRETISH_CODE_RE = re.compile(
 )
 
 __all__ = [
-    "DirectProcessRunnerClientAdapter",
+    "DirectPythonBackend",
     "PYTHON_RUNNER_RECOVERABLE_TIMEOUT_GRACE_SECONDS",
-    "PythonRunnerClientAdapter",
+    "PythonSupervisor",
 ]
 
 
@@ -82,10 +83,10 @@ def _process_debug_metadata(process: Any) -> dict[str, Any]:
     return metadata
 
 
-def _runner_source() -> str:
-    spec = importlib.util.find_spec("predict_rlm.sandbox.python_runner")
+def _payload_source() -> str:
+    spec = importlib.util.find_spec("predict_rlm.backends.supervisor._payload")
     if spec is None or spec.origin is None:
-        raise RuntimeError("Could not locate predict_rlm.sandbox.python_runner")
+        raise RuntimeError("Could not locate predict_rlm.backends.supervisor._payload")
     return Path(spec.origin).read_text(encoding="utf-8")
 
 
@@ -131,7 +132,7 @@ class RunnerProcess(Protocol):
     def kill(self) -> None: ...
 
 
-class RunnerBackend(Protocol):
+class SupervisorTransport(Protocol):
     def copy_to(self, host_path: str, container_path: str) -> None: ...
 
     def copy_from(self, container_path: str, host_path: str) -> None: ...
@@ -314,7 +315,7 @@ class _DirectProcessRunnerAdapter:
         )
 
 
-class PythonRunnerClientAdapter(PersistentJsonRpcRunnerClient, PredictRLMClientAdapter):
+class PythonSupervisor(SupervisorClient, ExecutionBackend):
     _LIST_DIR_SCRIPT = (
         "import json, pathlib, sys; "
         "root = pathlib.Path(sys.argv[1]); "
@@ -323,22 +324,22 @@ class PythonRunnerClientAdapter(PersistentJsonRpcRunnerClient, PredictRLMClientA
 
     def __init__(
         self,
-        backend: RunnerBackend,
+        backend: SupervisorTransport,
         *,
         tools: dict[str, Callable[..., Any]] | None = None,
         output_fields: list[dict[str, Any]] | None = None,
-        runner_path: str = "/tmp/predict_rlm_runner.py",
+        runner_path: str = "/tmp/predict_rlm_payload.py",
         python_executable: str = "python3",
         workdir: str | None = None,
         exec_timeout: float = 900.0,
         recoverable_timeout_grace: float = PYTHON_RUNNER_RECOVERABLE_TIMEOUT_GRACE_SECONDS,
-        supervisor_name: str = "Python runner supervisor",
+        supervisor_name: str = "Python supervisor",
         debug_interpreter: str = "python_runner",
-        debug_event_prefix: str = "python_runner.runner",
+        debug_event_prefix: str = "python_runner.supervisor",
         restart_process_description: str = "supervisor process",
         filesystem_state_description: str = "runner filesystem state",
     ) -> None:
-        PersistentJsonRpcRunnerClient.__init__(
+        SupervisorClient.__init__(
             self,
             supervisor_name=supervisor_name,
         )
@@ -362,7 +363,7 @@ class PythonRunnerClientAdapter(PersistentJsonRpcRunnerClient, PredictRLMClientA
         self._tools_registered = False
         self._output_fields_registered = False
         self._stdout_reader: _TimeoutLineReader | None = None
-        self._execution_gate = ClientAdapterExecutionGate(supervisor_name)
+        self._execution_gate = BackendExecutionGate(supervisor_name)
         self._debug_request_context: dict[int, dict[str, Any]] = {}
         self._defer_next_submit_finalization = False
 
@@ -550,7 +551,7 @@ class PythonRunnerClientAdapter(PersistentJsonRpcRunnerClient, PredictRLMClientA
         install_runner_script = getattr(self.adapter, "install_runner_script", None)
         if install_runner_script is not None:
             install_runner_script(
-                _runner_source(),
+                _payload_source(),
                 self.runner_path,
                 timeout=self.exec_timeout,
             )
@@ -558,7 +559,7 @@ class PythonRunnerClientAdapter(PersistentJsonRpcRunnerClient, PredictRLMClientA
         with tempfile.NamedTemporaryFile(
             "w", encoding="utf-8", suffix=".py", delete=False
         ) as tmp:
-            tmp.write(_runner_source())
+            tmp.write(_payload_source())
             tmp_path = tmp.name
         try:
             self.adapter.copy_to(tmp_path, self.runner_path)
@@ -786,7 +787,7 @@ class PythonRunnerClientAdapter(PersistentJsonRpcRunnerClient, PredictRLMClientA
         *,
         request_id: int,
         request_start: float,
-        process: PersistentSupervisorProcess,
+        process: SupervisorProcess,
     ) -> None:
         stderr = self._read_stderr_for_process(process)
         self._debug_request_context.pop(request_id, None)
@@ -831,7 +832,7 @@ class PythonRunnerClientAdapter(PersistentJsonRpcRunnerClient, PredictRLMClientA
         self,
         method: str,
         params: dict[str, Any],
-        process: PersistentSupervisorProcess,
+        process: SupervisorProcess,
         *,
         request_id: int,
         request_timeout: float,
@@ -913,7 +914,7 @@ class PythonRunnerClientAdapter(PersistentJsonRpcRunnerClient, PredictRLMClientA
 
     def _read_supervisor_stdout_line(
         self,
-        process: PersistentSupervisorProcess,
+        process: SupervisorProcess,
         *,
         deadline: float,
         timeout: float,
@@ -1122,7 +1123,7 @@ class PythonRunnerClientAdapter(PersistentJsonRpcRunnerClient, PredictRLMClientA
             )
 
 
-class DirectProcessRunnerClientAdapter(PythonRunnerClientAdapter):
+class DirectPythonBackend(PythonSupervisor):
     """PredictRLM interpreter that runs the persistent Python supervisor locally."""
 
     def __init__(
@@ -1130,7 +1131,7 @@ class DirectProcessRunnerClientAdapter(PythonRunnerClientAdapter):
         *,
         tools: dict[str, Callable[..., Any]] | None = None,
         output_fields: list[dict[str, Any]] | None = None,
-        runner_path: str = "/tmp/predict_rlm_runner.py",
+        runner_path: str = "/tmp/predict_rlm_payload.py",
         python_executable: str | None = None,
         workdir: str | None = None,
         exec_timeout: float = 900.0,

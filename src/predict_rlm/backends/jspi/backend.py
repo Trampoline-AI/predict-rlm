@@ -32,21 +32,7 @@ from dspy.primitives.code_interpreter import CodeInterpreterError, FinalOutput
 from dspy.primitives.python_interpreter import PythonInterpreter
 from pydantic import BaseModel
 
-from predict_rlm._shared import strip_code_fences
-from predict_rlm.execution_timeout import (
-    ITERATION_TIMEOUT_FAILURE_CLASS,
-    RecoverableExecutionTimeout,
-    format_recoverable_timeout_result,
-    recoverable_timeout_host_deadline_seconds,
-    resolve_execution_timeout,
-)
-from predict_rlm.interpreters.base import (
-    STALE_RESPONSE_DISCARD_LIMIT,
-    ClientAdapterExecutionGate,
-    SandboxExecutionError,
-)
-
-from ._logging import (
+from predict_rlm._logging import (
     configure_predict_rlm_logging,
     emit_trace_error,
     emit_trace_result,
@@ -55,7 +41,21 @@ from ._logging import (
     interpreter_result_logging_enabled,
     live_tool_call_logging_enabled,
 )
-from .telemetry import (
+from predict_rlm._shared import strip_code_fences
+from predict_rlm.backends.base import (
+    STALE_RESPONSE_DISCARD_LIMIT,
+    BackendExecutionGate,
+    SandboxExecutionError,
+    SandboxFatalError,
+)
+from predict_rlm.execution_timeout import (
+    ITERATION_TIMEOUT_FAILURE_CLASS,
+    RecoverableExecutionTimeout,
+    format_recoverable_timeout_result,
+    recoverable_timeout_host_deadline_seconds,
+    resolve_execution_timeout,
+)
+from predict_rlm.telemetry import (
     TelemetryContext,
     make_span_id,
     reset_current_telemetry_context,
@@ -79,34 +79,6 @@ def _set_future_exception(future: asyncio.Future[Any], exc: BaseException) -> No
     if not future.done():
         future.set_exception(exc)
 
-
-class SandboxFatalError(RuntimeError):
-    """Raised when the sandbox subprocess dies and the run cannot continue.
-
-    Deliberately NOT a subclass of ``CodeInterpreterError``. DSPy's
-    ``RLM._execute_iteration`` catches ``(CodeInterpreterError, SyntaxError)``
-    and converts the exception into an ``[Error] ...`` string fed back to
-    the model on the next iteration. That's the right move for ordinary
-    in-sandbox errors (``NameError``, a tool raising, ``SUBMIT`` validation
-    failure, etc.) — the model can read the error and self-correct.
-
-    Sandbox-level failures are categorically different:
-    - the Deno subprocess has been killed (exec timeout) or crashed
-      (BrokenPipe)
-    - any per-run setup done by ``PredictRLM._setup_sandbox_files`` —
-      input mounts, output dirs, skill module imports — is gone with it
-
-    If we surfaced these as ``CodeInterpreterError``, the RLM would keep
-    iterating on a freshly-spawned but empty sandbox. The model would trip
-    over ``FileNotFoundError`` on previously-mounted inputs, fabricate an
-    explanation (e.g. "my markdown was malformed"), and burn iterations
-    until the outer deadline kills the whole run.
-
-    Making this a ``RuntimeError`` sibling means DSPy's catch tuple can't
-    swallow it: the exception propagates out of ``rlm.forward()`` and the
-    run fails fast. Callers that want to retry must do so at a higher level
-    (new ``PredictRLM`` call), not by reusing the dead interpreter.
-    """
 
 
 # JSON-RPC 2.0 helpers (local to avoid coupling to dspy internals)
@@ -143,7 +115,7 @@ DEFAULT_ALLOWED_DOMAINS: list[str] = [
 ]
 
 # Path to our custom runner.js with concurrent tool support
-RUNNER_PATH = Path(__file__).parent / "sandbox" / "runner.js"
+RUNNER_PATH = Path(__file__).with_name("payload.js")
 
 # Wall-clock budget for a single JSON-RPC request/response round-trip with the
 # deno subprocess (health_check, mount, sync_file, etc). Without this ceiling,
@@ -186,7 +158,7 @@ def _needs_jspi_flag() -> bool:
     return True
 
 
-class JspiClientAdapter(PythonInterpreter):
+class JspiBackend(PythonInterpreter):
     """PythonInterpreter with JSPI and concurrent async tool execution.
 
     JSPI (JavaScript Promise Integration) allows Python code running in the
@@ -218,7 +190,7 @@ class JspiClientAdapter(PythonInterpreter):
 
     Example:
         ```python
-        interpreter = JspiClientAdapter(
+        interpreter = JspiBackend(
             tools={"my_tool": my_tool_func},
             allowed_domains=["api.example.com"],
             skill_packages=["pdfplumber", "openpyxl"],
@@ -383,7 +355,7 @@ class JspiClientAdapter(PythonInterpreter):
         self._active_tool_count = 0
         # Per-execute wall-clock timeout (see __init__ docstring).
         self._exec_timeout = exec_timeout
-        self._execution_gate = ClientAdapterExecutionGate("JSPI client adapter")
+        self._execution_gate = BackendExecutionGate("JSPI backend")
 
     def configure_debug(self, enabled: bool) -> None:
         self._debug = enabled
@@ -1668,10 +1640,10 @@ class JspiClientAdapter(PythonInterpreter):
         tool_request_id: int | str | None = None,
     ) -> dict:
         """Execute a tool asynchronously and return the response dict."""
-        from .trace import ToolCall, ms_since, record_tool_call
+        from predict_rlm.trace import ToolCall, ms_since, record_tool_call
 
         if not hasattr(self, "_execution_gate"):
-            self._execution_gate = ClientAdapterExecutionGate("JSPI client adapter")
+            self._execution_gate = BackendExecutionGate("JSPI backend")
 
         if getattr(self, "_verbose", False) or live_tool_call_logging_enabled():
             emit_trace_tool_call(

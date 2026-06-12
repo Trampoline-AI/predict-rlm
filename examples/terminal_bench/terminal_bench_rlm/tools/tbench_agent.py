@@ -31,7 +31,7 @@ TERMINAL_WRAPPER_TOOL_NAMES = frozenset(
     {"run_terminal_command", "send_terminal_keys", "read_terminal"}
 )
 PredictRLM: Any | None = None
-DirectProcessRunnerClientAdapter: Any | None = None
+DirectPythonBackend: Any | None = None
 DAYTONA_REMOTE_ROOT = "/tmp/predict_rlm_controller"
 DAYTONA_REMOTE_HOME = "/tmp/predict_rlm_home"
 DAYTONA_REMOTE_RESULT_SENTINEL = "PREDICT_RLM_REMOTE_RESULT_JSON="
@@ -380,13 +380,13 @@ def _with_terminal_bench_skill(
 
 
 def _interpreter_class() -> Any:
-    global DirectProcessRunnerClientAdapter
-    if DirectProcessRunnerClientAdapter is None:
-        DirectProcessRunnerClientAdapter = getattr(
-            importlib.import_module("predict_rlm.interpreters"),
-            "DirectProcessRunnerClientAdapter",
+    global DirectPythonBackend
+    if DirectPythonBackend is None:
+        DirectPythonBackend = getattr(
+            importlib.import_module("predict_rlm.backends"),
+            "DirectPythonBackend",
         )
-    return DirectProcessRunnerClientAdapter
+    return DirectPythonBackend
 
 
 

@@ -10,10 +10,10 @@ from typing import Any, Callable, Literal, Protocol
 
 import pytest
 
-from predict_rlm.interpreter import JspiClientAdapter
-from predict_rlm.interpreters import (
-    DirectProcessRunnerClientAdapter,
-    SbxClientAdapter,
+from predict_rlm.backends import (
+    DirectPythonBackend,
+    JspiBackend,
+    SbxBackend,
     SbxConfig,
 )
 
@@ -214,7 +214,7 @@ def _make_jspi(tmp_path: Path, spec: RuntimeSpec) -> RuntimeHandle:
         pytest.skip("JSPI contracts require Deno")
     return InterpreterRuntimeHandle(
         spec,
-        JspiClientAdapter(
+        JspiBackend(
             tools=_default_tools(),
             preinstall_packages=False,
             exec_timeout=10,
@@ -225,7 +225,7 @@ def _make_jspi(tmp_path: Path, spec: RuntimeSpec) -> RuntimeHandle:
 def _make_direct_process(tmp_path: Path, spec: RuntimeSpec) -> RuntimeHandle:
     return InterpreterRuntimeHandle(
         spec,
-        DirectProcessRunnerClientAdapter(
+        DirectPythonBackend(
             tools=_default_tools(),
             runner_path=str(tmp_path / "predict_rlm_runner.py"),
             workdir=str(tmp_path),
@@ -245,7 +245,7 @@ def _make_sbx(tmp_path: Path, spec: RuntimeSpec) -> RuntimeHandle:
         pytest.skip("real SBX runtime contracts require the sbx CLI")
     return InterpreterRuntimeHandle(
         spec,
-        SbxClientAdapter(
+        SbxBackend(
             config=SbxConfig(name="runtime-contract-sbx", exec_timeout=10),
             tools=_default_tools(),
             preinstall_packages=False,
@@ -257,7 +257,7 @@ def _make_sbx(tmp_path: Path, spec: RuntimeSpec) -> RuntimeHandle:
 def _make_internal_jsonrpc(tmp_path: Path, spec: RuntimeSpec) -> RuntimeHandle:
     return InterpreterRuntimeHandle(
         spec,
-        SbxClientAdapter(
+        SbxBackend(
             config=SbxConfig(name="runtime-contract-local-supervisor", exec_timeout=10),
             tools=_default_tools(),
             preinstall_packages=False,

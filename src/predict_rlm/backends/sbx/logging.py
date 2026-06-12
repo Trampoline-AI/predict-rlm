@@ -1,4 +1,4 @@
-"""Logging helpers for SBX client adapter backends."""
+"""Logging helpers for Docker Sandboxes execution backends."""
 
 from __future__ import annotations
 
@@ -8,7 +8,7 @@ from typing import Any
 
 from predict_rlm._logging import format_log_fields
 
-logger = logging.getLogger("predict_rlm.interpreters.sbx")
+logger = logging.getLogger("predict_rlm.backends.sbx")
 
 
 def log_interpreter_lifecycle(

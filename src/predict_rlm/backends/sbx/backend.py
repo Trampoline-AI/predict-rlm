@@ -1,4 +1,4 @@
-"""Docker Sandboxes client adapter."""
+"""Docker Sandboxes execution backend."""
 
 from __future__ import annotations
 
@@ -19,7 +19,6 @@ import tempfile
 import threading
 import time
 import uuid
-from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Callable
 
@@ -52,19 +51,20 @@ from predict_rlm.execution_timeout import (
     resolve_execution_timeout,
 )
 from predict_rlm.files import get_synced_file_params
-from predict_rlm.interpreter import SandboxFatalError
 from predict_rlm.trace import ToolCall, ms_since, record_tool_call
 
-from .base import (
-    ClientAdapterExecutionGate,
-    PredictRLMClientAdapter,
+from ..base import (
+    BackendExecutionGate,
+    ExecutionBackend,
     SandboxExecutionError,
-    SbxConfig,
+    SandboxFatalError,
+    SupervisorClient,
+    SupervisorProcess,
 )
-from .persistent_runner import PersistentJsonRpcRunnerClient, PersistentSupervisorProcess
-from .sbx_logging import log_interpreter_lifecycle, log_partial_output
+from .config import SbxConfig
+from .logging import log_interpreter_lifecycle, log_partial_output
 
-RUNNER_PATH = Path(__file__).parents[1] / "sandbox" / "python_runner.py"
+SUPERVISOR_PAYLOAD_SOURCE_PATH = Path(__file__).parents[1] / "supervisor" / "_payload.py"
 DEFAULT_PACKAGE_DOMAINS = ["pypi.org", "files.pythonhosted.org"]
 SBX_PYTHON_EXECUTABLE = "python3"
 SBX_TRANSPORT_PACKAGES = ["websockets"]
@@ -82,10 +82,10 @@ class _DetachedWebSocketSupervisorProcess:
         return None
 
 
-class SbxClientAdapter(PersistentJsonRpcRunnerClient, PredictRLMClientAdapter):
-    """Client adapter backed by Docker Sandboxes.
+class SbxBackend(SupervisorClient, ExecutionBackend):
+    """Execution backend backed by Docker Sandboxes.
 
-    The adapter starts a Python JSON-RPC supervisor inside a Docker Sandbox and
+    The backend starts a Python JSON-RPC supervisor inside a Docker Sandbox and
     maps predict-rlm virtual paths under a per-run workspace staging root.
     """
 
@@ -108,7 +108,7 @@ class SbxClientAdapter(PersistentJsonRpcRunnerClient, PredictRLMClientAdapter):
         _websocket_url: str | None = None,
         _staging_root: str | Path | None = None,
     ) -> None:
-        PersistentJsonRpcRunnerClient.__init__(self, supervisor_name="Sbx supervisor")
+        SupervisorClient.__init__(self, supervisor_name="Sbx supervisor")
         self.config = config or SbxConfig()
         self.allowed_domains = allowed_domains
         self.tools = tools or {}
@@ -141,9 +141,9 @@ class SbxClientAdapter(PersistentJsonRpcRunnerClient, PredictRLMClientAdapter):
         self._ws: ClientConnection | None = None
         self._pending_tool_calls: dict[concurrent.futures.Future[dict[str, Any]], int] = {}
         self._active_execute_timeout_deadline: float | None = None
-        self._execution_gate = ClientAdapterExecutionGate("SBX client adapter")
+        self._execution_gate = BackendExecutionGate("SBX backend")
         self._sandbox_name: str | None = None
-        self._prepared_runner_path: Path | None = None
+        self._prepared_supervisor_path: Path | None = None
         self._published_websocket_url: str | None = None
         self._shutdown = False
 
@@ -511,7 +511,7 @@ class SbxClientAdapter(PersistentJsonRpcRunnerClient, PredictRLMClientAdapter):
         )
 
     def _start_sbx_websocket_supervisor(self) -> None:
-        runner_path = self._start_sbx_and_prepare_runner()
+        supervisor_path = self._start_sbx_and_prepare_supervisor()
         assert self._sandbox_name is not None
         runner_root = self._staging_root
         runner_root.mkdir(parents=True, exist_ok=True)
@@ -526,7 +526,7 @@ class SbxClientAdapter(PersistentJsonRpcRunnerClient, PredictRLMClientAdapter):
             f"PREDICT_RLM_SBX_ROOT={runner_root}",
             SBX_PYTHON_EXECUTABLE,
             "-u",
-            str(runner_path),
+            str(supervisor_path),
             "--websocket-host",
             "0.0.0.0",
             "--websocket-port",
@@ -619,7 +619,7 @@ class SbxClientAdapter(PersistentJsonRpcRunnerClient, PredictRLMClientAdapter):
         return f"{scheme}://{host}:{port}{self._websocket_path}"
 
     def _start_sbx_and_build_supervisor_command(self) -> list[str]:
-        runner_path = self._start_sbx_and_prepare_runner()
+        supervisor_path = self._start_sbx_and_prepare_supervisor()
         assert self._sandbox_name is not None
         runner_root = self._staging_root
         runner_root.mkdir(parents=True, exist_ok=True)
@@ -634,10 +634,10 @@ class SbxClientAdapter(PersistentJsonRpcRunnerClient, PredictRLMClientAdapter):
             f"PREDICT_RLM_SBX_ROOT={runner_root}",
             SBX_PYTHON_EXECUTABLE,
             "-u",
-            str(runner_path),
+            str(supervisor_path),
         ]
 
-    def _start_sbx_and_prepare_runner(self) -> Path:
+    def _start_sbx_and_prepare_supervisor(self) -> Path:
         if shutil.which("sbx") is None:
             self._log_lifecycle("sbx.create.missing_cli", status="error")
             raise SandboxFatalError(
@@ -646,7 +646,7 @@ class SbxClientAdapter(PersistentJsonRpcRunnerClient, PredictRLMClientAdapter):
             )
 
         if self._sandbox_name is None:
-            runner_path = self._prepare_runner_script()
+            supervisor_path = self._prepare_supervisor_script()
 
             primary_workspace = str(self._staging_root)
             if self.config.workspace_read_only:
@@ -703,20 +703,20 @@ class SbxClientAdapter(PersistentJsonRpcRunnerClient, PredictRLMClientAdapter):
             self._apply_network_policy()
             self._bootstrap_packages()
         else:
-            runner_path = self._prepared_runner_path or self._prepare_runner_script()
+            supervisor_path = self._prepared_supervisor_path or self._prepare_supervisor_script()
 
-        return runner_path
+        return supervisor_path
 
     def _start_sbx_and_build_runner_command(self) -> list[str]:
         return self._start_sbx_and_build_supervisor_command()
 
-    def _prepare_runner_script(self) -> Path:
-        runner_dir = self._staging_root / ".predict_rlm_runner"
-        runner_dir.mkdir(parents=True, exist_ok=True)
-        runner_path = runner_dir / "python_runner.py"
-        shutil.copy2(RUNNER_PATH, runner_path)
-        self._prepared_runner_path = runner_path
-        return runner_path
+    def _prepare_supervisor_script(self) -> Path:
+        supervisor_dir = self._staging_root / ".predict_rlm_supervisor"
+        supervisor_dir.mkdir(parents=True, exist_ok=True)
+        supervisor_path = supervisor_dir / "_payload.py"
+        shutil.copy2(SUPERVISOR_PAYLOAD_SOURCE_PATH, supervisor_path)
+        self._prepared_supervisor_path = supervisor_path
+        return supervisor_path
 
     def _parse_sandbox_name(self, stdout: str) -> str:
         for token in reversed(stdout.replace("\n", " ").split()):
@@ -821,7 +821,7 @@ class SbxClientAdapter(PersistentJsonRpcRunnerClient, PredictRLMClientAdapter):
 
     def _read_supervisor_stdout_line(
         self,
-        process: PersistentSupervisorProcess,
+        process: SupervisorProcess,
         *,
         deadline: float,
         timeout: float,
@@ -906,7 +906,7 @@ class SbxClientAdapter(PersistentJsonRpcRunnerClient, PredictRLMClientAdapter):
                 self._proc.wait(timeout=1)
             self._proc = None
             return
-        if self._sandbox_name and self._prepared_runner_path is not None:
+        if self._sandbox_name and self._prepared_supervisor_path is not None:
             subprocess.run(
                 [
                     "sbx",
@@ -916,7 +916,7 @@ class SbxClientAdapter(PersistentJsonRpcRunnerClient, PredictRLMClientAdapter):
                     self._sandbox_name,
                     "pkill",
                     "-f",
-                    str(self._prepared_runner_path),
+                    str(self._prepared_supervisor_path),
                 ],
                 check=False,
                 capture_output=True,
@@ -1255,7 +1255,7 @@ class SbxClientAdapter(PersistentJsonRpcRunnerClient, PredictRLMClientAdapter):
             raise SandboxFatalError("Sbx WebSocket supervisor is not connected")
         return self._ws
 
-    def _websocket_process_for_diagnostics(self) -> PersistentSupervisorProcess:
+    def _websocket_process_for_diagnostics(self) -> SupervisorProcess:
         process = self._proc
         if process is not None:
             return process
@@ -1342,7 +1342,7 @@ class SbxClientAdapter(PersistentJsonRpcRunnerClient, PredictRLMClientAdapter):
         *,
         request_id: int,
         request_start: float,
-        process: PersistentSupervisorProcess,
+        process: SupervisorProcess,
     ) -> None:
         stderr = self._read_stderr_for_process(process)
         self._log_lifecycle(
@@ -1359,7 +1359,7 @@ class SbxClientAdapter(PersistentJsonRpcRunnerClient, PredictRLMClientAdapter):
         self,
         method: str,
         params: dict[str, Any],
-        process: PersistentSupervisorProcess,
+        process: SupervisorProcess,
         *,
         request_id: int,
         request_timeout: float,
@@ -1510,7 +1510,7 @@ class SbxClientAdapter(PersistentJsonRpcRunnerClient, PredictRLMClientAdapter):
 
     def _read_stderr_for_process(
         self,
-        process: PersistentSupervisorProcess,
+        process: SupervisorProcess,
         *,
         max_wait_seconds: float = 0.5,
     ) -> str:
@@ -1570,232 +1570,3 @@ class SbxClientAdapter(PersistentJsonRpcRunnerClient, PredictRLMClientAdapter):
 
     def _raise_execute_error(self, response: dict[str, Any]) -> None:
         self._unwrap_execute_response(response)
-
-
-class SbxPool:
-    """Thread-safe pool of prewarmed Docker Sandboxes interpreters."""
-
-    def __init__(
-        self,
-        *,
-        size: int,
-        config: SbxConfig | None = None,
-        allowed_domains: list[str] | None = None,
-        tools: dict[str, Callable[..., Any]] | None = None,
-        output_fields: list[dict] | None = None,
-        preinstall_packages: bool = True,
-        skill_packages: list[str] | None = None,
-        debug: bool = False,
-        extra_read_paths: list[str] | None = None,
-        extra_write_paths: list[str] | None = None,
-        _supervisor_command: list[str] | None = None,
-        _runner_command: list[str] | None = None,
-        _staging_root: str | Path | None = None,
-    ) -> None:
-        if size < 1:
-            raise ValueError("SbxPool size must be at least 1")
-        self.size = size
-        self.config = config or SbxConfig()
-        self._pool_name_prefix = self.config.name or f"predict-rlm-sbx-pool-{uuid.uuid4().hex[:12]}"
-        self._interpreter_kwargs = {
-            "config": self.config,
-            "allowed_domains": allowed_domains,
-            "tools": tools,
-            "output_fields": output_fields,
-            "preinstall_packages": preinstall_packages,
-            "skill_packages": skill_packages,
-            "debug": debug,
-            "extra_read_paths": extra_read_paths,
-            "extra_write_paths": extra_write_paths,
-            "_supervisor_command": _supervisor_command or _runner_command,
-        }
-        self._staging_root = Path(_staging_root) if _staging_root is not None else None
-        self._available: queue.Queue[SbxClientAdapter] = queue.Queue(maxsize=size)
-        self._all_interpreters: list[SbxClientAdapter] = []
-        self._lock = threading.Lock()
-        self._state_changed = threading.Condition(self._lock)
-        self._started = False
-        self._starting = False
-        self._shutdown = False
-        self._shutdown_requested = False
-        self._shutting_down = False
-
-    def __enter__(self) -> SbxPool:
-        self.start()
-        return self
-
-    def __exit__(self, exc_type, exc, traceback) -> None:
-        self.shutdown()
-
-    def start(self) -> None:
-        if self._begin_start(allow_restart=True):
-            self._finish_start()
-
-    def _begin_start(self, *, allow_restart: bool) -> bool:
-        with self._state_changed:
-            if allow_restart:
-                while self._shutting_down:
-                    self._state_changed.wait()
-            elif self._is_stopping_locked():
-                raise RuntimeError("SbxPool is shut down")
-            if self._started:
-                return False
-            while self._starting:
-                self._state_changed.wait()
-                if not allow_restart and self._is_stopping_locked():
-                    raise RuntimeError("SbxPool is shut down")
-                if self._started:
-                    return False
-            if not allow_restart and self._is_stopping_locked():
-                raise RuntimeError("SbxPool is shut down")
-            self._starting = True
-            self._shutdown = False
-            self._shutdown_requested = False
-            return True
-
-    def _finish_start(self) -> None:
-        interpreters: list[SbxClientAdapter] = []
-        try:
-            for index in range(self.size):
-                interpreters.append(self._create_interpreter(index))
-            with concurrent.futures.ThreadPoolExecutor(max_workers=self.size) as executor:
-                futures = [executor.submit(interpreter.prewarm) for interpreter in interpreters]
-                for future in concurrent.futures.as_completed(futures):
-                    future.result()
-        except Exception:
-            self._shutdown_interpreters(interpreters, suppress_errors=True)
-            with self._state_changed:
-                self._drain_available_locked()
-                self._all_interpreters.clear()
-                self._started = False
-                self._starting = False
-                self._state_changed.notify_all()
-            raise
-
-        with self._state_changed:
-            self._drain_available_locked()
-            self._all_interpreters = interpreters
-            for interpreter in interpreters:
-                self._available.put(interpreter)
-            self._started = True
-            self._starting = False
-            self._shutdown = False
-            self._state_changed.notify_all()
-
-    @contextmanager
-    def lease(
-        self,
-        *,
-        tools: dict[str, Callable[..., Any]] | None = None,
-        output_fields: list[dict] | None = None,
-    ):
-        self._ensure_started_for_lease()
-        interpreter = self._acquire_interpreter()
-        try:
-            interpreter.configure_runtime(tools=tools, output_fields=output_fields)
-            yield interpreter
-        finally:
-            with self._state_changed:
-                stopping = self._is_stopping_locked() or interpreter not in self._all_interpreters
-            if stopping:
-                return
-            try:
-                interpreter.reset()
-            except Exception:
-                interpreter.shutdown()
-                with self._state_changed:
-                    if self._is_stopping_locked() or interpreter not in self._all_interpreters:
-                        self._state_changed.notify_all()
-                        return
-                    index = self._all_interpreters.index(interpreter)
-                    replacement = self._create_interpreter(index)
-                    replacement.prewarm()
-                    self._all_interpreters[index] = replacement
-                    interpreter = replacement
-            with self._state_changed:
-                if self._is_stopping_locked() or interpreter not in self._all_interpreters:
-                    self._state_changed.notify_all()
-                    return
-                self._available.put_nowait(interpreter)
-                self._state_changed.notify()
-
-    def shutdown(self) -> None:
-        with self._state_changed:
-            while self._starting:
-                self._shutdown_requested = True
-                self._state_changed.notify_all()
-                self._state_changed.wait()
-            if self._shutdown:
-                return
-            self._shutdown = True
-            self._shutdown_requested = False
-            self._shutting_down = True
-            interpreters = list(self._all_interpreters)
-            self._drain_available_locked()
-            self._all_interpreters.clear()
-            self._started = False
-            self._state_changed.notify_all()
-
-        try:
-            self._shutdown_interpreters(interpreters)
-        finally:
-            with self._state_changed:
-                self._shutting_down = False
-                self._state_changed.notify_all()
-
-    def _ensure_started_for_lease(self) -> None:
-        if self._begin_start(allow_restart=False):
-            self._finish_start()
-        with self._state_changed:
-            if self._is_stopping_locked() or not self._started:
-                raise RuntimeError("SbxPool is shut down")
-
-    def _acquire_interpreter(self) -> SbxClientAdapter:
-        with self._state_changed:
-            while True:
-                if self._is_stopping_locked() or not self._started:
-                    raise RuntimeError("SbxPool is shut down")
-                try:
-                    return self._available.get_nowait()
-                except queue.Empty:
-                    self._state_changed.wait()
-
-    def _is_stopping_locked(self) -> bool:
-        return self._shutdown or self._shutdown_requested or self._shutting_down
-
-    def _create_interpreter(self, index: int) -> SbxClientAdapter:
-        kwargs = dict(self._interpreter_kwargs)
-        if self.size > 1:
-            kwargs["config"] = self.config.model_copy(
-                update={"name": f"{self._pool_name_prefix}-{index}"}
-            )
-        if self._staging_root is not None:
-            kwargs["_staging_root"] = self._staging_root / f"runner-{index}"
-        return SbxClientAdapter(**kwargs)
-
-    def _drain_available_locked(self) -> None:
-        while True:
-            try:
-                self._available.get_nowait()
-            except queue.Empty:
-                break
-
-    def _shutdown_interpreters(
-        self,
-        interpreters: list[SbxClientAdapter],
-        *,
-        suppress_errors: bool = False,
-    ) -> None:
-        first_error: BaseException | None = None
-        with concurrent.futures.ThreadPoolExecutor(
-            max_workers=max(1, len(interpreters))
-        ) as executor:
-            futures = [executor.submit(interpreter.shutdown) for interpreter in interpreters]
-            for future in concurrent.futures.as_completed(futures):
-                try:
-                    future.result()
-                except BaseException as exc:
-                    if first_error is None:
-                        first_error = exc
-        if first_error is not None and not suppress_errors:
-            raise first_error

@@ -243,15 +243,15 @@ def test_verbose_iteration_log_includes_execution_timeout(timeout_value, expecte
 
 @pytest.mark.asyncio
 async def test_jspi_per_iteration_timeout_has_recoverable_host_grace():
+    from predict_rlm.backends import JspiBackend
     from predict_rlm.execution_timeout import (
         DEFAULT_RECOVERABLE_EXECUTION_TIMEOUT_GRACE_SECONDS,
         ITERATION_TIMEOUT_FAILURE_CLASS,
         format_recoverable_timeout_result,
         recoverable_timeout_host_deadline_seconds,
     )
-    from predict_rlm.interpreter import JspiClientAdapter
 
-    interpreter = JspiClientAdapter.__new__(JspiClientAdapter)
+    interpreter = JspiBackend.__new__(JspiBackend)
     spans = []
     killed = []
     interpreter._write_telemetry_span = lambda name, **kwargs: spans.append(
@@ -293,15 +293,16 @@ async def test_jspi_per_iteration_timeout_has_recoverable_host_grace():
 @pytest.mark.asyncio
 async def test_jspi_silent_iteration_timeout_recovery_failure_is_bounded(monkeypatch):
     import predict_rlm.execution_timeout as execution_timeout
+    from predict_rlm.backends import JspiBackend
+    from predict_rlm.backends.base import SandboxFatalError
     from predict_rlm.execution_timeout import ITERATION_TIMEOUT_FAILURE_CLASS
-    from predict_rlm.interpreter import JspiClientAdapter, SandboxFatalError
 
     monkeypatch.setattr(
         execution_timeout,
         "DEFAULT_RECOVERABLE_EXECUTION_TIMEOUT_GRACE_SECONDS",
         0.2,
     )
-    interpreter = JspiClientAdapter.__new__(JspiClientAdapter)
+    interpreter = JspiBackend.__new__(JspiBackend)
     spans = []
     killed = []
     interpreter._write_telemetry_span = lambda name, **kwargs: spans.append(
@@ -336,9 +337,9 @@ async def test_jspi_silent_iteration_timeout_recovery_failure_is_bounded(monkeyp
 
 @pytest.mark.asyncio
 async def test_jspi_timeout_result_formats_buffered_stdout_and_stderr():
-    from predict_rlm.interpreter import JspiClientAdapter
+    from predict_rlm.backends import JspiBackend
 
-    interpreter = JspiClientAdapter.__new__(JspiClientAdapter)
+    interpreter = JspiBackend.__new__(JspiBackend)
     interpreter._pending_file_ops = {}
     interpreter._active_tool_count = 0
     interpreter._sync_files = lambda: None
@@ -357,9 +358,9 @@ async def test_jspi_timeout_result_formats_buffered_stdout_and_stderr():
 
 
 def test_jspi_recoverable_timeout_preserves_output_and_globals():
-    from predict_rlm.interpreter import JspiClientAdapter
+    from predict_rlm.backends import JspiBackend
 
-    interpreter = JspiClientAdapter(preinstall_packages=False, exec_timeout=5.0)
+    interpreter = JspiBackend(preinstall_packages=False, exec_timeout=5.0)
     try:
         result = interpreter.execute(
             """
@@ -452,9 +453,9 @@ def test_predict_rlm_jspi_timeout_preserves_state_history_and_predict_tool():
 
 
 def test_jspi_no_timeout_execution_still_returns_output_and_stderr():
-    from predict_rlm.interpreter import JspiClientAdapter
+    from predict_rlm.backends import JspiBackend
 
-    interpreter = JspiClientAdapter(preinstall_packages=False, exec_timeout=5.0)
+    interpreter = JspiBackend(preinstall_packages=False, exec_timeout=5.0)
     try:
         result = interpreter.execute(
             """

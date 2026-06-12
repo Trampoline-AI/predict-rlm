@@ -6,10 +6,7 @@ from typing import Any
 import pytest
 from dspy.primitives.code_interpreter import CodeInterpreterError
 
-from predict_rlm.interpreters.persistent_runner import (
-    PersistentJsonRpcRunnerClient,
-    PersistentSupervisorProcess,
-)
+from predict_rlm.backends.base import SupervisorClient, SupervisorProcess
 
 
 class FakePipe:
@@ -50,7 +47,7 @@ class FakeProcess:
         self.returncode = -9
 
 
-class FakeClient(PersistentJsonRpcRunnerClient):
+class FakeClient(SupervisorClient):
     def __init__(self, processes: list[FakeProcess]) -> None:
         super().__init__(supervisor_name="fake supervisor", stale_response_discard_limit=2)
         self.processes = list(processes)
@@ -84,7 +81,7 @@ class FakeClient(PersistentJsonRpcRunnerClient):
 
     def _read_supervisor_stdout_line(
         self,
-        process: PersistentSupervisorProcess,
+        process: SupervisorProcess,
         *,
         deadline: float,
         timeout: float,
@@ -96,7 +93,7 @@ class FakeClient(PersistentJsonRpcRunnerClient):
         self,
         method: str,
         params: dict[str, Any],
-        process: PersistentSupervisorProcess,
+        process: SupervisorProcess,
         *,
         request_id: int,
         request_timeout: float,
@@ -117,7 +114,7 @@ class FakeClient(PersistentJsonRpcRunnerClient):
     def _discard_supervisor_process(self) -> None:
         self.process = None
 
-    def _read_stderr_for_process(self, process: PersistentSupervisorProcess) -> str:
+    def _read_stderr_for_process(self, process: SupervisorProcess) -> str:
         return process.stderr.read()
 
     def _format_supervisor_restart_diagnostic(
@@ -137,7 +134,7 @@ class FakeClient(PersistentJsonRpcRunnerClient):
         raise CodeInterpreterError(str(error.get("message") or "runner error"))
 
 
-def test_persistent_client_discards_stale_response_then_returns_fresh() -> None:
+def test_supervisor_client_discards_stale_response_then_returns_fresh() -> None:
     process = FakeProcess(
         [
             {"jsonrpc": "2.0", "id": 99, "result": {"output": "stale"}},
@@ -149,7 +146,7 @@ def test_persistent_client_discards_stale_response_then_returns_fresh() -> None:
     assert client.execute("print('fresh')") == "fresh"
 
 
-def test_persistent_client_discards_stale_error_then_returns_fresh() -> None:
+def test_supervisor_client_discards_stale_error_then_returns_fresh() -> None:
     process = FakeProcess(
         [
             {
@@ -165,7 +162,7 @@ def test_persistent_client_discards_stale_error_then_returns_fresh() -> None:
     assert client.execute("print('fresh')") == "fresh"
 
 
-def test_persistent_client_exhausted_stale_resync_raises_cleanly() -> None:
+def test_supervisor_client_exhausted_stale_resync_raises_cleanly() -> None:
     process = FakeProcess(
         [
             {"jsonrpc": "2.0", "id": 99, "result": {"output": "stale"}},
@@ -179,7 +176,7 @@ def test_persistent_client_exhausted_stale_resync_raises_cleanly() -> None:
         client.execute("print('fresh')")
 
 
-def test_persistent_client_recovers_dead_runner_after_structured_timeout() -> None:
+def test_supervisor_client_recovers_dead_supervisor_after_structured_timeout() -> None:
     first = FakeProcess(
         [
             {
@@ -208,7 +205,7 @@ def test_persistent_client_recovers_dead_runner_after_structured_timeout() -> No
     assert restarted.stdin.writes == []
 
 
-def test_persistent_client_host_timeout_unwraps_recoverable_timeout() -> None:
+def test_supervisor_client_host_timeout_unwraps_recoverable_timeout() -> None:
     process = FakeProcess([])
     client = FakeClient([process])
 

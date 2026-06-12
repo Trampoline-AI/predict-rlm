@@ -346,17 +346,18 @@ def test_host_tool_errors_propagate_to_execute_error(runner: LocalRunner) -> Non
     assert "predict failed" in response["error"]["message"]
 
 
-def test_terminal_bench_runner_payload_is_shared_with_sbx() -> None:
-    shared_runner = (
+def test_terminal_bench_payload_is_shared_with_sbx() -> None:
+    shared_payload = (
         Path(__file__).resolve().parents[3]
         / "src"
         / "predict_rlm"
-        / "sandbox"
-        / "python_runner.py"
+        / "backends"
+        / "supervisor"
+        / "_payload.py"
     )
 
-    assert runner_script_path() == shared_runner
-    assert runner_source() == shared_runner.read_text(encoding="utf-8")
+    assert runner_script_path() == shared_payload
+    assert runner_source() == shared_payload.read_text(encoding="utf-8")
 
 
 def test_runner_attributes_child_process_output_to_execute_result(

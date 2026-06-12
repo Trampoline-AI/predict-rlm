@@ -2,7 +2,7 @@
 
 Background:
     Sandbox code calling ``await recalculate(path)`` triggers a host
-    tool dispatch in ``JspiClientAdapter._execute_tool_async``. If the
+    tool dispatch in ``JspiBackend._execute_tool_async``. If the
     tool is slow (e.g. LibreOffice on a whole-column formula → 2-3
     minutes), the overall ``execute`` round-trip blows past the
     ``_exec_timeout`` ceiling. That timeout **kills the Deno
@@ -33,12 +33,12 @@ import time
 
 import pytest
 
-import predict_rlm.interpreter as rlm_interpreter
-from predict_rlm.interpreter import JspiClientAdapter
+import predict_rlm.backends.jspi.backend as rlm_interpreter
+from predict_rlm.backends import JspiBackend
 
 
 def _build_interp_with_tool(tool_fn, tool_name: str = "slow_tool"):
-    interp = JspiClientAdapter.__new__(JspiClientAdapter)
+    interp = JspiBackend.__new__(JspiBackend)
     interp.tools = {tool_name: tool_fn}
     interp._debug = False
     interp._executor = None  # only used for sync tools

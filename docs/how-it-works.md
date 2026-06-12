@@ -12,8 +12,8 @@
 Each iteration is a REPL turn: the LLM sees the output of its previous code,
 decides what to do next, and writes more code. State persists between
 iterations, so it can accumulate findings across many steps. See
-[Sandbox architecture and recovery](sandboxes.md) for the backend component
-model and timeout/state guarantees.
+[predict-rlm Architecture](../ARCHITECTURE.md) for the backend component model
+and timeout/state guarantees.
 
 ## Observability
 

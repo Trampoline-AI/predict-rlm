@@ -1,16 +1,17 @@
-"""Tests for JspiClientAdapter with concurrent async tool execution."""
+"""Tests for JspiBackend with concurrent async tool execution."""
 
 import pytest
 from dspy.primitives.code_interpreter import CodeInterpreterError, FinalOutput
 
-from predict_rlm.interpreter import JspiClientAdapter, SandboxFatalError
+from predict_rlm.backends import JspiBackend
+from predict_rlm.backends.base import SandboxFatalError
 
 pytestmark = pytest.mark.integration
 
 
 class TestSubmitDefaults:
     def test_bare_submit_uses_single_output_default(self):
-        interpreter = JspiClientAdapter(
+        interpreter = JspiBackend(
             preinstall_packages=False,
             output_fields=[
                 {
@@ -30,7 +31,7 @@ class TestSubmitDefaults:
         assert result.output == {"answer": None}
 
     def test_bare_submit_without_default_still_errors(self):
-        interpreter = JspiClientAdapter(
+        interpreter = JspiBackend(
             preinstall_packages=False,
             output_fields=[{"name": "answer", "type": "str"}],
         )
@@ -46,7 +47,7 @@ class TestCodeFenceStripping:
 
     def test_strip_repl_fence(self):
         """Code wrapped in ```repl fence is extracted and executed."""
-        interpreter = JspiClientAdapter(preinstall_packages=False)
+        interpreter = JspiBackend(preinstall_packages=False)
         try:
             result = interpreter.execute("""```repl
 x = 2 + 2
@@ -58,7 +59,7 @@ print(x)
 
     def test_strip_repl_fence_with_text_before(self):
         """```repl fence with explanatory text before is handled."""
-        interpreter = JspiClientAdapter(preinstall_packages=False)
+        interpreter = JspiBackend(preinstall_packages=False)
         try:
             result = interpreter.execute("""Here's the code to run:
 ```repl
@@ -70,7 +71,7 @@ print("extracted")
 
     def test_repl_fence_handles_inline_backticks(self):
         """Inline ``` (not on own line) inside code is preserved."""
-        interpreter = JspiClientAdapter(preinstall_packages=False)
+        interpreter = JspiBackend(preinstall_packages=False)
         try:
             # Inline ``` in strings work fine - they're not on their own line
             result = interpreter.execute("""```repl
@@ -83,7 +84,7 @@ print(len(s))
 
     def test_fallback_python_fence(self):
         """Falls back to ```python fence for backwards compatibility."""
-        interpreter = JspiClientAdapter(preinstall_packages=False)
+        interpreter = JspiBackend(preinstall_packages=False)
         try:
             result = interpreter.execute("""```python
 print("fallback")
@@ -94,7 +95,7 @@ print("fallback")
 
     def test_fallback_bare_fence(self):
         """Falls back to bare ``` fence for backwards compatibility."""
-        interpreter = JspiClientAdapter(preinstall_packages=False)
+        interpreter = JspiBackend(preinstall_packages=False)
         try:
             result = interpreter.execute("""```
 print(42)
@@ -105,7 +106,7 @@ print(42)
 
     def test_no_fence_unchanged(self):
         """Code without fences executes normally."""
-        interpreter = JspiClientAdapter(preinstall_packages=False)
+        interpreter = JspiBackend(preinstall_packages=False)
         try:
             result = interpreter.execute("print('no fence')")
             assert "no fence" in str(result)
@@ -113,7 +114,7 @@ print(42)
             interpreter.shutdown()
 
     def test_prints_before_runtime_error_are_in_error(self):
-        interpreter = JspiClientAdapter(preinstall_packages=False)
+        interpreter = JspiBackend(preinstall_packages=False)
         try:
             with pytest.raises(CodeInterpreterError) as exc_info:
                 interpreter.execute("print('before failure')\nraise ValueError('bad')")
@@ -125,7 +126,7 @@ print(42)
         assert getattr(exc_info.value, "partial_output") == "before failure\n"
 
     def test_verbose_prints_partial_output_before_error(self, capsys):
-        interpreter = JspiClientAdapter(preinstall_packages=False, verbose=True)
+        interpreter = JspiBackend(preinstall_packages=False, verbose=True)
         try:
             with pytest.raises(CodeInterpreterError):
                 interpreter.execute("print('before failure')\nraise ValueError('bad')")
@@ -140,7 +141,7 @@ print(42)
 
     def test_double_fence_handled(self):
         """Double fences (model outputs ```...```\\n```) are handled correctly."""
-        interpreter = JspiClientAdapter(preinstall_packages=False)
+        interpreter = JspiBackend(preinstall_packages=False)
         try:
             # Model sometimes outputs a trailing bare ``` after the closing fence
             result = interpreter.execute("""```repl
@@ -153,7 +154,7 @@ print("double fence")
 
     def test_multiple_repl_blocks(self):
         """Multiple ```repl blocks are all extracted and executed in order."""
-        interpreter = JspiClientAdapter(preinstall_packages=False)
+        interpreter = JspiBackend(preinstall_packages=False)
         try:
             result = interpreter.execute("""Here's step 1:
 ```repl
@@ -190,7 +191,7 @@ print(f"z = {z}")
             await asyncio.sleep(0.01)
             return f"logged: {msg}"
 
-        interpreter = JspiClientAdapter(
+        interpreter = JspiBackend(
             preinstall_packages=False,
             tools={"log_tool": log_tool},
         )
@@ -219,12 +220,12 @@ print(f"Results: {result1}, {result2}")
             interpreter.shutdown()
 
 
-class TestJspiClientAdapter:
-    """Tests that JspiClientAdapter executes code correctly."""
+class TestJspiBackend:
+    """Tests that JspiBackend executes code correctly."""
 
     def test_interpreter_executes_python_code(self):
-        """JspiClientAdapter executes Python code and returns output."""
-        interpreter = JspiClientAdapter(preinstall_packages=False)
+        """JspiBackend executes Python code and returns output."""
+        interpreter = JspiBackend(preinstall_packages=False)
         try:
             result = interpreter.execute("x = 2 + 2\nprint(x)")
             assert "4" in str(result)
@@ -233,7 +234,7 @@ class TestJspiClientAdapter:
 
     def test_interpreter_state_persists(self):
         """Variables persist between code executions in the same interpreter."""
-        interpreter = JspiClientAdapter(preinstall_packages=False)
+        interpreter = JspiBackend(preinstall_packages=False)
         try:
             interpreter.execute("my_list = [1, 2, 3]")
             interpreter.execute("my_list.append(4)")
@@ -244,7 +245,7 @@ class TestJspiClientAdapter:
 
     def test_interpreter_can_use_stdlib(self):
         """Interpreter has access to standard library modules."""
-        interpreter = JspiClientAdapter(preinstall_packages=False)
+        interpreter = JspiBackend(preinstall_packages=False)
         try:
             result = interpreter.execute("""
 import re
@@ -261,10 +262,10 @@ print(match.group(1)[:4])
             interpreter.shutdown()
 
     def test_interpreter_has_jspi_flag_when_needed(self):
-        """JspiClientAdapter includes the JSPI V8 flag only when V8 < 13.7."""
-        from predict_rlm.interpreter import _needs_jspi_flag
+        """JspiBackend includes the JSPI V8 flag only when V8 < 13.7."""
+        from predict_rlm.backends.jspi.backend import _needs_jspi_flag
 
-        interpreter = JspiClientAdapter(preinstall_packages=False)
+        interpreter = JspiBackend(preinstall_packages=False)
         try:
             if _needs_jspi_flag():
                 assert "--v8-flags=--experimental-wasm-jspi" in interpreter.deno_command
@@ -274,8 +275,8 @@ print(match.group(1)[:4])
             interpreter.shutdown()
 
     def test_interpreter_has_pypi_network_by_default(self):
-        """JspiClientAdapter has PyPI network access by default for package installation."""
-        interpreter = JspiClientAdapter()
+        """JspiBackend has PyPI network access by default for package installation."""
+        interpreter = JspiBackend()
         try:
             net_flags = [arg for arg in interpreter.deno_command if "--allow-net" in arg]
             assert len(net_flags) == 1
@@ -286,8 +287,8 @@ print(match.group(1)[:4])
             interpreter.shutdown()
 
     def test_interpreter_with_allowed_domains(self):
-        """JspiClientAdapter can be configured with allowed domains."""
-        interpreter = JspiClientAdapter(
+        """JspiBackend can be configured with allowed domains."""
+        interpreter = JspiBackend(
             preinstall_packages=False, allowed_domains=["api.example.com", "cdn.example.com"]
         )
         try:
@@ -311,7 +312,7 @@ class TestInterpreterWithTools:
             outputs = signature.split("->")[1].strip().split(",")
             return {out.strip(): f"Result for {out.strip()}" for out in outputs}
 
-        interpreter = JspiClientAdapter(preinstall_packages=False, tools={"predict": predict})
+        interpreter = JspiBackend(preinstall_packages=False, tools={"predict": predict})
         try:
             output = interpreter.execute("""
 result = await predict("question -> answer", question="What is 2+2?")
@@ -329,7 +330,7 @@ print(result["answer"])
         def get_prices() -> str:
             return "Item 1: $10.00\nItem 2: $20.00\nItem 3: $15.00"
 
-        interpreter = JspiClientAdapter(
+        interpreter = JspiBackend(
             preinstall_packages=False, tools={"get_prices": get_prices}
         )
         try:
@@ -354,7 +355,7 @@ print(f"Total: ${total:.2f}")
         def format_id(raw_id: str) -> str:
             return f"ID-{raw_id.strip()}"
 
-        interpreter = JspiClientAdapter(
+        interpreter = JspiBackend(
             preinstall_packages=False,
             tools={
                 "fetch_data": fetch_data,
@@ -383,7 +384,7 @@ class TestConcurrentToolExecution:
             time.sleep(0.005)
             return f"Result for {item_id}"
 
-        interpreter = JspiClientAdapter(preinstall_packages=False, tools={"slow_tool": slow_tool})
+        interpreter = JspiBackend(preinstall_packages=False, tools={"slow_tool": slow_tool})
         try:
             output = interpreter.execute("""
 import asyncio
@@ -404,7 +405,7 @@ print(results)
         def my_tool(value: str) -> str:
             return f"Got: {value}"
 
-        interpreter = JspiClientAdapter(preinstall_packages=False, tools={"my_tool": my_tool})
+        interpreter = JspiBackend(preinstall_packages=False, tools={"my_tool": my_tool})
         try:
             output = interpreter.execute("""
 result = await my_tool("test_value")
@@ -422,7 +423,7 @@ print(result)
             call_log.append(msg)
             return f"Tracked: {msg}"
 
-        interpreter = JspiClientAdapter(preinstall_packages=False, tools={"tracker": tracker})
+        interpreter = JspiBackend(preinstall_packages=False, tools={"tracker": tracker})
         try:
             output = interpreter.execute("""
 import asyncio
@@ -451,7 +452,7 @@ class TestPreinstalledPackages:
 
     def test_pandas_is_available(self):
         """Pandas can be imported and used in the sandbox."""
-        interpreter = JspiClientAdapter()
+        interpreter = JspiBackend()
         try:
             output = interpreter.execute("""
 import pandas as pd
@@ -467,7 +468,7 @@ print(f"Sum of a: {df['a'].sum()}")
 
     def test_pydantic_is_available(self):
         """Pydantic can be imported and used for validation in the sandbox."""
-        interpreter = JspiClientAdapter()
+        interpreter = JspiBackend()
         try:
             output = interpreter.execute("""
 from pydantic import BaseModel, Field
@@ -488,7 +489,7 @@ print(f"Model fields: {list(item.model_fields.keys())}")
 
     def test_pydantic_validation_works(self):
         """Pydantic validation errors are raised correctly in the sandbox."""
-        interpreter = JspiClientAdapter()
+        interpreter = JspiBackend()
         try:
             output = interpreter.execute("""
 from pydantic import BaseModel, ValidationError
@@ -517,7 +518,7 @@ class TestToolPersistence:
         def my_tool(value: str) -> str:
             return f"Got: {value}"
 
-        interpreter = JspiClientAdapter(preinstall_packages=False, tools={"my_tool": my_tool})
+        interpreter = JspiBackend(preinstall_packages=False, tools={"my_tool": my_tool})
         try:
             # First execution - use the tool
             output1 = interpreter.execute("""
@@ -554,7 +555,7 @@ print(result)
             time.sleep(0.001)  # Small delay to simulate work
             return f"Processed: {item_id}"
 
-        interpreter = JspiClientAdapter(
+        interpreter = JspiBackend(
             preinstall_packages=False, tools={"counter_tool": counter_tool}
         )
         try:
@@ -586,7 +587,7 @@ print(result)
         def check_tool() -> str:
             return "check_ok"
 
-        interpreter = JspiClientAdapter(
+        interpreter = JspiBackend(
             preinstall_packages=False, tools={"check_tool": check_tool}
         )
         try:
@@ -623,7 +624,7 @@ class TestToolFailures:
         def failing_tool() -> str:
             raise ValueError("Tool failed intentionally")
 
-        interpreter = JspiClientAdapter(
+        interpreter = JspiBackend(
             preinstall_packages=False, tools={"failing_tool": failing_tool}
         )
         try:
@@ -651,7 +652,7 @@ except Exception as e:
                 raise RuntimeError("Intentional failure")
             return "success"
 
-        interpreter = JspiClientAdapter(
+        interpreter = JspiBackend(
             preinstall_packages=False, tools={"maybe_fail": maybe_fail}
         )
         try:
@@ -689,7 +690,7 @@ print(f"Third call: {result}")
                 raise ValueError(f"Item {item_id} failed")
             return f"Item {item_id} ok"
 
-        interpreter = JspiClientAdapter(
+        interpreter = JspiBackend(
             preinstall_packages=False, tools={"conditional_tool": conditional_tool}
         )
         try:
@@ -727,7 +728,7 @@ print(f"Total: {len(results)}")
             time.sleep(delay)
             return f"Completed after {delay}s"
 
-        interpreter = JspiClientAdapter(preinstall_packages=False, tools={"slow_tool": slow_tool})
+        interpreter = JspiBackend(preinstall_packages=False, tools={"slow_tool": slow_tool})
         try:
             output = interpreter.execute("""
 import asyncio
@@ -757,7 +758,7 @@ print("Timeout pattern works")
         def none_tool() -> None:
             return None
 
-        interpreter = JspiClientAdapter(preinstall_packages=False, tools={"none_tool": none_tool})
+        interpreter = JspiBackend(preinstall_packages=False, tools={"none_tool": none_tool})
         try:
             output = interpreter.execute("""
 result = await none_tool()
@@ -781,7 +782,7 @@ print(f"Result type: {type(result).__name__}")
         def empty_dict() -> dict:
             return {}
 
-        interpreter = JspiClientAdapter(
+        interpreter = JspiBackend(
             preinstall_packages=False,
             tools={
                 "empty_string": empty_string,
@@ -823,7 +824,7 @@ class TestRealisticWorkloads:
             call_times.append((item_id, delay))
             return {"id": item_id, "status": "ok", "latency_ms": int(delay * 1000)}
 
-        interpreter = JspiClientAdapter(preinstall_packages=False, tools={"api_call": api_call})
+        interpreter = JspiBackend(preinstall_packages=False, tools={"api_call": api_call})
         try:
             output = interpreter.execute("""
 import asyncio
@@ -854,7 +855,7 @@ print(f"Latency range: {min(latencies)}-{max(latencies)}ms")
             time.sleep(delay)
             return f"item_{item_id}_{'slow' if slow else 'fast'}"
 
-        interpreter = JspiClientAdapter(
+        interpreter = JspiBackend(
             preinstall_packages=False, tools={"variable_speed": variable_speed}
         )
         try:
@@ -889,7 +890,7 @@ print(f"All completed: {len(results) == 8}")
             batch_results.append(result)
             return result
 
-        interpreter = JspiClientAdapter(
+        interpreter = JspiBackend(
             preinstall_packages=False, tools={"batch_item": batch_item}
         )
         try:
@@ -933,7 +934,7 @@ print(f"Unique batches: {sorted(batches)}")
                 raise RuntimeError(f"Transient error for item {item_id}")
             return {"id": item_id, "success": True}
 
-        interpreter = JspiClientAdapter(preinstall_packages=False, tools={"flaky_api": flaky_api})
+        interpreter = JspiBackend(preinstall_packages=False, tools={"flaky_api": flaky_api})
         try:
             output = interpreter.execute("""
 import asyncio
@@ -979,7 +980,7 @@ print(f"All processed: {len(results) == 10}")
             call_log.append({"id": call_id, "elapsed": elapsed})
             return f"call_{call_id}_done"
 
-        interpreter = JspiClientAdapter(
+        interpreter = JspiBackend(
             preinstall_packages=False, tools={"stress_call": stress_call}
         )
         try:
@@ -1007,7 +1008,7 @@ print(f"Completed: {completed}/30")
             time.sleep(random.uniform(0.001, 0.005))
             return f"result_{item_id}"
 
-        interpreter = JspiClientAdapter(
+        interpreter = JspiBackend(
             preinstall_packages=False, tools={"stress_tool": stress_tool}
         )
         try:
@@ -1050,7 +1051,7 @@ class TestPydanticSerialization:
             received_data.append(data)
             return f"Processed: {data.get('name', 'unknown')}"
 
-        interpreter = JspiClientAdapter(tools={"process_model": process_model})
+        interpreter = JspiBackend(tools={"process_model": process_model})
         try:
             output = interpreter.execute("""
 from pydantic import BaseModel
@@ -1080,7 +1081,7 @@ print(result)
             received_data.append(data)
             return f"Got {len(data.get('items', []))} items"
 
-        interpreter = JspiClientAdapter(tools={"process_nested": process_nested})
+        interpreter = JspiBackend(tools={"process_nested": process_nested})
         try:
             output = interpreter.execute("""
 from pydantic import BaseModel
@@ -1126,7 +1127,7 @@ print(result)
             received_data.append(items)
             return f"Received {len(items)} items"
 
-        interpreter = JspiClientAdapter(tools={"process_list": process_list})
+        interpreter = JspiBackend(tools={"process_list": process_list})
         try:
             output = interpreter.execute("""
 from pydantic import BaseModel
@@ -1161,7 +1162,7 @@ print(result)
             received_kwargs.append(kwargs)
             return f"Got kwargs: {list(kwargs.keys())}"
 
-        interpreter = JspiClientAdapter(tools={"with_kwargs": with_kwargs})
+        interpreter = JspiBackend(tools={"with_kwargs": with_kwargs})
         try:
             output = interpreter.execute("""
 from pydantic import BaseModel
@@ -1188,7 +1189,7 @@ print(result)
         def echo(data: dict) -> dict:
             return {"echoed": data}
 
-        interpreter = JspiClientAdapter(tools={"echo": echo})
+        interpreter = JspiBackend(tools={"echo": echo})
         try:
             # First call with Pydantic model
             output1 = interpreter.execute("""
@@ -1233,7 +1234,7 @@ print(f"Third: {result}")
             received_args.append(x)
             return f"Got type: {type(x).__name__}"
 
-        interpreter = JspiClientAdapter(tools={"receive_anything": receive_anything})
+        interpreter = JspiBackend(tools={"receive_anything": receive_anything})
         try:
             # Pass a coroutine (non-standard object) - should be converted to string
             output = interpreter.execute("""
@@ -1280,7 +1281,7 @@ class TestNoneValueSerialization:
             ExtractedItem(title="Task B", priority="high", due_date="2025-01-01", active=False),
         ]
 
-        interpreter = JspiClientAdapter(preinstall_packages=False)
+        interpreter = JspiBackend(preinstall_packages=False)
         try:
             result = interpreter.execute(
                 """
@@ -1310,7 +1311,7 @@ print(f"b_active={items[1]['active']}")
             {"name": "Bob", "email": "bob@test.com", "verified": False},
         ]
 
-        interpreter = JspiClientAdapter(preinstall_packages=False)
+        interpreter = JspiBackend(preinstall_packages=False)
         try:
             result = interpreter.execute(
                 """
@@ -1337,7 +1338,7 @@ class TestPredictRLMWithPydanticModels:
         # The actual integration test with PredictRLM would require a more complex setup
 
         # Simple test to verify that our defensive serialization works
-        interpreter = JspiClientAdapter(preinstall_packages=False)
+        interpreter = JspiBackend(preinstall_packages=False)
         try:
             result = interpreter.execute("""
 from pydantic import BaseModel, Field
@@ -1384,7 +1385,7 @@ class TestCustomPydanticTypesInSignatures:
             # Return mock data matching the expected type
             return {"tasks": [{"category": "Test", "title": "Task 1"}]}
 
-        interpreter = JspiClientAdapter(tools={"predict": mock_predict})
+        interpreter = JspiBackend(tools={"predict": mock_predict})
         try:
             result = interpreter.execute("""
 from pydantic import BaseModel
@@ -1421,7 +1422,7 @@ print(f"First task: {result['tasks'][0]}")
                 "person": {"name": "Alice", "address": {"street": "123 Main", "city": "NYC"}}
             }
 
-        interpreter = JspiClientAdapter(tools={"predict": mock_predict})
+        interpreter = JspiBackend(tools={"predict": mock_predict})
         try:
             result = interpreter.execute("""
 from pydantic import BaseModel
@@ -1457,7 +1458,7 @@ print(f"Got person: {result['person'].name} at {result['person'].address.city}")
             received_schemas.append(pydantic_schemas)
             return {"item": {"name": "Widget", "price": 9.99}}
 
-        interpreter = JspiClientAdapter(tools={"predict": mock_predict})
+        interpreter = JspiBackend(tools={"predict": mock_predict})
         try:
             result = interpreter.execute("""
 from pydantic import BaseModel
@@ -1487,7 +1488,7 @@ print(f"Got item: {result['item'].name}")
             received_schemas.append(pydantic_schemas)
             return {"name": "test", "count": 42, "active": True}
 
-        interpreter = JspiClientAdapter(tools={"predict": mock_predict})
+        interpreter = JspiBackend(tools={"predict": mock_predict})
         try:
             result = interpreter.execute("""
 result = await predict("text: str -> name: str, count: int, active: bool", text="test")
@@ -1508,7 +1509,7 @@ print(f"Got: {result['name']}, {result['count']}, {result['active']}")
             received_schemas.append(pydantic_schemas)
             return {"text": "extracted text"}
 
-        interpreter = JspiClientAdapter(tools={"predict": mock_predict})
+        interpreter = JspiBackend(tools={"predict": mock_predict})
         try:
             result = interpreter.execute("""
 result = await predict("img: dspy.Image -> text: str", img="http://example.com/img.png")
@@ -1533,7 +1534,7 @@ print(f"Got: {result['text']}")
                 "items": [{"name": "Item1", "qty": 1}],
             }
 
-        interpreter = JspiClientAdapter(tools={"predict": mock_predict})
+        interpreter = JspiBackend(tools={"predict": mock_predict})
         try:
             result = interpreter.execute("""
 from pydantic import BaseModel
@@ -1571,7 +1572,7 @@ print(f"Got {len(result['items'])} items")
                 raise RuntimeError("Intentional error")
             return {"item": {"value": 42}}
 
-        interpreter = JspiClientAdapter(tools={"predict": mock_predict})
+        interpreter = JspiBackend(tools={"predict": mock_predict})
         try:
             # First call fails
             output1 = interpreter.execute("""
@@ -1636,7 +1637,7 @@ class TestPydanticLiteralSerialization:
                     }
             return {"items": []}
 
-        interpreter = JspiClientAdapter(preinstall_packages=True, tools={"predict": mock_predict})
+        interpreter = JspiBackend(preinstall_packages=True, tools={"predict": mock_predict})
 
         try:
             # Execute code that defines a Pydantic model with Literal and uses it
@@ -1689,7 +1690,7 @@ if result['items']:
             received_data.append(items)
             return f"Processed {len(items)} items"
 
-        interpreter = JspiClientAdapter(
+        interpreter = JspiBackend(
             preinstall_packages=True, tools={"process_items": process_items}
         )
 
@@ -1874,7 +1875,7 @@ class TestSerializationFailureRecovery:
                 ]
             }
 
-        interpreter = JspiClientAdapter(tools={"predict": mock_predict})
+        interpreter = JspiBackend(tools={"predict": mock_predict})
         try:
             # This should work without serialization errors
             result = interpreter.execute("""
@@ -1926,7 +1927,7 @@ print("Predict still works!")
     def test_pydantic_model_json_schema_with_method_serialization(self):
         """Test that model_json_schema() with methods doesn't cause JSON serialization errors."""
 
-        interpreter = JspiClientAdapter(preinstall_packages=False)
+        interpreter = JspiBackend(preinstall_packages=False)
         try:
             # This reproduces the exact issue from the user's example
             result = interpreter.execute("""
@@ -1984,7 +1985,7 @@ except TypeError as e:
                     received_schemas.append({"success": False, "error": str(e)})
             return {"items": []}
 
-        interpreter = JspiClientAdapter(tools={"predict": mock_predict})
+        interpreter = JspiBackend(tools={"predict": mock_predict})
         try:
             result = interpreter.execute("""
 from pydantic import BaseModel, Field
@@ -2021,7 +2022,7 @@ print("Predict call completed")
 
     def test_reproduce_user_exact_error_scenario(self):
         """Reproduce the exact error scenario from the user's example with ExtractedItem."""
-        interpreter = JspiClientAdapter(preinstall_packages=False)
+        interpreter = JspiBackend(preinstall_packages=False)
         try:
             # This is the exact pattern from the user's error output
             result = interpreter.execute("""
@@ -2081,7 +2082,7 @@ except TypeError as e:
                     raise RuntimeError(f"Schema serialization failed: {e}")
             return {"items": []}
 
-        interpreter = JspiClientAdapter(tools={"predict": mock_predict})
+        interpreter = JspiBackend(tools={"predict": mock_predict})
         try:
             # Use field validators which might add function references to the schema
             result = interpreter.execute("""
@@ -2122,7 +2123,7 @@ print("Schema extraction and serialization successful")
             call_log.append(data)
             return f"Got: {data}"
 
-        interpreter = JspiClientAdapter(preinstall_packages=False, tools={"my_tool": my_tool})
+        interpreter = JspiBackend(preinstall_packages=False, tools={"my_tool": my_tool})
         try:
             # First call - success
             output1 = interpreter.execute("""
@@ -2161,7 +2162,7 @@ print(result)
             call_log.append({"sig": signature, "kwargs": kwargs})
             return {"output": f"Processed {len(kwargs)} args"}
 
-        interpreter = JspiClientAdapter(preinstall_packages=False, tools={"predict": predict})
+        interpreter = JspiBackend(preinstall_packages=False, tools={"predict": predict})
         try:
             # First call - success
             output1 = interpreter.execute("""
@@ -2200,7 +2201,7 @@ print(result)
             call_log.append({"id": item_id, "data": data})
             return f"Processed {item_id}"
 
-        interpreter = JspiClientAdapter(preinstall_packages=False, tools={"process": process})
+        interpreter = JspiBackend(preinstall_packages=False, tools={"process": process})
         try:
             # Run parallel calls where one will fail due to undefined reference
             output = interpreter.execute("""
@@ -2251,7 +2252,7 @@ print(result)
         def get_data() -> dict:
             return {"items": [1, 2, 3]}
 
-        interpreter = JspiClientAdapter(preinstall_packages=False, tools={"get_data": get_data})
+        interpreter = JspiBackend(preinstall_packages=False, tools={"get_data": get_data})
         try:
             # First call - success
             output1 = interpreter.execute("""
@@ -2289,7 +2290,7 @@ print(f"Recovery: {data['items'][0]}")
             received.append(d)
             return f"Got dict with {len(d)} keys"
 
-        interpreter = JspiClientAdapter(
+        interpreter = JspiBackend(
             preinstall_packages=False, tools={"accept_dict": accept_dict}
         )
         try:
@@ -2333,7 +2334,7 @@ print(result)
             call_count["success"] += 1
             return f"Count: {call_count['success']}"
 
-        interpreter = JspiClientAdapter(
+        interpreter = JspiBackend(
             preinstall_packages=False, tools={"counter_tool": counter_tool}
         )
         try:
@@ -2371,7 +2372,7 @@ print(result)
             received.append(data)
             return "processed"
 
-        interpreter = JspiClientAdapter(tools={"process_model": process_model})
+        interpreter = JspiBackend(tools={"process_model": process_model})
         try:
             # Success with valid model
             output1 = interpreter.execute("""
@@ -2426,7 +2427,7 @@ print(f"Third: {result}")
         def my_tool(x) -> str:
             return f"got {x}"
 
-        interpreter = JspiClientAdapter(preinstall_packages=False, tools={"my_tool": my_tool})
+        interpreter = JspiBackend(preinstall_packages=False, tools={"my_tool": my_tool})
         try:
             # Cause a serialization failure inside the tool
             output1 = interpreter.execute("""
@@ -2476,7 +2477,7 @@ print(result)
             call_log.append(msg)
             return f"tracked: {msg}"
 
-        interpreter = JspiClientAdapter(
+        interpreter = JspiBackend(
             preinstall_packages=False, tools={"track_tool": track_tool}
         )
         try:
@@ -2534,7 +2535,7 @@ print(result)
             tool_c_calls.append(x)
             return f"C: {x}"
 
-        interpreter = JspiClientAdapter(
+        interpreter = JspiBackend(
             preinstall_packages=False,
             tools={
                 "tool_a": tool_a,
@@ -2608,7 +2609,7 @@ class TestToolSurvivalAfterAsyncErrors:
             call_counts["fast"] += 1
             return f"fast: {x}"
 
-        interpreter = JspiClientAdapter(
+        interpreter = JspiBackend(
             preinstall_packages=False,
             tools={"slow_tool": slow_tool, "fast_tool": fast_tool},
         )
@@ -2670,7 +2671,7 @@ print(f"After error: {r1}, {r2}")
             search_calls.append(query)
             return f"results for: {query}"
 
-        interpreter = JspiClientAdapter(
+        interpreter = JspiBackend(
             preinstall_packages=False,
             tools={"search": search_tool},
         )
@@ -2718,7 +2719,7 @@ print(f"search is async: {is_coroutine}")
             tool_calls.append(x)
             return f"result: {x}"
 
-        interpreter = JspiClientAdapter(
+        interpreter = JspiBackend(
             preinstall_packages=False,
             tools={"my_tool": my_tool},
         )
@@ -2796,7 +2797,7 @@ class TestCancellationAndLateResponses:
             call_order.append(f"end:{msg}")
             return f"result: {msg}"
 
-        interpreter = JspiClientAdapter(
+        interpreter = JspiBackend(
             preinstall_packages=False,
             tools={"slow_tool": slow_tool},
         )
@@ -2842,7 +2843,7 @@ print(result)
                 raise ValueError("Intentional failure")
             return f"result: {msg}"
 
-        interpreter = JspiClientAdapter(
+        interpreter = JspiBackend(
             preinstall_packages=False,
             tools={"counting_tool": counting_tool},
         )
@@ -2909,7 +2910,7 @@ print(result)
                 raise ValueError("Intentional failure")
             return f"result: {msg}"
 
-        interpreter = JspiClientAdapter(
+        interpreter = JspiBackend(
             preinstall_packages=False,
             tools={"timed_tool": timed_tool},
         )
@@ -2961,7 +2962,7 @@ print(result)
             call_log.append(f"end_{n}")
             return f"result_{n}"
 
-        interpreter = JspiClientAdapter(
+        interpreter = JspiBackend(
             preinstall_packages=False,
             tools={"numbered_tool": numbered_tool},
         )
@@ -3008,7 +3009,7 @@ print(result)
                 raise RuntimeError("Flaky failure")
             return "success"
 
-        interpreter = JspiClientAdapter(
+        interpreter = JspiBackend(
             preinstall_packages=False,
             tools={"flaky_tool": flaky_tool},
         )
@@ -3065,7 +3066,7 @@ class TestPydanticReconstruction:
                 {"category": "Form", "title": "Fill W-9"},
             ]}
 
-        interpreter = JspiClientAdapter(tools={"predict": mock_predict})
+        interpreter = JspiBackend(tools={"predict": mock_predict})
         try:
             result = interpreter.execute("""
 from pydantic import BaseModel
@@ -3090,7 +3091,7 @@ for task in result["tasks"]:
         def mock_predict(signature: str, pydantic_schemas=None, **kwargs):
             return {"summary": {"title": "Project X", "score": 95}}
 
-        interpreter = JspiClientAdapter(tools={"predict": mock_predict})
+        interpreter = JspiBackend(tools={"predict": mock_predict})
         try:
             result = interpreter.execute("""
 from pydantic import BaseModel
@@ -3112,7 +3113,7 @@ print(f"{result['summary'].title}: {result['summary'].score}")
         def mock_predict(signature: str, pydantic_schemas=None, **kwargs):
             return {"items": [{"a": 1}, {"b": 2}]}
 
-        interpreter = JspiClientAdapter(tools={"predict": mock_predict})
+        interpreter = JspiBackend(tools={"predict": mock_predict})
         try:
             result = interpreter.execute("""
 result = await predict("doc: str -> items: list[dict]", doc="test")
@@ -3131,7 +3132,7 @@ print(f"Got {len(result['items'])} items, first has key: {list(result['items'][0
                 {"category": "Cert", "title": "Get ISO cert", "extra_field": "bonus"},
             ]}
 
-        interpreter = JspiClientAdapter(tools={"predict": mock_predict})
+        interpreter = JspiBackend(tools={"predict": mock_predict})
         try:
             result = interpreter.execute("""
 from pydantic import BaseModel
@@ -3154,7 +3155,7 @@ print(f"title: {task.title}, extra: {task.extra_field}")
         def mock_predict(signature: str, pydantic_schemas=None, **kwargs):
             return {"answer": "Paris", "confidence": 0.95}
 
-        interpreter = JspiClientAdapter(tools={"predict": mock_predict})
+        interpreter = JspiBackend(tools={"predict": mock_predict})
         try:
             result = interpreter.execute("""
 result = await predict("question: str -> answer: str, confidence: float", question="capital?")
@@ -3171,7 +3172,7 @@ print(f"attr: {result.answer}, sub: {result['confidence']}")
         def mock_predict(signature: str, pydantic_schemas=None, **kwargs):
             return {"items": ["apple", "banana", "cherry"]}
 
-        interpreter = JspiClientAdapter(tools={"predict": mock_predict})
+        interpreter = JspiBackend(tools={"predict": mock_predict})
         try:
             result = interpreter.execute("""
 result = await predict("text: str -> items: list[str]", text="fruits")
@@ -3199,7 +3200,7 @@ class TestSandboxFatalErrors:
 
     def test_exec_timeout_raises_sandbox_fatal_error(self):
         """exec_timeout firing raises SandboxFatalError, not CodeInterpreterError."""
-        interpreter = JspiClientAdapter(preinstall_packages=False, exec_timeout=2.0)
+        interpreter = JspiBackend(preinstall_packages=False, exec_timeout=2.0)
         try:
             with pytest.raises(SandboxFatalError, match="timed out"):
                 interpreter.execute("while True:\n    pass\n")
@@ -3209,7 +3210,7 @@ class TestSandboxFatalErrors:
     def test_timeout_error_survives_rlm_catch_tuple(self):
         """Simulate DSPy's RLM._execute_iteration handler: the fatal error
         must propagate past `except (CodeInterpreterError, SyntaxError)`."""
-        interpreter = JspiClientAdapter(preinstall_packages=False, exec_timeout=2.0)
+        interpreter = JspiBackend(preinstall_packages=False, exec_timeout=2.0)
         caught_by_rlm_handler = False
         propagated = False
         try:

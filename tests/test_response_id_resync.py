@@ -1,7 +1,7 @@
 """RED-GREEN repro for the Response-ID desync bomb.
 
 Background:
-    ``JspiClientAdapter._send_request`` increments ``self._request_id``,
+    ``JspiBackend._send_request`` increments ``self._request_id``,
     writes a JSON-RPC message to deno's stdin, then reads one line from
     stdout and asserts the response's ``id`` matches the request. If it
     doesn't, the helper raises ``Response ID mismatch``.
@@ -38,18 +38,18 @@ import queue
 import types
 
 import pytest
+from dspy.primitives.code_interpreter import CodeInterpreterError
 
-import predict_rlm.interpreter as rlm_interpreter
-from predict_rlm.interpreter import CodeInterpreterError, JspiClientAdapter
-from predict_rlm.interpreters import SbxClientAdapter, SbxConfig
-from predict_rlm.interpreters.base import STALE_RESPONSE_DISCARD_LIMIT
+import predict_rlm.backends.jspi.backend as rlm_interpreter
+from predict_rlm.backends import JspiBackend, SbxBackend, SbxConfig
+from predict_rlm.backends.base import STALE_RESPONSE_DISCARD_LIMIT
 
 
 def _build_interp(stdout_lines: list[str]):
-    """Build a JspiClientAdapter whose ``_read_with_timeout`` is mocked
+    """Build a JspiBackend whose ``_read_with_timeout`` is mocked
     to pop from a scripted queue. Avoids real fd/select plumbing.
     """
-    interp = JspiClientAdapter.__new__(JspiClientAdapter)
+    interp = JspiBackend.__new__(JspiBackend)
     interp._stdout_fd = -1
     interp._read_buf = ""
     interp._use_jspi = False
@@ -162,7 +162,7 @@ def test_matching_response_passes_through_unchanged():
 
 
 def _build_execute_loop_interp(stdout_lines: list[str]):
-    interp = JspiClientAdapter.__new__(JspiClientAdapter)
+    interp = JspiBackend.__new__(JspiBackend)
     interp._pending_file_ops = {}
     interp._debug = False
     interp._sync_files = lambda: None
@@ -262,8 +262,8 @@ class _BufferingStdin:
         return None
 
 
-def _build_sbx_request_interp(tmp_path, stdout_lines: list[str]) -> SbxClientAdapter:
-    interp = SbxClientAdapter(
+def _build_sbx_request_interp(tmp_path, stdout_lines: list[str]) -> SbxBackend:
+    interp = SbxBackend(
         config=SbxConfig(name="resync-test", exec_timeout=1),
         preinstall_packages=False,
         _runner_command=["unused"],
@@ -282,7 +282,7 @@ def _build_sbx_request_interp(tmp_path, stdout_lines: list[str]) -> SbxClientAda
     return interp
 
 
-def _close_sbx_request_interp(interp: SbxClientAdapter) -> None:
+def _close_sbx_request_interp(interp: SbxBackend) -> None:
     interp._proc = None
 
 

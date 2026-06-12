@@ -15,54 +15,63 @@ Lifecycle callbacks:
                     to broadcast progress (e.g. to a websocket).
 """
 
-from .files import File, LocalDir, LocalFile, OutputDir, OutputFile, SyncedFile
-from .interpreters import (
-    DEFAULT_SBX_TEMPLATE,
-    DirectProcessRunnerClientAdapter,
-    PythonRunnerClientAdapter,
-    SandboxBackend,
-    SbxConfig,
-    SbxPool,
+from .backends import (
+    BackendName,
+    DirectPythonBackend,
+    PythonSupervisor,
 )
+from .files import File, LocalDir, LocalFile, OutputDir, OutputFile, SyncedFile
 from .predict_rlm import PredictRLM, SubmitConfirmationContext
 from .rlm_skills import Skill
 from .trace import IterationStep, RunTrace
 
 _SBX_EXTRA_INSTALL_HINT = (
-    "SbxClientAdapter requires the optional SBX dependencies. "
+    "SbxBackend requires the optional SBX dependencies. "
     "Install them with `pip install 'predict-rlm[sbx]'` or "
     "`uv pip install 'predict-rlm[sbx]'`."
 )
 
 
 def __getattr__(name: str):
-    if name == "SbxClientAdapter":
-        try:
-            from .interpreters.sbx import SbxClientAdapter
-        except ImportError as exc:
-            raise ImportError(_SBX_EXTRA_INSTALL_HINT) from exc
+    try:
+        if name == "DEFAULT_SBX_TEMPLATE":
+            from .backends.sbx import DEFAULT_SBX_TEMPLATE
 
-        return SbxClientAdapter
+            return DEFAULT_SBX_TEMPLATE
+        if name == "SbxConfig":
+            from .backends.sbx import SbxConfig
+
+            return SbxConfig
+        if name == "SbxBackend":
+            from .backends.sbx import SbxBackend
+
+            return SbxBackend
+        if name == "SbxPool":
+            from .backends.sbx import SbxPool
+
+            return SbxPool
+    except ImportError as exc:
+        raise ImportError(_SBX_EXTRA_INSTALL_HINT) from exc
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 __all__ = [
     "File",
-    "DirectProcessRunnerClientAdapter",
+    "DirectPythonBackend",
     "IterationStep",
     "LocalDir",
     "LocalFile",
     "OutputDir",
     "OutputFile",
     "PredictRLM",
-    "PythonRunnerClientAdapter",
+    "PythonSupervisor",
     "RunTrace",
     "SubmitConfirmationContext",
     "DEFAULT_SBX_TEMPLATE",
-    "SandboxBackend",
+    "BackendName",
     "Skill",
     "SbxConfig",
-    "SbxClientAdapter",
+    "SbxBackend",
     "SbxPool",
     "SyncedFile",
 ]

@@ -212,7 +212,8 @@ installed and logged in.
 
 The native execution stack uses a persistent supervisor plus a persistent Python kernel so successful iterations preserve full REPL state. Per-iteration timeouts are recoverable when the backend can interrupt execution cleanly; native hard-kill fallback restores only a pre-timeout pickleable snapshot and tells the RLM which globals / imports were lost.
 
-See [Sandbox architecture and recovery](docs/sandboxes.md) for the component model, timeout behavior, and what is shared between JSPI, SBX, Docker, and Harbor-style adapters.
+See [predict-rlm Architecture](ARCHITECTURE.md) for the component model,
+timeout behavior, and shared backend contracts.
 
 ### Using the spreadsheet skill
 
@@ -330,8 +331,8 @@ same handlers fire for every `PredictRLM` instance.
 
 - [How it works](docs/how-it-works.md) — understand the sandbox, REPL loop,
   signatures, and file I/O
-- [Sandbox architecture](docs/sandboxes.md) — compare JSPI, SBX, Docker, and
-  Harbor-style runner state/recovery semantics
+- [Architecture](ARCHITECTURE.md) — compare backend component and
+  state/recovery semantics
 - [API reference](docs/api.md) — constructor params for `PredictRLM`, `File`,
   and `Skill`
 - [Skills](docs/skills.md) — define, compose, and mount custom skills

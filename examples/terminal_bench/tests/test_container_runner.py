@@ -13,8 +13,8 @@ from typing import Iterator
 import pytest
 from dspy.primitives.code_interpreter import CodeInterpreterError
 
+from predict_rlm.backends import DirectPythonBackend, PythonSupervisor
 from predict_rlm.debug import reset_debug_logger_for_tests
-from predict_rlm.interpreters import DirectProcessRunnerClientAdapter, PythonRunnerClientAdapter
 
 _EXAMPLE_DIR = Path(__file__).resolve().parent.parent
 if str(_EXAMPLE_DIR) not in sys.path:
@@ -133,8 +133,8 @@ class FakeAdapter:
 
 
 @pytest.fixture
-def local_runner_interpreter(tmp_path: Path) -> Iterator[DirectProcessRunnerClientAdapter]:
-    interpreter = DirectProcessRunnerClientAdapter(
+def local_runner_interpreter(tmp_path: Path) -> Iterator[DirectPythonBackend]:
+    interpreter = DirectPythonBackend(
         runner_path=str(tmp_path / "predict_rlm_runner.py"),
         workdir=str(tmp_path),
         exec_timeout=10,
@@ -146,10 +146,10 @@ def local_runner_interpreter(tmp_path: Path) -> Iterator[DirectProcessRunnerClie
         interpreter.shutdown()
 
 
-def _fake_python_runner(adapter, **kwargs) -> PythonRunnerClientAdapter:
+def _fake_python_runner(adapter, **kwargs) -> PythonSupervisor:
     kwargs.setdefault("runner_path", "/tmp/predict_rlm_runner.py")
     kwargs.setdefault("python_executable", "python3")
-    return PythonRunnerClientAdapter(adapter, **kwargs)
+    return PythonSupervisor(adapter, **kwargs)
 
 
 def test_execute_reset_shutdown_requests_and_maps_success() -> None:
@@ -182,7 +182,7 @@ def test_execute_reset_shutdown_requests_and_maps_success() -> None:
 
 
 def test_shutdown_kills_original_process_if_wait_races_with_process_clear() -> None:
-    interpreter: PythonRunnerClientAdapter | None = None
+    interpreter: PythonSupervisor | None = None
 
     def clear_process_then_timeout() -> None:
         assert interpreter is not None
@@ -242,7 +242,7 @@ def test_execute_debug_logs_empty_output_diagnostic(monkeypatch, tmp_path: Path)
     empty_events = [
         record
         for record in records
-        if record.get("event") == "python_runner.runner.empty_execute_output"
+        if record.get("event") == "python_runner.supervisor.empty_execute_output"
     ]
 
     assert empty_events
@@ -271,7 +271,7 @@ def test_execute_strips_python_and_repl_fences_before_runner_request() -> None:
 
 
 def test_local_runner_preserves_stdout_from_repl_fenced_code(
-    local_runner_interpreter: DirectProcessRunnerClientAdapter,
+    local_runner_interpreter: DirectPythonBackend,
 ) -> None:
     result = local_runner_interpreter.execute(
         "```repl\nprint('local stdout survives')\n```"
@@ -281,7 +281,7 @@ def test_local_runner_preserves_stdout_from_repl_fenced_code(
 
 
 def test_local_runner_recoverable_timeout_preserves_streams_and_live_state(
-    local_runner_interpreter: DirectProcessRunnerClientAdapter,
+    local_runner_interpreter: DirectPythonBackend,
 ) -> None:
     assert local_runner_interpreter.execute("state = 'survived'\nprint('set')") == "set\n"
 
@@ -311,7 +311,7 @@ def test_local_runner_recoverable_timeout_preserves_streams_and_live_state(
 
 
 def test_local_runner_surfaces_subprocess_failure_and_survives(
-    local_runner_interpreter: DirectProcessRunnerClientAdapter,
+    local_runner_interpreter: DirectPythonBackend,
 ) -> None:
     with pytest.raises(CodeInterpreterError) as exc_info:
         local_runner_interpreter.execute(
@@ -333,7 +333,7 @@ def test_local_runner_surfaces_subprocess_failure_and_survives(
 
 
 def test_local_runner_unbounded_runner_exit_returns_error_and_supervisor_survives(
-    local_runner_interpreter: DirectProcessRunnerClientAdapter,
+    local_runner_interpreter: DirectPythonBackend,
 ) -> None:
     with pytest.raises(CodeInterpreterError) as exc_info:
         local_runner_interpreter.execute("import os\nos._exit(7)")
@@ -347,7 +347,7 @@ def test_local_runner_unbounded_runner_exit_returns_error_and_supervisor_survive
 
 
 def test_local_runner_protocol_stdin_is_isolated_from_user_subprocesses(
-    local_runner_interpreter: DirectProcessRunnerClientAdapter,
+    local_runner_interpreter: DirectPythonBackend,
 ) -> None:
     local_runner_interpreter.execute("sentinel = 123")
 
@@ -531,7 +531,7 @@ def test_lm_selected_silent_runner_timeout_is_recoverable_and_restarts() -> None
     assert len(processes) >= 2
     assert processes[0].poll() is not None
     assert "[Timeout] Iteration execution timed out after 0.2s" in timeout_result
-    assert "Python runner supervisor request timed out after 0.3s" in timeout_result
+    assert "Python supervisor request timed out after 0.3s" in timeout_result
     assert "supervisor process was killed and restarted" in timeout_result
     assert "Python globals from the timed-out supervisor were lost" in timeout_result
     assert timeout_result.timeout_seconds == 0.2
@@ -564,7 +564,7 @@ def test_execute_after_structured_timeout_restarts_dead_runner_with_diagnostic()
     assert "[Timeout] Iteration execution timed out after 0.2s" in timeout_result
     assert len(adapter.started) == 2
     assert restarted_process.requests == []
-    assert "Python runner supervisor exited after the previous execute response" in restart_result
+    assert "Python supervisor exited after the previous execute response" in restart_result
     assert "The supervisor process was restarted" in restart_result
     assert "Python globals from the prior supervisor were lost" in restart_result
     assert "supervisor_returncode=137" in restart_result
@@ -601,7 +601,7 @@ def test_execute_after_structured_error_restarts_dead_runner_with_diagnostic() -
 
     assert len(adapter.started) == 2
     assert restarted_process.requests == []
-    assert "Python runner supervisor exited after the previous execute response" in restart_result
+    assert "Python supervisor exited after the previous execute response" in restart_result
     assert "previous_response=structured_error" in restart_result
     assert "previous_execution_timeout_seconds=45" in restart_result
     assert "supervisor_returncode=0" in restart_result

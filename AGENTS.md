@@ -91,7 +91,7 @@ uv sync --extra examples       # include example deps (pymupdf)
 make test                      # all tests
 make test-unit                 # unit only (no Deno required)
 make test-integration          # integration only (requires Deno v2)
-uv run pytest tests/test_predict_rlm.py::TestPredictTool::test_name -v  # single test
+uv run pytest tests/test_predict_rlm.py::TestPredictTool::test_name -v
 
 # Lint
 uv run ruff check src/ tests/
@@ -121,9 +121,10 @@ small.
   builds action/extract signatures, manages LM contexts. The
   `_create_predict_tool()` method handles signature parsing, Pydantic model
   reconstruction from JSON schemas, and `dspy.Image` type coercion.
-- **`interpreter.py`** -- `JspiClientAdapter`. Manages the Deno subprocess running
-  `sandbox/runner.js`. Handles JSPI flag detection, concurrent tool execution
-  via `asyncio.gather()`, package installation, and network permissions.
+- **`backends/jspi/backend.py`** -- `JspiBackend`. Manages the Deno
+  subprocess running `backends/jspi/payload.js`. Handles JSPI flag
+  detection, concurrent tool execution via `asyncio.gather()`, package
+  installation, and network permissions.
 - **`rlm_skills.py`** -- `Skill` dataclass and `merge_skills()`. Skills bundle
   instructions + PyPI packages + tools. Merging concatenates instructions,
   deduplicates packages, and raises on tool name conflicts.
@@ -131,8 +132,9 @@ small.
   signatures with full tool docs and skill instructions.
   `format_tool_docs_full()` formats tool docstrings (unlike DSPy's default
   truncated format).
-- **`sandbox/runner.js`** -- Deno script: Pyodide runtime, JSON-RPC 2.0 tool
-  bridge, concurrent async execution, micropip package installation.
+- **`backends/jspi/payload.js`** -- Deno script: Pyodide runtime,
+  JSON-RPC 2.0 tool bridge, concurrent async execution, micropip package
+  installation.
 
 ### Example structure
 

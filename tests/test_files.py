@@ -766,7 +766,7 @@ class TestFileIOIntegration:
 
     def test_mount_and_read_file(self):
         """Mount a host file and read its contents inside the sandbox."""
-        from predict_rlm.interpreter import JspiClientAdapter
+        from predict_rlm.backends import JspiBackend
 
         with tempfile.NamedTemporaryFile(
             mode="w", suffix=".txt", delete=False
@@ -775,7 +775,7 @@ class TestFileIOIntegration:
             tmp_path = f.name
 
         try:
-            interpreter = JspiClientAdapter(
+            interpreter = JspiBackend(
                 preinstall_packages=False,
                 extra_read_paths=[tmp_path],
             )
@@ -796,10 +796,10 @@ print(content)
 
     def test_write_and_sync_output_file(self):
         """RLM writes a file in sandbox, sync it back to host."""
-        from predict_rlm.interpreter import JspiClientAdapter
+        from predict_rlm.backends import JspiBackend
 
         with tempfile.TemporaryDirectory() as tmpdir:
-            interpreter = JspiClientAdapter(
+            interpreter = JspiBackend(
                 preinstall_packages=False,
                 extra_write_paths=[tmpdir],
             )
@@ -834,7 +834,7 @@ print("done")
 
     def test_full_roundtrip_mount_read_write_sync(self):
         """Full round-trip: mount input → read in sandbox → transform → write output → sync."""
-        from predict_rlm.interpreter import JspiClientAdapter
+        from predict_rlm.backends import JspiBackend
 
         with tempfile.NamedTemporaryFile(
             mode="w", suffix=".csv", delete=False
@@ -844,7 +844,7 @@ print("done")
 
         with tempfile.TemporaryDirectory() as output_dir:
             try:
-                interpreter = JspiClientAdapter(
+                interpreter = JspiBackend(
                     preinstall_packages=False,
                     extra_read_paths=[input_path],
                     extra_write_paths=[output_dir],
@@ -901,9 +901,9 @@ print(f"Wrote {{len(rows)}} rows")
 
     def test_mkdir_p_creates_nested_dirs(self):
         """mkdir_p creates deeply nested directories in MEMFS."""
-        from predict_rlm.interpreter import JspiClientAdapter
+        from predict_rlm.backends import JspiBackend
 
-        interpreter = JspiClientAdapter(preinstall_packages=False)
+        interpreter = JspiBackend(preinstall_packages=False)
         try:
             interpreter._ensure_deno_process()
             interpreter.mkdir_p("/sandbox/output/deep/nested/dir")
@@ -919,9 +919,9 @@ print(exists)
 
     def test_list_dir_empty(self):
         """list_dir on empty directory returns empty list."""
-        from predict_rlm.interpreter import JspiClientAdapter
+        from predict_rlm.backends import JspiBackend
 
-        interpreter = JspiClientAdapter(preinstall_packages=False)
+        interpreter = JspiBackend(preinstall_packages=False)
         try:
             interpreter._ensure_deno_process()
             interpreter.mkdir_p("/sandbox/output/empty")
@@ -932,9 +932,9 @@ print(exists)
 
     def test_list_dir_nonexistent(self):
         """list_dir on nonexistent directory returns empty list."""
-        from predict_rlm.interpreter import JspiClientAdapter
+        from predict_rlm.backends import JspiBackend
 
-        interpreter = JspiClientAdapter(preinstall_packages=False)
+        interpreter = JspiBackend(preinstall_packages=False)
         try:
             interpreter._ensure_deno_process()
             files = interpreter.list_dir("/sandbox/output/doesnotexist")
@@ -944,7 +944,7 @@ print(exists)
 
     def test_mount_binary_file_roundtrip(self):
         """Binary files survive the mount → read → write → sync round-trip."""
-        from predict_rlm.interpreter import JspiClientAdapter
+        from predict_rlm.backends import JspiBackend
 
         # Create a binary file with known bytes
         binary_content = bytes(range(256))
@@ -956,7 +956,7 @@ print(exists)
 
         with tempfile.TemporaryDirectory() as output_dir:
             try:
-                interpreter = JspiClientAdapter(
+                interpreter = JspiBackend(
                     preinstall_packages=False,
                     extra_read_paths=[input_path],
                     extra_write_paths=[output_dir],

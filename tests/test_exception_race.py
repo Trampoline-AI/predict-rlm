@@ -34,7 +34,7 @@ These tests verify the fixes work correctly by simulating the production pattern
 
 import pytest
 
-from predict_rlm.interpreter import JspiClientAdapter
+from predict_rlm.backends import JspiBackend
 
 pytestmark = pytest.mark.integration
 
@@ -54,7 +54,7 @@ class TestToolsExistInNamespace:
             call_count += 1
             return {"item": item, "count": call_count}
 
-        interp = JspiClientAdapter(
+        interp = JspiBackend(
             tools={"predict": predict},
             preinstall_packages=False,
         )
@@ -109,7 +109,7 @@ else:
             await asyncio.sleep(0.01)
             return {"item": item}
 
-        interp = JspiClientAdapter(
+        interp = JspiBackend(
             tools={"predict": predict},
             preinstall_packages=False,
         )
@@ -177,7 +177,7 @@ class TestToolsSurviveExceptions:
             results.append(f"slow_tool called with: {value}")
             return f"processed: {value}"
 
-        interp = JspiClientAdapter(
+        interp = JspiBackend(
             tools={"slow_tool": slow_tool},
             preinstall_packages=False,
         )
@@ -237,7 +237,7 @@ except NameError as e:
             call_count += 1
             return call_count
 
-        interp = JspiClientAdapter(
+        interp = JspiBackend(
             tools={"count_tool": count_tool},
             preinstall_packages=False,
         )
@@ -291,7 +291,7 @@ except NameError as e:
             call_log.append(f"predict({item})")
             return {"item": item, "value": f"extracted_{item}"}
 
-        interp = JspiClientAdapter(
+        interp = JspiBackend(
             tools={"predict": predict},
             preinstall_packages=False,
         )
@@ -374,7 +374,7 @@ class TestProductionScenarioReproduction:
         async def get_pages() -> list:
             return [{"page": 1}, {"page": 2}]
 
-        interp = JspiClientAdapter(
+        interp = JspiBackend(
             tools={"predict": predict, "search": search, "get_pages": get_pages},
             preinstall_packages=False,
         )
@@ -465,7 +465,7 @@ except NameError as e:
             await asyncio.sleep(0.01)  # Simulate latency
             return {"extracted": item.get("name", "unknown"), "count": call_count}
 
-        interp = JspiClientAdapter(
+        interp = JspiBackend(
             tools={"predict": predict},
             preinstall_packages=False,
         )

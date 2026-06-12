@@ -9,9 +9,9 @@ from pathlib import Path
 
 def runner_script_path() -> Path:
     """Return the shared runner script copied by both SBX and Terminal-Bench."""
-    spec = importlib.util.find_spec("predict_rlm.sandbox.python_runner")
+    spec = importlib.util.find_spec("predict_rlm.backends.supervisor._payload")
     if spec is None or spec.origin is None:
-        raise RuntimeError("Could not locate predict_rlm.sandbox.python_runner")
+        raise RuntimeError("Could not locate predict_rlm.backends.supervisor._payload")
     return Path(spec.origin).resolve()
 
 
@@ -20,6 +20,6 @@ def runner_source() -> str:
 
 
 if __name__ == "__main__":
-    from predict_rlm.sandbox.python_runner import _main
+    from predict_rlm.backends.supervisor._payload import _stdio_main
 
-    asyncio.run(_main())
+    asyncio.run(_stdio_main())

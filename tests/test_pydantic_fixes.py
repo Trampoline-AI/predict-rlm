@@ -363,9 +363,7 @@ class TestListDictInInterpreter(unittest.TestCase):
 
     def test_predict_with_list_dict_output(self):
         """Test that predict with list[dict] output works through the sandbox."""
-        from predict_rlm.interpreter import (
-            JspiClientAdapter,
-        )
+        from predict_rlm.backends import JspiBackend
 
         # Track calls to predict
         predict_calls = []
@@ -382,7 +380,7 @@ class TestListDictInInterpreter(unittest.TestCase):
                 ]
             }
 
-        interpreter = JspiClientAdapter(
+        interpreter = JspiBackend(
             tools={"predict": mock_predict},
             preinstall_packages=False,
         )
@@ -418,9 +416,7 @@ print("Serialized OK:", len(serialized), "chars")
 
     def test_predict_with_list_dict_containing_none_values(self):
         """Test that predict with list[dict] containing None values works correctly."""
-        from predict_rlm.interpreter import (
-            JspiClientAdapter,
-        )
+        from predict_rlm.backends import JspiBackend
 
         def mock_predict(signature: str, **kwargs):
             # Return list of dicts with None values (common in extraction results)
@@ -443,7 +439,7 @@ print("Serialized OK:", len(serialized), "chars")
                 ]
             }
 
-        interpreter = JspiClientAdapter(
+        interpreter = JspiBackend(
             tools={"predict": mock_predict},
             preinstall_packages=False,
         )
@@ -480,9 +476,7 @@ print("Parsed priority is None:", parsed[0]["priority"] is None)
 
     def test_predict_with_list_dict_complex_nested_values(self):
         """Test that predict handles list[dict] with complex nested structures."""
-        from predict_rlm.interpreter import (
-            JspiClientAdapter,
-        )
+        from predict_rlm.backends import JspiBackend
 
         def mock_predict(signature: str, **kwargs):
             # Return list of dicts with nested structures
@@ -500,7 +494,7 @@ print("Parsed priority is None:", parsed[0]["priority"] is None)
                 ]
             }
 
-        interpreter = JspiClientAdapter(
+        interpreter = JspiBackend(
             tools={"predict": mock_predict},
             preinstall_packages=False,
         )
@@ -913,9 +907,7 @@ class TestSchemaExtractionFromCallStack(unittest.TestCase):
         weren't being found by _get_pydantic_schemas because it only looked at
         immediate caller's globals, not the full call stack.
         """
-        from predict_rlm.interpreter import (
-            JspiClientAdapter,
-        )
+        from predict_rlm.backends import JspiBackend
 
         # Track what schemas are extracted and passed to predict
         received_schemas = []
@@ -929,7 +921,7 @@ class TestSchemaExtractionFromCallStack(unittest.TestCase):
             )
             return {"tasks": []}
 
-        interpreter = JspiClientAdapter(
+        interpreter = JspiBackend(
             tools={"predict": mock_predict},
             preinstall_packages=False,
         )

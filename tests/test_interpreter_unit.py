@@ -11,12 +11,9 @@ from unittest.mock import patch
 import pytest
 from dspy.primitives.code_interpreter import CodeInterpreterError
 
-from predict_rlm.interpreter import (
-    RUNNER_PATH,
-    JspiClientAdapter,
-    SandboxFatalError,
-    _needs_jspi_flag,
-)
+from predict_rlm.backends import JspiBackend
+from predict_rlm.backends.base import SandboxFatalError
+from predict_rlm.backends.jspi.backend import RUNNER_PATH, _needs_jspi_flag
 from predict_rlm.telemetry import TelemetryContext
 
 
@@ -61,11 +58,11 @@ class TestNeedsJspiFlag:
 
 
 def _make_interpreter():
-    """Create a JspiClientAdapter without running __init__ (no Deno subprocess)."""
-    return JspiClientAdapter.__new__(JspiClientAdapter)
+    """Create a JspiBackend without running __init__ (no Deno subprocess)."""
+    return JspiBackend.__new__(JspiBackend)
 
 
-def _attach_telemetry(interp: JspiClientAdapter) -> ListTelemetrySink:
+def _attach_telemetry(interp: JspiBackend) -> ListTelemetrySink:
     sink = ListTelemetrySink()
     interp._telemetry_context = TelemetryContext(sink=sink, trace_id="trace-1")
     interp._interpreter_id = "jspi-test"
@@ -73,28 +70,28 @@ def _attach_telemetry(interp: JspiClientAdapter) -> ListTelemetrySink:
 
 
 class TestBuildDenoCommand:
-    @patch("predict_rlm.interpreter._needs_jspi_flag", return_value=True)
+    @patch("predict_rlm.backends.jspi.backend._needs_jspi_flag", return_value=True)
     def test_includes_jspi_flag_when_needed(self, _):
         interp = _make_interpreter()
         with patch.object(interp, "_get_deno_dir", return_value=[]):
             cmd = interp._build_deno_command([], [], [], [])
         assert "--v8-flags=--experimental-wasm-jspi" in cmd
 
-    @patch("predict_rlm.interpreter._needs_jspi_flag", return_value=False)
+    @patch("predict_rlm.backends.jspi.backend._needs_jspi_flag", return_value=False)
     def test_excludes_jspi_flag_when_not_needed(self, _):
         interp = _make_interpreter()
         with patch.object(interp, "_get_deno_dir", return_value=[]):
             cmd = interp._build_deno_command([], [], [], [])
         assert "--v8-flags=--experimental-wasm-jspi" not in cmd
 
-    @patch("predict_rlm.interpreter._needs_jspi_flag", return_value=False)
+    @patch("predict_rlm.backends.jspi.backend._needs_jspi_flag", return_value=False)
     def test_runner_path_in_command(self, _):
         interp = _make_interpreter()
         with patch.object(interp, "_get_deno_dir", return_value=[]):
             cmd = interp._build_deno_command([], [], [], [])
         assert str(RUNNER_PATH) in cmd
 
-    @patch("predict_rlm.interpreter._needs_jspi_flag", return_value=False)
+    @patch("predict_rlm.backends.jspi.backend._needs_jspi_flag", return_value=False)
     def test_allow_read_includes_runner_and_user_paths(self, _):
         interp = _make_interpreter()
         with patch.object(interp, "_get_deno_dir", return_value=[]):
@@ -104,7 +101,7 @@ class TestBuildDenoCommand:
         assert str(RUNNER_PATH) in read_paths
         assert "/data/input" in read_paths
 
-    @patch("predict_rlm.interpreter._needs_jspi_flag", return_value=False)
+    @patch("predict_rlm.backends.jspi.backend._needs_jspi_flag", return_value=False)
     def test_write_paths_also_in_allow_read(self, _):
         interp = _make_interpreter()
         with patch.object(interp, "_get_deno_dir", return_value=[]):
@@ -112,7 +109,7 @@ class TestBuildDenoCommand:
         read_arg = [a for a in cmd if a.startswith("--allow-read=")][0]
         assert "/data/output" in read_arg
 
-    @patch("predict_rlm.interpreter._needs_jspi_flag", return_value=False)
+    @patch("predict_rlm.backends.jspi.backend._needs_jspi_flag", return_value=False)
     def test_allow_write_includes_tempdir_and_user_paths(self, _):
         interp = _make_interpreter()
         with patch.object(interp, "_get_deno_dir", return_value=[]):
@@ -123,21 +120,21 @@ class TestBuildDenoCommand:
         assert tempfile.gettempdir() in write_paths
         assert "/tmp" in write_paths
 
-    @patch("predict_rlm.interpreter._needs_jspi_flag", return_value=False)
+    @patch("predict_rlm.backends.jspi.backend._needs_jspi_flag", return_value=False)
     def test_allow_net_with_domains(self, _):
         interp = _make_interpreter()
         with patch.object(interp, "_get_deno_dir", return_value=[]):
             cmd = interp._build_deno_command([], [], ["pypi.org", "api.example.com"], [])
         assert "--allow-net=pypi.org,api.example.com" in cmd
 
-    @patch("predict_rlm.interpreter._needs_jspi_flag", return_value=False)
+    @patch("predict_rlm.backends.jspi.backend._needs_jspi_flag", return_value=False)
     def test_no_allow_net_when_empty(self, _):
         interp = _make_interpreter()
         with patch.object(interp, "_get_deno_dir", return_value=[]):
             cmd = interp._build_deno_command([], [], [], [])
         assert not any(a.startswith("--allow-net") for a in cmd)
 
-    @patch("predict_rlm.interpreter._needs_jspi_flag", return_value=False)
+    @patch("predict_rlm.backends.jspi.backend._needs_jspi_flag", return_value=False)
     def test_always_includes_allow_env_and_no_prompt(self, _):
         interp = _make_interpreter()
         with patch.object(interp, "_get_deno_dir", return_value=[]):
@@ -145,7 +142,7 @@ class TestBuildDenoCommand:
         assert "--allow-env" in cmd
         assert "--no-prompt" in cmd
 
-    @patch("predict_rlm.interpreter._needs_jspi_flag", return_value=False)
+    @patch("predict_rlm.backends.jspi.backend._needs_jspi_flag", return_value=False)
     def test_env_vars_as_final_arg(self, _):
         interp = _make_interpreter()
         with patch.object(interp, "_get_deno_dir", return_value=[]):
@@ -154,7 +151,7 @@ class TestBuildDenoCommand:
             )
         assert cmd[-1] == "PYODIDE_PREINSTALL,SKILL_PACKAGES"
 
-    @patch("predict_rlm.interpreter._needs_jspi_flag", return_value=False)
+    @patch("predict_rlm.backends.jspi.backend._needs_jspi_flag", return_value=False)
     def test_no_env_vars_runner_is_last(self, _):
         interp = _make_interpreter()
         with patch.object(interp, "_get_deno_dir", return_value=[]):
@@ -290,7 +287,7 @@ class TestJspiTelemetry:
         assert timeout["attributes"]["process.pid"] == 4321
 
     def test_tool_timeout_emits_host_tool_failure(self, monkeypatch):
-        import predict_rlm.interpreter as rlm_interpreter
+        import predict_rlm.backends.jspi.backend as rlm_interpreter
 
         monkeypatch.setattr(rlm_interpreter, "TOOL_CALL_TIMEOUT_SEC", 0.01)
 

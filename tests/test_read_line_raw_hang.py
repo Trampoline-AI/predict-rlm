@@ -1,7 +1,7 @@
 """RED-GREEN repro for the deno-stdout blocking-read hang.
 
 Background:
-    ``JspiClientAdapter._read_with_timeout`` is called inline from
+    ``JspiBackend._read_with_timeout`` is called inline from
     ``_send_request``, which is used by the synchronous health-check
     path (``_health_check`` → ``_ensure_deno_process``). When that path
     runs inside an asyncio coroutine (via ``aexecute`` → ``_aexecute_inner``),
@@ -38,11 +38,11 @@ import types
 
 import pytest
 
-from predict_rlm.interpreter import JspiClientAdapter
+from predict_rlm.backends import JspiBackend
 
 
 def _make_interp_with_partial_pipe():
-    """Build a JspiClientAdapter pointed at a real OS pipe fd, with
+    """Build a JspiBackend pointed at a real OS pipe fd, with
     some partial bytes (no newline) already sitting in the kernel
     buffer. The write end is left open and silent, simulating a deno
     process that wrote a partial line then stopped producing output
@@ -52,7 +52,7 @@ def _make_interp_with_partial_pipe():
     # Write partial data (no '\n'). Writer stays open so read won't get EOF.
     os.write(write_fd, b"partial-line-no-newline-here")
 
-    interp = JspiClientAdapter.__new__(JspiClientAdapter)
+    interp = JspiBackend.__new__(JspiBackend)
     interp._stdout_fd = read_fd
     interp._read_buf = ""
     interp.deno_process = types.SimpleNamespace(
@@ -87,7 +87,7 @@ def test_read_with_timeout_does_not_hang_on_partial_line():
         t.join(timeout=2.0)
 
         assert not t.is_alive(), (
-            "JspiClientAdapter._read_with_timeout hung on a partial-line "
+            "JspiBackend._read_with_timeout hung on a partial-line "
             "stdout — deno-stdout deadlock is present"
         )
         assert result["returned"], "thread ended without returning a value"
@@ -141,7 +141,7 @@ def test_send_request_does_not_hang_on_silent_deno():
     must raise within a bounded window — the previous hang behavior
     would block forever and fail the 3s thread-join safety net.
     """
-    import predict_rlm.interpreter as rlm_interpreter
+    import predict_rlm.backends.jspi.backend as rlm_interpreter
 
     # Shrink the request-read budget so the test doesn't wait 30s for
     # the default fix to fire. Reusing the module-level knob the fix
@@ -186,7 +186,7 @@ def test_send_request_does_not_hang_on_silent_deno():
         t.join(timeout=3.0)
 
         assert not t.is_alive(), (
-            "JspiClientAdapter._send_request hung on a silent deno stdout — "
+            "JspiBackend._send_request hung on a silent deno stdout — "
             "_send_request is still passing timeout=None to _read_with_timeout"
         )
         assert result["exc"] is not None, (

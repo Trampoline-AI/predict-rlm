@@ -127,14 +127,14 @@ class FakeInterpreterContext:
         return False
 
 
-class TestSandboxBackendSelection:
+class TestBackendNameSelection:
     """Tests for PredictRLM sandbox backend selection."""
 
     def test_default_backend_remains_jspi(self):
         rlm = PredictRLM(ImageAnalysisSignature, sub_lm=MagicMock(), max_iterations=1)
         execution_tools = {"predict": MagicMock()}
 
-        with patch("predict_rlm.predict_rlm.JspiClientAdapter") as mock_jspi:
+        with patch("predict_rlm.predict_rlm.JspiBackend") as mock_jspi:
             mock_repl = MagicMock()
             mock_jspi.return_value = mock_repl
 
@@ -145,18 +145,18 @@ class TestSandboxBackendSelection:
         assert mock_jspi.call_args.kwargs["tools"] == execution_tools
 
     def test_explicit_sbx_backend_uses_sbx_interpreter(self):
-        from predict_rlm import SandboxBackend, SbxConfig
+        from predict_rlm import BackendName, SbxConfig
 
         rlm = PredictRLM(
             ImageAnalysisSignature,
             sub_lm=MagicMock(),
             max_iterations=1,
-            sandbox_backend=SandboxBackend.SBX,
+            sandbox_backend=BackendName.SBX,
             sbx_config=SbxConfig(name="test-sbx"),
         )
         execution_tools = {"predict": MagicMock()}
 
-        with patch("predict_rlm.predict_rlm.SbxClientAdapter") as mock_sbx:
+        with patch("predict_rlm.backends.sbx.SbxBackend") as mock_sbx:
             mock_repl = MagicMock()
             mock_sbx.return_value = mock_repl
 
@@ -348,7 +348,7 @@ class TestSandboxBackendSelection:
         )
         execution_tools = {"predict": MagicMock()}
 
-        with patch("predict_rlm.predict_rlm.SbxClientAdapter") as mock_sbx:
+        with patch("predict_rlm.backends.sbx.SbxBackend") as mock_sbx:
             with rlm._interpreter_context(execution_tools=execution_tools) as repl:
                 assert repl is leased
 
@@ -2103,7 +2103,7 @@ class TestExecuteIteration:
         assert "output from execute" in after_text
 
     def test_sync_sandbox_fatal_error_propagates(self):
-        from predict_rlm.interpreter import SandboxFatalError
+        from predict_rlm.backends.base import SandboxFatalError
 
         mock_lm = MagicMock()
         rlm = PredictRLM(ImageAnalysisSignature, sub_lm=mock_lm, max_iterations=5)
@@ -2127,7 +2127,7 @@ class TestExecuteIteration:
             )
 
     def test_failed_iteration_preserves_partial_output_before_error(self):
-        from predict_rlm.interpreters.base import SandboxExecutionError
+        from predict_rlm.backends.base import SandboxExecutionError
 
         mock_lm = MagicMock()
         rlm = PredictRLM(ImageAnalysisSignature, sub_lm=mock_lm, max_iterations=5)
@@ -2177,18 +2177,18 @@ class TestPredictRLMTelemetry:
         )
         created_kwargs = {}
 
-        class FakeJspiClientAdapter:
+        class FakeJspiBackend:
             def __init__(self, **kwargs):
                 created_kwargs.update(kwargs)
 
             def shutdown(self):
                 created_kwargs["shutdown_called"] = True
 
-        with patch("predict_rlm.predict_rlm.JspiClientAdapter", FakeJspiClientAdapter):
+        with patch("predict_rlm.predict_rlm.JspiBackend", FakeJspiBackend):
             rlm._begin_telemetry_execution()
             try:
                 with rlm._interpreter_context(execution_tools={}) as repl:
-                    assert isinstance(repl, FakeJspiClientAdapter)
+                    assert isinstance(repl, FakeJspiBackend)
             finally:
                 rlm._clear_telemetry_execution()
 
@@ -2568,7 +2568,7 @@ class TestAexecuteIteration:
 
     @pytest.mark.asyncio
     async def test_sandbox_fatal_error_propagates(self):
-        from predict_rlm.interpreter import SandboxFatalError
+        from predict_rlm.backends.base import SandboxFatalError
 
         mock_lm = MagicMock()
         rlm = PredictRLM(ImageAnalysisSignature, sub_lm=mock_lm, max_iterations=5)
