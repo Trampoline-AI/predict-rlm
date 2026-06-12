@@ -78,6 +78,7 @@ from .trace import (
     reset_predict_call_collector,
     reset_tool_call_collector,
     snapshot_lm_history_len,
+    TokenUsage,
     usage_since,
 )
 
@@ -2384,6 +2385,7 @@ class PredictRLM(dspy.RLM):
             reasoning_chars=len(getattr(pred, "reasoning", "") or ""),
             execution_timeout_seconds=execution_timeout,
         )
+        self._last_action_lm_usage = usage_since(dspy.settings.lm, lm_hist_before_action)
         return lm_finish_since(dspy.settings.lm, lm_hist_before_action)
 
     def _prepare_iteration_execution(self, pred: Any, iteration: int) -> tuple[str, bool]:
@@ -3065,6 +3067,9 @@ class PredictRLM(dspy.RLM):
         else:
             prompt_output = full_output
 
+        predict_calls = drain_predict_calls()
+        iteration_usage = self._build_iteration_usage(predict_calls)
+
         return (
             IterationStep(
                 iteration=iteration + 1,
@@ -3075,11 +3080,21 @@ class PredictRLM(dspy.RLM):
                 error=_output_indicates_error(full_output),
                 duration_ms=ms_since(iter_start),
                 tool_calls=drain_tool_calls(),
-                predict_calls=drain_predict_calls(),
+                predict_calls=predict_calls,
                 lm=action_lm_metadata,
+                usage=iteration_usage,
             ),
             isinstance(result, dspy.Prediction),
         )
+
+    def _build_iteration_usage(self, predict_calls: list[Any]) -> LMUsage:
+        """Per-iteration usage: main action-LM call plus this turn's sub predict() calls."""
+        main = getattr(self, "_last_action_lm_usage", None) or TokenUsage()
+        self._last_action_lm_usage = None
+        sub = TokenUsage()
+        for group in predict_calls:
+            sub += group.total_usage
+        return LMUsage(main=main, sub=sub)
 
     def _forward_traced(
         self, file_plan: dict[str, Any] | None, **input_args: Any

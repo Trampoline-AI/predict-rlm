@@ -226,6 +226,13 @@ class ProposerRunTrace(BaseModel):
     )
 
 
+class LMUsage(BaseModel):
+    """Token usage split by main LM and sub-LM."""
+
+    main: TokenUsage = Field(default_factory=TokenUsage, description="Main LM token usage")
+    sub: TokenUsage = Field(default_factory=TokenUsage, description="Sub-LM token usage")
+
+
 class IterationStep(BaseModel):
     """One iteration of the RLM code-generation loop."""
 
@@ -254,13 +261,13 @@ class IterationStep(BaseModel):
         default=None,
         description="Why the main LM stopped while generating this iteration's code",
     )
-
-
-class LMUsage(BaseModel):
-    """Token usage split by main LM and sub-LM."""
-
-    main: TokenUsage = Field(default_factory=TokenUsage, description="Main LM token usage")
-    sub: TokenUsage = Field(default_factory=TokenUsage, description="Sub-LM token usage")
+    usage: LMUsage = Field(
+        default_factory=LMUsage,
+        description=(
+            "Per-iteration token usage and cost, split into the main action-LM "
+            "call and any sub-LM predict() calls made during this iteration"
+        ),
+    )
 
 
 class RunTrace(BaseModel):
