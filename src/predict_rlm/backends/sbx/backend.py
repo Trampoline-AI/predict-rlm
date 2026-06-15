@@ -51,6 +51,7 @@ from predict_rlm.execution_timeout import (
     resolve_execution_timeout,
 )
 from predict_rlm.files import get_synced_file_params
+from predict_rlm.serialization import to_plain_data
 from predict_rlm.trace import ToolCall, ms_since, record_tool_call
 
 from ..base import (
@@ -263,6 +264,11 @@ class SbxBackend(SupervisorClient, ExecutionBackend):
         return host_path
 
     def _map_variable_value(self, value: Any) -> Any:
+        # Normalize rich objects (pydantic models, dataclasses, sets) to plain data
+        # first -- they are injected into the sandbox via repr(), and e.g. a model's
+        # repr is a constructor call (RfpAnalysis(...)) referencing a class the
+        # sandbox doesn't have, which would raise NameError.
+        value = to_plain_data(value)
         if isinstance(value, str) and (value == "/sandbox" or value.startswith("/sandbox/")):
             return str(self._host_path_for_virtual_path(value))
         if isinstance(value, list):

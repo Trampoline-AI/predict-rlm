@@ -1642,6 +1642,35 @@ class TestSbxBackendLocalWebSocketRunner:
         finally:
             interpreter.shutdown()
 
+    def test_pydantic_model_variable_injected_as_plain_data(self, tmp_path: Path):
+        """A pydantic-model input variable must cross the boundary as plain data.
+
+        Input variables are injected into the sandbox via repr(); a model's repr is a
+        constructor call (e.g. RfpAnalysis(...)) referencing a class the sandbox does
+        not have, so it would raise NameError. to_plain_data() normalizes the model to
+        a dict first. Regression for chained-RLM runs that pass a model output as the
+        next RLM's input.
+        """
+        from pydantic import BaseModel
+
+        class KeyDate(BaseModel):
+            name: str
+
+        class RfpAnalysis(BaseModel):
+            title: str
+            key_dates: list[KeyDate]
+
+        interpreter = self.make_interpreter(tmp_path)
+        try:
+            output = interpreter.execute(
+                "print(type(rfp).__name__, rfp['title'], rfp['key_dates'][0]['name'])",
+                variables={"rfp": RfpAnalysis(title="T", key_dates=[KeyDate(name="due")])},
+            )
+        finally:
+            interpreter.shutdown()
+
+        assert output == "dict T due\n"
+
     def test_websocket_host_tool_round_trip(self, tmp_path: Path):
         def add(a: int, b: int) -> dict:
             return {"total": a + b}
