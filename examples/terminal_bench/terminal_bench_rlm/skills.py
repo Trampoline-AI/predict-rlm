@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from typing import Any
 
+from terminal_bench_rlm.web_search import web_search
+
 TERMINAL_BENCH_SKILL_NAME = "terminal-bench"
 
 DEFAULT_TERMINAL_BENCH_SKILL_INSTRUCTIONS = (
@@ -76,6 +78,14 @@ Avoid brute-force searches when a direct, sampled, analytical, or tool-assisted
 approach can solve the problem, and choose elegant, smart, effective strategies
 over exhaustive loops. Use programmatic tools for binary, image, audio, video,
 archive, or other non-text inputs rather than guessing.
+
+## Web search
+Use `await web_search(query, max_results=5)` to retrieve current public web
+information: package documentation, API references, error messages, release
+notes, standards, project pages, and unfamiliar command-line tools. Pass
+`domains=["example.com"]` to limit results to specific sites. The tool returns
+JSON with an answer, citations, and search result records; use those source URLs
+as evidence alongside local verification.
 
 ## Visual perception with predict
 For image understanding, prefer `await predict(...)` with a `dspy.Image` input when
@@ -173,4 +183,5 @@ def build_terminal_bench_skill(skill_cls: type[Any], instructions: str | None = 
     return skill_cls(
         name=TERMINAL_BENCH_SKILL_NAME,
         instructions=instructions or DEFAULT_TERMINAL_BENCH_SKILL_INSTRUCTIONS,
+        tools={"web_search": web_search},
     )
