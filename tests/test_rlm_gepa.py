@@ -1922,7 +1922,7 @@ def test_iteration_hard_count_transition_aligns_count_width(tmp_path: Path):
     rows = iteration_rows(tmp_path)
 
     assert rows[0]["hard: par → child"] == "0.260 → 0.180 -0.080; 13 →  9"
-    rendered = render_table(rows)
+    rendered = render_table(rows, width=120)
     plain_rendered = stats_report.re.sub(r"\033\[[0-9;]*m", "", rendered)
     assert ".260 → .180 -.080; 13 →  9" in plain_rendered
 
@@ -2085,7 +2085,7 @@ def test_reporting_tables_from_artifacts(tmp_path: Path):
     assert rows[0]["p"] == "1.00"
     assert rows[0]["iter"] == "0 [0]"
     assert rows[0]["_highlight"] is True
-    iteration_terminal = render_table(rows)
+    iteration_terminal = render_table(rows, width=120)
     iteration_plain_lines = [
         stats_report.re.sub(r"\033\[[0-9;]*m", "", line) for line in iteration_terminal.splitlines()
     ]
@@ -2141,7 +2141,7 @@ def test_reporting_tables_from_artifacts(tmp_path: Path):
         "hard: par → child": " +0.500",
     }
     assert candidates[1]["_highlight"] is True
-    candidate_terminal = render_table(candidates)
+    candidate_terminal = render_table(candidates, width=120)
     assert "\033[38;5;178m0.500 → \033[0m\033[1;38;5;220m1.000\033[38;5;178m +0.500" in candidate_terminal
     costs = cost_rows(tmp_path)
     assert costs[0]["scope"] == "executor"
@@ -2186,7 +2186,7 @@ def test_reporting_tables_from_artifacts(tmp_path: Path):
     assert "| Δ-seed" in rendered
     assert "| ----" in rendered
     assert "**1 [0]**" in rendered
-    terminal = render_stats(tmp_path)
+    terminal = render_stats(tmp_path, width=120)
     assert "┌" in terminal
     assert "\033[3m" in terminal
     assert "\033[38;5;248m" in terminal
@@ -2242,7 +2242,7 @@ def test_candidate_rows_show_flips_against_each_parent(tmp_path: Path):
         "hard: par → child": " +0.333\n +0.333",
     }
 
-    rendered = render_table(rows)
+    rendered = render_table(rows, width=120)
 
     assert " -> " not in rendered
     assert "\033[38;5;178m.333 → \033[0m\033[1;38;5;220m.667\033[38;5;178m +.333" in rendered
