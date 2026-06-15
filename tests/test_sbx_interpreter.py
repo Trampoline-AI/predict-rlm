@@ -1701,6 +1701,48 @@ class TestSbxBackendLocalWebSocketRunner:
         assert output == "4\n"
         assert seen_lengths == [950000]
 
+    def test_predict_forwards_nested_pydantic_schemas_for_custom_types(self, tmp_path: Path):
+        """predict() with a custom output type that nests sibling models.
+
+        The host builds the structured-output signature and can't resolve a
+        REPL-defined type by name, so the sandbox extracts model_json_schema()
+        and forwards it (on par with JSPI). The model is defined at REPL top
+        level but predict() is called from inside a function under gather(), and
+        the type nests sibling models -- which can't resolve via the mismatched
+        __main__ unless rebuilt against the execution globals. This is the exact
+        real-world failure mode; without the fix the host falls back to a plain
+        string signature and the predict() call raises.
+        """
+        received: dict = {}
+
+        def predict(signature: str, **kwargs) -> dict:
+            received["schemas"] = kwargs.get("pydantic_schemas")
+            return {"analysis": {}}
+
+        interpreter = self.make_interpreter(tmp_path, tools={"predict": predict})
+        try:
+            output = interpreter.execute(
+                "import asyncio\n"
+                "from pydantic import BaseModel, Field\n"
+                "class PageItem(BaseModel):\n"
+                "    name: str\n"
+                "class PageAnalysis(BaseModel):\n"
+                "    page_number: int\n"
+                "    items: list[PageItem] = Field(default_factory=list)\n"
+                "async def one(i):\n"
+                "    return await predict('doc: str -> analysis: PageAnalysis', doc='hi')\n"
+                "await asyncio.gather(*[one(i) for i in range(3)])\n"
+                "print('ok')"
+            )
+        finally:
+            interpreter.shutdown()
+
+        assert output == "ok\n"
+        schemas = received["schemas"]
+        assert schemas is not None and "PageAnalysis" in schemas
+        # nested sibling model must be present in the forwarded schema's $defs
+        assert "PageItem" in json.dumps(schemas["PageAnalysis"])
+
     def test_predicts_orphaned_by_gather_failure_do_not_hang_next_execute(
         self, tmp_path: Path
     ):

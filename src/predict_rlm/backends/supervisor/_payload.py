@@ -17,6 +17,7 @@ import multiprocessing
 import os
 import pathlib
 import queue
+import re
 import select
 import shutil
 import signal
@@ -357,13 +358,90 @@ async def _call_host_tool(name: str, *args: Any, **kwargs: Any) -> Any:
     return value
 
 
+_PREDICT_SIGNATURE_BUILTIN_TYPES = {
+    "Image", "List", "Optional", "Dict", "Any", "Union", "Literal", "Tuple", "Set", "BaseModel",
+}
+
+
+def _predict_pydantic_schemas(
+    signature: Any, user_globals: dict[str, Any] | None = None
+) -> dict[str, Any]:
+    """Extract JSON schemas for custom Pydantic types named in a predict() signature.
+
+    The host builds the structured-output signature, so it needs each custom type's
+    schema; without it the host can't resolve the name and falls back to a plain
+    string signature. Resolves capitalized type names from the kernel's execution
+    globals first -- that's where REPL top-level classes live, and it works inside
+    asyncio.gather where call-stack introspection can't reach the defining frame --
+    then falls back to the call stack. Mirrors the JSPI backend so SBX predict()
+    handles custom output types on par.
+    """
+    if not isinstance(signature, str):
+        return {}
+    schemas: dict[str, Any] = {}
+    for match in re.finditer(r"(?<![.\w])([A-Z][A-Za-z0-9_]*)", signature):
+        name = match.group(1)
+        if name in _PREDICT_SIGNATURE_BUILTIN_TYPES or name in schemas:
+            continue
+        cls = None
+        if user_globals is not None and name in user_globals:
+            cls = user_globals[name]
+        if cls is None:
+            frame = inspect.currentframe()
+            while frame is not None:
+                if name in frame.f_globals:
+                    cls = frame.f_globals[name]
+                    break
+                if name in frame.f_locals:
+                    cls = frame.f_locals[name]
+                    break
+                frame = frame.f_back
+        if cls is not None and hasattr(cls, "model_json_schema"):
+            try:
+                schemas[name] = _to_jsonable(_model_json_schema(cls, user_globals))
+            except Exception:
+                continue
+    return schemas
+
+
+def _model_json_schema(cls: Any, user_globals: dict[str, Any] | None) -> Any:
+    """``cls.model_json_schema()``, rebuilding against the user's globals if needed.
+
+    User code execs in a dedicated globals_dict tagged ``__name__='__main__'``,
+    but ``sys.modules['__main__']`` is the payload's own module — so a model that
+    references sibling models (``list[PageItem]``) can't resolve them by module
+    name and schema generation raises "not fully defined". Rebuilding with the
+    execution globals as the types namespace makes those siblings resolvable,
+    mirroring how Pyodide/JSPI runs user code directly in ``__main__``.
+    """
+    try:
+        return cls.model_json_schema()
+    except Exception:
+        rebuild = getattr(cls, "model_rebuild", None)
+        if rebuild is None:
+            raise
+        rebuild(force=True, _types_namespace=dict(user_globals or {}))
+        return cls.model_json_schema()
+
+
 def _register_tools(params: dict[str, Any], globals_dict: dict[str, Any]) -> dict[str, Any]:
     tool_names = globals_dict.setdefault("__predict_rlm_tool_names__", set())
     for name in params.get("tools", []):
-        async def _tool(*args: Any, __tool_name: str = name, **kwargs: Any) -> Any:
-            return await _call_host_tool(__tool_name, *args, **kwargs)
+        if name == "predict":
+            async def _predict_tool(*args: Any, _globals: dict[str, Any] = globals_dict, **kwargs: Any) -> Any:
+                signature = args[0] if args else kwargs.get("signature", "")
+                if "pydantic_schemas" not in kwargs:
+                    schemas = _predict_pydantic_schemas(signature, _globals)
+                    if schemas:
+                        kwargs = {**kwargs, "pydantic_schemas": schemas}
+                return await _call_host_tool("predict", *args, **kwargs)
 
-        globals_dict[name] = _tool
+            globals_dict[name] = _predict_tool
+        else:
+            async def _tool(*args: Any, __tool_name: str = name, **kwargs: Any) -> Any:
+                return await _call_host_tool(__tool_name, *args, **kwargs)
+
+            globals_dict[name] = _tool
         tool_names.add(name)
     _discard_kernel()
     return {}
