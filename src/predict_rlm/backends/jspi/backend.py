@@ -820,20 +820,19 @@ class JspiBackend(PythonInterpreter):
             hook(self)
 
     def sync_file_to(self, virtual_path: str, host_path: str) -> None:
-        """Sync a single file from the sandbox MEMFS back to the host."""
+        """Sync a single file from the sandbox MEMFS back to the host.
+
+        Sent as a request (not a fire-and-forget notification) so we block until the
+        Deno side has finished writing the host file. Callers read the host file right
+        after (workspace sync-back recomputes the host manifest, output extraction
+        reads submitted files), and a fire-and-forget write races those reads.
+        """
         self._ensure_deno_process()
-        # sync_file is a notification (no response expected), but we use
-        # _send_request for the JSON-RPC request pattern with a response.
-        # Use direct stdin write like the parent's _sync_files does.
-        sync_msg = json.dumps(
-            {
-                "jsonrpc": "2.0",
-                "method": "sync_file",
-                "params": {"virtual_path": virtual_path, "host_path": host_path},
-            }
+        self._send_request(
+            "sync_file",
+            {"virtual_path": virtual_path, "host_path": host_path},
+            f"syncing {virtual_path} to {host_path}",
         )
-        self.deno_process.stdin.write(sync_msg + "\n")
-        self.deno_process.stdin.flush()
 
     def _strip_code_fences(self, code: str) -> str:
         return strip_code_fences(code)

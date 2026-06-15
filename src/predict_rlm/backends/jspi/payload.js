@@ -920,17 +920,28 @@ while (true) {
     const params = input.params || {};
     const requestId = input.id; // undefined for notifications
 
-    // sync_file — notification (no response)
+    // sync_file — write a sandbox file back to the host. Responds when called as a
+    // request (id present) so the host can block until the write completes; still
+    // supports the notification form (no id) for fire-and-forget callers.
     if (method === "sync_file") {
       try {
         await Deno.writeFile(
           params.host_path || params.virtual_path,
           pyodide.FS.readFile(params.virtual_path),
         );
+        if (requestId) console.log(jsonrpcResult({ ok: true }, requestId));
       } catch (e) {
-        console.error(
-          `sync_file failed for ${params.virtual_path}: ${e.message || e}`,
-        );
+        if (requestId) {
+          console.log(jsonrpcError(
+            JSONRPC_APP_ERRORS.RuntimeError,
+            `sync_file failed: ${e.message || e}`,
+            requestId,
+          ));
+        } else {
+          console.error(
+            `sync_file failed for ${params.virtual_path}: ${e.message || e}`,
+          );
+        }
       }
       continue;
     }
