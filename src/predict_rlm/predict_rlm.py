@@ -66,6 +66,7 @@ from .trace import (
     IterationStep,
     LMUsage,
     RunTrace,
+    TokenUsage,
     _RawPredictCall,
     drain_predict_calls,
     drain_tool_calls,
@@ -78,7 +79,6 @@ from .trace import (
     reset_predict_call_collector,
     reset_tool_call_collector,
     snapshot_lm_history_len,
-    TokenUsage,
     usage_since,
 )
 

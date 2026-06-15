@@ -2964,7 +2964,7 @@ class TestSbxBackendRealSbx:
         required so pydantic exists in the sandbox.
         """
 
-        def predict(signature: str, **kwargs: Any) -> dict:
+        def predict(signature: str, **kwargs) -> dict:
             n = kwargs.get("page_number", 1)
             return {
                 "insight": {
