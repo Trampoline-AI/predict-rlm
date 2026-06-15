@@ -11,7 +11,7 @@ import dspy
 import pytest
 from dspy.primitives.code_interpreter import FinalOutput
 from dspy.primitives.repl_types import REPLEntry, REPLHistory
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, ValidationError
 
 from predict_rlm import PredictRLM, SbxPool
 from predict_rlm.predict_rlm import _models_from_schema
@@ -1302,6 +1302,43 @@ class TestModelsFromSchema:
         instance = Model(items=["a", "b"], counts=[1, 2, 3])
         assert instance.items == ["a", "b"]
         assert instance.counts == [1, 2, 3]
+
+    def test_defaulted_fields_stay_non_nullable(self):
+        """Not-required fields must round-trip as omittable, NOT nullable.
+
+        A field with a default (`mandatory: bool = True`) or a default_factory
+        (`tags: list[str]`) is "not required" in JSON Schema, but it is not
+        nullable. The reconstruction must keep the declared type (so the LM is told
+        the field is e.g. a list, never null) and preserve/restore the default --
+        otherwise the LM emits null and the user's original model rejects it.
+        Regression for the predict() schema round-trip bug.
+        """
+        from typing import List, Optional
+
+        class Item(BaseModel):
+            name: str  # required
+            note: Optional[str] = None  # genuinely nullable
+            mandatory: bool = True  # default value
+            tags: list[str] = Field(default_factory=list)  # default_factory
+
+        Model = _models_from_schema(Item.model_json_schema())["Item"]
+        fields = Model.model_fields
+
+        # Genuinely-nullable field stays Optional; defaulted ones do NOT become Optional.
+        assert fields["note"].annotation == Optional[str]
+        assert fields["mandatory"].annotation is bool
+        assert fields["tags"].annotation == List[str]
+
+        # Defaults are preserved / restored.
+        assert Model(name="x").mandatory is True
+        assert Model(name="x").tags == []
+
+        # The reconstructed model REJECTS null for the non-nullable defaulted fields
+        # (i.e. the LM will not be told null is acceptable).
+        with pytest.raises(ValidationError):
+            Model(name="x", tags=None)
+        with pytest.raises(ValidationError):
+            Model(name="x", mandatory=None)
 
     def test_nested_model_from_schema(self):
         """Nested models with $defs are reconstructed correctly."""

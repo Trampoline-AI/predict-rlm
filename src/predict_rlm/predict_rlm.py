@@ -38,7 +38,7 @@ from dspy.primitives.code_interpreter import CodeInterpreter, CodeInterpreterErr
 from dspy.utils.callback import ACTIVE_CALL_ID
 from dspy.utils.exceptions import AdapterParseError
 from litellm import ContextWindowExceededError
-from pydantic import ConfigDict, ValidationError, create_model
+from pydantic import ConfigDict, Field, ValidationError, create_model
 
 from ._logging import (
     configure_predict_rlm_logging,
@@ -455,6 +455,26 @@ class _ValidatingChatAdapter(_ValidatingOutputAdapterMixin, ChatAdapter):
             )
 
 
+_NO_RECOVERABLE_DEFAULT = object()
+
+
+def _schema_field_default(field_info: dict) -> Any:
+    """Default for a not-required field whose schema carries no explicit ``default``.
+
+    These are almost always ``default_factory`` collection fields (pydantic does not
+    serialize a factory's value into the JSON schema). Return a type-appropriate empty
+    default so the field stays OMITTABLE without becoming NULLABLE. Returns the
+    ``_NO_RECOVERABLE_DEFAULT`` sentinel when no sensible default can be inferred
+    (e.g. a scalar ``default_factory``), so the caller can fall back to a lenient type.
+    """
+    schema_type = field_info.get("type")
+    if schema_type == "array":
+        return Field(default_factory=list)
+    if schema_type == "object":
+        return Field(default_factory=dict)
+    return _NO_RECOVERABLE_DEFAULT
+
+
 def _models_from_schema(schema: dict) -> dict[str, type]:
     """Build Pydantic models from a JSON schema including $defs for nested types.
 
@@ -551,10 +571,30 @@ def _models_from_schema(schema: dict) -> dict[str, type]:
 
         for field_name, field_info in props.items():
             py_type = get_python_type(field_info)
+            # required-ness controls the DEFAULT, not nullability. A field's
+            # nullability is already encoded in its type (get_python_type maps
+            # anyOf-with-null to Optional); "not required" only means "may be omitted
+            # because it has a default", NOT "may be null". Reconstructing every
+            # not-required field as Optional[T]=None (the old behavior) handed the LM
+            # a weaker schema than the user's model -- so the LM emitted null for
+            # defaulted non-Optional fields, and the original model then rejected it.
             if field_name in required:
                 fields[field_name] = (py_type, ...)
+            elif "default" in field_info:
+                # Preserve the real default (e.g. mandatory: bool = True); keep the
+                # declared, possibly non-nullable type.
+                fields[field_name] = (py_type, field_info["default"])
             else:
-                fields[field_name] = (Optional[py_type], None)  # type: ignore[valid-type]
+                # Not required, no explicit default in the schema (default_factory).
+                # Provide a type-appropriate empty default so the field stays
+                # omittable without advertising null to the LM.
+                default = _schema_field_default(field_info)
+                if default is _NO_RECOVERABLE_DEFAULT:
+                    # Can't recover the default (e.g. a scalar default_factory); fall
+                    # back to the lenient Optional[T]=None so we don't over-constrain.
+                    fields[field_name] = (Optional[py_type], None)  # type: ignore[valid-type]
+                else:
+                    fields[field_name] = (py_type, default)
 
         built_models[name] = create_model(name, **fields)  # type: ignore[call-overload]
 
