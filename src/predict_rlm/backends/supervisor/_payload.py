@@ -424,6 +424,44 @@ def _model_json_schema(cls: Any, user_globals: dict[str, Any] | None) -> Any:
         return cls.model_json_schema()
 
 
+def _reconstruct_output_types(
+    signature: Any, result: Any, user_globals: dict[str, Any]
+) -> Any:
+    """Revive custom-model output fields of a predict() result into real instances.
+
+    The host serializes Pydantic outputs to dicts for JSON transport, so a field
+    declared ``-> finding: PageFinding`` arrives as a plain dict and ``finding.page``
+    would raise ``'dict' object has no attribute 'page'``. For each model-typed output
+    field this validates the dict back into the user's class (an ``extra='allow'``
+    subclass, matching the JSPI/Deno backend so fields the LM adds beyond the schema
+    survive). Validation errors propagate -- a malformed output is a real problem the
+    caller should see, not something to silently paper over.
+    """
+    if not isinstance(result, _PredictResult):
+        return result
+    outputs_part = signature.split("->", 1)[1] if isinstance(signature, str) and "->" in signature else ""
+    for match in re.finditer(
+        r"(\w+)\s*:\s*((?:Optional\[|list\[|List\[)*)\s*([A-Z][A-Za-z0-9_]*)", outputs_part
+    ):
+        field_name, wrapper, type_name = match.group(1), match.group(2) or "", match.group(3)
+        if type_name in _PREDICT_SIGNATURE_BUILTIN_TYPES or field_name not in result:
+            continue
+        value = result[field_name]
+        if value is None:
+            continue
+        cls = user_globals.get(type_name)
+        if cls is None or not hasattr(cls, "model_validate") or not hasattr(cls, "model_fields"):
+            continue
+        from pydantic import ConfigDict as _ConfigDict
+
+        cls = type(cls.__name__, (cls,), {"model_config": _ConfigDict(extra="allow")})
+        if "list[" in wrapper.lower() and isinstance(value, list):
+            result[field_name] = [cls.model_validate(item) for item in value]
+        elif isinstance(value, dict):
+            result[field_name] = cls.model_validate(value)
+    return result
+
+
 def _register_tools(params: dict[str, Any], globals_dict: dict[str, Any]) -> dict[str, Any]:
     tool_names = globals_dict.setdefault("__predict_rlm_tool_names__", set())
     for name in params.get("tools", []):
@@ -434,7 +472,8 @@ def _register_tools(params: dict[str, Any], globals_dict: dict[str, Any]) -> dic
                     schemas = _predict_pydantic_schemas(signature, _globals)
                     if schemas:
                         kwargs = {**kwargs, "pydantic_schemas": schemas}
-                return await _call_host_tool("predict", *args, **kwargs)
+                result = await _call_host_tool("predict", *args, **kwargs)
+                return _reconstruct_output_types(signature, result, _globals)
 
             globals_dict[name] = _predict_tool
         else:

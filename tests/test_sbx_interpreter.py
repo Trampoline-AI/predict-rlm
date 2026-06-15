@@ -25,7 +25,7 @@ import pytest
 from dspy.primitives.code_interpreter import CodeInterpreterError, FinalOutput
 
 from predict_rlm.backends import DEFAULT_SBX_TEMPLATE, SbxBackend, SbxConfig, SbxPool
-from predict_rlm.backends.base import SandboxFatalError
+from predict_rlm.backends.base import SandboxExecutionError, SandboxFatalError
 from predict_rlm.backends.supervisor._payload import _pickleable_globals_snapshot
 from predict_rlm.files import SyncedFile
 
@@ -1717,7 +1717,7 @@ class TestSbxBackendLocalWebSocketRunner:
 
         def predict(signature: str, **kwargs) -> dict:
             received["schemas"] = kwargs.get("pydantic_schemas")
-            return {"analysis": {}}
+            return {"analysis": {"page_number": 1, "items": [{"name": "x"}]}}
 
         interpreter = self.make_interpreter(tmp_path, tools={"predict": predict})
         try:
@@ -1742,6 +1742,185 @@ class TestSbxBackendLocalWebSocketRunner:
         assert schemas is not None and "PageAnalysis" in schemas
         # nested sibling model must be present in the forwarded schema's $defs
         assert "PageItem" in json.dumps(schemas["PageAnalysis"])
+
+    def test_predict_result_supports_attribute_and_subscript_access(self, tmp_path: Path):
+        """predict() return must work as ``result.page`` and ``result["page"]``.
+
+        The host returns a plain dict over the wire, which only supports
+        subscript -- ``result.page`` would raise ``'dict' object has no
+        attribute 'page'``. The sandbox wraps it in a Prediction-like object so
+        both forms work, matching the core instructions and the JSPI backend.
+        """
+
+        def predict(signature: str, **kwargs) -> dict:
+            return {"page": "p1", "items": ["a", "b"]}
+
+        interpreter = self.make_interpreter(tmp_path, tools={"predict": predict})
+        try:
+            output = interpreter.execute(
+                "r = await predict('doc: str -> page: str, items: list[str]', doc='hi')\n"
+                "print(r.page, r['page'], r.items, r['items'])"
+            )
+        finally:
+            interpreter.shutdown()
+
+        assert output == "p1 p1 ['a', 'b'] ['a', 'b']\n"
+
+    def test_predict_result_reconstructs_nested_pydantic_instances(self, tmp_path: Path):
+        """Custom output types arrive as dicts and are revived to instances.
+
+        The host serializes model instances to dicts for transport. The sandbox
+        rebuilds them so nested ``item.name`` attribute access works, matching
+        the JSPI backend and the core instructions for Pydantic return values.
+        """
+
+        def predict(signature: str, **kwargs) -> dict:
+            return {"analysis": {"page_number": 2, "items": [{"name": "x"}, {"name": "y"}]}}
+
+        interpreter = self.make_interpreter(tmp_path, tools={"predict": predict})
+        try:
+            output = interpreter.execute(
+                "from pydantic import BaseModel, Field\n"
+                "class PageItem(BaseModel):\n"
+                "    name: str\n"
+                "class PageAnalysis(BaseModel):\n"
+                "    page_number: int\n"
+                "    items: list[PageItem] = Field(default_factory=list)\n"
+                "r = await predict('doc: str -> analysis: PageAnalysis', doc='hi')\n"
+                "print(r.analysis.page_number, [i.name for i in r.analysis.items])"
+            )
+        finally:
+            interpreter.shutdown()
+
+        assert output == "2 ['x', 'y']\n"
+
+    def test_predict_reconstruction_preserves_extra_lm_fields(self, tmp_path: Path):
+        """Deno parity: fields the LM returns beyond the declared model survive.
+
+        Reconstruction validates into an ``extra='allow'`` subclass (matching the
+        JSPI/Deno backend) so an unexpected field like ``bonus`` is kept and
+        attribute-accessible rather than dropped. With a plain (extra='ignore')
+        model ``r.item.bonus`` would raise AttributeError.
+        """
+
+        def predict(signature: str, **kwargs) -> dict:
+            return {"item": {"name": "x", "bonus": "kept"}}
+
+        interpreter = self.make_interpreter(tmp_path, tools={"predict": predict})
+        try:
+            output = interpreter.execute(
+                "from pydantic import BaseModel\n"
+                "class Item(BaseModel):\n"
+                "    name: str\n"
+                "r = await predict('doc: str -> item: Item', doc='hi')\n"
+                "print(type(r.item).__name__, r.item.name, r.item.bonus)"
+            )
+        finally:
+            interpreter.shutdown()
+
+        assert output == "Item x kept\n"
+
+    def test_predict_reconstruction_raises_on_invalid_model_output(self, tmp_path: Path):
+        """A predict() output the declared model rejects must surface loudly.
+
+        When the host returns data that can't satisfy the model (here: missing the
+        required ``name``), reconstruction lets the validation error propagate so the
+        caller sees the real cause -- rather than silently leaking a dict and failing
+        a step later on attribute access with a misleading ``'dict' object has no
+        attribute ...``.
+        """
+
+        def predict(signature: str, **kwargs) -> dict:
+            return {"item": {}}  # missing required 'name'
+
+        interpreter = self.make_interpreter(tmp_path, tools={"predict": predict})
+        try:
+            with pytest.raises(SandboxExecutionError) as excinfo:
+                interpreter.execute(
+                    "from pydantic import BaseModel\n"
+                    "class Item(BaseModel):\n"
+                    "    name: str\n"
+                    "r = await predict('doc: str -> item: Item', doc='hi')\n"
+                    "print(r.item.name)"
+                )
+        finally:
+            interpreter.shutdown()
+
+        message = str(excinfo.value)
+        assert "validation error" in message.lower()
+        assert "'dict' object has no attribute" not in message
+
+    def test_predict_reconstruction_gap_function_local_model_not_resolved(
+        self, tmp_path: Path
+    ):
+        """KNOWN GAP: a predict output model defined inside a function isn't revived.
+
+        Reconstruction resolves the output model from the kernel's module globals only
+        (no call-stack walk). A model defined at REPL top level -- every real example --
+        resolves fine, but one defined INSIDE a function is not in module globals, so
+        the field stays a plain dict and attribute access raises. This is a deliberate,
+        documented limitation kept out of the hot path: if it ever shows up it fails
+        loudly here (not silently), and the fix would be stack-aware resolution at the
+        predict() call site. This test pins the gap so a future change is intentional.
+        """
+
+        def predict(signature: str, **kwargs) -> dict:
+            return {"item": {"name": "x"}}
+
+        interpreter = self.make_interpreter(tmp_path, tools={"predict": predict})
+        try:
+            # Item is function-local -> absent from kernel module globals -> not revived,
+            # so res.item is a plain dict and res.item.name raises.
+            with pytest.raises(SandboxExecutionError) as excinfo:
+                interpreter.execute(
+                    "async def run():\n"
+                    "    from pydantic import BaseModel\n"
+                    "    class Item(BaseModel):\n"
+                    "        name: str\n"
+                    "    res = await predict('doc: str -> item: Item', doc='hi')\n"
+                    "    return res.item.name\n"
+                    "await run()"
+                )
+        finally:
+            interpreter.shutdown()
+
+        assert "'dict' object has no attribute 'name'" in str(excinfo.value)
+
+    def test_predict_reconstructs_single_model_under_gather(self, tmp_path: Path):
+        """Real-world repro: predict() inside a function fanned out via gather().
+
+        Matches the RFP-page pattern: a single ``-> notes: PageRfpNotes`` output,
+        the model defined at REPL top level with Optional + list fields, predict()
+        called inside an async helper, all 38 fanned out with asyncio.gather, then
+        ``res.notes.page`` accessed. Without nested reconstruction this raises
+        ``'dict' object has no attribute 'page'``.
+        """
+
+        def predict(signature: str, **kwargs) -> dict:
+            n = kwargs.get("page_number", 0)
+            return {"notes": {"page": n, "page_type": "cover", "title_or_heading": None, "key_facts": ["a"]}}
+
+        interpreter = self.make_interpreter(tmp_path, tools={"predict": predict})
+        try:
+            output = interpreter.execute(
+                "import asyncio\n"
+                "from pydantic import BaseModel, Field\n"
+                "from typing import Optional\n"
+                "class PageRfpNotes(BaseModel):\n"
+                "    page: int\n"
+                "    page_type: str = Field(description='x')\n"
+                "    title_or_heading: Optional[str] = None\n"
+                "    key_facts: list[str] = Field(default_factory=list)\n"
+                "async def analyze(i):\n"
+                "    res = await predict('page_image: dspy.Image, page_number: int, nav_hint: str -> notes: PageRfpNotes', page_number=i+1, nav_hint='h')\n"
+                "    return res.notes\n"
+                "notes = await asyncio.gather(*[analyze(i) for i in range(38)])\n"
+                "print(len(notes), notes[0].page, notes[0].page_type, type(notes[0]).__name__)"
+            )
+        finally:
+            interpreter.shutdown()
+
+        assert output == "38 1 cover PageRfpNotes\n"
 
     def test_predicts_orphaned_by_gather_failure_do_not_hang_next_execute(
         self, tmp_path: Path
@@ -2744,6 +2923,60 @@ class TestSbxBackendRealSbx:
             interpreter.shutdown()
 
         assert output.strip() == "5"
+
+    def test_real_sbx_predict_reconstructs_pydantic_output_under_gather(self):
+        """End-to-end repro of the RFP-page failure in a real sbx sandbox.
+
+        The host serializes a custom output model to a dict for transport; the
+        sandbox must revive it to a real instance so ``res.insight.page`` works.
+        This runs reconstruction inside the actual sandbox (its own pip-installed
+        pydantic) under asyncio.gather -- the exact path that was returning a bare
+        dict and raising ``'dict' object has no attribute 'page'``. preinstall is
+        required so pydantic exists in the sandbox.
+        """
+
+        def predict(signature: str, **kwargs: Any) -> dict:
+            n = kwargs.get("page_number", 1)
+            return {
+                "insight": {
+                    "page": n,
+                    "title_or_section": "T",
+                    "purpose": "p",
+                    "key_facts": ["a"],
+                    "proposal_requirements": [],
+                }
+            }
+
+        interpreter = SbxBackend(
+            config=SbxConfig(name=f"predict-rlm-test-predict-{os.getpid()}"),
+            tools={"predict": predict},
+            preinstall_packages=True,
+        )
+        try:
+            output = interpreter.execute(
+                "import asyncio\n"
+                "from pydantic import BaseModel\n"
+                "from typing import Optional\n"
+                "class PageInsight(BaseModel):\n"
+                "    page: int\n"
+                "    title_or_section: Optional[str] = None\n"
+                "    purpose: str\n"
+                "    key_facts: list[str] = []\n"
+                "    proposal_requirements: list[str] = []\n"
+                "async def inspect_page(i):\n"
+                "    res = await predict('page: dspy.Image, page_number: int -> insight: PageInsight', page_number=i+1)\n"
+                "    return res.insight\n"
+                "results = await asyncio.gather(*[inspect_page(i) for i in range(9)])\n"
+                # Nested reconstructed values are REAL Pydantic instances: attribute
+                # access (not subscript), isinstance, and model_dump all work.
+                "print(len(results), type(results[0]).__name__, results[0].page,"
+                " isinstance(results[0], PageInsight), results[0].model_dump()['purpose'])",
+                timeout=30,
+            )
+        finally:
+            interpreter.shutdown()
+
+        assert output.strip() == "9 PageInsight 1 True p"
 
     def test_real_sbx_timeout_is_recoverable_and_runner_survives(self):
         interpreter = SbxBackend(
