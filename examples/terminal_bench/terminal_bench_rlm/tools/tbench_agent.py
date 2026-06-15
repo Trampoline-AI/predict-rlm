@@ -114,10 +114,13 @@ _SECRET_PAYLOAD_KEY_PARTS = (
 )
 _REMOTE_CONTROLLER_ENV_KEYS = (
     "CODEX_LM_AUTH_PROFILE",
+    "GEMINI_API_KEY",
+    "GOOGLE_API_KEY",
     "OPENAI_API_KEY",
     "OPENAI_BASE_URL",
     "OPENAI_ORG_ID",
     "OPENAI_ORGANIZATION",
+    "OPENROUTER_API_KEY",
     "PERPLEXITY_API_KEY",
 )
 _SUBMIT_CONFIRMATION_MODE_TERMINAL_BENCH = "terminal_bench"
@@ -185,7 +188,45 @@ def _coerce_float(value: Any) -> float:
     return float(value)
 
 
-def _build_lm(value: Any, reasoning_effort: str | None, service_tier: str | None = None) -> Any:
+def _coerce_optional_mapping(value: Any) -> dict[str, Any] | None:
+    if value is None:
+        return None
+    if isinstance(value, dict):
+        return dict(value)
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return None
+        parsed = json.loads(text)
+        if isinstance(parsed, dict):
+            return parsed
+    raise ValueError("LM extra body must be a JSON object")
+
+
+def _coerce_provider_only(value: Any) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        return [part.strip() for part in value.split(",") if part.strip()]
+    return [str(part).strip() for part in value if str(part).strip()]
+
+
+def _merge_provider_only(
+    extra_body: dict[str, Any] | str | None,
+    provider_only: list[str],
+) -> dict[str, Any] | None:
+    body = _coerce_optional_mapping(extra_body) or {}
+    if provider_only:
+        body["provider"] = {"only": provider_only}
+    return body or None
+
+
+def _build_lm(
+    value: Any,
+    reasoning_effort: str | None,
+    service_tier: str | None = None,
+    extra_body: dict[str, Any] | str | None = None,
+) -> Any:
     if not isinstance(value, str) or reasoning_effort is None:
         return value
     kwargs: dict[str, Any] = {"cache": False}
@@ -193,6 +234,9 @@ def _build_lm(value: Any, reasoning_effort: str | None, service_tier: str | None
         kwargs["reasoning_effort"] = reasoning_effort
     if service_tier:
         kwargs["service_tier"] = service_tier
+    body = _coerce_optional_mapping(extra_body)
+    if body:
+        kwargs["extra_body"] = body
     return dspy.LM(value, **kwargs)
 
 
@@ -478,6 +522,10 @@ class _TerminalBenchRLMBaseAgentMixin:
         sub_lm_reasoning_effort: str | None = None,
         lm_service_tier: str | None = None,
         sub_lm_service_tier: str | None = None,
+        lm_extra_body: dict[str, Any] | str | None = None,
+        sub_lm_extra_body: dict[str, Any] | str | None = None,
+        lm_provider_only: list[str] | str | None = None,
+        sub_lm_provider_only: list[str] | str | None = None,
         exec_timeout: float | str | None = None,
         no_rebuild: bool | None = None,
         phase_log_path: str | Path | None = None,
@@ -504,6 +552,12 @@ class _TerminalBenchRLMBaseAgentMixin:
         self.sub_lm_reasoning_effort = _coerce_optional_text(sub_lm_reasoning_effort)
         self.lm_service_tier = _coerce_optional_text(lm_service_tier)
         self.sub_lm_service_tier = _coerce_optional_text(sub_lm_service_tier)
+        self.lm_provider_only = _coerce_provider_only(lm_provider_only)
+        self.sub_lm_provider_only = _coerce_provider_only(sub_lm_provider_only)
+        self.lm_extra_body = _merge_provider_only(lm_extra_body, self.lm_provider_only)
+        self.sub_lm_extra_body = _merge_provider_only(
+            sub_lm_extra_body, self.sub_lm_provider_only
+        )
         self.phase_log_path = Path(phase_log_path) if phase_log_path is not None else None
         self.task_id = task_id
         self.predict_rlm_kwargs = predict_rlm_kwargs
@@ -549,13 +603,17 @@ class _TerminalBenchRLMBaseAgentMixin:
             rlm_kwargs = dict(self.predict_rlm_kwargs)
             if "lm" in rlm_kwargs:
                 rlm_kwargs["lm"] = _build_lm(
-                    rlm_kwargs["lm"], self.lm_reasoning_effort, self.lm_service_tier
+                    rlm_kwargs["lm"],
+                    self.lm_reasoning_effort,
+                    self.lm_service_tier,
+                    self.lm_extra_body,
                 )
             if "sub_lm" in rlm_kwargs:
                 rlm_kwargs["sub_lm"] = _build_lm(
                     rlm_kwargs["sub_lm"],
                     self.sub_lm_reasoning_effort,
                     self.sub_lm_service_tier,
+                    self.sub_lm_extra_body,
                 )
             rlm_kwargs["interpreter"] = interpreter
             _with_terminal_bench_skill(rlm_kwargs, self.skill_instructions)
@@ -1209,6 +1267,7 @@ class DaytonaRemotePredictRLMAgent(HarborPredictRLMBaseAgent):
             "codex_lm_exclude": list(self.codex_lm_exclude),
             "instruction": instruction,
             "interpreter_kwargs": self.interpreter_kwargs,
+            "lm_extra_body": self.lm_extra_body,
             "lm_reasoning_effort": self.lm_reasoning_effort,
             "lm_service_tier": self.lm_service_tier,
             "logging_dir": f"{self.remote_root}/logs",
@@ -1218,6 +1277,7 @@ class DaytonaRemotePredictRLMAgent(HarborPredictRLMBaseAgent):
             "predict_rlm_kwargs": self.predict_rlm_kwargs,
             "signature": self.signature,
             "skill_instructions": self.skill_instructions,
+            "sub_lm_extra_body": self.sub_lm_extra_body,
             "sub_lm_reasoning_effort": self.sub_lm_reasoning_effort,
             "sub_lm_service_tier": self.sub_lm_service_tier,
         }

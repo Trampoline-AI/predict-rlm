@@ -126,12 +126,14 @@ async def _run_predict_rlm_async(payload: dict[str, Any]) -> str:
                 rlm_kwargs["lm"],
                 payload.get("lm_reasoning_effort"),
                 payload.get("lm_service_tier"),
+                payload.get("lm_extra_body"),
             )
         if "sub_lm" in rlm_kwargs:
             rlm_kwargs["sub_lm"] = _build_lm(
                 rlm_kwargs["sub_lm"],
                 payload.get("sub_lm_reasoning_effort"),
                 payload.get("sub_lm_service_tier"),
+                payload.get("sub_lm_extra_body"),
             )
         rlm_kwargs["interpreter"] = interpreter
         _with_terminal_bench_skill(rlm_kwargs, payload.get("skill_instructions"))
