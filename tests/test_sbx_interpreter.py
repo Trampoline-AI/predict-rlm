@@ -14,6 +14,8 @@ import subprocess
 import sys
 import threading
 import time
+from collections import UserDict
+from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Annotated
@@ -24,6 +26,7 @@ from dspy.primitives.code_interpreter import CodeInterpreterError, FinalOutput
 
 from predict_rlm.backends import DEFAULT_SBX_TEMPLATE, SbxBackend, SbxConfig, SbxPool
 from predict_rlm.backends.base import SandboxFatalError
+from predict_rlm.backends.supervisor._payload import _pickleable_globals_snapshot
 from predict_rlm.files import SyncedFile
 
 PAYLOAD_PATH = Path(__file__).parents[1] / "src" / "predict_rlm" / "backends" / "supervisor" / "_payload.py"
@@ -215,6 +218,85 @@ def runner(tmp_path):
         yield proc
     finally:
         proc.close()
+
+
+class TestPythonRunnerSnapshots:
+    def test_snapshot_skips_native_like_objects_without_pickling(self):
+        class NativeLike:
+            reduce_called = False
+            __module__ = "mujoco._structs"
+
+            def __reduce__(self):
+                type(self).reduce_called = True
+                return int, (1,)
+
+        snapshot = _pickleable_globals_snapshot({"native_model": NativeLike()})
+
+        assert snapshot["globals"] == {}
+        assert snapshot["restored_globals"] == []
+        assert snapshot["lost_globals"] == ["native_model"]
+        assert NativeLike.reduce_called is False
+
+    def test_snapshot_preserves_safe_dataclass_and_mapping_values(self):
+        @dataclass
+        class RunSummary:
+            name: str
+            scores: list[int]
+            output_path: Path
+
+        snapshot = _pickleable_globals_snapshot({
+            "summary": RunSummary("mjcf", [1, 2], Path("/app/model.xml")),
+            "config": UserDict({"threshold": 0.6, "labels": ("fast", "exact")}),
+        })
+
+        assert snapshot["lost_globals"] == []
+        assert snapshot["restored_globals"] == ["config", "summary"]
+        assert snapshot["globals"] == {
+            "summary": {
+                "name": "mjcf",
+                "scores": [1, 2],
+                "output_path": Path("/app/model.xml"),
+            },
+            "config": {"threshold": 0.6, "labels": ("fast", "exact")},
+        }
+
+    def test_snapshot_crosses_runner_queue_after_hard_timeout(self, runner: LocalRunner):
+        runner.request(
+            "execute",
+            {
+                "code": (
+                    "from dataclasses import dataclass\n"
+                    "@dataclass\n"
+                    "class RunSummary:\n"
+                    "    name: str\n"
+                    "    scores: list[int]\n"
+                    "summary = RunSummary('mjcf', [1, 2])\n"
+                    "print('seeded')\n"
+                )
+            },
+        )
+        timeout = runner.request(
+            "execute",
+            {
+                "code": (
+                    "import signal\n"
+                    "signal.signal(signal.SIGINT, signal.SIG_IGN)\n"
+                    "while True:\n"
+                    "    pass\n"
+                ),
+                "execution_timeout_seconds": 0.05,
+                "execution_timeout_interrupt_grace_seconds": 0.01,
+            },
+        )
+        followup = runner.request(
+            "execute",
+            {"code": "print(type(summary).__name__)\nprint(summary['name'])"},
+        )
+
+        assert timeout["result"]["state"]["preserved"] is False
+        assert timeout["result"]["state"]["source"] == "pickle_snapshot"
+        assert "summary" in timeout["result"]["state"]["restored_globals"]
+        assert followup["result"]["output"] == "dict\nmjcf\n"
 
 
 class TestPythonRunnerProtocol:

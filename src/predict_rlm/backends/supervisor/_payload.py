@@ -5,7 +5,9 @@ from __future__ import annotations
 import ast
 import asyncio
 import builtins
+import collections.abc
 import contextlib
+import dataclasses
 import hashlib
 import inspect
 import io
@@ -14,7 +16,6 @@ import math
 import multiprocessing
 import os
 import pathlib
-import pickle
 import queue
 import select
 import shutil
@@ -507,11 +508,95 @@ def _is_user_global(name: str, globals_dict: dict[str, Any]) -> bool:
     return name not in tool_names
 
 
-def _should_exclude_from_pickle_snapshot(value: Any) -> bool:
+_SAFE_SNAPSHOT_SCALAR_TYPES = (type(None), bool, int, float, str, bytes)
+
+
+def _safe_snapshot_value(value: Any, seen: set[int] | None = None) -> tuple[bool, Any]:
+    if isinstance(value, _SAFE_SNAPSHOT_SCALAR_TYPES):
+        return True, value
+    if isinstance(value, pathlib.PurePath):
+        return True, value
     if inspect.ismodule(value) or inspect.isfunction(value) or inspect.isclass(value):
-        return True
-    value_type = type(value)
-    return value_type.__module__ == "__main__" and value_type.__name__ != "type"
+        return False, None
+
+    if seen is None:
+        seen = set()
+    value_id = id(value)
+    if value_id in seen:
+        return False, None
+
+    if dataclasses.is_dataclass(value) and not isinstance(value, type):
+        seen.add(value_id)
+        fields: dict[str, Any] = {}
+        try:
+            dataclass_fields = dataclasses.fields(value)
+        except TypeError:
+            return False, None
+        for field in dataclass_fields:
+            try:
+                field_value = getattr(value, field.name)
+            except Exception:
+                return False, None
+            ok, snapshot = _safe_snapshot_value(field_value, seen)
+            if not ok:
+                return False, None
+            fields[field.name] = snapshot
+        seen.discard(value_id)
+        return True, fields
+
+    if isinstance(value, list):
+        seen.add(value_id)
+        items = []
+        for item in value:
+            ok, snapshot = _safe_snapshot_value(item, seen)
+            if not ok:
+                return False, None
+            items.append(snapshot)
+        seen.discard(value_id)
+        return True, items
+
+    if isinstance(value, tuple):
+        seen.add(value_id)
+        items = []
+        for item in value:
+            ok, snapshot = _safe_snapshot_value(item, seen)
+            if not ok:
+                return False, None
+            items.append(snapshot)
+        seen.discard(value_id)
+        return True, tuple(items)
+
+    if isinstance(value, (set, frozenset)):
+        seen.add(value_id)
+        items = []
+        for item in value:
+            ok, snapshot = _safe_snapshot_value(item, seen)
+            if not ok:
+                return False, None
+            try:
+                hash(snapshot)
+            except TypeError:
+                return False, None
+            items.append(snapshot)
+        seen.discard(value_id)
+        return True, type(value)(items)
+
+    if not isinstance(value, collections.abc.Mapping):
+        return False, None
+    seen.add(value_id)
+    mapping: dict[Any, Any] = {}
+    for key, item in value.items():
+        key_ok, key_snapshot = _safe_snapshot_value(key, seen)
+        item_ok, item_snapshot = _safe_snapshot_value(item, seen)
+        if not key_ok or not item_ok:
+            return False, None
+        try:
+            hash(key_snapshot)
+        except TypeError:
+            return False, None
+        mapping[key_snapshot] = item_snapshot
+    seen.discard(value_id)
+    return True, mapping
 
 
 def _pickleable_globals_snapshot(globals_dict: dict[str, Any]) -> dict[str, Any]:
@@ -520,15 +605,11 @@ def _pickleable_globals_snapshot(globals_dict: dict[str, Any]) -> dict[str, Any]
     for name, value in sorted(globals_dict.items()):
         if not _is_user_global(name, globals_dict):
             continue
-        if _should_exclude_from_pickle_snapshot(value):
+        ok, snapshot = _safe_snapshot_value(value)
+        if not ok:
             lost.append(name)
             continue
-        try:
-            pickle.loads(pickle.dumps(value))
-        except Exception:
-            lost.append(name)
-            continue
-        restored[name] = value
+        restored[name] = snapshot
     return {
         "globals": restored,
         "restored_globals": sorted(restored),

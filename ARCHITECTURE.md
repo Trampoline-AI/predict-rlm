@@ -150,6 +150,14 @@ the protocol endpoint. The persistent kernel process owns successful-iteration
 REPL state. This split lets the supervisor interrupt or restart a stuck kernel
 while keeping the transport alive when possible.
 
+That process boundary is the recovery contract: user code runs in the
+kernel/runner process, and the supervisor is expected to survive kernel exits,
+hard-killed timeouts, and native-code aborts in the runner. A kernel failure is
+returned as an observation with explicit state metadata so the RLM can continue.
+If the supervisor process itself dies, the backend treats that as fatal and
+raises `SandboxFatalError`, because the JSON-RPC endpoint, host-tool bridge,
+and live kernel handle are gone.
+
 ## Direct local Python backend
 
 ```text
@@ -215,14 +223,35 @@ Python error.
 - Successful execute: same live CPython kernel; full globals persist.
 - Cooperative timeout: host sends `SIGINT`; if the kernel returns a structured
   timeout, full live state persists and `state.preserved=true`.
-- Hard timeout or crash: the supervisor kills/restarts the kernel, restores the
-  pre-timeout pickleable globals snapshot, and reports `state.preserved=false`,
-  restored names, and lost globals/imports.
+- Hard timeout or kernel/runner crash: the supervisor kills/restarts the
+  kernel, restores the pre-timeout safe globals snapshot, and reports
+  `state.preserved=false`, restored names, and lost globals/imports. The
+  supervisor should survive this class of failure.
+- Supervisor crash: the backend raises `SandboxFatalError`. This is the native
+  fatal boundary; recovery is only guaranteed below the supervisor, not after
+  the protocol endpoint itself exits.
 
 Snapshot restore is intentionally a downgrade from REPL persistence. It can
-restore simple pickleable values that existed before timed execution, but it
-cannot restore arbitrary live objects such as modules, function definitions,
-open handles, or mutations made during the killed execution.
+restore only values that existed before timed execution and can be copied
+without invoking arbitrary pickle or native-extension hooks. It cannot restore
+arbitrary live objects such as modules, function definitions, classes,
+open handles, imported modules, native-extension objects, or mutations made
+during the killed execution.
+
+The safe snapshot currently preserves:
+
+- scalar values: `None`, `bool`, `int`, `float`, `str`, and `bytes`;
+- `pathlib` paths;
+- plain `list`, `tuple`, `set`, and `frozenset` containers whose contents are
+  also safe;
+- `collections.abc.Mapping` instances, restored as plain `dict` values when
+  all keys and values are safe;
+- dataclass instances, restored as plain `dict` values when all fields are
+  safe.
+
+Everything else is marked lost. In particular, native/extension objects from
+packages such as MuJoCo, Torch, or OpenCV are not pickled or reduced during
+snapshotting; they are recorded under `lost_globals` instead.
 
 ## Shared contracts
 
@@ -232,7 +261,7 @@ Native supervisor backends share:
 - JSON-RPC response shapes for normal output, errors, `SUBMIT`, and timeouts;
 - the persistent-kernel REPL contract;
 - cooperative-interrupt then hard-kill timeout policy;
-- pickle-snapshot fallback metadata.
+- safe-snapshot fallback metadata, including restored and lost globals.
 
 Backend implementations own only substrate-specific operations: starting Deno,
 Docker Sandboxes, local processes, or containers; copying/mounting files;
