@@ -840,6 +840,69 @@ class TestPythonRunnerProtocol:
         assert response["result"]["output"] == "desktop\nyes\n"
 
 
+class TestSbxBackendCreateNaming:
+    """`sbx create` always receives a known `--name`; the name is never scraped
+    from stdout (regression guard for issue #39)."""
+
+    def _run_create(
+        self, tmp_path: Path, *, config: SbxConfig, create_stdout: str
+    ) -> tuple[SbxBackend, list[str]]:
+        backend = SbxBackend(
+            config=config,
+            preinstall_packages=False,
+            _supervisor_command=[sys.executable, "-u", str(PAYLOAD_PATH)],
+            _staging_root=tmp_path / "staging",
+        )
+        captured: dict[str, list[str]] = {}
+
+        def fake_run(cmd, *args, **kwargs):
+            captured["cmd"] = cmd
+            return SimpleNamespace(returncode=0, stdout=create_stdout, stderr="")
+
+        with (
+            patch("predict_rlm.backends.sbx.backend.shutil.which", return_value="/usr/bin/sbx"),
+            patch("predict_rlm.backends.sbx.backend.subprocess.run", side_effect=fake_run),
+            patch.object(SbxBackend, "_prepare_supervisor_script", return_value=tmp_path / "sup.py"),
+            patch.object(SbxBackend, "_apply_network_policy"),
+            patch.object(SbxBackend, "_bootstrap_packages"),
+            patch.object(SbxBackend, "_setup_direct_workspace_aliases_in_sandbox"),
+        ):
+            backend._start_sbx_and_prepare_supervisor()
+        return backend, captured["cmd"]
+
+    def test_generates_name_and_passes_it_to_create(self, tmp_path: Path):
+        backend, cmd = self._run_create(
+            tmp_path, config=SbxConfig(), create_stdout="some-auto-name\n"
+        )
+        assert "--name" in cmd
+        name = cmd[cmd.index("--name") + 1]
+        assert name.startswith("predict-rlm-")
+        assert backend._sandbox_name == name
+
+    def test_uses_explicit_config_name(self, tmp_path: Path):
+        backend, cmd = self._run_create(
+            tmp_path, config=SbxConfig(name="my-box"), create_stdout="my-box\n"
+        )
+        assert cmd[cmd.index("--name") + 1] == "my-box"
+        assert backend._sandbox_name == "my-box"
+
+    def test_ignores_update_banner_in_stdout(self, tmp_path: Path):
+        # The sbx update banner draws a Unicode box; the old code grabbed its
+        # bottom border as the name. The name must come from `--name`, not stdout.
+        banner = (
+            "╭──────────────────────────────╮\n"
+            "│  A new version of sbx is out │\n"
+            "╰──────────────────────────────╯\n"
+        )
+        backend, cmd = self._run_create(
+            tmp_path, config=SbxConfig(), create_stdout=banner
+        )
+        name = cmd[cmd.index("--name") + 1]
+        assert name.startswith("predict-rlm-")
+        assert backend._sandbox_name == name
+        assert "╰" not in backend._sandbox_name
+
+
 class TestSbxBackendLocalRunner:
     def make_interpreter(
         self,

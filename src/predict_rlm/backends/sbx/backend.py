@@ -825,6 +825,7 @@ class SbxBackend(SupervisorClient, ExecutionBackend):
             if self.config.workspace_read_only:
                 primary_workspace = f"{primary_workspace}:ro"
             direct_workspaces = self._direct_workspace_args()
+            sandbox_name = self.config.name or f"predict-rlm-{uuid.uuid4().hex[:12]}"
             create_cmd = [
                 "sbx",
                 "create",
@@ -832,9 +833,9 @@ class SbxBackend(SupervisorClient, ExecutionBackend):
                 primary_workspace,
                 *self.config.extra_workspaces,
                 *direct_workspaces,
+                "--name",
+                sandbox_name,
             ]
-            if self.config.name:
-                create_cmd.extend(["--name", self.config.name])
             for flag, value in (
                 ("--cpus", self.config.cpus),
                 ("--memory", self.config.memory),
@@ -868,7 +869,7 @@ class SbxBackend(SupervisorClient, ExecutionBackend):
                 )
                 raise SandboxFatalError(f"Failed to create sbx sandbox: {exc}") from exc
 
-            self._sandbox_name = self.config.name or self._parse_sandbox_name(created.stdout)
+            self._sandbox_name = sandbox_name
             self._log_lifecycle(
                 "sbx.create.ok",
                 duration_ms=ms_since(create_start),
@@ -973,12 +974,6 @@ class SbxBackend(SupervisorClient, ExecutionBackend):
         shutil.copy2(SUPERVISOR_PAYLOAD_SOURCE_PATH, supervisor_path)
         self._prepared_supervisor_path = supervisor_path
         return supervisor_path
-
-    def _parse_sandbox_name(self, stdout: str) -> str:
-        for token in reversed(stdout.replace("\n", " ").split()):
-            if token.strip():
-                return token.strip()
-        raise SandboxFatalError("Could not determine created sbx sandbox name")
 
     def _apply_network_policy(self) -> None:
         domains = list(DEFAULT_PACKAGE_DOMAINS)
