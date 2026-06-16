@@ -154,11 +154,18 @@ class SbxBackend(SupervisorClient, ExecutionBackend):
         self.on_runtime_hook_event = on_runtime_hook_event
         self._host_workspace = Path.cwd()
         self._owns_staging_root = _staging_root is None
-        self._staging_root = (
-            Path(_staging_root)
-            if _staging_root
-            else (self._host_workspace / ".predict_rlm_sbx" / uuid.uuid4().hex)
-        )
+        if _staging_root is not None:
+            self._staging_root = Path(_staging_root)
+        elif self.config.reuse and self.config.name:
+            # Deterministic staging root tied to the sandbox identity so the
+            # persisted container's bind mounts line up across sessions (#41).
+            self._staging_root = (
+                self._host_workspace / ".predict_rlm_sbx" / self.config.name
+            )
+        else:
+            self._staging_root = (
+                self._host_workspace / ".predict_rlm_sbx" / uuid.uuid4().hex
+            )
         self._staging_root.mkdir(parents=True, exist_ok=True)
         if self._owns_staging_root and not self.config.persist:
             _owned_staging_roots_pending_cleanup.add(str(self._staging_root))
@@ -542,6 +549,21 @@ class SbxBackend(SupervisorClient, ExecutionBackend):
                     text=True,
                 )
                 self._log_lifecycle("sbx.shutdown.rm")
+        elif (
+            self._supervisor_command is None
+            and self._sandbox_name
+            and self.config.reuse
+            and self.config.stop_on_shutdown
+        ):
+            # Persisted sandbox: leave the container intact but free CPU/RAM by
+            # stopping it (slower reattach next session). Never `sbx rm` (#41).
+            subprocess.run(
+                ["sbx", "stop", self._sandbox_name],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self._log_lifecycle("sbx.shutdown.stop")
         self._cleanup_direct_workspace_aliases_host_side()
         self._cleanup_staging_root()
         self._log_lifecycle("sbx.shutdown.complete")
@@ -555,6 +577,36 @@ class SbxBackend(SupervisorClient, ExecutionBackend):
             self._staging_root.parent.rmdir()
         except OSError:
             pass
+
+    def destroy(self) -> None:
+        """Force-remove the persisted sandbox and delete its staging root (#41).
+
+        Unlike :meth:`shutdown` (which, under ``reuse=True``, leaves the
+        container alive), ``destroy`` tears everything down so a subsequent
+        ``prewarm()`` does a clean create.
+        """
+        self._log_lifecycle("sbx.destroy.start")
+        if not self._shutdown:
+            with contextlib.suppress(Exception):
+                self.shutdown()
+        if self._sandbox_name:
+            self.remove(self._sandbox_name)
+        _owned_staging_roots_pending_cleanup.discard(str(self._staging_root))
+        shutil.rmtree(self._staging_root, ignore_errors=True)
+        with contextlib.suppress(OSError):
+            self._staging_root.parent.rmdir()
+        self._sandbox_name = None
+        self._log_lifecycle("sbx.destroy.complete")
+
+    @classmethod
+    def remove(cls, name: str) -> None:
+        """Force-remove a persisted sandbox by name (no staging-root cleanup)."""
+        subprocess.run(
+            ["sbx", "rm", "--force", name],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
 
     def _ensure_process(self) -> None:
         if self._uses_websocket_transport():
@@ -818,71 +870,166 @@ class SbxBackend(SupervisorClient, ExecutionBackend):
                 "Install it with `brew install docker/tap/sbx` and run `sbx login`."
             )
 
-        if self._sandbox_name is None:
-            supervisor_path = self._prepare_supervisor_script()
+        if self._sandbox_name is not None:
+            return self._prepared_supervisor_path or self._prepare_supervisor_script()
 
-            primary_workspace = str(self._staging_root)
-            if self.config.workspace_read_only:
-                primary_workspace = f"{primary_workspace}:ro"
-            direct_workspaces = self._direct_workspace_args()
-            sandbox_name = self.config.name or f"predict-rlm-{uuid.uuid4().hex[:12]}"
-            create_cmd = [
-                "sbx",
-                "create",
-                "shell",
-                primary_workspace,
-                *self.config.extra_workspaces,
-                *direct_workspaces,
-                "--name",
-                sandbox_name,
-            ]
-            for flag, value in (
-                ("--cpus", self.config.cpus),
-                ("--memory", self.config.memory),
-                ("--template", self.config.template),
-                ("--kit", self.config.kit),
-                ("--branch", self.config.branch),
-            ):
-                if value is not None:
-                    create_cmd.extend([flag, str(value)])
-            create_start = time.perf_counter()
-            self._log_lifecycle(
-                "sbx.create.start",
-                create_timeout=self.config.create_timeout,
-                workspace_read_only=self.config.workspace_read_only,
-                extra_workspaces=len(self.config.extra_workspaces),
-            )
-            try:
-                created = subprocess.run(
-                    create_cmd,
-                    check=True,
-                    capture_output=True,
-                    text=True,
-                    timeout=self.config.create_timeout,
-                )
-            except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
-                self._log_lifecycle(
-                    "sbx.create.error",
-                    duration_ms=ms_since(create_start),
-                    error_type=type(exc).__name__,
-                    status="error",
-                )
-                raise SandboxFatalError(f"Failed to create sbx sandbox: {exc}") from exc
+        supervisor_path = self._prepare_supervisor_script()
 
-            self._sandbox_name = sandbox_name
-            self._log_lifecycle(
-                "sbx.create.ok",
-                duration_ms=ms_since(create_start),
-                stdout_chars=len(created.stdout or ""),
-                stderr_chars=len(created.stderr or ""),
-            )
-            self._apply_network_policy()
-            self._bootstrap_packages()
-            self._setup_direct_workspace_aliases_in_sandbox()
-        else:
-            supervisor_path = self._prepared_supervisor_path or self._prepare_supervisor_script()
+        if self.config.reuse and self._try_reattach_named_sandbox():
+            return supervisor_path
 
+        self._create_and_bootstrap_sandbox()
         return supervisor_path
+
+    def _create_and_bootstrap_sandbox(self) -> None:
+        primary_workspace = str(self._staging_root)
+        if self.config.workspace_read_only:
+            primary_workspace = f"{primary_workspace}:ro"
+        direct_workspaces = self._direct_workspace_args()
+        sandbox_name = self.config.name or f"predict-rlm-{uuid.uuid4().hex[:12]}"
+        create_cmd = [
+            "sbx",
+            "create",
+            "shell",
+            primary_workspace,
+            *self.config.extra_workspaces,
+            *direct_workspaces,
+            "--name",
+            sandbox_name,
+        ]
+        for flag, value in (
+            ("--cpus", self.config.cpus),
+            ("--memory", self.config.memory),
+            ("--template", self.config.template),
+            ("--kit", self.config.kit),
+            ("--branch", self.config.branch),
+        ):
+            if value is not None:
+                create_cmd.extend([flag, str(value)])
+        create_start = time.perf_counter()
+        self._log_lifecycle(
+            "sbx.create.start",
+            create_timeout=self.config.create_timeout,
+            workspace_read_only=self.config.workspace_read_only,
+            extra_workspaces=len(self.config.extra_workspaces),
+        )
+        try:
+            created = subprocess.run(
+                create_cmd,
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=self.config.create_timeout,
+            )
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
+            self._log_lifecycle(
+                "sbx.create.error",
+                duration_ms=ms_since(create_start),
+                error_type=type(exc).__name__,
+                status="error",
+            )
+            raise SandboxFatalError(f"Failed to create sbx sandbox: {exc}") from exc
+
+        self._sandbox_name = sandbox_name
+        self._log_lifecycle(
+            "sbx.create.ok",
+            duration_ms=ms_since(create_start),
+            stdout_chars=len(created.stdout or ""),
+            stderr_chars=len(created.stderr or ""),
+        )
+        self._apply_network_policy()
+        self._bootstrap_packages()
+        self._setup_direct_workspace_aliases_in_sandbox()
+
+    def _probe_sandbox_state(self, name: str) -> str:
+        """Resolve a named sandbox to ``running`` / ``stopped`` / ``missing``."""
+        result = subprocess.run(
+            ["sbx", "ls"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=self.config.exec_timeout,
+        )
+        if result.returncode != 0:
+            return "missing"
+        for line in result.stdout.splitlines():
+            fields = line.split()
+            if not fields or fields[0] != name:
+                continue
+            rest = " ".join(fields[1:]).lower()
+            if "stop" in rest or "exit" in rest:
+                return "stopped"
+            return "running"
+        return "missing"
+
+    def _sbx_sandbox_healthy(self, name: str) -> bool:
+        """Cheap liveness probe: a trivial in-container command must succeed."""
+        result = subprocess.run(
+            ["sbx", "exec", name, "true"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=self.config.exec_timeout,
+        )
+        return result.returncode == 0
+
+    def _try_reattach_named_sandbox(self) -> bool:
+        """Attempt to reattach to a persisted named sandbox (#41).
+
+        Returns ``True`` if reattached (caller skips create+bootstrap), ``False``
+        if the caller should fall through to a clean create. Missing, stopped,
+        and unhealthy containers self-heal: stopped is started; unhealthy is
+        force-removed so the caller recreates.
+        """
+        name = self.config.name
+        assert name is not None
+        self._log_lifecycle("sbx.reattach.start", sandbox_name=name)
+        state = self._probe_sandbox_state(name)
+
+        if state == "missing":
+            self._log_lifecycle("sbx.reattach.miss", sandbox_name=name)
+            return False
+
+        if state == "stopped":
+            start_result = subprocess.run(
+                ["sbx", "start", name],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=self.config.create_timeout,
+            )
+            if start_result.returncode != 0:
+                self._log_lifecycle(
+                    "sbx.reattach.unhealthy.recreate",
+                    sandbox_name=name,
+                    reason="start_failed",
+                )
+                self._force_remove_sandbox(name)
+                return False
+
+        if not self._sbx_sandbox_healthy(name):
+            self._log_lifecycle(
+                "sbx.reattach.unhealthy.recreate",
+                sandbox_name=name,
+                reason="health_check_failed",
+            )
+            self._force_remove_sandbox(name)
+            return False
+
+        # Reattach: skip create + network policy + bootstrap; only re-assert the
+        # workspace aliases idempotently (alias script no-ops on a match).
+        self._sandbox_name = name
+        self._setup_direct_workspace_aliases_in_sandbox()
+        self._log_lifecycle("sbx.reattach.ok", sandbox_name=name)
+        return True
+
+    def _force_remove_sandbox(self, name: str) -> None:
+        subprocess.run(
+            ["sbx", "rm", "--force", name],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
 
     def _direct_workspace_args(self) -> list[str]:
         seen = {str(self._staging_root)}
