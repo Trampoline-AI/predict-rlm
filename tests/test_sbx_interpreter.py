@@ -3252,3 +3252,408 @@ class TestSbxBackendRealSbx:
             assert_predict_rlm_recovers_after_user_exceptions_and_tools_still_work(pool)
         finally:
             pool.shutdown()
+
+
+class TestSbxBackendReattachConfig:
+    """Config surface for reusable/persistent sandboxes (issue #41)."""
+
+    def test_reuse_requires_name(self):
+        with pytest.raises(Exception):
+            SbxConfig(reuse=True)
+
+    def test_reuse_implies_persist_and_no_remove(self):
+        config = SbxConfig(name="hot-box", reuse=True)
+        assert config.reuse is True
+        assert config.persist is True
+        assert config.remove_on_shutdown is False
+
+    def test_reuse_false_is_unchanged_default(self):
+        config = SbxConfig()
+        assert config.reuse is False
+        assert config.persist is False
+        assert config.remove_on_shutdown is True
+        assert config.stop_on_shutdown is False
+
+
+class TestSbxBackendReattachStagingRoot:
+    """Deterministic staging root tied to the sandbox name (issue #41)."""
+
+    def test_reuse_staging_root_is_deterministic_from_name(self, tmp_path: Path):
+        with patch(
+            "predict_rlm.backends.sbx.backend.Path.cwd", return_value=tmp_path
+        ):
+            backend_a = SbxBackend(config=SbxConfig(name="hot-box", reuse=True))
+            backend_b = SbxBackend(config=SbxConfig(name="hot-box", reuse=True))
+        assert backend_a._staging_root == backend_b._staging_root
+        assert backend_a._staging_root.name == "hot-box"
+
+    def test_reuse_staging_root_not_marked_for_cleanup(self, tmp_path: Path):
+        from predict_rlm.backends.sbx import backend as backend_mod
+
+        with patch(
+            "predict_rlm.backends.sbx.backend.Path.cwd", return_value=tmp_path
+        ):
+            backend = SbxBackend(config=SbxConfig(name="hot-box", reuse=True))
+        assert (
+            str(backend._staging_root)
+            not in backend_mod._owned_staging_roots_pending_cleanup
+        )
+
+    def test_ephemeral_staging_root_is_unique_uuid(self, tmp_path: Path):
+        with patch(
+            "predict_rlm.backends.sbx.backend.Path.cwd", return_value=tmp_path
+        ):
+            backend_a = SbxBackend(config=SbxConfig())
+            backend_b = SbxBackend(config=SbxConfig())
+        assert backend_a._staging_root != backend_b._staging_root
+
+
+def _reattach_backend(tmp_path: Path, *, name: str = "hot-box") -> SbxBackend:
+    return SbxBackend(
+        config=SbxConfig(name=name, reuse=True),
+        preinstall_packages=False,
+        _staging_root=tmp_path / "staging",
+    )
+
+
+class TestSbxBackendReattachDetection:
+    """3-way reattach resolution: running / stopped / missing (issue #41)."""
+
+    def _patches(self, backend: SbxBackend, *, ls_output: str):
+        runs: list[list[str]] = []
+
+        def fake_run(cmd, *args, **kwargs):
+            runs.append(list(cmd))
+            if cmd[:2] == ["sbx", "ls"]:
+                return SimpleNamespace(returncode=0, stdout=ls_output, stderr="")
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        cm = [
+            patch(
+                "predict_rlm.backends.sbx.backend.shutil.which",
+                return_value="/usr/bin/sbx",
+            ),
+            patch(
+                "predict_rlm.backends.sbx.backend.subprocess.run",
+                side_effect=fake_run,
+            ),
+            patch.object(
+                SbxBackend, "_prepare_supervisor_script", return_value=Path("/sup.py")
+            ),
+            patch.object(SbxBackend, "_apply_network_policy"),
+            patch.object(SbxBackend, "_bootstrap_packages"),
+            patch.object(SbxBackend, "_setup_direct_workspace_aliases_in_sandbox"),
+            patch.object(SbxBackend, "_sbx_sandbox_healthy", return_value=True),
+        ]
+        return runs, cm
+
+    def test_running_named_sandbox_reattaches_without_create_or_bootstrap(
+        self, tmp_path: Path
+    ):
+        backend = _reattach_backend(tmp_path)
+        runs, cms = self._patches(backend, ls_output="hot-box  running\n")
+        with (
+            cms[0],
+            cms[1],
+            cms[2],
+            patch.object(SbxBackend, "_apply_network_policy") as net,
+            patch.object(SbxBackend, "_bootstrap_packages") as boot,
+            patch.object(SbxBackend, "_setup_direct_workspace_aliases_in_sandbox"),
+            patch.object(SbxBackend, "_sbx_sandbox_healthy", return_value=True),
+        ):
+            backend._start_sbx_and_prepare_supervisor()
+        assert backend._sandbox_name == "hot-box"
+        # No create command was issued.
+        assert not any(r[:2] == ["sbx", "create"] for r in runs)
+        net.assert_not_called()
+        boot.assert_not_called()
+
+    def test_stopped_named_sandbox_is_started_then_reattaches(self, tmp_path: Path):
+        backend = _reattach_backend(tmp_path)
+        runs, cms = self._patches(backend, ls_output="hot-box  stopped\n")
+        with (
+            cms[0],
+            cms[1],
+            cms[2],
+            patch.object(SbxBackend, "_apply_network_policy") as net,
+            patch.object(SbxBackend, "_bootstrap_packages") as boot,
+            patch.object(SbxBackend, "_setup_direct_workspace_aliases_in_sandbox"),
+            patch.object(SbxBackend, "_sbx_sandbox_healthy", return_value=True),
+        ):
+            backend._start_sbx_and_prepare_supervisor()
+        assert backend._sandbox_name == "hot-box"
+        assert any(
+            r[:2] == ["sbx", "start"] and "hot-box" in r for r in runs
+        ), runs
+        assert not any(r[:2] == ["sbx", "create"] for r in runs)
+        net.assert_not_called()
+        boot.assert_not_called()
+
+    def test_missing_named_sandbox_falls_through_to_create(self, tmp_path: Path):
+        backend = _reattach_backend(tmp_path)
+        runs, cms = self._patches(backend, ls_output="other-box  running\n")
+        with (
+            cms[0],
+            cms[1],
+            cms[2],
+            patch.object(SbxBackend, "_apply_network_policy") as net,
+            patch.object(SbxBackend, "_bootstrap_packages") as boot,
+            patch.object(SbxBackend, "_setup_direct_workspace_aliases_in_sandbox"),
+            patch.object(SbxBackend, "_sbx_sandbox_healthy", return_value=True),
+        ):
+            backend._start_sbx_and_prepare_supervisor()
+        assert backend._sandbox_name == "hot-box"
+        assert any(r[:2] == ["sbx", "create"] for r in runs), runs
+        net.assert_called_once()
+        boot.assert_called_once()
+
+    def test_running_but_unhealthy_recreates(self, tmp_path: Path):
+        backend = _reattach_backend(tmp_path)
+        runs, _ = self._patches(backend, ls_output="hot-box  running\n")
+
+        def fake_run(cmd, *args, **kwargs):
+            runs.append(list(cmd))
+            if cmd[:2] == ["sbx", "ls"]:
+                return SimpleNamespace(
+                    returncode=0, stdout="hot-box  running\n", stderr=""
+                )
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        runs.clear()
+        with (
+            patch(
+                "predict_rlm.backends.sbx.backend.shutil.which",
+                return_value="/usr/bin/sbx",
+            ),
+            patch(
+                "predict_rlm.backends.sbx.backend.subprocess.run",
+                side_effect=fake_run,
+            ),
+            patch.object(
+                SbxBackend, "_prepare_supervisor_script", return_value=Path("/sup.py")
+            ),
+            patch.object(SbxBackend, "_apply_network_policy") as net,
+            patch.object(SbxBackend, "_bootstrap_packages") as boot,
+            patch.object(SbxBackend, "_setup_direct_workspace_aliases_in_sandbox"),
+            patch.object(SbxBackend, "_sbx_sandbox_healthy", return_value=False),
+        ):
+            backend._start_sbx_and_prepare_supervisor()
+        # Unhealthy -> force-remove + recreate + bootstrap.
+        assert any(
+            r[:2] == ["sbx", "rm"] and "hot-box" in r for r in runs
+        ), runs
+        assert any(r[:2] == ["sbx", "create"] for r in runs), runs
+        net.assert_called_once()
+        boot.assert_called_once()
+
+
+class TestSbxBackendReattachShutdown:
+    """Shutdown under reuse must not remove the sandbox or staging root."""
+
+    def test_reuse_shutdown_does_not_rm_or_delete_staging(self, tmp_path: Path):
+        backend = _reattach_backend(tmp_path)
+        backend._sandbox_name = "hot-box"
+        staging = backend._staging_root
+        assert staging.exists()
+        runs: list[list[str]] = []
+
+        def fake_run(cmd, *args, **kwargs):
+            runs.append(list(cmd))
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        with patch(
+            "predict_rlm.backends.sbx.backend.subprocess.run", side_effect=fake_run
+        ):
+            backend.shutdown()
+        assert not any(r[:2] == ["sbx", "rm"] for r in runs), runs
+        assert staging.exists()
+
+    def test_reuse_stop_on_shutdown_stops_container(self, tmp_path: Path):
+        backend = SbxBackend(
+            config=SbxConfig(name="hot-box", reuse=True, stop_on_shutdown=True),
+            preinstall_packages=False,
+            _staging_root=tmp_path / "staging",
+        )
+        backend._sandbox_name = "hot-box"
+        runs: list[list[str]] = []
+
+        def fake_run(cmd, *args, **kwargs):
+            runs.append(list(cmd))
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        with patch(
+            "predict_rlm.backends.sbx.backend.subprocess.run", side_effect=fake_run
+        ):
+            backend.shutdown()
+        assert any(
+            r[:2] == ["sbx", "stop"] and "hot-box" in r for r in runs
+        ), runs
+        assert not any(r[:2] == ["sbx", "rm"] for r in runs), runs
+
+
+class TestSbxBackendDestroy:
+    """Explicit teardown API (issue #41)."""
+
+    def test_destroy_removes_sandbox_and_staging_root(self, tmp_path: Path):
+        backend = _reattach_backend(tmp_path)
+        backend._sandbox_name = "hot-box"
+        staging = backend._staging_root
+        assert staging.exists()
+        runs: list[list[str]] = []
+
+        def fake_run(cmd, *args, **kwargs):
+            runs.append(list(cmd))
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        with patch(
+            "predict_rlm.backends.sbx.backend.subprocess.run", side_effect=fake_run
+        ):
+            backend.destroy()
+        assert any(
+            r[:3] == ["sbx", "rm", "--force"] and "hot-box" in r for r in runs
+        ), runs
+        assert not staging.exists()
+
+    def test_remove_classmethod_force_removes_named_sandbox(self):
+        runs: list[list[str]] = []
+
+        def fake_run(cmd, *args, **kwargs):
+            runs.append(list(cmd))
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        with patch(
+            "predict_rlm.backends.sbx.backend.subprocess.run", side_effect=fake_run
+        ):
+            SbxBackend.remove("hot-box")
+        assert any(
+            r[:3] == ["sbx", "rm", "--force"] and "hot-box" in r for r in runs
+        ), runs
+
+
+class TestSbxBackendReattachRegression:
+    """`reuse=False` default create path is unchanged (issue #41)."""
+
+    def test_default_path_still_creates_without_ls_probe(self, tmp_path: Path):
+        backend = SbxBackend(
+            config=SbxConfig(),
+            preinstall_packages=False,
+            _staging_root=tmp_path / "staging",
+        )
+        runs: list[list[str]] = []
+
+        def fake_run(cmd, *args, **kwargs):
+            runs.append(list(cmd))
+            return SimpleNamespace(returncode=0, stdout="auto-name\n", stderr="")
+
+        with (
+            patch(
+                "predict_rlm.backends.sbx.backend.shutil.which",
+                return_value="/usr/bin/sbx",
+            ),
+            patch(
+                "predict_rlm.backends.sbx.backend.subprocess.run", side_effect=fake_run
+            ),
+            patch.object(
+                SbxBackend, "_prepare_supervisor_script", return_value=Path("/sup.py")
+            ),
+            patch.object(SbxBackend, "_apply_network_policy") as net,
+            patch.object(SbxBackend, "_bootstrap_packages") as boot,
+            patch.object(SbxBackend, "_setup_direct_workspace_aliases_in_sandbox"),
+        ):
+            backend._start_sbx_and_prepare_supervisor()
+        # No reattach probe on the default path.
+        assert not any(r[:2] == ["sbx", "ls"] for r in runs), runs
+        assert any(r[:2] == ["sbx", "create"] for r in runs), runs
+        net.assert_called_once()
+        boot.assert_called_once()
+
+
+@pytest.mark.integration
+@pytest.mark.skipif(
+    not _real_sbx_available(),
+    reason="real Docker Sandboxes tests require PREDICT_RLM_RUN_SBX_TESTS=1, sbx CLI, and sbx login",
+)
+class TestSbxBackendRealSbxReattach:
+    """End-to-end persist + reattach lifecycle against a real sbx sandbox (#41).
+
+    The headline test the user asked for: first prewarm creates+bootstraps and
+    writes filesystem state; shutdown leaves the container alive (no `sbx rm`);
+    a second backend reattaches WITHOUT create/bootstrap (asserted via lifecycle
+    telemetry and a spy on `_bootstrap_packages`), the persisted state survives,
+    and finally `destroy()` removes it so a subsequent prewarm does a clean create.
+    """
+
+    def _list_names(self) -> list[str]:
+        result = subprocess.run(
+            ["sbx", "ls"], capture_output=True, text=True, check=False, timeout=15
+        )
+        return [line.split()[0] for line in result.stdout.splitlines() if line.split()]
+
+    def test_persist_reattach_destroy_lifecycle(self):
+        name = f"predict-rlm-reattach-{os.getpid()}"
+        config = SbxConfig(name=name, reuse=True)
+        marker = f"state-{os.getpid()}"
+
+        # First session: create + bootstrap + write persisted /sandbox state.
+        first = SbxBackend(config=config, preinstall_packages=False, debug=True)
+        try:
+            first.prewarm()
+            first.execute(
+                "from pathlib import Path\n"
+                f"Path('/sandbox/persisted.txt').write_text({marker!r})\n"
+                "print('wrote')"
+            )
+            first.shutdown()
+            # Container must still be listed (no `sbx rm` happened).
+            assert name in self._list_names()
+
+            # Second session: reattach. Spy on bootstrap/create to prove they are skipped.
+            second = SbxBackend(config=config, preinstall_packages=False, debug=True)
+            events: list[str] = []
+            orig_log = second._log_lifecycle
+
+            def spy_log(event, **fields):
+                events.append(event)
+                return orig_log(event, **fields)
+
+            with (
+                patch.object(second, "_log_lifecycle", side_effect=spy_log),
+                patch.object(
+                    SbxBackend,
+                    "_bootstrap_packages",
+                    side_effect=AssertionError("bootstrap must not run on reattach"),
+                ),
+            ):
+                second.prewarm()
+                out = second.execute(
+                    "from pathlib import Path\n"
+                    "print(Path('/sandbox/persisted.txt').read_text())"
+                )
+            assert out.strip() == marker
+            assert any(e.startswith("sbx.reattach") for e in events), events
+            assert not any(e == "sbx.create.start" for e in events), events
+            second.shutdown()
+            assert name in self._list_names()
+
+            # destroy() removes the container + staging root.
+            second.destroy()
+            assert name not in self._list_names()
+
+            # A fresh backend now does a clean create (reattach miss).
+            third = SbxBackend(config=config, preinstall_packages=False, debug=True)
+            try:
+                third.prewarm()
+                fresh = third.execute(
+                    "from pathlib import Path\n"
+                    "print(Path('/sandbox/persisted.txt').exists())"
+                )
+                assert fresh.strip() == "False"
+            finally:
+                third.destroy()
+        finally:
+            subprocess.run(
+                ["sbx", "rm", "--force", name],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
