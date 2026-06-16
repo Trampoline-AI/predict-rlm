@@ -1,6 +1,6 @@
 .PHONY: test test-unit test-integration \
         test-core test-sbx test-gepa test-codex-lm \
-        test-integration-jspi test-integration-sbx
+        test-integration-jspi test-integration-sbx test-local
 
 # Extra args after the target are forwarded to pytest, e.g.
 #   make test-core tests/test_predict_rlm.py -k schema
@@ -48,6 +48,12 @@ test-integration-jspi:
 # Real Docker Sandboxes integration tests. Requires the sbx CLI and `sbx login`.
 test-integration-sbx:
 	PREDICT_RLM_RUN_SBX_TESTS=1 uv run --extra sbx pytest -m "integration and sbx" $(ARGS)
+
+# Local-only tests (CI-flaky / timing-sensitive), excluded from every CI job via
+# `and not local`. The per-suite targets above include them by default; this runs
+# only the local-marked set.
+test-local:
+	uv run --all-extras pytest -m "local" $(ARGS)
 
 # Swallow forwarded pytest args (extra make goals) so they don't error as targets.
 %:

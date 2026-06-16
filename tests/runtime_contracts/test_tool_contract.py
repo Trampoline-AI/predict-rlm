@@ -120,7 +120,8 @@ _LARGE_TOOL_REQUEST_ATTEMPTS = 12
 # pipe transport (reader-thread drain racing the inline read), or just CI slowness? If
 # genuine, it's a real bug in DirectPythonBackend, not dead code -- which is why this is
 # skipped-with-a-flag rather than removed. Re-enable once that's answered.
-@pytest.mark.skip(reason="CI-flaky large-message pipe wedge; needs investigation (see comment) -- temporary")
+# local-only: CI-flaky large-message pipe wedge; needs investigation (see comment above) -- temporary
+@pytest.mark.local
 def test_large_host_tool_request_round_trips(runtime: RuntimeHandle) -> None:
     """A large host-tool request must survive the host<->runner channel.
 
