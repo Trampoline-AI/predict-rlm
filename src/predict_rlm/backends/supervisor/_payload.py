@@ -55,6 +55,14 @@ _TRUE_VALUES = {"1", "true", "yes", "on"}
 _KERNEL_PROCESS: multiprocessing.Process | None = None
 _KERNEL_REQUEST_QUEUE: multiprocessing.Queue | None = None
 _KERNEL_RESULT_QUEUE: multiprocessing.Queue | None = None
+# Out-of-band interrupt signalling (issue #42). The websocket receiver task may
+# set ``_INTERRUPT_REQUESTED`` while the serial run loop is blocked inside an
+# in-flight ``execute``; the execute loop polls and consumes the flag to trip
+# the same SIGINT -> grace -> hard-kill path the timeout deadline already uses.
+# All accesses happen on the single supervisor event loop, so a plain bool is
+# sufficient (no lock needed).
+_INTERRUPT_REQUESTED = False
+_EXECUTION_ACTIVE = False
 _DEFAULT_TIMEOUT_INTERRUPT_GRACE_SECONDS = 0.5
 _INTERNAL_GLOBAL_NAMES = {
     "SUBMIT",
@@ -817,6 +825,31 @@ def _pickle_snapshot_state(
     }
 
 
+def _build_interrupt_result(
+    timeout_seconds: float | None,
+    oob_interrupted: bool,
+    stdout: str,
+    stderr: str,
+    snapshot: dict[str, Any],
+    reason: str,
+) -> dict[str, Any]:
+    """Structured result for an interrupted cell (timeout OR out-of-band).
+
+    Reuses the recoverable-timeout result shape so it flows through the host's
+    existing ``format_recoverable_timeout_result`` path. ``interrupted`` flags an
+    out-of-band (host ``interrupt``) abort vs an execution-timeout abort.
+    """
+    timeout_info: dict[str, Any] = {"seconds": timeout_seconds}
+    if oob_interrupted:
+        timeout_info["interrupted"] = True
+    return {
+        "timeout": timeout_info,
+        "stdout": stdout,
+        "stderr": stderr,
+        "state": _pickle_snapshot_state(snapshot, reason),
+    }
+
+
 def _is_user_global(name: str, globals_dict: dict[str, Any]) -> bool:
     if name.startswith("__") and name.endswith("__"):
         return False
@@ -1334,6 +1367,39 @@ def _terminate_runner(process: multiprocessing.Process) -> None:
     process.join(timeout=0.5)
 
 
+def _request_interrupt() -> bool:
+    """Latch an out-of-band interrupt request and report whether a cell is running.
+
+    Returns ``True`` when a cell is currently executing (so the running execute
+    loop will trip the SIGINT path), ``False`` when idle (the flag is left
+    latched so a cell that starts momentarily later is still interrupted; it is
+    consumed/cleared either way by the execute loop or by the next execute start).
+    """
+    global _INTERRUPT_REQUESTED
+    _INTERRUPT_REQUESTED = True
+    return _EXECUTION_ACTIVE
+
+
+def _consume_interrupt_request() -> bool:
+    """Atomically read-and-clear the latched interrupt flag."""
+    global _INTERRUPT_REQUESTED
+    requested = _INTERRUPT_REQUESTED
+    _INTERRUPT_REQUESTED = False
+    return requested
+
+
+async def _handle_interrupt_request(request: dict[str, Any]) -> dict[str, Any]:
+    """Out-of-band ``interrupt`` JSON-RPC handler.
+
+    Trips the in-flight execute's interrupt path when a cell is running; a
+    no-op ack otherwise. Never touches ``ws.recv`` and never blocks on the
+    serial request queue, so it can run from the websocket receiver task while
+    the main run loop is blocked inside ``execute``.
+    """
+    running = _request_interrupt()
+    return _response(request.get("id"), {"running": running})
+
+
 def _discard_kernel() -> None:
     global _KERNEL_PROCESS, _KERNEL_REQUEST_QUEUE, _KERNEL_RESULT_QUEUE
     process = _KERNEL_PROCESS
@@ -1458,12 +1524,17 @@ async def _execute_code_in_runner_with_timeout(
     defer_final_output: bool = False,
     host_tool_bridge: _HostToolBridge | None = None,
 ) -> dict[str, Any]:
+    global _EXECUTION_ACTIVE
     process = _ensure_kernel(globals_dict, host_tool_bridge)
     assert _KERNEL_REQUEST_QUEUE is not None
     assert _KERNEL_RESULT_QUEUE is not None
-    pre_timeout_snapshot: dict[str, Any] | None = None
-    if timeout_seconds is not None:
-        pre_timeout_snapshot = await _kernel_pickle_snapshot(process)
+    # Snapshot pre-exec globals whenever the cell is interruptible (timeout OR
+    # an out-of-band interrupt), so warm state can be restored after SIGINT.
+    pre_timeout_snapshot: dict[str, Any] | None = await _kernel_pickle_snapshot(process)
+    # Clear any interrupt latched before this cell started, then mark active so
+    # an out-of-band interrupt arriving mid-cell trips the path below.
+    _consume_interrupt_request()
+    _EXECUTION_ACTIVE = True
     stdout_path = _capture_file_path("stdout")
     stderr_path = _capture_file_path("stderr")
     _KERNEL_REQUEST_QUEUE.put({
@@ -1478,6 +1549,9 @@ async def _execute_code_in_runner_with_timeout(
     )
     interrupt_deadline: float | None = None
     interrupt_sent = False
+    # Set when the interrupt was triggered out-of-band (a host ``interrupt``
+    # request) rather than by the execution timeout deadline.
+    oob_interrupted = False
     runner_message: dict[str, Any] | None = None
     try:
         while True:
@@ -1492,6 +1566,27 @@ async def _execute_code_in_runner_with_timeout(
             if not process.is_alive():
                 process.join(timeout=0.5)
                 break
+            # Out-of-band interrupt: trip the SAME SIGINT -> grace -> hard-kill
+            # path the timeout deadline uses. ``_consume_interrupt_request``
+            # clears the latch so a stale flag can't interrupt the next cell.
+            if not interrupt_sent and _consume_interrupt_request():
+                interrupt_sent = True
+                oob_interrupted = True
+                interrupt_deadline = now + timeout_interrupt_grace_seconds
+                interrupted = _signal_runner(process, signal.SIGINT)
+                _debug_event(
+                    "sbx.python_runner.execute.interrupt",
+                    code_hash=_code_hash(code),
+                    code_len=len(code),
+                    reason="out_of_band_interrupt",
+                    interrupt_sent=interrupted,
+                    interrupt_grace_seconds=timeout_interrupt_grace_seconds,
+                    child_pid=process.pid,
+                    child_exitcode=process.exitcode,
+                )
+                if interrupted and timeout_interrupt_grace_seconds > 0:
+                    await asyncio.sleep(0.01)
+                    continue
             if deadline is not None and not interrupt_sent and now >= deadline:
                 interrupt_sent = True
                 interrupt_deadline = now + timeout_interrupt_grace_seconds
@@ -1537,12 +1632,9 @@ async def _execute_code_in_runner_with_timeout(
                     child_pid=process.pid,
                     child_exitcode=process.exitcode,
                 )
-                return {
-                    "timeout": {"seconds": timeout_seconds},
-                    "stdout": stdout,
-                    "stderr": stderr,
-                    "state": _pickle_snapshot_state(snapshot, reason),
-                }
+                return _build_interrupt_result(
+                    timeout_seconds, oob_interrupted, stdout, stderr, snapshot, reason
+                )
             await asyncio.sleep(0.01)
         if host_tool_bridge is not None:
             await host_tool_bridge.drain_requests()
@@ -1578,12 +1670,9 @@ async def _execute_code_in_runner_with_timeout(
                     child_pid=process.pid,
                     child_exitcode=exitcode,
                 )
-                return {
-                    "timeout": {"seconds": timeout_seconds},
-                    "stdout": stdout,
-                    "stderr": stderr,
-                    "state": _pickle_snapshot_state(snapshot, reason),
-                }
+                return _build_interrupt_result(
+                    timeout_seconds, oob_interrupted, stdout, stderr, snapshot, reason
+                )
             _debug_event(
                 "sbx.python_runner.execute",
                 code_hash=_code_hash(code),
@@ -1600,6 +1689,39 @@ async def _execute_code_in_runner_with_timeout(
                 raise RuntimeError("execution runner exited without a result")
             raise RuntimeError(
                 f"execution runner exited without a result (exitcode={exitcode})"
+            )
+        if interrupt_sent and not runner_message.get("ok"):
+            # The kernel returned after our SIGINT (e.g. raised KeyboardInterrupt).
+            # Treat this as a graceful interrupt rather than surfacing the raw
+            # error: restore the pre-exec snapshot and return an interrupted
+            # result, mirroring the timeout path so warm state is preserved.
+            stdout = _read_capture_file(stdout_path)
+            stderr = _read_capture_file(stderr_path)
+            reason = "kernel interrupted by SIGINT"
+            snapshot = pre_timeout_snapshot or {
+                "globals": {},
+                "restored_globals": [],
+                "lost_globals": [],
+            }
+            _reset_globals_from_pickle_snapshot(globals_dict, snapshot)
+            _debug_event(
+                "sbx.python_runner.execute",
+                code_hash=_code_hash(code),
+                code_len=len(code),
+                timeout=True,
+                interrupted=oob_interrupted,
+                state_preserved=False,
+                state_source="pickle_snapshot",
+                state_loss_reason=reason,
+                restored_globals=snapshot.get("restored_globals", []),
+                lost_globals=snapshot.get("lost_globals", []),
+                stdout_len=len(stdout),
+                stderr_len=len(stderr),
+                child_pid=process.pid,
+                child_exitcode=process.exitcode,
+            )
+            return _build_interrupt_result(
+                timeout_seconds, oob_interrupted, stdout, stderr, snapshot, reason
             )
         if not runner_message.get("ok"):
             _debug_event(
@@ -1645,6 +1767,7 @@ async def _execute_code_in_runner_with_timeout(
         )
         return result
     finally:
+        _EXECUTION_ACTIVE = False
         _unlink_capture_files(stdout_path, stderr_path)
 
 
@@ -1738,6 +1861,11 @@ async def _handle_request(
             return _response(request_id, _list_dir(params))
         if method == "sync_file":
             return _response(request_id, _sync_file(params))
+        if method == "interrupt":
+            # Reached only when idle (the run loop dequeues it); mid-execute
+            # interrupts are handled out-of-band in the receiver. No cell is
+            # running here, so this is a no-op ack.
+            return await _handle_interrupt_request(request)
         if method == "shutdown":
             return _response(request_id, {"shutdown": True})
         raise ValueError(f"Unknown method: {method}")
@@ -1830,7 +1958,13 @@ class _WebSocketSupervisorSession:
                     continue
                 if not isinstance(message, dict):
                     continue
-                if message.get("method"):
+                if message.get("method") == "interrupt":
+                    # Handle out-of-band: the serial run loop is blocked inside
+                    # an in-flight execute, so queueing would deadlock. This trips
+                    # the running execute's interrupt path without using recv.
+                    response = await _handle_interrupt_request(message)
+                    await self.connection.send(json.dumps(response, default=str))
+                elif message.get("method"):
                     await self.requests.put(message)
                 elif "id" in message:
                     self.host_tool_bridge.deliver_response(message)

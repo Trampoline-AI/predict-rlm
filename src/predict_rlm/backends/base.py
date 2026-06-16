@@ -78,6 +78,11 @@ class BackendExecutionGate:
         finally:
             _TOOL_CALLBACK_GATES.reset(token)
 
+    def is_running(self) -> bool:
+        """Whether a top-level execution currently holds the gate."""
+        with self._condition:
+            return self._running
+
     def _acquire(self) -> None:
         with self._condition:
             while self._running:
