@@ -3,6 +3,8 @@ import pytest
 from predict_rlm.telemetry import classify_failure, classify_zero_score_failure
 from rlm_gepa.runtime.telemetry_analyzer import analyze_run, analyze_trace_rows
 
+pytestmark = pytest.mark.gepa
+
 
 @pytest.mark.parametrize(
     ("failure_class", "expected"),

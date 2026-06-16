@@ -6,6 +6,8 @@ import pytest
 from aiohttp import web
 from dspy_codex_lm.lm import CodexStreamError, CodexWSLM
 
+pytestmark = pytest.mark.codex_lm
+
 
 def _events():
     return [

@@ -22,12 +22,24 @@ from typing import Annotated
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from dspy.primitives.code_interpreter import CodeInterpreterError, FinalOutput
 
-from predict_rlm.backends import DEFAULT_SBX_TEMPLATE, SbxBackend, SbxConfig, SbxPool
-from predict_rlm.backends.base import SandboxExecutionError, SandboxFatalError
-from predict_rlm.backends.supervisor._payload import _pickleable_globals_snapshot
-from predict_rlm.files import SyncedFile
+pytest.importorskip("websockets")  # SBX/supervisor backend requires the [sbx] extra
+
+pytestmark = pytest.mark.sbx
+
+from dspy.primitives.code_interpreter import CodeInterpreterError, FinalOutput  # noqa: E402
+
+from predict_rlm.backends import (  # noqa: E402
+    DEFAULT_SBX_TEMPLATE,
+    SbxBackend,
+    SbxConfig,
+    SbxPool,
+)
+from predict_rlm.backends.base import SandboxExecutionError, SandboxFatalError  # noqa: E402
+from predict_rlm.backends.supervisor._payload import (  # noqa: E402
+    _pickleable_globals_snapshot,
+)
+from predict_rlm.files import SyncedFile  # noqa: E402
 
 PAYLOAD_PATH = Path(__file__).parents[1] / "src" / "predict_rlm" / "backends" / "supervisor" / "_payload.py"
 
@@ -2948,6 +2960,7 @@ class TestSbxPool:
 
 
 @pytest.mark.sbx
+@pytest.mark.integration
 @pytest.mark.skipif(
     not _real_sbx_available(),
     reason="real Docker Sandboxes tests require PREDICT_RLM_RUN_SBX_TESTS=1, sbx CLI, and sbx login",

@@ -10,7 +10,11 @@ from typing import Any, Callable, Literal, Protocol
 
 import pytest
 
-from predict_rlm.backends import (
+# The runtime-contract matrix exercises the supervisor/SBX backend (local-supervisor
+# seam and real SBX), so the whole package requires the [sbx] extra (websockets).
+pytest.importorskip("websockets")
+
+from predict_rlm.backends import (  # noqa: E402
     DirectPythonBackend,
     JspiBackend,
     SbxBackend,

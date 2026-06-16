@@ -4,6 +4,8 @@ import json
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 from predict_rlm.trace import (
     LMUsage,
     PredictCallDetail,
@@ -15,6 +17,8 @@ from rlm_gepa import AgentSpec, RLMGepaProject
 from rlm_gepa.reporting.cost import CostRow, append_cost_rows
 from rlm_gepa.reporting.stats import cost_rows
 from rlm_gepa.runtime.adapter import RLMGepaAdapter
+
+pytestmark = pytest.mark.gepa
 
 
 class _DummyLM:

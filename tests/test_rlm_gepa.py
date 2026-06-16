@@ -73,6 +73,8 @@ from rlm_gepa.service import (
     prepare_run_dir,
 )
 
+pytestmark = pytest.mark.gepa
+
 
 class _DummyLM:
     model = "dummy/model"

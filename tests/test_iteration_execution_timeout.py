@@ -357,6 +357,7 @@ async def test_jspi_timeout_result_formats_buffered_stdout_and_stderr():
     assert "[stderr]\nerr before" in result
 
 
+@pytest.mark.integration
 def test_jspi_recoverable_timeout_preserves_output_and_globals():
     from predict_rlm.backends import JspiBackend
 
@@ -385,6 +386,7 @@ while True:
         interpreter.shutdown()
 
 
+@pytest.mark.integration
 def test_predict_rlm_jspi_timeout_preserves_state_history_and_predict_tool():
     from predict_rlm import PredictRLM
     from predict_rlm.predict_rlm import dspy
@@ -452,6 +454,7 @@ def test_predict_rlm_jspi_timeout_preserves_state_history_and_predict_tool():
     assert "first predict: pre-timeout prediction" in second_history
 
 
+@pytest.mark.integration
 def test_jspi_no_timeout_execution_still_returns_output_and_stderr():
     from predict_rlm.backends import JspiBackend
 

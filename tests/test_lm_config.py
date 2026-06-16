@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import litellm
+import pytest
 from tenacity import wait_none
 
 from rlm_gepa.runtime import lm_config
+
+pytestmark = pytest.mark.gepa
 
 
 def _skip_env_validation(monkeypatch):

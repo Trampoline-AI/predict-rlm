@@ -7,6 +7,18 @@ import dspy
 import pytest
 from dspy_codex_lm.lm import CodexHTTPLM as CodexLM
 
+_HERE = Path(__file__).resolve().parent
+
+
+def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
+    """Mark every dspy_codex_lm test as `codex_lm` so it runs in the codex-lm CI job."""
+    for item in items:
+        try:
+            if _HERE in Path(str(item.fspath)).resolve().parents:
+                item.add_marker(pytest.mark.codex_lm)
+        except (OSError, ValueError):
+            continue
+
 
 @pytest.fixture(autouse=True)
 def reset_dspy_cache():

@@ -13,7 +13,7 @@ from dspy.primitives.code_interpreter import FinalOutput
 from dspy.primitives.repl_types import REPLEntry, REPLHistory
 from pydantic import BaseModel, Field, ValidationError
 
-from predict_rlm import PredictRLM, SbxPool
+from predict_rlm import PredictRLM
 from predict_rlm.predict_rlm import _models_from_schema
 from predict_rlm.rlm_skills import Skill
 from predict_rlm.telemetry import TelemetryContext, classify_failure
@@ -127,8 +127,13 @@ class FakeInterpreterContext:
         return False
 
 
+@pytest.mark.sbx
 class TestBackendNameSelection:
-    """Tests for PredictRLM sandbox backend selection."""
+    """Tests for PredictRLM sandbox backend selection.
+
+    Marked ``sbx`` because several cases import SBX symbols (SbxConfig/SbxPool),
+    which resolve the lazy SBX backend import and require the [sbx] extra.
+    """
 
     def test_default_backend_remains_jspi(self):
         rlm = PredictRLM(ImageAnalysisSignature, sub_lm=MagicMock(), max_iterations=1)
@@ -306,6 +311,8 @@ class TestBackendNameSelection:
         interpreter.shutdown.assert_not_called()
 
     def test_sbx_pool_requires_sbx_backend(self):
+        from predict_rlm import SbxPool
+
         with pytest.raises(ValueError, match="sbx_pool.*sandbox_backend='sbx'"):
             PredictRLM(
                 ImageAnalysisSignature,
@@ -315,6 +322,8 @@ class TestBackendNameSelection:
             )
 
     def test_sbx_pool_conflicts_with_custom_interpreter(self):
+        from predict_rlm import SbxPool
+
         with pytest.raises(ValueError, match="interpreter.*sbx_pool"):
             PredictRLM(
                 ImageAnalysisSignature,
@@ -327,6 +336,8 @@ class TestBackendNameSelection:
 
     def test_sbx_pool_leases_without_constructing_or_shutting_down_interpreter(self):
         from contextlib import contextmanager
+
+        from predict_rlm import SbxPool
 
         leased = MagicMock()
         leased.shutdown = MagicMock()

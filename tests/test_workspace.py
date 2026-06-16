@@ -7,6 +7,7 @@ import os
 import sys
 import tempfile
 from pathlib import Path
+from typing import TYPE_CHECKING
 from unittest.mock import MagicMock
 
 import dspy
@@ -14,7 +15,9 @@ import pytest
 from dspy.primitives.code_interpreter import CodeInterpreterError
 
 from predict_rlm import File, PredictRLM, Workspace, WorkspaceMode
-from predict_rlm.backends.sbx import SbxBackend, SbxConfig
+
+if TYPE_CHECKING:
+    from predict_rlm.backends.sbx import SbxBackend
 from predict_rlm.files import (
     build_file_instructions,
     build_file_plan,
@@ -442,7 +445,10 @@ class TestPredictRLMWorkspacePreparation:
                     )
                 })
 
+    @pytest.mark.sbx
     def test_external_sbx_interpreter_reuses_direct_workspace_setup(self, tmp_path: Path):
+        from predict_rlm.backends.sbx import SbxBackend, SbxConfig
+
         class Sig(dspy.Signature):
             workspace: Workspace = dspy.InputField()
             answer: str = dspy.OutputField()
@@ -611,8 +617,11 @@ Path("/sandbox/workspace/conflict.txt").write_text("sandbox change")
                 interpreter.shutdown()
 
 
+@pytest.mark.sbx
 class TestWorkspaceIOSbxLocalRunner:
     def make_interpreter(self, tmp_path: Path) -> SbxBackend:
+        from predict_rlm.backends.sbx import SbxBackend, SbxConfig
+
         return SbxBackend(
             config=SbxConfig(name="local-test"),
             preinstall_packages=False,

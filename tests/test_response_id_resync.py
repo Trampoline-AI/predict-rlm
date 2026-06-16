@@ -38,11 +38,16 @@ import queue
 import types
 
 import pytest
-from dspy.primitives.code_interpreter import CodeInterpreterError
 
-import predict_rlm.backends.jspi.backend as rlm_interpreter
-from predict_rlm.backends import JspiBackend, SbxBackend, SbxConfig
-from predict_rlm.backends.base import STALE_RESPONSE_DISCARD_LIMIT
+pytest.importorskip("websockets")  # SBX/supervisor backend requires the [sbx] extra
+
+pytestmark = pytest.mark.sbx
+
+from dspy.primitives.code_interpreter import CodeInterpreterError  # noqa: E402
+
+import predict_rlm.backends.jspi.backend as rlm_interpreter  # noqa: E402
+from predict_rlm.backends import JspiBackend, SbxBackend, SbxConfig  # noqa: E402
+from predict_rlm.backends.base import STALE_RESPONSE_DISCARD_LIMIT  # noqa: E402
 
 
 def _build_interp(stdout_lines: list[str]):
