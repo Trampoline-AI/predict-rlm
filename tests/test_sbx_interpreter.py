@@ -2105,6 +2105,147 @@ class TestSbxBackendLocalWebSocketRunner:
             interpreter.shutdown()
 
 
+class TestSbxBackendInterrupt(TestSbxBackendLocalWebSocketRunner):
+    """On-demand execution interrupt + cancellation-safe aexecute (issue #42).
+
+    Drives the real ``_payload.py`` over a real websocket (no Docker) via the
+    ``TestSbxBackendLocalWebSocketRunner`` seam.
+    """
+
+    @pytest.mark.local
+    def test_interrupt_unblocks_long_running_cell(self, tmp_path: Path):
+        """Criteria 1 + 3: interrupt from another thread aborts a long sleep
+        promptly (not ~120s) and the next execute succeeds with no ConcurrencyError.
+        """
+        interpreter = self.make_interpreter(tmp_path, startup_timeout=5)
+        try:
+            running_flag: dict[str, bool] = {}
+
+            def fire_interrupt():
+                time.sleep(1.0)
+                running_flag["was_running"] = interpreter.interrupt(timeout=10.0)
+
+            thread = threading.Thread(target=fire_interrupt)
+            thread.start()
+            start = time.monotonic()
+            # No timeout= -> relies purely on the interrupt to unblock.
+            result = interpreter.execute("import time\ntime.sleep(120)\nprint('done')")
+            elapsed = time.monotonic() - start
+            thread.join(timeout=5)
+
+            assert elapsed < 30, f"interrupt did not unblock promptly: {elapsed:.1f}s"
+            assert running_flag.get("was_running") is True
+            assert "done" not in str(result)
+
+            # Next execute must succeed on the warm sandbox (no ConcurrencyError).
+            assert interpreter.execute("print('alive')") == "alive\n"
+        finally:
+            interpreter.shutdown()
+
+    @pytest.mark.local
+    def test_interrupt_preserves_warm_state(self, tmp_path: Path):
+        """Criterion 2: a variable set before the interrupted cell survives."""
+        interpreter = self.make_interpreter(tmp_path, startup_timeout=5)
+        try:
+            assert interpreter.execute("kept = 99\nprint(kept)") == "99\n"
+
+            def fire_interrupt():
+                time.sleep(1.0)
+                interpreter.interrupt(timeout=10.0)
+
+            thread = threading.Thread(target=fire_interrupt)
+            thread.start()
+            interpreter.execute("import time\ntime.sleep(120)\nprint('done')")
+            thread.join(timeout=5)
+
+            assert interpreter.execute("print(kept)") == "99\n"
+        finally:
+            interpreter.shutdown()
+
+    @pytest.mark.local
+    def test_interrupt_returns_false_when_idle(self, tmp_path: Path):
+        """Criterion 5 (client view): interrupt while idle reports no cell ran."""
+        interpreter = self.make_interpreter(tmp_path, startup_timeout=5)
+        try:
+            interpreter.execute("print('warm')")
+            assert interpreter.interrupt(timeout=5.0) is False
+        finally:
+            interpreter.shutdown()
+
+    @pytest.mark.local
+    def test_aexecute_cancellation_is_prompt_and_keeps_sandbox_warm(
+        self, tmp_path: Path
+    ):
+        """Criteria 1 + 4: cancelling aexecute mid-cell unwinds the worker
+        promptly (no orphaned to_thread worker) and leaves the ws reusable.
+        """
+        interpreter = self.make_interpreter(tmp_path, startup_timeout=5)
+
+        async def scenario() -> float:
+            interpreter.execute("seed = 5")
+            task = asyncio.ensure_future(
+                interpreter.aexecute("import time\ntime.sleep(120)\nprint('done')")
+            )
+            await asyncio.sleep(1.0)
+            start = time.monotonic()
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            return time.monotonic() - start
+
+        try:
+            elapsed = asyncio.run(scenario())
+            assert elapsed < 30, f"cancellation did not unwind promptly: {elapsed:.1f}s"
+            # ws still usable and warm state preserved.
+            assert interpreter.execute("print(seed)") == "5\n"
+            assert (
+                threading.active_count() < 10
+            ), "orphaned worker thread(s) survived cancellation"
+        finally:
+            interpreter.shutdown()
+
+
+class TestSupervisorPayloadInterruptMethod:
+    """Criterion 5: server-side ``interrupt`` JSON-RPC method semantics."""
+
+    @pytest.mark.local
+    def test_interrupt_method_acks_running_false_when_idle(self, tmp_path: Path):
+        import predict_rlm.backends.supervisor._payload as payload
+
+        result = asyncio.run(
+            payload._handle_interrupt_request({"id": 1, "method": "interrupt"})
+        )
+        assert result["result"]["running"] is False
+        # No cell running -> the global interrupt flag must not stay latched.
+        assert payload._consume_interrupt_request() is False
+
+
+class TestSbxBackendLocalSupervisorInterrupt(TestSbxBackendLocalWebSocketRunner):
+    """Criterion 5 (in-runner): interrupt method trips the interrupt path."""
+
+    @pytest.mark.local
+    def test_interrupt_method_trips_interrupt_path_while_running(self, tmp_path: Path):
+        interpreter = self.make_interpreter(tmp_path, startup_timeout=5)
+        try:
+            interpreter.execute("flag = 1")
+
+            def fire_interrupt():
+                time.sleep(1.0)
+                interpreter.interrupt(timeout=10.0)
+
+            thread = threading.Thread(target=fire_interrupt)
+            thread.start()
+            start = time.monotonic()
+            interpreter.execute("import time\ntime.sleep(120)")
+            elapsed = time.monotonic() - start
+            thread.join(timeout=5)
+            assert elapsed < 30
+            # The runner kernel restored globals from snapshot; flag survives.
+            assert interpreter.execute("print(flag)") == "1\n"
+        finally:
+            interpreter.shutdown()
+
+
 class TestSbxCommandConstruction:
     def test_default_template_uses_explicit_non_docker_shell_template(
         self, monkeypatch, tmp_path: Path
