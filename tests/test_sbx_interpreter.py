@@ -2163,6 +2163,49 @@ class TestSbxBackendInterrupt(TestSbxBackendLocalWebSocketRunner):
             interpreter.shutdown()
 
     @pytest.mark.local
+    def test_interrupt_returns_only_after_cell_releases_gate(self, tmp_path: Path):
+        """Regression for the Fractal interrupt-recovery race (#42).
+
+        ``interrupt`` must not return until the interrupted cell has released
+        the execution gate -- i.e. the worker blocked in the execute ``recv``
+        loop has drained and the interpreter is quiescent. Otherwise the next
+        request calls ``recv`` concurrently with the still-draining worker and
+        trips a websockets ConcurrencyError.
+
+        Asserting the gate state directly (rather than racing a follow-up
+        request) makes the contract deterministic: without the wait-for-drain,
+        ``interrupt`` returns right after the ``ws.send`` while the cell is still
+        being torn down across several IPC hops, so the gate is still held.
+        """
+        interpreter = self.make_interpreter(tmp_path, startup_timeout=5)
+        gate = interpreter._execution_gate
+        try:
+            interpreter.execute("warm = 1")
+
+            def run_cell() -> None:
+                interpreter.execute("import time\ntime.sleep(120)\nprint('done')")
+
+            worker = threading.Thread(target=run_cell)
+            worker.start()
+            while not gate.is_running():
+                time.sleep(0.01)
+            time.sleep(0.5)  # let the kernel actually enter the sleep
+
+            was_running = interpreter.interrupt(timeout=10.0)
+
+            assert was_running is True
+            assert (
+                gate.is_running() is False
+            ), "interrupt returned before the interrupted cell released the gate"
+
+            worker.join(timeout=5)
+            assert not worker.is_alive()
+            # Warm sandbox + ws are immediately reusable, no ConcurrencyError.
+            assert interpreter.execute("print(warm)") == "1\n"
+        finally:
+            interpreter.shutdown()
+
+    @pytest.mark.local
     def test_interrupt_returns_false_when_idle(self, tmp_path: Path):
         """Criterion 5 (client view): interrupt while idle reports no cell ran."""
         interpreter = self.make_interpreter(tmp_path, startup_timeout=5)

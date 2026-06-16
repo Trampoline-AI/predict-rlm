@@ -83,6 +83,16 @@ class BackendExecutionGate:
         with self._condition:
             return self._running
 
+    def wait_until_idle(self, timeout: float | None = None) -> bool:
+        """Block until no top-level execution holds the gate.
+
+        Returns ``True`` once the gate is idle, or ``False`` if ``timeout``
+        elapsed first. Callers must be on a different thread than the one
+        holding the gate (the executing worker), otherwise this deadlocks.
+        """
+        with self._condition:
+            return self._condition.wait_for(lambda: not self._running, timeout)
+
     def _acquire(self) -> None:
         with self._condition:
             while self._running:

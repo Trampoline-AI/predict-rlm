@@ -329,6 +329,18 @@ class SbxBackend(SupervisorClient, ExecutionBackend):
             raise SandboxFatalError(
                 f"Failed to send interrupt to Sbx WebSocket supervisor: {exc}"
             ) from exc
+        # Sending the frame is not enough: the worker blocked in the execute
+        # ``recv`` loop is still the sole reader of ``self._ws``. Returning now
+        # would let the next request call ``recv`` concurrently and trip a
+        # websockets ConcurrencyError. Wait for the interrupted execute to
+        # return and release the gate so the interpreter is quiescent before we
+        # hand it back. If it does not drain in time, raise so callers fall back
+        # to a hard teardown rather than reusing a wedged connection.
+        if was_running and not self._execution_gate.wait_until_idle(timeout):
+            raise SandboxFatalError(
+                "Interrupt frame sent but the running cell did not release the "
+                f"execution gate within {timeout}s."
+            )
         return was_running
 
     async def ainterrupt(self, *, timeout: float | None = 10.0) -> bool:
