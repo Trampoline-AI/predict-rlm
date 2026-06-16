@@ -7,7 +7,10 @@ on:
     branches: [main]
 
 jobs:
-  unit-tests:
+  # Core package, no optional extras installed. Proves predict_rlm and its core
+  # logic import and pass standalone. Optional-subsystem modules (sbx/gepa/codex_lm)
+  # are deselected here, so a green run is a real "works without extras" signal.
+  unit-core:
     runs-on: ubuntu-latest
     strategy:
       matrix:
@@ -22,11 +25,14 @@ jobs:
       - name: Set up Python ${{ matrix.python-version }}
         run: uv python install ${{ matrix.python-version }}
 
-      - name: Install dependencies
-        run: uv sync --all-extras --python ${{ matrix.python-version }}
+      - name: Install dependencies (no extras)
+        run: uv sync --python ${{ matrix.python-version }}
 
-      - name: Run unit tests
-        run: uv run pytest tests/ -m "not integration" -q --cov=predict_rlm --cov-report=xml
+      - name: Run core unit tests
+        run: >-
+          uv run pytest tests/
+          -m "not integration and not sbx and not gepa and not codex_lm"
+          -q --cov=predict_rlm --cov-report=xml
 
       - name: Upload coverage to Codecov
         if: matrix.python-version == '3.12'
@@ -34,10 +40,12 @@ jobs:
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
           files: coverage.xml
-          flags: unit
+          flags: unit-core
           fail_ci_if_error: false
 
-  integration-tests:
+  # SBX/supervisor backend subsystem — the only genuinely optional extra
+  # (websockets). Modules guard collection with importorskip("websockets").
+  unit-sbx:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -49,18 +57,114 @@ jobs:
       - name: Set up Python
         run: uv python install 3.12
 
-      - name: Install dependencies
-        run: uv sync --all-extras --python 3.12
+      - name: Install dependencies (sbx extra)
+        run: uv sync --extra sbx --python 3.12
 
-      - name: Run integration tests
-        run: uv run pytest tests/ -m "integration" -q --cov=predict_rlm --cov-report=xml
+      - name: Run sbx unit tests
+        run: >-
+          uv run pytest tests/
+          -m "sbx and not integration"
+          -q --cov=predict_rlm --cov-report=xml
 
       - name: Upload coverage to Codecov
         uses: codecov/codecov-action@v5
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
           files: coverage.xml
-          flags: integration
+          flags: unit-sbx
+          fail_ci_if_error: false
+
+  # dspy_codex_lm subsystem. litellm/openai arrive transitively via dspy, but the
+  # [codex-lm] extra pins the versions this subsystem requires; this job exercises
+  # it in isolation and attributes failures separately.
+  unit-codex-lm:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: astral-sh/setup-uv@cec208311dfd045dd5311c1add060b2062131d57
+        with:
+          version: "latest"
+
+      - name: Set up Python
+        run: uv python install 3.12
+
+      - name: Install dependencies (codex-lm extra)
+        run: uv sync --extra codex-lm --python 3.12
+
+      - name: Run codex-lm unit tests
+        run: >-
+          uv run pytest tests/
+          -m "codex_lm and not integration"
+          -q --cov=predict_rlm --cov-report=xml
+
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v5
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          files: coverage.xml
+          flags: unit-codex-lm
+          fail_ci_if_error: false
+
+  # rlm_gepa subsystem. gepa/tqdm arrive transitively via dspy, but the [gepa]
+  # extra pins what this subsystem requires; this job exercises it in isolation.
+  unit-gepa:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: astral-sh/setup-uv@cec208311dfd045dd5311c1add060b2062131d57
+        with:
+          version: "latest"
+
+      - name: Set up Python
+        run: uv python install 3.12
+
+      - name: Install dependencies (gepa extra)
+        run: uv sync --extra gepa --python 3.12
+
+      - name: Run gepa unit tests
+        run: >-
+          uv run pytest tests/
+          -m "gepa and not integration"
+          -q --cov=predict_rlm --cov-report=xml
+
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v5
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          files: coverage.xml
+          flags: unit-gepa
+          fail_ci_if_error: false
+
+  # Real-backend tests for the default Deno/WASM (JSPI) sandbox. Deno is a default
+  # dependency, so no extra is needed. Real-SBX integration tests (`integration and
+  # sbx`) are excluded here; they need the sbx CLI + login and are run locally
+  # (no standing CI job) via: PREDICT_RLM_RUN_SBX_TESTS=1 pytest -m "integration and sbx".
+  integration-jspi:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: astral-sh/setup-uv@cec208311dfd045dd5311c1add060b2062131d57
+        with:
+          version: "latest"
+
+      - name: Set up Python
+        run: uv python install 3.12
+
+      - name: Install dependencies (no extras; Deno is a default dependency)
+        run: uv sync --python 3.12
+
+      - name: Run JSPI integration tests
+        run: uv run pytest tests/ -m "integration and not sbx" -q --cov=predict_rlm --cov-report=xml
+
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v5
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          files: coverage.xml
+          flags: integration-jspi
           fail_ci_if_error: false
 
   lint:
