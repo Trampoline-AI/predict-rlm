@@ -7,6 +7,7 @@ import base64
 import json
 import logging
 import os
+import secrets
 import select
 import shutil
 import socket
@@ -1693,9 +1694,13 @@ class TestSbxBackendLocalWebSocketRunner:
         tools: dict | None = None,
         path: str | None = None,
         url_path: str | None = None,
+        port: int | None = None,
+        name: str = "local-websocket-test",
+        reuse: bool = False,
+        staging_root: Path | None = None,
         startup_timeout: float = 3,
     ) -> SbxBackend:
-        port = _free_local_port()
+        port = port or _free_local_port()
         websocket_path = path or f"/predict-rlm-test-{os.getpid()}-{time.time_ns()}"
         command = [
             sys.executable,
@@ -1712,7 +1717,8 @@ class TestSbxBackendLocalWebSocketRunner:
         ]
         return SbxBackend(
             config=SbxConfig(
-                name="local-websocket-test",
+                name=name,
+                reuse=reuse,
                 exec_timeout=5,
                 websocket_startup_timeout=startup_timeout,
                 websocket_max_message_bytes=32 * 1024 * 1024,
@@ -1721,7 +1727,7 @@ class TestSbxBackendLocalWebSocketRunner:
             preinstall_packages=False,
             _websocket_supervisor_command=command,
             _websocket_url=f"ws://127.0.0.1:{port}{url_path or websocket_path}",
-            _staging_root=tmp_path / "ws-staging",
+            _staging_root=staging_root or tmp_path / "ws-staging",
         )
 
     def test_websocket_execute_and_state_persistence(self, tmp_path: Path):
@@ -1819,6 +1825,63 @@ class TestSbxBackendLocalWebSocketRunner:
 
         assert output == "4\n"
         assert seen_lengths == [950000]
+
+    def test_reusable_named_websocket_supervisors_run_concurrently(
+        self, tmp_path: Path
+    ):
+        staging_root = tmp_path / "shared-staging"
+        first = self.make_interpreter(
+            tmp_path,
+            name="shared-websocket-test",
+            reuse=True,
+            staging_root=staging_root,
+            path="/predict-rlm-first",
+        )
+        second = self.make_interpreter(
+            tmp_path,
+            name="shared-websocket-test",
+            reuse=True,
+            staging_root=staging_root,
+            path="/predict-rlm-second",
+        )
+        barrier = threading.Barrier(3)
+        errors: list[BaseException] = []
+        outputs: dict[str, str] = {}
+
+        def execute(interpreter: SbxBackend, label: str) -> None:
+            try:
+                barrier.wait(timeout=2)
+                outputs[label] = interpreter.execute(
+                    f"owner = {label!r}\n"
+                    "import time\n"
+                    "time.sleep(0.2)\n"
+                    "print(owner)"
+                )
+            except BaseException as exc:
+                errors.append(exc)
+
+        try:
+            first.prewarm()
+            second.prewarm()
+
+            threads = [
+                threading.Thread(target=execute, args=(first, "first")),
+                threading.Thread(target=execute, args=(second, "second")),
+            ]
+            for thread in threads:
+                thread.start()
+            barrier.wait(timeout=2)
+            for thread in threads:
+                thread.join(timeout=3)
+
+            assert all(not thread.is_alive() for thread in threads)
+            assert errors == []
+            assert outputs == {"first": "first\n", "second": "second\n"}
+            assert first.execute("print(owner)") == "first\n"
+            assert second.execute("print(owner)") == "second\n"
+        finally:
+            first.shutdown()
+            second.shutdown()
 
     def test_predict_forwards_nested_pydantic_schemas_for_custom_types(self, tmp_path: Path):
         """predict() with a custom output type that nests sibling models.
@@ -2447,7 +2510,7 @@ class TestSbxCommandConstruction:
         monkeypatch.setattr(
             interpreter,
             "_publish_websocket_port",
-            lambda: "ws://127.0.0.1:49152/test",
+            lambda port=None: "ws://127.0.0.1:49152/test",
         )
 
         interpreter._start_sbx_websocket_supervisor()
@@ -2464,6 +2527,51 @@ class TestSbxCommandConstruction:
         )
         assert interpreter._proc is not None
         assert not any(cmd[:3] == ["sbx", "exec", "-d"] for cmd in run_commands)
+
+    def test_websocket_supervisor_uses_dynamic_port_by_default(
+        self, monkeypatch, tmp_path: Path
+    ):
+        popen_commands: list[list[str]] = []
+        published_ports: list[int | None] = []
+
+        class FakeProcess:
+            stdout = None
+            stderr = None
+            stdin = None
+            pid = 12345
+
+            def poll(self):
+                return None
+
+        def fake_run(command, **kwargs):
+            return subprocess.CompletedProcess(command, 0, stdout="created-name\n", stderr="")
+
+        def fake_popen(command, **kwargs):
+            popen_commands.append(command)
+            return FakeProcess()
+
+        monkeypatch.setattr(shutil, "which", lambda name: "/usr/local/bin/sbx")
+        monkeypatch.setattr(subprocess, "run", fake_run)
+        monkeypatch.setattr(subprocess, "Popen", fake_popen)
+        monkeypatch.setattr(secrets, "randbelow", lambda upper: 12345)
+        interpreter = SbxBackend(
+            config=SbxConfig(name="created-name"),
+            preinstall_packages=False,
+            _staging_root=tmp_path / "staging",
+        )
+
+        def fake_publish(port=None):
+            published_ports.append(port)
+            return "ws://127.0.0.1:49152/test"
+
+        monkeypatch.setattr(interpreter, "_publish_websocket_port", fake_publish)
+
+        interpreter._start_sbx_websocket_supervisor()
+
+        supervisor_exec = popen_commands[0]
+        assert supervisor_exec[supervisor_exec.index("--websocket-port") + 1] == "32345"
+        assert published_ports == [32345]
+        assert interpreter._active_websocket_port == 32345
 
     def test_websocket_recovery_restarts_detached_supervisor_after_kill(
         self, monkeypatch, tmp_path: Path
@@ -3947,4 +4055,3 @@ class TestSbxBackendRealSbxReattach:
                 text=True,
                 check=False,
             )
-

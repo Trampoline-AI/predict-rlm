@@ -182,6 +182,7 @@ class SbxBackend(SupervisorClient, ExecutionBackend):
         self._sandbox_name: str | None = None
         self._prepared_supervisor_path: Path | None = None
         self._published_websocket_url: str | None = None
+        self._active_websocket_port: int | None = None
         self._shutdown = False
         self._post_execute_hooks: list[Callable[[Any], Any]] = []
         self._owned_direct_aliases: list[Path] = []
@@ -850,6 +851,8 @@ class SbxBackend(SupervisorClient, ExecutionBackend):
     def _start_sbx_websocket_supervisor(self) -> None:
         supervisor_path = self._start_sbx_and_prepare_supervisor()
         assert self._sandbox_name is not None
+        websocket_port = self._resolve_websocket_port()
+        self._active_websocket_port = websocket_port
         runner_root = self._staging_root
         runner_root.mkdir(parents=True, exist_ok=True)
         command = [
@@ -866,7 +869,7 @@ class SbxBackend(SupervisorClient, ExecutionBackend):
             "--websocket-host",
             "0.0.0.0",
             "--websocket-port",
-            str(self.config.websocket_port),
+            str(websocket_port),
             "--websocket-path",
             self._websocket_path,
             "--websocket-max-message-bytes",
@@ -886,12 +889,27 @@ class SbxBackend(SupervisorClient, ExecutionBackend):
             bufsize=1,
             start_new_session=True,
         )
-        self._websocket_url = self._publish_websocket_port()
+        self._websocket_url = self._publish_websocket_port(websocket_port)
+
+    def _resolve_websocket_port(self) -> int:
+        if self.config.websocket_port:
+            return self.config.websocket_port
+        return self._choose_dynamic_websocket_port()
+
+    def _choose_dynamic_websocket_port(self) -> int:
+        return 20_000 + secrets.randbelow(40_000)
 
     def _connect_websocket_supervisor(self, url: str) -> None:
         deadline = time.monotonic() + self.config.websocket_startup_timeout
         last_error: BaseException | None = None
         while True:
+            if self._proc is not None and self._proc.poll() is not None:
+                stderr = self._read_stderr_for_process(self._proc)
+                diagnostic = stderr.strip() or str(last_error or "process exited")
+                raise SandboxFatalError(
+                    "Sbx WebSocket supervisor exited before accepting connections at "
+                    f"{url}: {diagnostic}"
+                )
             try:
                 self._ws = websocket_connect(
                     url,
@@ -911,15 +929,18 @@ class SbxBackend(SupervisorClient, ExecutionBackend):
                     ) from last_error
                 time.sleep(0.1)
 
-    def _publish_websocket_port(self) -> str:
+    def _publish_websocket_port(self, port: int | None = None) -> str:
         assert self._sandbox_name is not None
+        port = port or self._active_websocket_port or self.config.websocket_port
+        if not port:
+            raise SandboxFatalError("Cannot publish sbx WebSocket supervisor without a port")
         result = subprocess.run(
             [
                 "sbx",
                 "ports",
                 self._sandbox_name,
                 "--publish",
-                str(self.config.websocket_port),
+                str(port),
             ],
             check=False,
             capture_output=True,
@@ -929,7 +950,7 @@ class SbxBackend(SupervisorClient, ExecutionBackend):
         if result.returncode != 0:
             raise SandboxFatalError(
                 "Failed to publish sbx WebSocket supervisor port "
-                f"{self.config.websocket_port}: exit code {result.returncode}; "
+                f"{port}: exit code {result.returncode}; "
                 f"stdout: {result.stdout.strip()}; stderr: {result.stderr.strip()}"
             )
         endpoint = self._parse_published_websocket_endpoint(result.stdout)
