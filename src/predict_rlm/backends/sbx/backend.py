@@ -740,6 +740,7 @@ class SbxBackend(SupervisorClient, ExecutionBackend):
                 text=True,
                 env=env,
                 bufsize=1,
+                start_new_session=True,
             )
             self._start_stdout_reader()
             if self.output_fields:
@@ -843,6 +844,7 @@ class SbxBackend(SupervisorClient, ExecutionBackend):
             text=True,
             env=env,
             bufsize=1,
+            start_new_session=True,
         )
 
     def _start_sbx_websocket_supervisor(self) -> None:
@@ -882,6 +884,7 @@ class SbxBackend(SupervisorClient, ExecutionBackend):
             stderr=subprocess.PIPE,
             text=True,
             bufsize=1,
+            start_new_session=True,
         )
         self._websocket_url = self._publish_websocket_port()
 

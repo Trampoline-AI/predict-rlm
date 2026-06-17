@@ -2291,6 +2291,32 @@ class TestSbxBackendLocalSupervisorInterrupt(TestSbxBackendLocalWebSocketRunner)
             interpreter.shutdown()
 
 
+class TestSbxSupervisorSignalIsolation(TestSbxBackendLocalWebSocketRunner):
+    """Regression: a terminal SIGINT (Ctrl-C interrupting an RLM turn) must not
+    reach the supervisor subprocess.
+
+    The supervisor is launched without ``start_new_session`` it shares the
+    host's process group, so a terminal Ctrl-C is delivered to the Go ``sbx``
+    child too. The child cancels its context ("ERROR: context canceled") and
+    exits, while Python only sees an ``asyncio.CancelledError`` during the LLM
+    phase (no execute in flight) and hands the supervisor back as healthy. The
+    next request then fails with "Sbx supervisor exited unexpectedly". The
+    out-of-band signal bypasses the in-band #42 interrupt machinery entirely;
+    detaching the process group is what keeps Ctrl-C off the child.
+    """
+
+    @pytest.mark.local
+    def test_supervisor_runs_in_its_own_process_group(self, tmp_path: Path):
+        interpreter = self.make_interpreter(tmp_path)
+        try:
+            interpreter.execute("x = 1")
+            proc = interpreter._proc
+            assert proc is not None and proc.poll() is None
+            assert os.getpgid(proc.pid) != os.getpgid(0)
+        finally:
+            interpreter.shutdown()
+
+
 class TestSbxCommandConstruction:
     def test_default_template_uses_explicit_non_docker_shell_template(
         self, monkeypatch, tmp_path: Path
