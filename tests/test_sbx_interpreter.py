@@ -3426,7 +3426,7 @@ class TestSbxBackendRealSbx:
         ])
         pool = SbxPool(
             size=1,
-            config=SbxConfig(name=f"predict-rlm-test-predict-timeout-{os.getpid()}"),
+            config=SbxConfig(name=f"predict-rlm-test-predict-timeout-{os.getpid()}", exec_timeout=12.0),
             preinstall_packages=False,
         )
         rlm = PredictRLM(
@@ -3457,7 +3457,7 @@ class TestSbxBackendRealSbx:
     def test_predict_rlm_recovers_after_user_exceptions_and_tools_still_work(self):
         pool = SbxPool(
             size=1,
-            config=SbxConfig(name=f"predict-rlm-test-user-exceptions-{os.getpid()}"),
+            config=SbxConfig(name=f"predict-rlm-test-user-exceptions-{os.getpid()}", exec_timeout=12.0),
             preinstall_packages=False,
         )
         try:

@@ -1496,9 +1496,11 @@ async def _kernel_pickle_snapshot(
 
 
 async def _register_runtime_hooks_in_runner(
-    params: dict[str, Any], globals_dict: dict[str, Any]
+    params: dict[str, Any],
+    globals_dict: dict[str, Any],
+    host_tool_bridge: _HostToolBridge | None = None,
 ) -> dict[str, Any]:
-    process = _ensure_kernel(globals_dict)
+    process = _ensure_kernel(globals_dict, host_tool_bridge)
     assert _KERNEL_REQUEST_QUEUE is not None
     assert _KERNEL_RESULT_QUEUE is not None
     _KERNEL_REQUEST_QUEUE.put({"op": "register_runtime_hooks", "params": params})
@@ -1851,7 +1853,10 @@ async def _handle_request(
             return _response(request_id, _register_tools(params, globals_dict))
         if method == "register_runtime_hooks":
             return _response(
-                request_id, await _register_runtime_hooks_in_runner(params, globals_dict)
+                request_id,
+                await _register_runtime_hooks_in_runner(
+                    params, globals_dict, host_tool_bridge
+                ),
             )
         if method == "mount_file":
             return _response(request_id, _mount_file(params))
