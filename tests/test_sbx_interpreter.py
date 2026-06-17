@@ -40,6 +40,7 @@ from predict_rlm.backends.supervisor._payload import (  # noqa: E402
     _pickleable_globals_snapshot,
 )
 from predict_rlm.files import SyncedFile  # noqa: E402
+from predict_rlm.workspace import DirectWorkspaceMount  # noqa: E402
 
 PAYLOAD_PATH = Path(__file__).parents[1] / "src" / "predict_rlm" / "backends" / "supervisor" / "_payload.py"
 
@@ -3491,6 +3492,51 @@ class TestSbxBackendReattachStagingRoot:
             backend_a = SbxBackend(config=SbxConfig())
             backend_b = SbxBackend(config=SbxConfig())
         assert backend_a._staging_root != backend_b._staging_root
+
+    def test_reuse_relocated_staging_root_is_deterministic_across_sessions(
+        self, tmp_path: Path
+    ):
+        """Reattach regression: when the deterministic staging root is nested in
+        a direct workspace mount it gets relocated out, but the relocated path
+        must stay identical across sessions — otherwise the reattached
+        container's bind mounts point at the previous session's now-gone temp
+        dir and the websocket supervisor never starts (issues #41/#42).
+        """
+        mounts = [DirectWorkspaceMount(host_path=str(tmp_path), sandbox_path="/work")]
+
+        def _make() -> SbxBackend:
+            with patch(
+                "predict_rlm.backends.sbx.backend.Path.cwd", return_value=tmp_path
+            ):
+                return SbxBackend(
+                    config=SbxConfig(name="hot-box", reuse=True),
+                    direct_workspace_mounts=mounts,
+                )
+
+        backend_a = _make()
+        backend_b = _make()
+        try:
+            assert tmp_path not in backend_a._staging_root.parents
+            assert backend_a._staging_root == backend_b._staging_root
+            assert backend_a._staging_root.name == "predict-rlm-sbx-hot-box"
+        finally:
+            for backend in (backend_a, backend_b):
+                shutil.rmtree(backend._staging_root, ignore_errors=True)
+
+    def test_ephemeral_relocated_staging_root_stays_unique(self, tmp_path: Path):
+        """Non-reusable sandboxes still relocate to a random per-run temp dir."""
+        mounts = [DirectWorkspaceMount(host_path=str(tmp_path), sandbox_path="/work")]
+        with patch(
+            "predict_rlm.backends.sbx.backend.Path.cwd", return_value=tmp_path
+        ):
+            backend_a = SbxBackend(config=SbxConfig(), direct_workspace_mounts=mounts)
+            backend_b = SbxBackend(config=SbxConfig(), direct_workspace_mounts=mounts)
+        try:
+            assert tmp_path not in backend_a._staging_root.parents
+            assert backend_a._staging_root != backend_b._staging_root
+        finally:
+            for backend in (backend_a, backend_b):
+                shutil.rmtree(backend._staging_root, ignore_errors=True)
 
 
 def _reattach_backend(tmp_path: Path, *, name: str = "hot-box") -> SbxBackend:

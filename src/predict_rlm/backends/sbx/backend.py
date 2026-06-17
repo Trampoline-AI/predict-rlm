@@ -508,7 +508,8 @@ class SbxBackend(SupervisorClient, ExecutionBackend):
                 continue
             old_staging_root = self._staging_root
             _owned_staging_roots_pending_cleanup.discard(str(old_staging_root))
-            self._staging_root = Path(tempfile.mkdtemp(prefix="predict-rlm-sbx-"))
+            self._staging_root = self._relocated_staging_root()
+            self._staging_root.mkdir(parents=True, exist_ok=True)
             if not self.config.persist:
                 _owned_staging_roots_pending_cleanup.add(str(self._staging_root))
             shutil.rmtree(old_staging_root, ignore_errors=True)
@@ -517,6 +518,14 @@ class SbxBackend(SupervisorClient, ExecutionBackend):
             except OSError:
                 pass
             return
+
+    def _relocated_staging_root(self) -> Path:
+        # A reusable named sandbox must relocate to the same path every session
+        # or the persisted container's bind mounts point at a prior session's
+        # vanished temp dir and the supervisor never starts on reattach (#41).
+        if self.config.reuse and self.config.name:
+            return Path(tempfile.gettempdir()) / f"predict-rlm-sbx-{self.config.name}"
+        return Path(tempfile.mkdtemp(prefix="predict-rlm-sbx-"))
 
     def _same_direct_workspace_mounts(self, mounts: list[DirectWorkspaceMount]) -> bool:
         return self._direct_workspace_mount_keys(mounts) == self._direct_workspace_mount_keys(
