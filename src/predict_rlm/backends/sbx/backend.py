@@ -815,6 +815,7 @@ class SbxBackend(SupervisorClient, ExecutionBackend):
                 error_type=type(exc).__name__,
                 duration_ms=round((time.perf_counter() - start) * 1000),
             )
+            self._teardown_failed_websocket_supervisor()
             raise
         self._log_lifecycle(
             "sbx.runner.started",
@@ -2014,6 +2015,23 @@ class SbxBackend(SupervisorClient, ExecutionBackend):
 
     def _ensure_process_for_request(self, method: str) -> None:
         self._ensure_process_for_method(method)
+
+    def _teardown_failed_websocket_supervisor(self) -> None:
+        # A connect/handshake failure otherwise leaves a half-started supervisor
+        # alive with _websocket_url still set, which short-circuits relaunch so
+        # the next prewarm/execute reconnects to the dead endpoint. Kill it and
+        # reset transport state so the next attempt rebuilds from scratch.
+        if self._proc is not None and self._proc.poll() is None:
+            with contextlib.suppress(Exception):
+                self._proc.kill()
+                self._proc.wait(timeout=5)
+        self._discard_supervisor_process()
+        if self._websocket_supervisor_command is None:
+            # The sbx path's URL came from `sbx ports --publish`; drop it so the
+            # retry republishes instead of reusing the dead forward. The local
+            # runner's externally supplied URL stays put.
+            self._websocket_url = None
+            self._published_websocket_url = None
 
     def _discard_supervisor_process(self) -> None:
         if self._ws is not None:

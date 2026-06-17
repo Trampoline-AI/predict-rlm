@@ -3888,3 +3888,37 @@ class TestSbxBackendRealSbxReattach:
                 text=True,
                 check=False,
             )
+
+    def test_reattach_after_interpreter_error_recovers(self):
+        name = f"predict-rlm-recover-{os.getpid()}"
+        config = SbxConfig(name=name, reuse=True)
+
+        first = SbxBackend(config=config, preinstall_packages=False, debug=True)
+        try:
+            first.prewarm()
+            first.execute("keep = 7\nprint('ready')")
+            with pytest.raises(CodeInterpreterError, match="ValueError"):
+                first.execute("raise ValueError('boom')")
+            # The supervisor survives the error: same session keeps working and
+            # globals defined before the error are intact.
+            assert first.execute("print(keep + 1)").strip() == "8"
+            first.shutdown()
+            assert name in self._list_names()
+
+            # Reattach to the sandbox that errored then detached: still usable.
+            second = SbxBackend(config=config, preinstall_packages=False, debug=True)
+            second.prewarm()
+            assert second.execute("print('recovered')").strip() == "recovered"
+            with pytest.raises(CodeInterpreterError, match="ValueError"):
+                second.execute("raise ValueError('again')")
+            assert second.execute("print(6 * 7)").strip() == "42"
+            second.destroy()
+            assert name not in self._list_names()
+        finally:
+            subprocess.run(
+                ["sbx", "rm", "--force", name],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+
