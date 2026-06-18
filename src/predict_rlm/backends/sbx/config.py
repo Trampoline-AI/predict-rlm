@@ -30,8 +30,6 @@ class SbxConfig(BaseModel):
 
     @model_validator(mode="after")
     def _apply_reuse_semantics(self) -> "SbxConfig":
-        # A reusable sandbox needs a stable identity to reattach to, and must
-        # outlive the host session (persist, never auto-removed on shutdown).
         if self.reuse:
             if not self.name:
                 raise ValueError("SbxConfig.reuse=True requires a non-empty `name`.")

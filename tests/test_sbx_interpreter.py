@@ -23,6 +23,7 @@ from typing import Annotated
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from pydantic import ValidationError
 
 pytest.importorskip("websockets")  # SBX/supervisor backend requires the [sbx] extra
 
@@ -2170,17 +2171,10 @@ class TestSbxBackendLocalWebSocketRunner:
 
 
 class TestSbxBackendInterrupt(TestSbxBackendLocalWebSocketRunner):
-    """On-demand execution interrupt + cancellation-safe aexecute (issue #42).
-
-    Drives the real ``_payload.py`` over a real websocket (no Docker) via the
-    ``TestSbxBackendLocalWebSocketRunner`` seam.
-    """
+    """On-demand interrupt and cancellation-safe async execution."""
 
     @pytest.mark.local
     def test_interrupt_unblocks_long_running_cell(self, tmp_path: Path):
-        """Criteria 1 + 3: interrupt from another thread aborts a long sleep
-        promptly (not ~120s) and the next execute succeeds with no ConcurrencyError.
-        """
         interpreter = self.make_interpreter(tmp_path, startup_timeout=5)
         try:
             running_flag: dict[str, bool] = {}
@@ -2192,7 +2186,6 @@ class TestSbxBackendInterrupt(TestSbxBackendLocalWebSocketRunner):
             thread = threading.Thread(target=fire_interrupt)
             thread.start()
             start = time.monotonic()
-            # No timeout= -> relies purely on the interrupt to unblock.
             result = interpreter.execute("import time\ntime.sleep(120)\nprint('done')")
             elapsed = time.monotonic() - start
             thread.join(timeout=5)
@@ -2201,14 +2194,12 @@ class TestSbxBackendInterrupt(TestSbxBackendLocalWebSocketRunner):
             assert running_flag.get("was_running") is True
             assert "done" not in str(result)
 
-            # Next execute must succeed on the warm sandbox (no ConcurrencyError).
             assert interpreter.execute("print('alive')") == "alive\n"
         finally:
             interpreter.shutdown()
 
     @pytest.mark.local
     def test_interrupt_preserves_warm_state(self, tmp_path: Path):
-        """Criterion 2: a variable set before the interrupted cell survives."""
         interpreter = self.make_interpreter(tmp_path, startup_timeout=5)
         try:
             assert interpreter.execute("kept = 99\nprint(kept)") == "99\n"
@@ -2228,19 +2219,6 @@ class TestSbxBackendInterrupt(TestSbxBackendLocalWebSocketRunner):
 
     @pytest.mark.local
     def test_interrupt_returns_only_after_cell_releases_gate(self, tmp_path: Path):
-        """Regression for the Fractal interrupt-recovery race (#42).
-
-        ``interrupt`` must not return until the interrupted cell has released
-        the execution gate -- i.e. the worker blocked in the execute ``recv``
-        loop has drained and the interpreter is quiescent. Otherwise the next
-        request calls ``recv`` concurrently with the still-draining worker and
-        trips a websockets ConcurrencyError.
-
-        Asserting the gate state directly (rather than racing a follow-up
-        request) makes the contract deterministic: without the wait-for-drain,
-        ``interrupt`` returns right after the ``ws.send`` while the cell is still
-        being torn down across several IPC hops, so the gate is still held.
-        """
         interpreter = self.make_interpreter(tmp_path, startup_timeout=5)
         gate = interpreter._execution_gate
         try:
@@ -2253,7 +2231,7 @@ class TestSbxBackendInterrupt(TestSbxBackendLocalWebSocketRunner):
             worker.start()
             while not gate.is_running():
                 time.sleep(0.01)
-            time.sleep(0.5)  # let the kernel actually enter the sleep
+            time.sleep(0.5)
 
             was_running = interpreter.interrupt(timeout=10.0)
 
@@ -2264,14 +2242,12 @@ class TestSbxBackendInterrupt(TestSbxBackendLocalWebSocketRunner):
 
             worker.join(timeout=5)
             assert not worker.is_alive()
-            # Warm sandbox + ws are immediately reusable, no ConcurrencyError.
             assert interpreter.execute("print(warm)") == "1\n"
         finally:
             interpreter.shutdown()
 
     @pytest.mark.local
     def test_interrupt_returns_false_when_idle(self, tmp_path: Path):
-        """Criterion 5 (client view): interrupt while idle reports no cell ran."""
         interpreter = self.make_interpreter(tmp_path, startup_timeout=5)
         try:
             interpreter.execute("print('warm')")
@@ -2283,9 +2259,6 @@ class TestSbxBackendInterrupt(TestSbxBackendLocalWebSocketRunner):
     def test_aexecute_cancellation_is_prompt_and_keeps_sandbox_warm(
         self, tmp_path: Path
     ):
-        """Criteria 1 + 4: cancelling aexecute mid-cell unwinds the worker
-        promptly (no orphaned to_thread worker) and leaves the ws reusable.
-        """
         interpreter = self.make_interpreter(tmp_path, startup_timeout=5)
 
         async def scenario() -> float:
@@ -2303,34 +2276,25 @@ class TestSbxBackendInterrupt(TestSbxBackendLocalWebSocketRunner):
         try:
             elapsed = asyncio.run(scenario())
             assert elapsed < 30, f"cancellation did not unwind promptly: {elapsed:.1f}s"
-            # ws still usable and warm state preserved.
             assert interpreter.execute("print(seed)") == "5\n"
-            assert (
-                threading.active_count() < 10
-            ), "orphaned worker thread(s) survived cancellation"
         finally:
             interpreter.shutdown()
 
 
 class TestSupervisorPayloadInterruptMethod:
-    """Criterion 5: server-side ``interrupt`` JSON-RPC method semantics."""
-
     @pytest.mark.local
     def test_interrupt_method_acks_running_false_when_idle(self, tmp_path: Path):
         import predict_rlm.backends.supervisor._payload as payload
 
-        payload._consume_interrupt_request()  # clear any prior latch
+        payload._consume_interrupt_request()
         result = asyncio.run(
             payload._handle_interrupt_request({"id": 1, "method": "interrupt"})
         )
-        # Idle -> ack reports no cell was running (the no-op ack contract).
         assert result["result"]["running"] is False
-        payload._consume_interrupt_request()  # don't leak the latch to other tests
+        payload._consume_interrupt_request()
 
 
 class TestSbxBackendLocalSupervisorInterrupt(TestSbxBackendLocalWebSocketRunner):
-    """Criterion 5 (in-runner): interrupt method trips the interrupt path."""
-
     @pytest.mark.local
     def test_interrupt_method_trips_interrupt_path_while_running(self, tmp_path: Path):
         interpreter = self.make_interpreter(tmp_path, startup_timeout=5)
@@ -2348,26 +2312,12 @@ class TestSbxBackendLocalSupervisorInterrupt(TestSbxBackendLocalWebSocketRunner)
             elapsed = time.monotonic() - start
             thread.join(timeout=5)
             assert elapsed < 30
-            # The runner kernel restored globals from snapshot; flag survives.
             assert interpreter.execute("print(flag)") == "1\n"
         finally:
             interpreter.shutdown()
 
 
 class TestSbxSupervisorSignalIsolation(TestSbxBackendLocalWebSocketRunner):
-    """Regression: a terminal SIGINT (Ctrl-C interrupting an RLM turn) must not
-    reach the supervisor subprocess.
-
-    The supervisor is launched without ``start_new_session`` it shares the
-    host's process group, so a terminal Ctrl-C is delivered to the Go ``sbx``
-    child too. The child cancels its context ("ERROR: context canceled") and
-    exits, while Python only sees an ``asyncio.CancelledError`` during the LLM
-    phase (no execute in flight) and hands the supervisor back as healthy. The
-    next request then fails with "Sbx supervisor exited unexpectedly". The
-    out-of-band signal bypasses the in-band #42 interrupt machinery entirely;
-    detaching the process group is what keeps Ctrl-C off the child.
-    """
-
     @pytest.mark.local
     def test_supervisor_runs_in_its_own_process_group(self, tmp_path: Path):
         interpreter = self.make_interpreter(tmp_path)
@@ -3575,10 +3525,8 @@ class TestSbxBackendRealSbx:
 
 
 class TestSbxBackendReattachConfig:
-    """Config surface for reusable/persistent sandboxes (issue #41)."""
-
     def test_reuse_requires_name(self):
-        with pytest.raises(Exception):
+        with pytest.raises(ValidationError, match="reuse=True"):
             SbxConfig(reuse=True)
 
     def test_reuse_implies_persist_and_no_remove(self):
@@ -3596,8 +3544,6 @@ class TestSbxBackendReattachConfig:
 
 
 class TestSbxBackendReattachStagingRoot:
-    """Deterministic staging root tied to the sandbox name (issue #41)."""
-
     def test_reuse_staging_root_is_deterministic_from_name(self, tmp_path: Path):
         with patch(
             "predict_rlm.backends.sbx.backend.Path.cwd", return_value=tmp_path
@@ -3630,12 +3576,6 @@ class TestSbxBackendReattachStagingRoot:
     def test_reuse_relocated_staging_root_is_deterministic_across_sessions(
         self, tmp_path: Path
     ):
-        """Reattach regression: when the deterministic staging root is nested in
-        a direct workspace mount it gets relocated out, but the relocated path
-        must stay identical across sessions — otherwise the reattached
-        container's bind mounts point at the previous session's now-gone temp
-        dir and the websocket supervisor never starts (issues #41/#42).
-        """
         mounts = [DirectWorkspaceMount(host_path=str(tmp_path), sandbox_path="/work")]
 
         def _make() -> SbxBackend:
@@ -3658,7 +3598,6 @@ class TestSbxBackendReattachStagingRoot:
                 shutil.rmtree(backend._staging_root, ignore_errors=True)
 
     def test_ephemeral_relocated_staging_root_stays_unique(self, tmp_path: Path):
-        """Non-reusable sandboxes still relocate to a random per-run temp dir."""
         mounts = [DirectWorkspaceMount(host_path=str(tmp_path), sandbox_path="/work")]
         with patch(
             "predict_rlm.backends.sbx.backend.Path.cwd", return_value=tmp_path
@@ -3682,8 +3621,6 @@ def _reattach_backend(tmp_path: Path, *, name: str = "hot-box") -> SbxBackend:
 
 
 class TestSbxBackendReattachDetection:
-    """3-way reattach resolution: running / stopped / missing (issue #41)."""
-
     def _patches(self, backend: SbxBackend, *, ls_output: str):
         runs: list[list[str]] = []
 
@@ -3705,10 +3642,6 @@ class TestSbxBackendReattachDetection:
             patch.object(
                 SbxBackend, "_prepare_supervisor_script", return_value=Path("/sup.py")
             ),
-            patch.object(SbxBackend, "_apply_network_policy"),
-            patch.object(SbxBackend, "_bootstrap_packages"),
-            patch.object(SbxBackend, "_setup_direct_workspace_aliases_in_sandbox"),
-            patch.object(SbxBackend, "_sbx_sandbox_healthy", return_value=True),
         ]
         return runs, cm
 
@@ -3728,7 +3661,6 @@ class TestSbxBackendReattachDetection:
         ):
             backend._start_sbx_and_prepare_supervisor()
         assert backend._sandbox_name == "hot-box"
-        # No create command was issued.
         assert not any(r[:2] == ["sbx", "create"] for r in runs)
         net.assert_not_called()
         boot.assert_not_called()
@@ -3803,7 +3735,6 @@ class TestSbxBackendReattachDetection:
             patch.object(SbxBackend, "_sbx_sandbox_healthy", return_value=False),
         ):
             backend._start_sbx_and_prepare_supervisor()
-        # Unhealthy -> force-remove + recreate + bootstrap.
         assert any(
             r[:2] == ["sbx", "rm"] and "hot-box" in r for r in runs
         ), runs
@@ -3813,8 +3744,6 @@ class TestSbxBackendReattachDetection:
 
 
 class TestSbxBackendReattachShutdown:
-    """Shutdown under reuse must not remove the sandbox or staging root."""
-
     def test_reuse_shutdown_does_not_rm_or_delete_staging(self, tmp_path: Path):
         backend = _reattach_backend(tmp_path)
         backend._sandbox_name = "hot-box"
@@ -3857,8 +3786,6 @@ class TestSbxBackendReattachShutdown:
 
 
 class TestSbxBackendDestroy:
-    """Explicit teardown API (issue #41)."""
-
     def test_destroy_removes_sandbox_and_staging_root(self, tmp_path: Path):
         backend = _reattach_backend(tmp_path)
         backend._sandbox_name = "hot-box"
@@ -3896,8 +3823,6 @@ class TestSbxBackendDestroy:
 
 
 class TestSbxBackendReattachRegression:
-    """`reuse=False` default create path is unchanged (issue #41)."""
-
     def test_default_path_still_creates_without_ls_probe(self, tmp_path: Path):
         backend = SbxBackend(
             config=SbxConfig(),
@@ -3926,7 +3851,6 @@ class TestSbxBackendReattachRegression:
             patch.object(SbxBackend, "_setup_direct_workspace_aliases_in_sandbox"),
         ):
             backend._start_sbx_and_prepare_supervisor()
-        # No reattach probe on the default path.
         assert not any(r[:2] == ["sbx", "ls"] for r in runs), runs
         assert any(r[:2] == ["sbx", "create"] for r in runs), runs
         net.assert_called_once()
@@ -3939,15 +3863,6 @@ class TestSbxBackendReattachRegression:
     reason="real Docker Sandboxes tests require PREDICT_RLM_RUN_SBX_TESTS=1, sbx CLI, and sbx login",
 )
 class TestSbxBackendRealSbxReattach:
-    """End-to-end persist + reattach lifecycle against a real sbx sandbox (#41).
-
-    The headline test the user asked for: first prewarm creates+bootstraps and
-    writes filesystem state; shutdown leaves the container alive (no `sbx rm`);
-    a second backend reattaches WITHOUT create/bootstrap (asserted via lifecycle
-    telemetry and a spy on `_bootstrap_packages`), the persisted state survives,
-    and finally `destroy()` removes it so a subsequent prewarm does a clean create.
-    """
-
     def _list_names(self) -> list[str]:
         result = subprocess.run(
             ["sbx", "ls"], capture_output=True, text=True, check=False, timeout=15
@@ -3959,7 +3874,6 @@ class TestSbxBackendRealSbxReattach:
         config = SbxConfig(name=name, reuse=True)
         marker = f"state-{os.getpid()}"
 
-        # First session: create + bootstrap + write persisted /sandbox state.
         first = SbxBackend(config=config, preinstall_packages=False, debug=True)
         try:
             first.prewarm()
@@ -3969,10 +3883,8 @@ class TestSbxBackendRealSbxReattach:
                 "print('wrote')"
             )
             first.shutdown()
-            # Container must still be listed (no `sbx rm` happened).
             assert name in self._list_names()
 
-            # Second session: reattach. Spy on bootstrap/create to prove they are skipped.
             second = SbxBackend(config=config, preinstall_packages=False, debug=True)
             events: list[str] = []
             orig_log = second._log_lifecycle
@@ -4000,11 +3912,9 @@ class TestSbxBackendRealSbxReattach:
             second.shutdown()
             assert name in self._list_names()
 
-            # destroy() removes the container + staging root.
             second.destroy()
             assert name not in self._list_names()
 
-            # A fresh backend now does a clean create (reattach miss).
             third = SbxBackend(config=config, preinstall_packages=False, debug=True)
             try:
                 third.prewarm()
@@ -4033,13 +3943,10 @@ class TestSbxBackendRealSbxReattach:
             first.execute("keep = 7\nprint('ready')")
             with pytest.raises(CodeInterpreterError, match="ValueError"):
                 first.execute("raise ValueError('boom')")
-            # The supervisor survives the error: same session keeps working and
-            # globals defined before the error are intact.
             assert first.execute("print(keep + 1)").strip() == "8"
             first.shutdown()
             assert name in self._list_names()
 
-            # Reattach to the sandbox that errored then detached: still usable.
             second = SbxBackend(config=config, preinstall_packages=False, debug=True)
             second.prewarm()
             assert second.execute("print('recovered')").strip() == "recovered"

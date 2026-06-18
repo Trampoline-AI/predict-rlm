@@ -157,8 +157,6 @@ class SbxBackend(SupervisorClient, ExecutionBackend):
         if _staging_root is not None:
             self._staging_root = Path(_staging_root)
         elif self.config.reuse and self.config.name:
-            # Deterministic staging root tied to the sandbox identity so the
-            # persisted container's bind mounts line up across sessions (#41).
             self._staging_root = (
                 self._host_workspace / ".predict_rlm_sbx" / self.config.name
             )
@@ -175,8 +173,6 @@ class SbxBackend(SupervisorClient, ExecutionBackend):
         self._ws: ClientConnection | None = None
         self._pending_tool_calls: dict[concurrent.futures.Future[dict[str, Any]], int] = {}
         self._active_execute_timeout_deadline: float | None = None
-        # Grace period for the graceful interrupt issued when an in-flight
-        # ``aexecute`` is cancelled (issue #42).
         self.cancellation_interrupt_timeout: float = 10.0
         self._execution_gate = BackendExecutionGate("SBX backend")
         self._sandbox_name: str | None = None
@@ -270,13 +266,6 @@ class SbxBackend(SupervisorClient, ExecutionBackend):
         try:
             return await asyncio.to_thread(self.execute, code, variables, timeout=timeout)
         except asyncio.CancelledError:
-            # The ``to_thread`` worker is still the sole reader of ``self._ws``
-            # and the cell keeps running in-sandbox. Send an interrupt (a
-            # thread-safe ``ws.send`` that does NOT touch recv) so the worker's
-            # in-flight execute returns promptly, the execution gate releases,
-            # and the warm sandbox + ws are reused by the next request. Graceful
-            # mirror of the supervisor backend's
-            # ``_abort_supervisor_after_cancellation``: we keep the sandbox.
             await self._abort_execution_after_cancellation()
             raise
 
@@ -286,7 +275,7 @@ class SbxBackend(SupervisorClient, ExecutionBackend):
         except asyncio.CancelledError:
             raise
         except Exception:
-            # Best-effort; never mask the original CancelledError.
+            # Preserve the original cancellation even if cleanup has to be best-effort.
             pass
 
     def _interrupt_after_cancellation(self) -> None:
@@ -295,9 +284,6 @@ class SbxBackend(SupervisorClient, ExecutionBackend):
         try:
             self.interrupt(timeout=self.cancellation_interrupt_timeout)
         except Exception:
-            # Graceful interrupt failed: fall back to a hard teardown so the
-            # next request rebuilds the supervisor rather than wedging on the
-            # orphaned recv. The warm sandbox is sacrificed only in this path.
             self._hard_abort_websocket_after_failed_interrupt()
 
     def interrupt(self, *, timeout: float | None = 10.0) -> bool:
@@ -324,19 +310,11 @@ class SbxBackend(SupervisorClient, ExecutionBackend):
         try:
             ws.send(self._serialize_supervisor_message(payload), text=True)
         except TypeError:
-            # Older websockets ClientConnection.send has no ``text`` kwarg.
             ws.send(self._serialize_supervisor_message(payload))
         except Exception as exc:
             raise SandboxFatalError(
                 f"Failed to send interrupt to Sbx WebSocket supervisor: {exc}"
             ) from exc
-        # Sending the frame is not enough: the worker blocked in the execute
-        # ``recv`` loop is still the sole reader of ``self._ws``. Returning now
-        # would let the next request call ``recv`` concurrently and trip a
-        # websockets ConcurrencyError. Wait for the interrupted execute to
-        # return and release the gate so the interpreter is quiescent before we
-        # hand it back. If it does not drain in time, raise so callers fall back
-        # to a hard teardown rather than reusing a wedged connection.
         if was_running and not self._execution_gate.wait_until_idle(timeout):
             raise SandboxFatalError(
                 "Interrupt frame sent but the running cell did not release the "
@@ -350,11 +328,8 @@ class SbxBackend(SupervisorClient, ExecutionBackend):
     def _hard_abort_websocket_after_failed_interrupt(self) -> None:
         """Tear down the websocket + supervisor when a graceful interrupt fails.
 
-        Hard fallback for issue #42: if the interrupt frame cannot be sent (or
-        does not release the worker), discard the transport so the next request
-        rebuilds a fresh supervisor instead of raising ``ConcurrencyError`` on a
-        wedged recv. This sacrifices the warm sandbox. Kept separate from
-        ``shutdown()`` to avoid colliding with issue #41's lifecycle changes.
+        This sacrifices the warm sandbox instead of reusing a connection with an
+        execute still draining in another thread.
         """
         with contextlib.suppress(Exception):
             self._discard_supervisor_process()
@@ -521,9 +496,6 @@ class SbxBackend(SupervisorClient, ExecutionBackend):
             return
 
     def _relocated_staging_root(self) -> Path:
-        # A reusable named sandbox must relocate to the same path every session
-        # or the persisted container's bind mounts point at a prior session's
-        # vanished temp dir and the supervisor never starts on reattach (#41).
         if self.config.reuse and self.config.name:
             return Path(tempfile.gettempdir()) / f"predict-rlm-sbx-{self.config.name}"
         return Path(tempfile.mkdtemp(prefix="predict-rlm-sbx-"))
@@ -658,8 +630,6 @@ class SbxBackend(SupervisorClient, ExecutionBackend):
             and self.config.reuse
             and self.config.stop_on_shutdown
         ):
-            # Persisted sandbox: leave the container intact but free CPU/RAM by
-            # stopping it (slower reattach next session). Never `sbx rm` (#41).
             subprocess.run(
                 ["sbx", "stop", self._sandbox_name],
                 check=False,
@@ -682,12 +652,7 @@ class SbxBackend(SupervisorClient, ExecutionBackend):
             pass
 
     def destroy(self) -> None:
-        """Force-remove the persisted sandbox and delete its staging root (#41).
-
-        Unlike :meth:`shutdown` (which, under ``reuse=True``, leaves the
-        container alive), ``destroy`` tears everything down so a subsequent
-        ``prewarm()`` does a clean create.
-        """
+        """Force-remove the sandbox and delete its staging root."""
         self._log_lifecycle("sbx.destroy.start")
         if not self._shutdown:
             with contextlib.suppress(Exception):
@@ -1101,13 +1066,7 @@ class SbxBackend(SupervisorClient, ExecutionBackend):
         return result.returncode == 0
 
     def _try_reattach_named_sandbox(self) -> bool:
-        """Attempt to reattach to a persisted named sandbox (#41).
-
-        Returns ``True`` if reattached (caller skips create+bootstrap), ``False``
-        if the caller should fall through to a clean create. Missing, stopped,
-        and unhealthy containers self-heal: stopped is started; unhealthy is
-        force-removed so the caller recreates.
-        """
+        """Return True when an existing named sandbox is ready to reuse."""
         name = self.config.name
         assert name is not None
         self._log_lifecycle("sbx.reattach.start", sandbox_name=name)
@@ -1143,8 +1102,6 @@ class SbxBackend(SupervisorClient, ExecutionBackend):
             self._force_remove_sandbox(name)
             return False
 
-        # Reattach: skip create + network policy + bootstrap; only re-assert the
-        # workspace aliases idempotently (alias script no-ops on a match).
         self._sandbox_name = name
         self._setup_direct_workspace_aliases_in_sandbox()
         self._log_lifecycle("sbx.reattach.ok", sandbox_name=name)
