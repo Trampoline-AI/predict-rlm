@@ -180,6 +180,7 @@ class SbxPool:
         *,
         tools: dict[str, Callable[..., Any]] | None = None,
         output_fields: list[dict] | None = None,
+        skill_packages: list[str] | None = None,
         debug: bool | None = None,
         verbose: bool | None = None,
         runtime_hooks: list[Any] | None = None,
@@ -200,6 +201,7 @@ class SbxPool:
             interpreter.configure_runtime(
                 tools=tools,
                 output_fields=output_fields,
+                skill_packages=skill_packages,
                 debug=effective_debug,
                 verbose=effective_verbose,
                 runtime_hooks=runtime_hooks,

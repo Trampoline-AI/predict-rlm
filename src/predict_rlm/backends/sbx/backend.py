@@ -92,6 +92,10 @@ def _cleanup_pending_staging_roots() -> None:
 atexit.register(_cleanup_pending_staging_roots)
 
 
+def _dedupe_packages(packages: list[str]) -> list[str]:
+    return list(dict.fromkeys(packages))
+
+
 class _DetachedWebSocketSupervisorProcess:
     stdin = None
     stdout = None
@@ -136,7 +140,8 @@ class SbxBackend(SupervisorClient, ExecutionBackend):
         self.tools = tools or {}
         self.output_fields = output_fields or []
         self.preinstall_packages = preinstall_packages
-        self.skill_packages = skill_packages or []
+        self.skill_packages = _dedupe_packages(skill_packages or [])
+        self._installed_skill_packages: set[str] = set()
         self.debug = debug
         self.verbose = verbose
         configure_predict_rlm_logging(
@@ -521,6 +526,7 @@ class SbxBackend(SupervisorClient, ExecutionBackend):
         *,
         tools: dict[str, Callable[..., Any]] | None = None,
         output_fields: list[dict] | None = None,
+        skill_packages: list[str] | None = None,
         debug: bool | None = None,
         verbose: bool | None = None,
         runtime_hooks: list[RuntimeHook] | None = None,
@@ -534,6 +540,8 @@ class SbxBackend(SupervisorClient, ExecutionBackend):
             self.tools = tools
         if output_fields is not None:
             self.output_fields = output_fields
+        if skill_packages is not None:
+            self.ensure_skill_packages(skill_packages)
         if runtime_hooks is not None:
             self.runtime_hooks = list(runtime_hooks)
             self.on_runtime_hook_event = on_runtime_hook_event
@@ -548,8 +556,31 @@ class SbxBackend(SupervisorClient, ExecutionBackend):
             "sbx.runtime.configured",
             tools=len(self.tools),
             output_fields=len(self.output_fields),
+            skill_packages=len(self.skill_packages),
             process_running=bool(self._proc and self._proc.poll() is None),
         )
+
+    def ensure_skill_packages(self, packages: list[str]) -> None:
+        requested = _dedupe_packages(packages)
+        if not requested:
+            return
+        known_packages = set(self.skill_packages)
+        self.skill_packages.extend(
+            package for package in requested if package not in known_packages
+        )
+        missing = [
+            package
+            for package in requested
+            if package not in self._installed_skill_packages
+        ]
+        if not missing or self._sandbox_name is None:
+            return
+        self._install_packages(
+            missing,
+            event="sbx.skill_packages",
+            failure_label="install sbx skill packages",
+        )
+        self._installed_skill_packages.update(missing)
 
     def _register_runtime_hooks(self) -> None:
         self._send_request(
@@ -968,6 +999,9 @@ class SbxBackend(SupervisorClient, ExecutionBackend):
         supervisor_path = self._prepare_supervisor_script()
 
         if self.config.reuse and self._try_reattach_named_sandbox():
+            if self.skill_packages:
+                self._apply_network_policy()
+                self.ensure_skill_packages(self.skill_packages)
             return supervisor_path
 
         self._create_and_bootstrap_sandbox()
@@ -1230,6 +1264,23 @@ class SbxBackend(SupervisorClient, ExecutionBackend):
         if self.preinstall_packages:
             packages.extend(["pydantic", "pandas"])
         packages.extend(self.skill_packages)
+        packages = _dedupe_packages(packages)
+        self._install_packages(
+            packages,
+            event="sbx.bootstrap",
+            failure_label="bootstrap sbx packages",
+        )
+        self._installed_skill_packages.update(self.skill_packages)
+
+    def _install_packages(
+        self,
+        packages: list[str],
+        *,
+        event: str,
+        failure_label: str,
+    ) -> None:
+        if not packages:
+            return
         assert self._sandbox_name is not None
         command = [
             "sbx",
@@ -1244,9 +1295,9 @@ class SbxBackend(SupervisorClient, ExecutionBackend):
             "--break-system-packages",
             *packages,
         ]
-        bootstrap_start = time.perf_counter()
+        install_start = time.perf_counter()
         self._log_lifecycle(
-            "sbx.bootstrap.start",
+            f"{event}.start",
             packages=",".join(packages),
             timeout_seconds=self.config.exec_timeout,
         )
@@ -1260,34 +1311,34 @@ class SbxBackend(SupervisorClient, ExecutionBackend):
             )
         except subprocess.TimeoutExpired as exc:
             self._log_lifecycle(
-                "sbx.bootstrap.timeout",
+                f"{event}.timeout",
                 packages=",".join(packages),
-                duration_ms=ms_since(bootstrap_start),
+                duration_ms=ms_since(install_start),
                 status="error",
             )
             raise SandboxFatalError(
-                f"Failed to bootstrap sbx packages {packages}: timed out after "
+                f"Failed to {failure_label} {packages}: timed out after "
                 f"{self.config.exec_timeout}s"
             ) from exc
         if result.returncode != 0:
             self._log_lifecycle(
-                "sbx.bootstrap.error",
+                f"{event}.error",
                 packages=",".join(packages),
-                duration_ms=ms_since(bootstrap_start),
+                duration_ms=ms_since(install_start),
                 returncode=result.returncode,
                 stdout_chars=len(result.stdout or ""),
                 stderr_chars=len(result.stderr or ""),
                 status="error",
             )
             raise SandboxFatalError(
-                "Failed to bootstrap sbx packages "
+                f"Failed to {failure_label} "
                 f"{packages}: exit code {result.returncode}; "
                 f"stdout: {result.stdout.strip()}; stderr: {result.stderr.strip()}"
             )
         self._log_lifecycle(
-            "sbx.bootstrap.ok",
+            f"{event}.ok",
             packages=",".join(packages),
-            duration_ms=ms_since(bootstrap_start),
+            duration_ms=ms_since(install_start),
             stdout_chars=len(result.stdout or ""),
             stderr_chars=len(result.stderr or ""),
         )

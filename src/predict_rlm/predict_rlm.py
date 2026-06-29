@@ -1522,6 +1522,9 @@ class PredictRLM(dspy.RLM):
                 configure_runtime(**runtime_kwargs)
             else:
                 self._inject_execution_context(self._interpreter, execution_tools)
+            skill_packages_configured = self._ensure_interpreter_skill_packages(
+                self._interpreter
+            )
             backend = self._interpreter_backend_label(self._interpreter)
             configured = self._configure_interpreter_debug(self._interpreter)
             self._log_lifecycle(
@@ -1530,6 +1533,7 @@ class PredictRLM(dspy.RLM):
                 interpreter=type(self._interpreter).__name__,
                 debug_configured=configured["debug"],
                 verbose_configured=configured["verbose"],
+                skill_packages_configured=skill_packages_configured,
                 owner="caller",
             )
             try:
@@ -1571,6 +1575,7 @@ class PredictRLM(dspy.RLM):
                 with self._sbx_pool.lease(
                     tools=execution_tools,
                     output_fields=self._get_output_fields_info(),
+                    skill_packages=self._skill_packages or None,
                     debug=self._debug,
                     verbose=self._iteration_logging_enabled(),
                     runtime_hooks=self._runtime_hooks,
@@ -1803,6 +1808,15 @@ class PredictRLM(dspy.RLM):
 
     def _configure_interpreter_debug(self, repl: Any) -> dict[str, bool]:
         return self._configure_interpreter_logging(repl)
+
+    def _ensure_interpreter_skill_packages(self, repl: Any) -> bool:
+        if not self._skill_packages:
+            return False
+        ensure_skill_packages = self._declared_callable(repl, "ensure_skill_packages")
+        if ensure_skill_packages is None:
+            return False
+        ensure_skill_packages(self._skill_packages)
+        return True
 
     def _configure_interpreter_logging(self, repl: Any) -> dict[str, bool]:
         configured = {"debug": False, "verbose": False}
