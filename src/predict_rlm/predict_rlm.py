@@ -184,6 +184,15 @@ def _prepend_partial_output(partial_output: str, error: str) -> str:
     return f"{partial_output}\n{error}"
 
 
+def _shorten_repl_output(output: str, max_output_chars: int) -> str:
+    if len(output) <= max_output_chars:
+        return output
+    return (
+        output[:max_output_chars]
+        + f"\n... (truncated to {max_output_chars}/{len(output):,} chars)"
+    )
+
+
 def _output_indicates_error(output: str) -> bool:
     return any(
         line.startswith(("[Error]", "[Type Error]")) for line in output.splitlines()
@@ -653,11 +662,11 @@ The REPL runs inside an async event loop — use `await` directly, not `asyncio.
 
 {execution_timeout_instructions}## Managing state & output
 
-Each iteration's printed output is captured and shown to you in subsequent iterations, but **truncated to ~5000 characters**. This is a hard limit — output beyond 5K chars is cut off.
+Each iteration's printed output is captured and shown to you in subsequent iterations, but **truncated to {max_output_chars:,} characters**. Output beyond that limit is cut off.
 
 **What persists fully:** Python variables. Everything you store in a variable (`all_items`, `records`, `chunks`, etc.) survives intact across successful iterations and cooperative timeouts. If a hard-kill timeout is required, the runtime restores only the pre-timeout pickleable globals snapshot and reports any unpickleable names that were lost.
 
-**What gets truncated:** printed output. If you `print(big_list)` and it's 50K chars, you'll only see the first 5K in the next iteration's context.
+**What gets truncated:** printed output. If you `print(big_list)` and it's longer than {max_output_chars:,} characters, you'll only see a shortened view in the next iteration's context.
 
 **How to work effectively across iterations:**
 - **Store in variables, print summaries:** `items.extend(new_items); print(f"{{len(items)}} items so far")` — the data is in `items` (full), you see the count (tiny).
@@ -903,7 +912,7 @@ class PredictRLM(dspy.RLM):
         sub_lm: dspy.LM | str | None = None,
         max_iterations: int = 30,
         max_llm_calls: int = 50,
-        max_output_chars: int = 100_000,
+        max_output_chars: int = 50_000,
         verbose: bool = True,
         tools: dict[str, Callable[..., str]] | list[Callable] | None = None,
         interpreter: CodeInterpreter | None = None,
@@ -3065,12 +3074,7 @@ class PredictRLM(dspy.RLM):
             entry = None
 
         full_output = entry.output if entry else ""
-        if len(full_output) > 5000:
-            prompt_output = (
-                full_output[:5000] + f"\n... (truncated to 5000/{len(full_output):,} chars)"
-            )
-        else:
-            prompt_output = full_output
+        prompt_output = _shorten_repl_output(full_output, self.max_output_chars)
 
         predict_calls = drain_predict_calls()
         iteration_usage = self._build_iteration_usage(predict_calls)
@@ -3147,7 +3151,7 @@ class PredictRLM(dspy.RLM):
 
                 try:
                     status = "max_iterations"
-                    history = REPLHistory()
+                    history = REPLHistory(max_output_chars=self.max_output_chars)
                     pending_submit_confirmation = False
                     # Reset partial-trajectory capture for this forward() call
                     # so crash-recovery consumers (see e.g. the spreadbench
@@ -3317,7 +3321,7 @@ class PredictRLM(dspy.RLM):
 
                 try:
                     status = "max_iterations"
-                    history = REPLHistory()
+                    history = REPLHistory(max_output_chars=self.max_output_chars)
                     pending_submit_confirmation = False
                     # Reset partial-trajectory capture for this aforward() call
                     # so crash-recovery consumers (see e.g. the spreadbench
@@ -3485,6 +3489,7 @@ class PredictRLM(dspy.RLM):
             skill_instructions=self._skill_instructions,
             file_instructions=file_instructions,
             model_execution_timeout=self._model_execution_timeout,
+            max_output_chars=self.max_output_chars,
         )
         return dspy.Predict(action_sig), dspy.Predict(extract_sig)
 
@@ -3498,4 +3503,5 @@ class PredictRLM(dspy.RLM):
             self._format_tool_docs,
             skill_instructions=self._skill_instructions,
             model_execution_timeout=self._model_execution_timeout,
+            max_output_chars=self.max_output_chars,
         )

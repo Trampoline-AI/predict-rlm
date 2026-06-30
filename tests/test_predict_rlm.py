@@ -1922,6 +1922,41 @@ class TestSubmitConfirmation:
         assert len(result.trace.steps) == 1
         assert rlm.generate_action.call_count == 1
 
+    def test_max_output_chars_controls_traced_history_and_step_output(self):
+        rlm = PredictRLM(
+            ImageAnalysisSignature,
+            sub_lm=MagicMock(),
+            max_iterations=2,
+            max_output_chars=12,
+        )
+        long_output = "abcdefghijklmnopqrstuvwxyz"
+
+        class LongOutputRepl(FakeSubmitRepl):
+            def execute(self, code, variables=None, timeout=None):
+                self.executed.append(code)
+                if code.startswith("SUBMIT"):
+                    return FinalOutput(self.final_payload)
+                return long_output
+
+        result = self._run_sync(
+            rlm,
+            [
+                self._prediction("print('long')"),
+                self._prediction("SUBMIT(answer='done')"),
+            ],
+            repl=LongOutputRepl(),
+        )
+
+        second_call_history = rlm.generate_action.call_args_list[1].kwargs["repl_history"]
+        formatted_history = second_call_history.format()
+        assert "Output (26 chars):" in formatted_history
+        assert "abcdefghijkl" not in formatted_history
+        assert "... (14 characters omitted) ..." in formatted_history
+
+        first_step = result.trace.steps[0]
+        assert first_step.untruncated_output == long_output
+        assert first_step.output == "abcdefghijkl\n... (truncated to 12/26 chars)"
+
     def test_first_submit_prompts_and_second_submit_completes(self):
         seen_contexts = []
 

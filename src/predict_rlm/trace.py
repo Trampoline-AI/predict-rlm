@@ -182,7 +182,7 @@ class ProposerIterationStep(BaseModel):
     )
     code: str = Field(description="Python code executed for this iteration")
     output: str = Field(
-        description="Sandbox output visible in later model context, shortened to 5K chars"
+        description="Sandbox output visible in later model context, shortened by max_output_chars"
     )
     untruncated_output: str = Field(
         description="Full sandbox output before context shortening"
@@ -242,7 +242,7 @@ class IterationStep(BaseModel):
     )
     code: str = Field(description="Python code executed for this iteration")
     output: str = Field(
-        description="Sandbox output visible in later model context, shortened to 5K chars"
+        description="Sandbox output visible in later model context, shortened by max_output_chars"
     )
     untruncated_output: str = Field(
         description="Full sandbox output before context shortening"

@@ -104,6 +104,7 @@ def build_rlm_signatures(
     skill_instructions: str = "",
     file_instructions: str = "",
     model_execution_timeout: bool = True,
+    max_output_chars: int = 50_000,
 ) -> tuple[Signature, Signature]:
     """Build action and extract signatures for RLM subclasses.
 
@@ -131,6 +132,7 @@ def build_rlm_signatures(
             inputs=inputs_str,
             final_output_names=final_output_names,
             output_fields=output_fields,
+            max_output_chars=max_output_chars,
             execution_timeout_instructions=(
                 EXECUTION_TIMEOUT_INSTRUCTIONS if model_execution_timeout else ""
             ),
