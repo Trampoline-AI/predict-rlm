@@ -32,14 +32,17 @@ If sandbox code prints output and then raises, the printed output is preserved
 before the formatted `[Error] ...` line in both the verbose stream and the
 structured run trace.
 
-## Signatures and file I/O
+## Signatures, file I/O, and in-context inputs
 
 The DSPy signature defines the **inputs**, **outputs**, and **strategy** (via
 the docstring). Use `File` for file-typed fields — input files are mounted into
 the sandbox, output files are synced back (see [API](api.md#file) for details).
+Use `CtxStr` for string inputs like criteria or rubrics that should be
+appended verbatim to the outer RLM prompt while still remaining available as a
+normal Python string variable.
 
 ```python
-from predict_rlm import File, PredictRLM, Skill
+from predict_rlm import CtxStr, File, PredictRLM, Skill
 
 class AnalyzeDocuments(dspy.Signature):
     """Analyze documents and produce a structured report.
@@ -49,6 +52,7 @@ class AnalyzeDocuments(dspy.Signature):
     3. Produce the report following the criteria's format
     """
     documents: list[File] = dspy.InputField()
+    criteria: CtxStr = dspy.InputField(desc="Report criteria to follow")
     analysis: DocumentAnalysis = dspy.OutputField()
 
 pdf_skill = Skill(
@@ -65,7 +69,7 @@ rlm = PredictRLM(
 )
 
 documents = [File(path="report.pdf"), File(path="appendix.pdf")]
-result = rlm(documents=documents)
+result = rlm(documents=documents, criteria="Cover deadlines, fees, and risks.")
 ```
 
 Inside the sandbox, the RLM autonomously decides which pages to load and when:

@@ -277,6 +277,38 @@ class MySignature(dspy.Signature):
 
 ---
 
+## `CtxStr`
+
+String input marker for small-to-moderate text that should be injected
+verbatim into the outer RLM prompt. Use this for criteria, rubrics, task
+instructions, or other text the outer RLM should see immediately instead of
+only inspecting through REPL variables.
+
+```python
+from predict_rlm import CtxStr
+
+class Analyze(dspy.Signature):
+    criteria: CtxStr = dspy.InputField(desc="Full rubric to apply")
+    data: str = dspy.InputField(desc="Data available as a normal REPL variable")
+    answer: str = dspy.OutputField()
+
+result = rlm(
+    criteria="Use this rubric exactly...",
+    data="This stays out of the prompt unless the RLM inspects it.",
+)
+```
+
+Callers pass a plain `str`. Inside the sandbox, the value is still available as
+the same-named Python string variable. In addition, PredictRLM appends the full
+value to the end of the action and extract prompts under `## In-Context Inputs`
+with the field name and explicit begin/end delimiters.
+
+`CtxStr` is input-only and currently supports class-based DSPy signatures
+only. Use `field: CtxStr`, not `list[CtxStr]`,
+`CtxStr | None`, or string signatures like `"criteria: CtxStr -> answer"`.
+
+---
+
 ## `Skill`
 
 Reusable bundle of instructions, packages, modules, and tools. See the

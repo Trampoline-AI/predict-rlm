@@ -103,6 +103,7 @@ def build_rlm_signatures(
     format_tool_docs: Callable[[dict[str, Callable]], str],
     skill_instructions: str = "",
     file_instructions: str = "",
+    in_context_instructions: str = "",
     model_execution_timeout: bool = True,
     max_output_chars: int = 50_000,
 ) -> tuple[Signature, Signature]:
@@ -143,6 +144,8 @@ def build_rlm_signatures(
         full_instructions += f"\n\n{file_instructions}"
     if skill_instructions:
         full_instructions += f"\n\n## Skills\n\n{skill_instructions}"
+    if in_context_instructions:
+        full_instructions += f"\n\n{in_context_instructions}"
 
     action_sig = dspy.Signature({}, full_instructions)
     action_sig = action_sig.append(
@@ -210,6 +213,8 @@ def build_rlm_signatures(
             + "\n"
         )
     full_extract_instructions = extended_task_instructions + extract_instructions
+    if in_context_instructions:
+        full_extract_instructions += f"\n\n{in_context_instructions}"
 
     extract_sig = dspy.Signature(
         {**signature.output_fields},

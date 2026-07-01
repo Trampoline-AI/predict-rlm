@@ -59,6 +59,7 @@ from .backends.base import SandboxFatalError
 from .backends.jspi import JspiBackend
 from .execution_timeout import validate_execution_timeout
 from .files import File, build_file_plan, scan_file_fields, scan_workspace_fields
+from .in_context import build_in_context_instructions, scan_in_context_fields
 from .rlm_skills import Skill, merge_skills
 from .runtime_hooks import RuntimeHook, RuntimeHookEvent
 from .telemetry import TelemetryContext, make_span_id
@@ -3126,10 +3127,7 @@ class PredictRLM(dspy.RLM):
         _, output_file_fields = scan_file_fields(self.signature) if file_plan else (None, {})
 
         orig_action, orig_extract = self.generate_action, self.extract
-        if file_plan:
-            self.generate_action, self.extract = self._build_signatures_with_files(
-                file_plan["instructions"]
-            )
+        runtime_signatures_rebuilt = False
 
         run_start = time.perf_counter()
         lm = dspy.settings.lm
@@ -3145,6 +3143,18 @@ class PredictRLM(dspy.RLM):
 
         try:
             self._validate_inputs(input_args)
+            in_context_instructions = build_in_context_instructions(
+                self.signature,
+                input_args,
+            )
+            if file_plan or in_context_instructions:
+                self.generate_action, self.extract = (
+                    self._build_signatures_with_runtime_instructions(
+                        file_instructions=file_plan["instructions"] if file_plan else "",
+                        in_context_instructions=in_context_instructions,
+                    )
+                )
+                runtime_signatures_rebuilt = True
             output_field_names = list(self.signature.output_fields.keys())
             execution_tools = self._prepare_execution_tools()
             variables = self._build_variables(**input_args)
@@ -3284,7 +3294,7 @@ class PredictRLM(dspy.RLM):
         finally:
             self._clear_telemetry_execution()
             self._trace_export_context = None
-            if file_plan:
+            if runtime_signatures_rebuilt:
                 self.generate_action, self.extract = orig_action, orig_extract
 
     async def _aforward_traced(
@@ -3294,10 +3304,7 @@ class PredictRLM(dspy.RLM):
         _, output_file_fields = scan_file_fields(self.signature) if file_plan else (None, {})
 
         orig_action, orig_extract = self.generate_action, self.extract
-        if file_plan:
-            self.generate_action, self.extract = self._build_signatures_with_files(
-                file_plan["instructions"]
-            )
+        runtime_signatures_rebuilt = False
 
         run_start = time.perf_counter()
         lm = dspy.settings.lm
@@ -3315,6 +3322,18 @@ class PredictRLM(dspy.RLM):
 
         try:
             self._validate_inputs(input_args)
+            in_context_instructions = build_in_context_instructions(
+                self.signature,
+                input_args,
+            )
+            if file_plan or in_context_instructions:
+                self.generate_action, self.extract = (
+                    self._build_signatures_with_runtime_instructions(
+                        file_instructions=file_plan["instructions"] if file_plan else "",
+                        in_context_instructions=in_context_instructions,
+                    )
+                )
+                runtime_signatures_rebuilt = True
             output_field_names = list(self.signature.output_fields.keys())
             execution_tools = self._prepare_execution_tools()
             variables = self._build_variables(**input_args)
@@ -3456,13 +3475,16 @@ class PredictRLM(dspy.RLM):
         finally:
             self._clear_telemetry_execution()
             self._trace_export_context = None
-            if file_plan:
+            if runtime_signatures_rebuilt:
                 self.generate_action, self.extract = orig_action, orig_extract
 
-    def _build_signatures_with_files(
-        self, file_instructions: str
+    def _build_signatures_with_runtime_instructions(
+        self,
+        *,
+        file_instructions: str = "",
+        in_context_instructions: str = "",
     ) -> tuple[dspy.Predict, dspy.Predict]:
-        """Build signatures with file instructions.
+        """Build signatures with per-call runtime instructions.
 
         File output fields are replaced with str in the signature so the RLM
         submits a path string, not a JSON object. The framework wraps the
@@ -3502,13 +3524,23 @@ class PredictRLM(dspy.RLM):
             self._format_tool_docs,
             skill_instructions=self._skill_instructions,
             file_instructions=file_instructions,
+            in_context_instructions=in_context_instructions,
             model_execution_timeout=self._model_execution_timeout,
             max_output_chars=self.max_output_chars,
         )
         return dspy.Predict(action_sig), dspy.Predict(extract_sig)
 
+    def _build_signatures_with_files(
+        self,
+        file_instructions: str,
+    ) -> tuple[dspy.Predict, dspy.Predict]:
+        return self._build_signatures_with_runtime_instructions(
+            file_instructions=file_instructions,
+        )
+
     def _build_signatures(self) -> tuple[Signature, Signature]:
         """Build action and extract signatures with predict documentation."""
+        scan_in_context_fields(self.signature)
         raw_tools = {name: tool.func for name, tool in self._user_tools.items()}
         return build_rlm_signatures(
             self.signature,

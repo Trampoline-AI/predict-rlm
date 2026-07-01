@@ -101,6 +101,8 @@ codex-lm usage
 - **Simple file I/O** — pass local or cloud files as typed inputs and outputs
   via `File`, keeping interop with your existing data pipelines straightforward.
   (S3 files support soon)
+- **In-context string inputs** — mark criteria, rubrics, or task instructions
+  with `CtxStr` when the outer RLM should see the full text in its prompt.
 - **Structured sub-LM calls** — native Pydantic and DSPy signature support for
   type-safe sub-LM invocations with structured outputs
 
@@ -334,7 +336,7 @@ same handlers fire for every `PredictRLM` instance.
 - [Architecture](ARCHITECTURE.md) — compare backend component and
   state/recovery semantics
 - [API reference](docs/api.md) — constructor params for `PredictRLM`, `File`,
-  and `Skill`
+  `CtxStr`, and `Skill`
 - [Skills](docs/skills.md) — define, compose, and mount custom skills
 - [RLM-GEPA](src/rlm_gepa/README.md) — optimize RLM skills from traces and
   configure `AgentSpec`

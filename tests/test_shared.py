@@ -185,6 +185,27 @@ class TestBuildRlmSignatures:
         )
         assert "Input files are mounted at /sandbox/input." in action.instructions
 
+    def test_in_context_instructions_appended_last_to_action_and_extract(self):
+        sig = dspy.Signature("question -> answer")
+        action, extract = build_rlm_signatures(
+            sig,
+            self.ACTION_TEMPLATE,
+            {},
+            format_tool_docs_full,
+            skill_instructions="Skill block.",
+            file_instructions="File block.",
+            in_context_instructions="## In-Context Inputs\n\nCriteria block.",
+        )
+
+        assert str(action.instructions).rstrip().endswith("Criteria block.")
+        assert str(extract.instructions).rstrip().endswith("Criteria block.")
+        assert str(action.instructions).index("File block.") < str(
+            action.instructions
+        ).index("Skill block.")
+        assert str(action.instructions).index("Skill block.") < str(
+            action.instructions
+        ).index("Criteria block.")
+
     def test_original_signature_instructions_preserved(self):
         sig = dspy.Signature("question -> answer", "Be concise and accurate.")
         action, extract = build_rlm_signatures(
