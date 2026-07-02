@@ -220,7 +220,18 @@ def _map_virtual_path(path: Any) -> Any:
 
 def _virtual_from_real(path: pathlib.Path) -> str:
     rel = path.resolve().relative_to(SANDBOX_DIR)
-    return "/sandbox/" + rel.as_posix()
+    rel_text = rel.as_posix()
+    if rel_text == ".":
+        return "/sandbox"
+    return "/sandbox/" + rel_text
+
+
+def _snapshot_path_value(value: pathlib.PurePath) -> str:
+    text = os.fspath(value)
+    try:
+        return _virtual_from_real(REAL_PATH(text))
+    except ValueError:
+        return text
 
 
 def _open(path: Any, *args: Any, **kwargs: Any):
@@ -854,10 +865,12 @@ _SAFE_SNAPSHOT_SCALAR_TYPES = (type(None), bool, int, float, str, bytes)
 
 
 def _safe_snapshot_value(value: Any, seen: set[int] | None = None) -> tuple[bool, Any]:
+    if isinstance(value, _VirtualPath):
+        return True, value.virtual_path
     if isinstance(value, _SAFE_SNAPSHOT_SCALAR_TYPES):
         return True, value
     if isinstance(value, pathlib.PurePath):
-        return True, value
+        return True, _snapshot_path_value(value)
     if inspect.ismodule(value) or inspect.isfunction(value) or inspect.isclass(value):
         return False, None
 
