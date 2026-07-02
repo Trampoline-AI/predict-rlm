@@ -226,12 +226,11 @@ def _virtual_from_real(path: pathlib.Path) -> str:
     return "/sandbox/" + rel_text
 
 
-def _snapshot_path_value(value: pathlib.PurePath) -> str:
-    text = os.fspath(value)
+def _snapshot_path_value(value: pathlib.PurePath) -> pathlib.PurePath | str:
     try:
-        return _virtual_from_real(REAL_PATH(text))
+        return _virtual_from_real(REAL_PATH(os.fspath(value)))
     except ValueError:
-        return text
+        return value
 
 
 def _open(path: Any, *args: Any, **kwargs: Any):

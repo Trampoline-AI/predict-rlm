@@ -270,7 +270,7 @@ class TestPythonRunnerSnapshots:
             "summary": {
                 "name": "mjcf",
                 "scores": [1, 2],
-                "output_path": "/app/model.xml",
+                "output_path": Path("/app/model.xml"),
             },
             "config": {"threshold": 0.6, "labels": ("fast", "exact")},
         }
