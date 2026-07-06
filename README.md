@@ -4,11 +4,17 @@
 
 # predict-rlm
 
-Production focused Self-harnessed LM runtime (RLM) that allows the LM to call
-its sub-lm with [DSPy](https://dspy.ai) signatures. Define your inputs, outputs,
-and tools — the model handles its own control flow. Get fully interpretable
-trajectories and performance that scales directly with model improvements.
-Without context rot.
+Many LLM workflows are too complex for one prompt and too adaptive for a fixed
+chain.
+
+**predict-rlm gives models a runtime for those workflows:** inspect files, keep
+state, branch, call focused sub-models, use tools, manage large context through
+code, and return typed output.
+
+You define the inputs, outputs, tools, and operating procedure. The model writes
+and executes Python in a sandboxed REPL, adapting as it discovers evidence.
+
+Use it when you know the outcome you want, but not the exact path.
 
 Based on the [Recursive Language Models](https://arxiv.org/abs/2512.24601v1)
 paper by [Alex L. Zhang](https://x.com/a1zhang),
@@ -28,6 +34,22 @@ paper by [Alex L. Zhang](https://x.com/a1zhang),
   crafted  with ♥ in MTL · NYC · FLP<br>by <a href="https://trampoline.ai">Trampoline AI</a>
 </p>
 
+## When to use it
+
+predict-rlm is a good fit when the model needs to explore, reason, and adapt
+before it can produce the final output:
+
+- codebase analysis and investigations
+- document review, redaction, extraction, and comparison
+- log analysis and incident-style evidence gathering
+- spreadsheet and financial-model workflows
+- audits, compliance review, and messy data transformation
+- multi-file synthesis with typed outputs and readable traces
+
+It is probably not the right tool for simple chat completions, one-shot
+classification, deterministic ETL, or tiny prompts where a direct LLM call is
+already enough.
+
 ## Installation
 
 ```bash
@@ -42,6 +64,9 @@ uv add "predict-rlm[gepa]"
 
 # Codex-backed DSPy LM and the `codex-lm` CLI
 uv add "predict-rlm[codex-lm]"
+
+# Docker Sandboxes backend support
+uv add "predict-rlm[sbx]"
 ```
 
 With the Codex LM extra installed, import `CodexLM` or use the script. The
@@ -62,28 +87,21 @@ codex-lm usage
   <img src="https://raw.githubusercontent.com/Trampoline-AI/predict-rlm/main/docs/bitter_lesson_spectrum.svg" alt="Bitter Lesson Spectrum — from hand-written prompts to RLMs" width="680"/>
 </p>
 
-- **Avoid context rot** — The root LM only interacts with its context
-  programmatically through the REPL, staying well within its comfortable
-  operating range — enabling complex, long-horizon tasks that would otherwise
-  cause models to silently degrade.
-- **Bitter lesson-proof: RLMs improve as LMs improve** — Unlike harnesses, which
-  can cap or constrain the base model's capabilities, the performance, speed,
-  and cost of RLM calls correlate directly with improvements to base model
-  capabilities.
-  [If the base model handles 10M tokens tomorrow, the RLM handles 100M.](https://alexzhang13.github.io/blog/2025/rlm/)
-- **Symbolic reasoning & recursion** — like algebra, RLMs express the
-  _structure_ of computation rather than performing each operation individually;
-  a single line can represent 1M sub-calls — in direct contrast to agents like
-  Claude Code that must mechanically emit each sub-agent call one at a time.
-- **Interpretability** — RLM trajectories are fully readable: you can trace
-  every peek, chunk, sub-call, and verification step the model takes. This not
-  only reveals _how_ the model decomposed a problem, but provides concrete
-  optimization signals which tools like [GEPA](https://gepa-ai.github.io/gepa)
-  can ingest to evolve the RLM's strategies.
-- **Ideal for improving performance per token** — RLMs allow small models to
-  punch way above their weight (RLM(GPT-5-mini) outperforms base GPT-5)
-  providing great opportunities for reducing costs or stretching limited compute
-  budgets without sacrificing quality.
+- **Avoid context rot** — The outer LM works through files, variables, and tool
+  calls instead of trying to keep every detail in one prompt. Large inputs stay
+  as file paths and metadata until the runtime needs to inspect them.
+- **Adaptive execution inside a defined procedure** — A signature gives the
+  workflow a contract, while the REPL lets the model branch, retry, verify, and
+  accumulate state across iterations.
+- **Focused sub-model calls** — `predict()` lets the runtime spin up typed
+  DSPy signatures for narrow perception and extraction tasks, including
+  multimodal calls with `dspy.Image`.
+- **Readable trajectories** — Every run records generated code, output, tool
+  calls, `predict()` subcalls, timings, token usage, errors, and final `SUBMIT`
+  payloads, so you can inspect what happened instead of guessing.
+- **Optimization-ready traces** — The same traces that help humans debug a run
+  can feed tools like [GEPA](https://gepa-ai.github.io/gepa) to improve RLM
+  strategies from scored examples.
 
 ## Features
 
@@ -91,18 +109,16 @@ codex-lm usage
   <img src="https://raw.githubusercontent.com/Trampoline-AI/predict-rlm/main/docs/harness_vs_rlm.svg" alt="Classic harness vs RLM architecture" width="600"/>
 </p>
 
-- **Multimodal** — process images, documents, audio, and video through sub-LM
+- **Multimodal** — process images and rendered document pages through sub-LM
   calls using native provider multimodal APIs.
 - **Async tool calling** — native RLM async support in the WASM sandbox,
-  enabling concurrent sub-LM invocations and tool calls
-- **Prompt-optimized skills & tools** — predict-rlm skills comes tested and
-  optimized to ensure maximum LM interoperability and performance, bundling
-  instructions, PyPI packages, and tools for domain-specific tasks
-- **Simple file I/O** — pass local or cloud files as typed inputs and outputs
-  via `File`, keeping interop with your existing data pipelines straightforward.
-  (S3 files support soon)
+  enabling concurrent sub-LM invocations and tool calls.
+- **Skills & tools** — bundle domain instructions, PyPI packages, sandbox
+  modules, and host-side tools for reusable task capabilities.
+- **Simple file I/O** — pass local files and mutable workspaces as typed inputs,
+  and return generated artifacts through `File` outputs.
 - **Structured sub-LM calls** — native Pydantic and DSPy signature support for
-  type-safe sub-LM invocations with structured outputs
+  type-safe sub-LM invocations with structured outputs.
 
 ## Demos
 
@@ -167,8 +183,9 @@ sandbox lifecycle diagnostics; error-like debug records are colored red.
 
 ### Optional: Docker Sandboxes backend
 
-JSPI/Deno/Pyodide remains the default sandbox. Use Docker Sandboxes (`sbx`) when
-you want an explicit opt-in Linux Python runner:
+JSPI/Deno/Pyodide remains the default sandbox. After installing
+`predict-rlm[sbx]`, use Docker Sandboxes (`sbx`) when you want an explicit
+opt-in Linux Python runner:
 
 ```bash
 brew install docker/tap/sbx
