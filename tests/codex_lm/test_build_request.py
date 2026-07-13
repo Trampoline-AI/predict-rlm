@@ -1,3 +1,6 @@
+import pytest
+
+
 def test_build_request_from_prompt(lm):
     request, headers = lm._build_request(prompt="hello world", messages=None, kwargs={})
     assert request["store"] is False
@@ -24,6 +27,56 @@ def test_build_request_headers_include_account_id(lm):
     assert headers["ChatGPT-Account-Id"] == "fake-account"
     assert headers["originator"] == "opencode"
     assert "session_id" in headers
+
+
+@pytest.mark.parametrize(
+    "model",
+    ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"],
+)
+def test_gpt_5_6_models_use_responses_lite_header(model):
+    from dspy_codex_lm import CodexHTTPLM as CodexLM
+
+    lm = CodexLM(model=model, access_token="fake", account_id="acct")
+
+    request, headers = lm._build_request(prompt="x", messages=None, kwargs={})
+
+    assert headers["x-openai-internal-codex-responses-lite"] == "true"
+    assert {
+        "originator": headers["originator"],
+        "reasoning.context": request.get("reasoning", {}).get("context"),
+        "parallel_tool_calls": request.get("parallel_tool_calls"),
+    } == {
+        "originator": "codex_cli_rs",
+        "reasoning.context": "all_turns",
+        "parallel_tool_calls": False,
+    }
+    assert request["parallel_tool_calls"] is False
+
+
+def test_gpt_5_6_request_does_not_mutate_constructor_reasoning():
+    from dspy_codex_lm import CodexHTTPLM as CodexLM
+
+    reasoning = {"effort": "high"}
+    lm = CodexLM(
+        model="gpt-5.6-sol",
+        access_token="fake",
+        account_id="acct",
+        reasoning=reasoning,
+    )
+
+    request, _ = lm._build_request(prompt="x", messages=None, kwargs={})
+
+    assert request["reasoning"]["context"] == "all_turns"
+    assert reasoning == {"effort": "high"}
+
+
+def test_gpt_5_3_codex_does_not_use_responses_lite_header(lm):
+    request, headers = lm._build_request(prompt="x", messages=None, kwargs={})
+
+    assert "x-openai-internal-codex-responses-lite" not in headers
+    assert headers["originator"] == "opencode"
+    assert "reasoning" not in request
+    assert "parallel_tool_calls" not in request
 
 
 def test_each_call_gets_unique_session_id(lm):

@@ -124,6 +124,21 @@ def test_resolve_codex_model_strips_openai_prefix():
 def test_resolve_codex_model_accepts_spark_slug():
     assert resolve_codex_model("openai/gpt-5.3-codex-spark") == "gpt-5.3-codex-spark"
 
+@pytest.mark.parametrize(
+    ("model", "expected"),
+    [
+        ("gpt-5.6-sol", "gpt-5.6-sol"),
+        ("openai/gpt-5.6-sol", "gpt-5.6-sol"),
+        ("gpt-5.6-terra", "gpt-5.6-terra"),
+        ("openai/gpt-5.6-terra", "gpt-5.6-terra"),
+        ("gpt-5.6-luna", "gpt-5.6-luna"),
+        ("openai/gpt-5.6-luna", "gpt-5.6-luna"),
+    ],
+)
+def test_resolve_codex_model_accepts_gpt_5_6_family(model: str, expected: str):
+    assert resolve_codex_model(model) == expected
+
+
 
 @pytest.mark.parametrize(
     "slug",
@@ -133,6 +148,7 @@ def test_resolve_codex_model_accepts_spark_slug():
         "gpt-4.1",
         "gpt-5",
         "gpt-5-mini",
+        "gpt-5.6",
         "o3",
         "o4-mini",
         "openai/o3",

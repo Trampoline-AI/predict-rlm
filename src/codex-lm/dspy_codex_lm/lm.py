@@ -672,6 +672,13 @@ class CodexHTTPLM(dspy.LM):
         headers = dict(request.pop("headers", None) or {})
         self._apply_request_auth(request, headers)
         headers["originator"] = "opencode"
+        if request["model"].startswith("gpt-5.6-"):
+            reasoning = dict(request.get("reasoning") or {})
+            reasoning["context"] = "all_turns"
+            request["reasoning"] = reasoning
+            request["parallel_tool_calls"] = False
+            headers["originator"] = "codex_cli_rs"
+            headers["x-openai-internal-codex-responses-lite"] = "true"
         headers["session_id"] = str(uuid.uuid4())
         request["_codex_lm_proxy_url"] = proxy_url
         return request, headers
@@ -1109,6 +1116,14 @@ class _AiohttpCodexWSTransport:
         sticky_state: dict[str, Any],
     ):
         ws_headers = dict(headers)
+        responses_lite = ws_headers.pop("x-openai-internal-codex-responses-lite", None)
+        payload = _ws_request_payload(request)
+        if responses_lite is not None:
+            client_metadata = dict(payload.get("client_metadata") or {})
+            client_metadata["ws_request_header_x_openai_internal_codex_responses_lite"] = (
+                responses_lite
+            )
+            payload["client_metadata"] = client_metadata
         ws_headers["Authorization"] = f"Bearer {request['api_key']}"
         ws_headers["OpenAI-Beta"] = CODEX_WS_BETA_HEADER
         ws_headers["x-client-request-id"] = request_id
@@ -1122,7 +1137,55 @@ class _AiohttpCodexWSTransport:
                     turn_state = getattr(response, "headers", {}).get("x-codex-turn-state")
                     if turn_state:
                         sticky_state["turn_state"] = turn_state
-                    await ws.send_str(json.dumps(_ws_request_payload(request)))
+                    if responses_lite is not None:
+                        prewarm_payload = {**payload, "input": [], "generate": False}
+                        await ws.send_str(json.dumps(prewarm_payload))
+                        prewarm_response_id = None
+                        async for message in ws:
+                            if message.type == aiohttp.WSMsgType.TEXT:
+                                event = json.loads(message.data)
+                                if event.get("type") == "response.completed":
+                                    prewarm_response_id = (event.get("response") or {}).get("id")
+                                    break
+                                if event.get("type") in {"error", "response.failed"}:
+                                    failure_kind = (
+                                        "failed" if event["type"] == "response.failed" else "error"
+                                    )
+                                    error_details = (
+                                        (event.get("response") or {}).get("error")
+                                        if failure_kind == "failed"
+                                        else event.get("error") or event
+                                    ) or {}
+                                    prewarm_error = _codex_stream_error_from_state(
+                                        {
+                                            "failure": {
+                                                "kind": failure_kind,
+                                                "code": error_details.get("code"),
+                                                "message": error_details.get("message")
+                                                or f"response.{failure_kind} (no message)",
+                                                "retry_after_seconds": (
+                                                    _retry_after_seconds_from_error(error_details)
+                                                ),
+                                            }
+                                        }
+                                    )
+                                    if prewarm_error is not None:
+                                        raise prewarm_error
+                            elif message.type in (
+                                aiohttp.WSMsgType.CLOSED,
+                                aiohttp.WSMsgType.CLOSE,
+                            ):
+                                break
+                            elif message.type == aiohttp.WSMsgType.ERROR:
+                                raise CodexStreamError(
+                                    f"Codex WebSocket error: {ws.exception()}"
+                                )
+                        if prewarm_response_id is None:
+                            raise CodexStreamError(
+                                "Codex WebSocket prewarm ended without a response id"
+                            )
+                        payload["previous_response_id"] = prewarm_response_id
+                    await ws.send_str(json.dumps(payload))
                     async for message in ws:
                         if message.type == aiohttp.WSMsgType.TEXT:
                             yield json.loads(message.data)

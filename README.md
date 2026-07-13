@@ -45,7 +45,8 @@ uv add "predict-rlm[codex-lm]"
 ```
 
 With the Codex LM extra installed, import `CodexLM` or use the script. The
-vendored backend supports current Codex model slugs including `gpt-5.5`.
+vendored backend supports the GPT-5.6 family: `gpt-5.6-sol`, `gpt-5.6-terra`,
+and `gpt-5.6-luna`.
 
 ```python
 from dspy_codex_lm import CodexLM
