@@ -754,6 +754,7 @@ def test_maintained_backends_select_native_session_adapter():
     assert isinstance(rlm.runtime_spec.execution, JspiExecutionBackend)
 
 
+@pytest.mark.sbx
 def test_maintained_sbx_backends_select_final_execution_ownership_seam():
     from predict_rlm import PredictRLM
     from predict_rlm.backends.sbx import (
@@ -1676,14 +1677,20 @@ def test_synced_file_operation_is_portable_to_custom_final_backend():
     assert not backend.session.captured_host_path.exists()
 
 
-@pytest.mark.parametrize("backend_name", ["jspi", "sbx", "sbx-pool"])
+@pytest.mark.parametrize(
+    "backend_name",
+    [
+        "jspi",
+        pytest.param("sbx", marks=pytest.mark.sbx),
+        pytest.param("sbx-pool", marks=pytest.mark.sbx),
+    ],
+)
 def test_synced_file_operation_runs_on_maintained_final_backend_lifecycles(
     backend_name: str,
     monkeypatch,
 ):
     from predict_rlm import PredictRLM
     from predict_rlm.backends.jspi import execution as jspi_execution
-    from predict_rlm.backends.sbx import execution as sbx_execution
 
     interpreter = MaintainedSyncedInterpreter()
 
@@ -1696,6 +1703,8 @@ def test_synced_file_operation_runs_on_maintained_final_backend_lifecycles(
     if backend_name == "jspi":
         monkeypatch.setattr(jspi_execution, "JspiBackend", build_interpreter)
     elif backend_name == "sbx":
+        from predict_rlm.backends.sbx import execution as sbx_execution
+
         monkeypatch.setattr(sbx_execution, "SbxBackend", build_interpreter)
         kwargs["sandbox_backend"] = "sbx"
     else:
@@ -1729,6 +1738,7 @@ def test_synced_file_operation_runs_on_maintained_final_backend_lifecycles(
         assert pool.released
 
 
+@pytest.mark.sbx
 def test_sync_forward_awaits_owned_sbx_host_retirement_before_loop_teardown(
     monkeypatch,
 ):
