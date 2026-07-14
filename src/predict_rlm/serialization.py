@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import dataclasses
+from enum import Enum
 from typing import Any
 
 
@@ -21,6 +22,9 @@ def to_plain_data(value: Any) -> Any:
 
     if dataclasses.is_dataclass(value) and not isinstance(value, type):
         return to_plain_data(dataclasses.asdict(value))
+
+    if isinstance(value, Enum):
+        return to_plain_data(value.value)
 
     if isinstance(value, dict):
         return {key: to_plain_data(item) for key, item in value.items()}
