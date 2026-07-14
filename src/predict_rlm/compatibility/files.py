@@ -6,29 +6,80 @@ import os
 import tempfile
 import typing
 import uuid
+from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any
 
-from predict_rlm.files import (
-    File,
-    _direct_workspace_sandbox_path,
-)
+from predict_rlm.files import File
 from predict_rlm.runtime import (
     Artifact,
+    ArtifactBinding,
+    DirectoryCreationSession,
+    ExecutionResult,
     ExecutionSession,
     FieldDescriptor,
+    FileTransfer,
+    FileTransferSession,
+    HostDirectoryMount,
+    HostDirectorySession,
     InputAdapter,
+    MountedInput,
+    MutableDirectorySession,
     OutputAdapter,
     OutputReservation,
     PreparedInput,
     RunContext,
+    SandboxRootReservation,
+    SessionRequirements,
 )
-from predict_rlm.workspace import (
-    DirectWorkspaceMount,
-    Workspace,
-    WorkspaceMode,
-    WorkspaceSyncState,
-)
+from predict_rlm.workspace import Workspace, WorkspaceMode, WorkspaceSyncState
+
+
+@dataclass
+class _WorkspaceMountState:
+    artifact: Artifact
+    sandbox_path: str
+    sync_state: WorkspaceSyncState | None
+    host_directory_mount: HostDirectoryMount | None = None
+    mounted: bool = False
+    finalized: bool = False
+
+
+@dataclass(frozen=True, kw_only=True)
+class _WorkspacePreparedInput(PreparedInput):
+    mount_states: tuple[_WorkspaceMountState, ...]
+
+
+def _workspace_mount_states(
+    prepared: PreparedInput,
+) -> tuple[_WorkspaceMountState, ...]:
+    if not isinstance(prepared, _WorkspacePreparedInput):
+        raise TypeError("WorkspaceInputAdapter requires typed Workspace prepared state")
+    return prepared.mount_states
+
+
+def _uses_default_workspace_mount_path(workspace: Workspace) -> bool:
+    return (
+        "mount_path" not in workspace.model_fields_set
+        and workspace.mount_path == Workspace.model_fields["mount_path"].default
+    )
+
+
+def _direct_workspace_sandbox_path(workspace: Workspace, workspace_root: str) -> str:
+    if os.path.islink(workspace_root):
+        raise ValueError(f"Workspace path cannot be a symlink: {workspace.path}")
+    if _uses_default_workspace_mount_path(workspace):
+        return workspace_root
+    mount_path = workspace.mount_path
+    if mount_path == "/sandbox" or mount_path.startswith("/sandbox/"):
+        raise ValueError(
+            "Workspace(mode='direct') mount_path must not be under /sandbox; "
+            "omit mount_path to use the SBX-mounted host path, or pass an absolute "
+            "sandbox path such as /workspace."
+        )
+    if not mount_path.startswith("/"):
+        raise ValueError("Workspace(mode='direct') mount_path must be absolute.")
+    return mount_path
 
 
 def _annotation_contains(annotation: Any, value_type: type[Any]) -> bool:
@@ -42,6 +93,16 @@ def _annotation_contains(annotation: Any, value_type: type[Any]) -> bool:
         for item in typing.get_args(annotation)
         if item not in (type(None), Ellipsis)
     )
+
+
+def _replace_model_path(value: Any, planned: str, actual: str) -> Any:
+    if value == planned:
+        return actual
+    if isinstance(value, list):
+        return [_replace_model_path(item, planned, actual) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_replace_model_path(item, planned, actual) for item in value)
+    return value
 
 
 def validate_file_workspace_signature(signature: Any) -> None:
@@ -129,6 +190,7 @@ class FileInputAdapter(InputAdapter[File]):
             raise ValueError(f"File input {field.name!r} cannot be None")
 
         artifacts: list[Artifact] = []
+        read_paths: list[str] = []
         model_paths: list[str | None] = []
         for item in field.unpack(value):
             if item is None and field.item_allows_none:
@@ -138,7 +200,7 @@ class FileInputAdapter(InputAdapter[File]):
                 raise TypeError("File inputs must contain File values with a path")
             if not os.path.isfile(item.path):
                 raise FileNotFoundError(item.path)
-            ctx.state.setdefault("extra_read_paths", []).append(os.path.abspath(item.path))
+            read_paths.append(os.path.abspath(item.path))
             sandbox_path = f"/sandbox/input/{field.name}/{os.path.basename(item.path)}"
             artifacts.append(
                 Artifact(
@@ -156,6 +218,10 @@ class FileInputAdapter(InputAdapter[File]):
         return PreparedInput(
             model_value=model_value,
             artifacts=tuple(artifacts),
+            sandbox_roots=(
+                SandboxRootReservation(f"/sandbox/input/{field.name}"),
+            ),
+            requirements=SessionRequirements(extra_read_paths=tuple(read_paths)),
             instructions=(
                 f"Input file field `{field.name}` is mounted at {model_value!r}.",
             ),
@@ -176,10 +242,17 @@ class WorkspaceInputAdapter(InputAdapter[Workspace]):
     ) -> PreparedInput:
         if value is None:
             if field.allows_none:
-                return PreparedInput(model_value=None)
+                return _WorkspacePreparedInput(
+                    model_value=None,
+                    mount_states=(),
+                )
             raise ValueError(f"Workspace input {field.name!r} cannot be None")
 
-        artifacts: list[Artifact] = []
+        mount_states = []
+        host_directory_mounts = []
+        workspace_roots = []
+        writable_workspace_roots = []
+        sandbox_roots = []
         model_paths: list[str | None] = []
         mount_owners = ctx.state.setdefault("workspace_mount_owners", {})
         for workspace in field.unpack(value):
@@ -191,19 +264,22 @@ class WorkspaceInputAdapter(InputAdapter[Workspace]):
             if not os.path.isdir(workspace.path):
                 raise FileNotFoundError(workspace.path)
             workspace_root = os.path.abspath(workspace.path)
-            ctx.state.setdefault("extra_read_paths", []).append(workspace_root)
-            ctx.state.setdefault("extra_write_paths", []).append(workspace_root)
+            workspace_roots.append(workspace_root)
             if workspace.mode is WorkspaceMode.DIRECT:
                 sandbox_path = _direct_workspace_sandbox_path(workspace, workspace_root)
-                kind = "compat.workspace.direct"
-                workspace_binding: Any = DirectWorkspaceMount(
+                sync_state = None
+                host_directory_mount = HostDirectoryMount(
                     host_path=workspace_root,
                     sandbox_path=sandbox_path,
                 )
+                host_directory_mounts.append(host_directory_mount)
+                writable_workspace_roots.append(workspace_root)
             else:
                 sandbox_path = workspace.mount_path
-                kind = "compat.workspace.mirror"
-                workspace_binding = WorkspaceSyncState(workspace)
+                sync_state = WorkspaceSyncState(workspace)
+                host_directory_mount = None
+                if workspace.sync_back:
+                    writable_workspace_roots.append(workspace_root)
             owner = mount_owners.get(sandbox_path)
             if owner is not None:
                 raise ValueError(
@@ -211,29 +287,173 @@ class WorkspaceInputAdapter(InputAdapter[Workspace]):
                     f"{sandbox_path!r} appears in both {owner!r} and {field.name!r}"
                 )
             mount_owners[sandbox_path] = field.name
-            artifacts.append(
-                Artifact(
-                    id=f"workspace-input-{uuid.uuid4().hex}",
-                    kind=kind,
-                    metadata={
-                        "source_path": workspace_root,
-                        "sandbox_path": sandbox_path,
-                        "workspace": workspace,
-                        "workspace_binding": workspace_binding,
-                    },
+            sandbox_roots.append(SandboxRootReservation(sandbox_path))
+            artifact = Artifact(
+                id=f"workspace-input-{uuid.uuid4().hex}",
+                kind="compat.workspace",
+                metadata={"sandbox_path": sandbox_path},
+            )
+            mount_states.append(
+                _WorkspaceMountState(
+                    artifact=artifact,
+                    sandbox_path=sandbox_path,
+                    sync_state=sync_state,
+                    host_directory_mount=host_directory_mount,
                 )
             )
             model_paths.append(sandbox_path)
 
         model_value = field.pack(model_paths)
-        return PreparedInput(
+        return _WorkspacePreparedInput(
             model_value=model_value,
-            artifacts=tuple(artifacts),
+            mount_states=tuple(mount_states),
+            artifacts=tuple(state.artifact for state in mount_states),
+            host_directory_mounts=tuple(host_directory_mounts),
+            sandbox_roots=tuple(sandbox_roots),
+            requirements=SessionRequirements(
+                extra_read_paths=tuple(workspace_roots),
+                extra_write_paths=tuple(writable_workspace_roots),
+            ),
             instructions=(
                 f"Workspace field `{field.name}` is mounted at {model_value!r}. Edit files in "
-                "that directory; mirror-mode changes sync back after every code block.",
+                "that directory; mirror changes sync back after every code block when "
+                "sync_back is enabled.",
             ),
         )
+
+    async def mount(
+        self,
+        field: FieldDescriptor,
+        prepared: PreparedInput,
+        ctx: RunContext,
+        session: ExecutionSession,
+    ) -> MountedInput:
+        del field, ctx
+        states = _workspace_mount_states(prepared)
+        bindings = []
+        model_value = prepared.model_value
+        for state in states:
+            if state.host_directory_mount is not None:
+                if not isinstance(session, HostDirectorySession):
+                    raise TypeError(
+                        f"Execution session {session.name!r} does not support host "
+                        "directory mounts"
+                    )
+                sandbox_path = await session.mount_host_directory(
+                    state.host_directory_mount
+                )
+            else:
+                if not isinstance(session, DirectoryCreationSession):
+                    raise TypeError(
+                        f"Execution session {session.name!r} does not support directory "
+                        "creation"
+                    )
+                sandbox_path = state.sandbox_path
+                await session.create_directory(state.sandbox_path)
+                if not isinstance(session, FileTransferSession):
+                    raise TypeError(
+                        f"Execution session {session.name!r} does not support file transfer"
+                    )
+                sync_state = state.sync_state
+                assert sync_state is not None
+                for source_path, target_path in await sync_state.aiter_mounts():
+                    await session.transfer_file(
+                        FileTransfer(
+                            source_path=source_path,
+                            sandbox_path=target_path,
+                        )
+                    )
+            state.mounted = True
+            model_value = _replace_model_path(
+                model_value,
+                state.sandbox_path,
+                sandbox_path,
+            )
+            bindings.append(
+                ArtifactBinding(
+                    artifact_id=state.artifact.id,
+                    path=sandbox_path,
+                )
+            )
+        return MountedInput(model_value=model_value, bindings=tuple(bindings))
+
+    async def after_execution(
+        self,
+        field: FieldDescriptor,
+        prepared: PreparedInput,
+        ctx: RunContext,
+        session: ExecutionSession,
+        result: ExecutionResult | None,
+        error: BaseException | None,
+    ) -> None:
+        del field, ctx, result, error
+        states = _workspace_mount_states(prepared)
+        mirror_states = [
+            state
+            for state in states
+            if state.sync_state is not None and state.sync_state.workspace.sync_back
+        ]
+        if not mirror_states:
+            return
+        if not isinstance(session, MutableDirectorySession):
+            raise TypeError(
+                f"Execution session {session.name!r} does not support mutable directory inputs"
+            )
+        first_error: BaseException | None = None
+        additional_errors = []
+        for state in mirror_states:
+            sync_state = state.sync_state
+            assert sync_state is not None
+            try:
+                await sync_state.async_sync_from_sandbox(session)
+            except BaseException as exc:
+                if first_error is None:
+                    first_error = exc
+                else:
+                    additional_errors.append(exc)
+        if first_error is not None:
+            if additional_errors:
+                setattr(first_error, "workspace_sync_errors", tuple(additional_errors))
+            raise first_error
+
+    async def finalize(
+        self,
+        field: FieldDescriptor,
+        prepared: PreparedInput,
+        ctx: RunContext,
+        session: ExecutionSession | None,
+        error: BaseException | None,
+    ) -> None:
+        del field, ctx, error
+        states = _workspace_mount_states(prepared)
+        first_error: BaseException | None = None
+        additional_errors = []
+        for state in states:
+            if state.finalized:
+                continue
+            try:
+                if (
+                    state.sync_state is not None
+                    and state.sync_state.workspace.sync_back
+                    and state.mounted
+                ):
+                    if not isinstance(session, MutableDirectorySession):
+                        raise TypeError(
+                            "Execution session does not support mutable "
+                            "directory inputs"
+                        )
+                    await state.sync_state.async_sync_from_sandbox(session)
+            except BaseException as exc:
+                if first_error is None:
+                    first_error = exc
+                else:
+                    additional_errors.append(exc)
+            finally:
+                state.finalized = True
+        if first_error is not None:
+            if additional_errors:
+                setattr(first_error, "workspace_finalize_errors", tuple(additional_errors))
+            raise first_error
 
 
 class FileOutputAdapter(OutputAdapter[File]):
@@ -250,7 +470,7 @@ class FileOutputAdapter(OutputAdapter[File]):
         field: FieldDescriptor,
         value: File | list[File] | None,
         ctx: RunContext,
-    ) -> None:
+    ) -> SessionRequirements:
         import tempfile
 
         host_base = self.output_dir or tempfile.mkdtemp(prefix="predict-rlm-")
@@ -259,7 +479,7 @@ class FileOutputAdapter(OutputAdapter[File]):
         )
         Path(host_dir).mkdir(parents=True, exist_ok=True)
         ctx.state.setdefault("output_host_dirs", {})[field.name] = host_dir
-        ctx.state.setdefault("extra_write_paths", []).append(host_dir)
+        return SessionRequirements(extra_write_paths=(host_dir,))
 
     async def reserve(
         self,

@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from predict_rlm._logging import configure_predict_rlm_logging
+from predict_rlm.runtime import SessionRequirements
 from predict_rlm.trace import ms_since
 
 from .backend import SbxBackend
@@ -22,9 +23,6 @@ from .logging import log_pool_lifecycle
 
 class SbxPool:
     """Thread-safe pool of prewarmed Docker Sandboxes backends."""
-
-    supports_direct_workspaces = False
-    supports_mirror_workspaces = True
 
     def __init__(
         self,
@@ -53,21 +51,26 @@ class SbxPool:
         )
         self.debug = debug
         self.verbose = verbose
+        self.session_requirements = SessionRequirements(
+            allowed_domains=tuple(allowed_domains or ()),
+            extra_read_paths=tuple(extra_read_paths or ()),
+            extra_write_paths=tuple(extra_write_paths or ()),
+        )
         configure_predict_rlm_logging(
             debug=True if debug else None,
             verbose=True if verbose else None,
         )
         self._interpreter_kwargs = {
             "config": self.config,
-            "allowed_domains": allowed_domains,
+            "allowed_domains": list(self.session_requirements.allowed_domains) or None,
             "tools": tools,
             "output_fields": output_fields,
             "preinstall_packages": preinstall_packages,
             "skill_packages": skill_packages,
             "debug": debug,
             "verbose": verbose,
-            "extra_read_paths": extra_read_paths,
-            "extra_write_paths": extra_write_paths,
+            "extra_read_paths": list(self.session_requirements.extra_read_paths) or None,
+            "extra_write_paths": list(self.session_requirements.extra_write_paths) or None,
             "_supervisor_command": _supervisor_command,
             "_runner_command": _runner_command,
         }

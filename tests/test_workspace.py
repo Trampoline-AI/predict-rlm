@@ -2,30 +2,32 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
+import json
 import os
+import shutil
 import sys
 import tempfile
 from pathlib import Path
-from typing import TYPE_CHECKING
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import dspy
 import pytest
-from dspy.primitives.code_interpreter import CodeInterpreterError
 
-from predict_rlm import File, PredictRLM, Workspace, WorkspaceMode
-
-if TYPE_CHECKING:
-    from predict_rlm.backends.sbx import SbxBackend
-from predict_rlm.files import (
-    build_file_instructions,
-    build_file_plan,
-    is_workspace_type,
-    scan_workspace_fields,
+from predict_rlm import PredictRLM, Workspace, WorkspaceMode
+from predict_rlm.compatibility import WorkspaceInputAdapter
+from predict_rlm.runtime import (
+    ArtifactBinding,
+    ArtifactFileInfo,
+    ExecutionResult,
+    FieldDescriptor,
+    FileTransfer,
+    HostDirectoryMount,
+    PreparedInput,
+    UnsupportedOperationError,
 )
 from predict_rlm.workspace import (
-    DirectWorkspaceMount,
     WorkspaceFileInfo,
     WorkspaceSyncConflictError,
     WorkspaceSyncState,
@@ -61,178 +63,6 @@ class TestWorkspace:
         workspace = Workspace(path="/tmp/repo", mount_path="/workspace", mode="direct")
         assert workspace.mode is WorkspaceMode.DIRECT
         assert workspace.mount_path == "/workspace"
-
-
-class TestIsWorkspaceType:
-    def test_workspace(self):
-        assert is_workspace_type(Workspace) is True
-
-    def test_list_workspace(self):
-        assert is_workspace_type(list[Workspace]) is True
-
-    def test_pep604_optional_workspace(self):
-        assert is_workspace_type(Workspace | None) is True
-
-    def test_file_is_not_workspace(self):
-        assert is_workspace_type(File) is False
-
-
-class TestScanWorkspaceFields:
-    def test_input_workspace_field(self):
-        class Sig(dspy.Signature):
-            workspace: Workspace = dspy.InputField()
-            answer: str = dspy.OutputField()
-
-        assert scan_workspace_fields(Sig) == {"workspace": "workspace"}
-
-    def test_pep604_optional_list_workspace_field(self):
-        class Sig(dspy.Signature):
-            workspaces: list[Workspace] | None = dspy.InputField()
-            answer: str = dspy.OutputField()
-
-        assert scan_workspace_fields(Sig) == {"workspaces": "list_workspace"}
-
-    def test_output_workspace_rejected(self):
-        class Sig(dspy.Signature):
-            query: str = dspy.InputField()
-            workspace: Workspace = dspy.OutputField()
-
-        with pytest.raises(TypeError, match=r"Workspace fields are input-only.*File/list\[File\]"):
-            scan_workspace_fields(Sig)
-
-
-class TestWorkspaceInstructions:
-    def test_workspace_instructions(self):
-        result = build_file_instructions(
-            input_mounts={},
-            output_dirs={},
-            workspace_mounts={"workspace": "/sandbox/workspace"},
-        )
-        assert "Workspace directories" in result
-        assert "/sandbox/workspace" in result
-        assert "Mirror-mode workspace changes sync back" in result
-        assert "Direct SBX workspaces update host files immediately" in result
-
-
-class TestWorkspaceFilePlan:
-    def test_workspace_plan_excludes_safe_defaults(self):
-        with tempfile.TemporaryDirectory() as tmpdir:
-            os.makedirs(os.path.join(tmpdir, ".git"))
-            os.makedirs(os.path.join(tmpdir, ".venv"))
-            os.makedirs(os.path.join(tmpdir, "node_modules"))
-            with open(os.path.join(tmpdir, "keep.txt"), "w") as f:
-                f.write("keep")
-            with open(os.path.join(tmpdir, ".git", "config"), "w") as f:
-                f.write("git")
-            with open(os.path.join(tmpdir, ".venv", "pyvenv.cfg"), "w") as f:
-                f.write("venv")
-            with open(os.path.join(tmpdir, "node_modules", "pkg.js"), "w") as f:
-                f.write("pkg")
-
-            workspace = Workspace(path=tmpdir)
-            plan = build_file_plan(
-                input_args={"workspace": workspace},
-                input_file_fields={},
-                output_file_fields={},
-                input_workspace_fields={"workspace": "workspace"},
-            )
-
-            assert plan is not None
-            assert os.path.abspath(tmpdir) in plan["write_paths"]
-            state = plan["workspace_states"][0]
-            mounts = state.iter_mounts()
-            virtual_paths = [virtual for _, virtual in mounts]
-            assert virtual_paths == ["/sandbox/workspace/keep.txt"]
-
-    def test_direct_workspace_plan_does_not_create_sync_state(self):
-        with tempfile.TemporaryDirectory() as tmpdir:
-            workspace = Workspace(
-                path=tmpdir,
-                mount_path="/workspace",
-                mode=WorkspaceMode.DIRECT,
-            )
-
-            plan = build_file_plan(
-                input_args={"workspace": workspace},
-                input_file_fields={},
-                output_file_fields={},
-                input_workspace_fields={"workspace": "workspace"},
-            )
-
-            assert plan is not None
-            assert plan["workspace_states"] == []
-            assert len(plan["direct_workspace_mounts"]) == 1
-            assert plan["direct_workspace_mounts"][0].host_path == os.path.abspath(tmpdir)
-            assert plan["direct_workspace_mounts"][0].sandbox_path == "/workspace"
-            assert plan["workspace_mounts_for_instructions"] == {
-                "workspace": "/workspace"
-            }
-
-    def test_direct_workspace_default_mount_path_uses_host_path(self):
-        with tempfile.TemporaryDirectory() as tmpdir:
-            workspace = Workspace(path=tmpdir, mode=WorkspaceMode.DIRECT)
-
-            plan = build_file_plan(
-                input_args={"workspace": workspace},
-                input_file_fields={},
-                output_file_fields={},
-                input_workspace_fields={"workspace": "workspace"},
-            )
-
-            assert plan is not None
-            assert plan["direct_workspace_mounts"][0].sandbox_path == os.path.abspath(
-                tmpdir
-            )
-            assert plan["workspace_mounts_for_instructions"] == {
-                "workspace": os.path.abspath(tmpdir)
-            }
-
-    def test_direct_workspace_rejects_sandbox_mount_path(self):
-        with tempfile.TemporaryDirectory() as tmpdir:
-            with pytest.raises(ValueError, match="must not be under /sandbox"):
-                build_file_plan(
-                    input_args={
-                        "workspace": Workspace(
-                            path=tmpdir,
-                            mount_path="/sandbox/workspace",
-                            mode=WorkspaceMode.DIRECT,
-                        )
-                    },
-                    input_file_fields={},
-                    output_file_fields={},
-                    input_workspace_fields={"workspace": "workspace"},
-                )
-
-    def test_duplicate_workspace_mount_paths_rejected_for_list(self):
-        with tempfile.TemporaryDirectory() as one, tempfile.TemporaryDirectory() as two:
-            workspaces = [
-                Workspace(path=one, mount_path="/sandbox/workspace"),
-                Workspace(path=two, mount_path="/sandbox/workspace"),
-            ]
-
-            with pytest.raises(ValueError, match="Duplicate Workspace.mount_path"):
-                build_file_plan(
-                    input_args={"workspaces": workspaces},
-                    input_file_fields={},
-                    output_file_fields={},
-                    input_workspace_fields={"workspaces": "list_workspace"},
-                )
-
-    def test_duplicate_workspace_mount_paths_rejected_across_fields(self):
-        with tempfile.TemporaryDirectory() as one, tempfile.TemporaryDirectory() as two:
-            with pytest.raises(ValueError, match="Duplicate Workspace.mount_path"):
-                build_file_plan(
-                    input_args={
-                        "workspace": Workspace(path=one, mount_path="/sandbox/workspace"),
-                        "other": Workspace(path=two, mount_path="/sandbox/workspace"),
-                    },
-                    input_file_fields={},
-                    output_file_fields={},
-                    input_workspace_fields={
-                        "workspace": "workspace",
-                        "other": "workspace",
-                    },
-                )
 
 
 class TestWorkspaceSyncState:
@@ -362,358 +192,542 @@ class TestWorkspaceSyncState:
                 assert f.read() == "keep"
 
 
-class TestPredictRLMWorkspacePreparation:
-    def _make_rlm(self, sig):
-        return PredictRLM(sig, sub_lm=MagicMock(), max_iterations=1)
+class _WorkspaceAdapterContext:
+    def __init__(self) -> None:
+        self.state = {}
+        self.bindings = []
 
-    def test_workspace_transformed_to_mount_path_string(self):
-        class Sig(dspy.Signature):
-            workspace: Workspace = dspy.InputField()
-            answer: str = dspy.OutputField()
+    def bind(self, binding: ArtifactBinding) -> None:
+        self.bindings.append(binding)
 
-        with tempfile.TemporaryDirectory() as tmpdir:
-            rlm = self._make_rlm(Sig)
-            plan, args = rlm._prepare_file_io({
-                "workspace": Workspace(path=tmpdir, mount_path="/sandbox/project")
-            })
 
-            assert plan is not None
-            assert args["workspace"] == "/sandbox/project"
-            assert len(plan["workspace_states"]) == 1
+class _WorkspaceTransportSession:
+    name = "workspace-transport"
 
-    @pytest.mark.sbx
-    def test_direct_workspace_transformed_to_effective_sandbox_path(self):
-        class Sig(dspy.Signature):
-            workspace: Workspace = dspy.InputField()
-            answer: str = dspy.OutputField()
+    def __init__(self) -> None:
+        self.direct_mounts: list[HostDirectoryMount] = []
+        self.direct_mount_path: str | None = None
+        self.created_directories: list[str] = []
+        self.transfers: list[FileTransfer] = []
+        self.sandbox_files: dict[str, bytes] = {}
+        self.inspect_calls: list[str] = []
+        self.collect_calls: list[tuple[str, str]] = []
 
-        with tempfile.TemporaryDirectory() as tmpdir:
-            rlm = PredictRLM(
-                Sig,
-                sub_lm=MagicMock(),
-                max_iterations=1,
-                sandbox_backend="sbx",
+    async def transfer_file(self, transfer: FileTransfer) -> str:
+        self.transfers.append(transfer)
+        self.sandbox_files[transfer.sandbox_path] = Path(
+            transfer.source_path
+        ).read_bytes()
+        return transfer.sandbox_path
+
+    async def mount_host_directory(self, mount: HostDirectoryMount) -> str:
+        self.direct_mounts.append(mount)
+        return self.direct_mount_path or mount.sandbox_path
+
+    async def create_directory(self, sandbox_path: str) -> None:
+        self.created_directories.append(sandbox_path)
+
+    async def inspect_directory(self, sandbox_path: str):
+        self.inspect_calls.append(sandbox_path)
+        prefix = sandbox_path.rstrip("/") + "/"
+        return {
+            path.removeprefix(prefix): ArtifactFileInfo(
+                type="file",
+                sha256=hashlib.sha256(contents).hexdigest(),
+                size=len(contents),
             )
-            plan, args = rlm._prepare_file_io({
-                "workspace": Workspace(
-                    path=tmpdir,
-                    mount_path="/workspace",
-                    mode=WorkspaceMode.DIRECT,
-                )
-            })
+            for path, contents in self.sandbox_files.items()
+            if path.startswith(prefix)
+        }
 
-            assert plan is not None
-            assert args["workspace"] == "/workspace"
-            assert plan["workspace_states"] == []
-            assert len(plan["direct_workspace_mounts"]) == 1
+    async def collect_file(self, sandbox_path: str, host_path: str) -> None:
+        self.collect_calls.append((sandbox_path, host_path))
+        destination = Path(host_path)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_bytes(self.sandbox_files[sandbox_path])
 
-    def test_direct_workspace_rejects_default_jspi_backend(self):
-        class Sig(dspy.Signature):
-            workspace: Workspace = dspy.InputField()
-            answer: str = dspy.OutputField()
 
-        with tempfile.TemporaryDirectory() as tmpdir:
-            rlm = self._make_rlm(Sig)
-            with pytest.raises(ValueError, match="requires the SBX backend"):
-                rlm._prepare_file_io({
-                    "workspace": Workspace(
-                        path=tmpdir,
-                        mount_path="/workspace",
-                        mode=WorkspaceMode.DIRECT,
-                    )
-                })
+class _CopyInOnlyWorkspaceSession:
+    name = "copy-in-only"
 
-    def test_direct_workspace_rejects_sbx_pool(self):
-        class Sig(dspy.Signature):
-            workspace: Workspace = dspy.InputField()
-            answer: str = dspy.OutputField()
+    def __init__(self) -> None:
+        self.created_directories: list[str] = []
+        self.transfers: list[FileTransfer] = []
 
-        with tempfile.TemporaryDirectory() as tmpdir:
-            pool = MagicMock()
-            rlm = PredictRLM(
-                Sig,
-                sub_lm=MagicMock(),
-                max_iterations=1,
-                sandbox_backend="sbx",
-                sbx_pool=pool,
+    async def create_directory(self, sandbox_path: str) -> None:
+        self.created_directories.append(sandbox_path)
+
+    async def transfer_file(self, transfer: FileTransfer) -> str:
+        self.transfers.append(transfer)
+        return transfer.sandbox_path
+
+
+class TestWorkspaceInputAdapterLifecycle:
+    @pytest.mark.asyncio
+    async def test_workspace_lifecycle_rejects_prepared_input_without_typed_state(self):
+        with pytest.raises(TypeError, match="typed Workspace prepared state"):
+            await WorkspaceInputAdapter().mount(
+                FieldDescriptor("workspace", Workspace),
+                PreparedInput(model_value="/sandbox/workspace"),
+                _WorkspaceAdapterContext(),
+                _WorkspaceTransportSession(),
             )
-            with pytest.raises(ValueError, match="SbxPool"):
-                rlm._prepare_file_io({
-                    "workspace": Workspace(
-                        path=tmpdir,
-                        mount_path="/workspace",
-                        mode=WorkspaceMode.DIRECT,
-                    )
-                })
 
-    @pytest.mark.sbx
-    def test_external_sbx_interpreter_reuses_direct_workspace_setup(self, tmp_path: Path):
-        from predict_rlm.backends.sbx import SbxBackend, SbxConfig
+    @pytest.mark.asyncio
+    async def test_copy_in_only_workspace_does_not_require_sync_back_capabilities(
+        self,
+        tmp_path: Path,
+    ):
+        workspace_root = tmp_path / "workspace"
+        workspace_root.mkdir()
+        (workspace_root / "source.txt").write_text("before", encoding="utf-8")
+        field = FieldDescriptor("workspace", Workspace)
+        ctx = _WorkspaceAdapterContext()
+        adapter = WorkspaceInputAdapter()
+        prepared = await adapter.prepare(
+            field,
+            Workspace(path=str(workspace_root), sync_back=False),
+            ctx,
+        )
+        session = _CopyInOnlyWorkspaceSession()
 
-        class Sig(dspy.Signature):
-            workspace: Workspace = dspy.InputField()
-            answer: str = dspy.OutputField()
+        mounted = await adapter.mount(field, prepared, ctx, session)
+        await adapter.finalize(field, prepared, ctx, session, None)
 
-        workspace = tmp_path / "workspace"
-        workspace.mkdir()
-        mount = DirectWorkspaceMount(
-            host_path=os.path.abspath(workspace),
+        assert mounted.model_value == "/sandbox/workspace"
+        assert session.created_directories == ["/sandbox/workspace"]
+        assert [transfer.sandbox_path for transfer in session.transfers] == [
+            "/sandbox/workspace/source.txt"
+        ]
+
+    @pytest.mark.asyncio
+    async def test_prepare_uses_neutral_artifacts_and_typed_requirements(
+        self,
+        tmp_path: Path,
+    ):
+        workspace_root = tmp_path / "workspace"
+        workspace_root.mkdir()
+        workspace = Workspace(
+            path=str(workspace_root),
+            mount_path="/workspace",
+            mode=WorkspaceMode.DIRECT,
+        )
+        field = FieldDescriptor("workspace", Workspace)
+        ctx = _WorkspaceAdapterContext()
+        adapter = WorkspaceInputAdapter()
+
+        prepared = await adapter.prepare(field, workspace, ctx)
+        expected_mount = HostDirectoryMount(
+            host_path=str(workspace_root.resolve()),
             sandbox_path="/workspace",
         )
-        interpreter = SbxBackend(
-            config=SbxConfig(name="local-test"),
-            preinstall_packages=False,
-            direct_workspace_mounts=[mount],
-            _runner_command=[sys.executable, "-u", str(RUNNER_PATH)],
-            _staging_root=tmp_path / "staging",
+        assert prepared.model_value == "/workspace"
+        assert len(prepared.artifacts) == 1
+        artifact = prepared.artifacts[0]
+        assert artifact.kind == "compat.workspace"
+        assert dict(artifact.metadata) == {"sandbox_path": "/workspace"}
+        assert "workspace_binding" not in artifact.metadata
+        assert "compat.workspace.direct" not in artifact.kind
+        assert "compat.workspace.mirror" not in artifact.kind
+        json.dumps(dict(artifact.metadata))
+        assert prepared.host_directory_mounts == (expected_mount,)
+        assert prepared.requirements.extra_read_paths == (str(workspace_root.resolve()),)
+        assert prepared.requirements.extra_write_paths == (str(workspace_root.resolve()),)
+
+    @pytest.mark.asyncio
+    async def test_direct_mount_uses_exact_host_directory_primitive(self, tmp_path: Path):
+        workspace_root = tmp_path / "workspace"
+        workspace_root.mkdir()
+        field = FieldDescriptor("workspace", Workspace)
+        ctx = _WorkspaceAdapterContext()
+        adapter = WorkspaceInputAdapter()
+        prepared = await adapter.prepare(
+            field,
+            Workspace(
+                path=str(workspace_root),
+                mount_path="/workspace",
+                mode=WorkspaceMode.DIRECT,
+            ),
+            ctx,
         )
-        rlm = PredictRLM(
-            Sig,
-            sub_lm=MagicMock(),
-            max_iterations=1,
-            interpreter=interpreter,
+        session = _WorkspaceTransportSession()
+        session.direct_mount_path = "/mounted/workspace"
+
+        mounted = await adapter.mount(field, prepared, ctx, session)
+
+        assert session.direct_mounts == [
+            HostDirectoryMount(
+                host_path=str(workspace_root.resolve()),
+                sandbox_path="/workspace",
+            )
+        ]
+        assert session.transfers == []
+        assert mounted.model_value == "/mounted/workspace"
+        assert [binding.path for binding in mounted.bindings] == [
+            "/mounted/workspace"
+        ]
+
+    @pytest.mark.asyncio
+    async def test_direct_mount_is_rejected_by_jspi_and_pooled_sbx(self, tmp_path: Path):
+        from predict_rlm.backends.jspi import JspiExecutionBackend
+        from predict_rlm.backends.sbx import SbxPoolExecutionBackend
+
+        mount = HostDirectoryMount(str(tmp_path), "/workspace")
+        ctx = MagicMock(spec=None)
+
+        with pytest.raises(UnsupportedOperationError, match="JSPI"):
+            await JspiExecutionBackend().validate_host_directory_mounts(
+                (mount,),
+                ctx,
+            )
+        with pytest.raises(UnsupportedOperationError, match="SbxPool"):
+            await SbxPoolExecutionBackend(MagicMock()).validate_host_directory_mounts(
+                (mount,),
+                ctx,
+            )
+
+    @pytest.mark.asyncio
+    async def test_mirror_mount_and_sync_use_generic_transport_after_success_and_failure(
+        self,
+        tmp_path: Path,
+    ):
+        workspace_root = tmp_path / "workspace"
+        workspace_root.mkdir()
+        original = workspace_root / "original.txt"
+        deleted = workspace_root / "deleted.txt"
+        original.write_text("before", encoding="utf-8")
+        deleted.write_text("delete", encoding="utf-8")
+        field = FieldDescriptor("workspace", Workspace)
+        ctx = _WorkspaceAdapterContext()
+        adapter = WorkspaceInputAdapter()
+        prepared = await adapter.prepare(field, Workspace(path=str(workspace_root)), ctx)
+        session = _WorkspaceTransportSession()
+
+        mounted = await adapter.mount(field, prepared, ctx, session)
+
+        assert session.created_directories == ["/sandbox/workspace"]
+        assert {transfer.sandbox_path for transfer in session.transfers} == {
+            "/sandbox/workspace/deleted.txt",
+            "/sandbox/workspace/original.txt",
+        }
+        assert mounted.model_value == "/sandbox/workspace"
+
+        session.sandbox_files["/sandbox/workspace/original.txt"] = b"after success"
+        session.sandbox_files["/sandbox/workspace/created.txt"] = b"created"
+        del session.sandbox_files["/sandbox/workspace/deleted.txt"]
+        await adapter.after_execution(
+            field,
+            prepared,
+            ctx,
+            session,
+            ExecutionResult(value="ok"),
+            None,
         )
 
-        try:
-            plan, _ = rlm._prepare_file_io({
-                "workspace": Workspace(
-                    path=str(workspace),
-                    mount_path="/workspace",
-                    mode=WorkspaceMode.DIRECT,
-                )
-            })
-            assert plan is not None
+        assert original.read_text(encoding="utf-8") == "after success"
+        assert (workspace_root / "created.txt").read_text(encoding="utf-8") == "created"
+        assert not deleted.exists()
 
-            rlm._setup_sandbox_files(interpreter, plan)
-            interpreter._proc = MagicMock()
-            interpreter._proc.poll.return_value = None
-            rlm._setup_sandbox_files(interpreter, plan)
-        finally:
-            interpreter._proc = None
-            interpreter.shutdown()
+        session.sandbox_files["/sandbox/workspace/original.txt"] = b"after failure"
+        execution_error = RuntimeError("generated code failed")
+        await adapter.after_execution(
+            field,
+            prepared,
+            ctx,
+            session,
+            None,
+            execution_error,
+        )
 
-    def test_missing_workspace_raises(self):
-        class Sig(dspy.Signature):
-            workspace: Workspace = dspy.InputField()
-            answer: str = dspy.OutputField()
+        assert original.read_text(encoding="utf-8") == "after failure"
+        assert session.inspect_calls == ["/sandbox/workspace", "/sandbox/workspace"]
 
-        rlm = self._make_rlm(Sig)
-        with pytest.raises(FileNotFoundError, match="Workspace"):
-            rlm._prepare_file_io({"workspace": Workspace(path="/no/such/workspace")})
+    @pytest.mark.asyncio
+    async def test_finalize_syncs_once_and_is_idempotent(self, tmp_path: Path):
+        workspace_root = tmp_path / "workspace"
+        workspace_root.mkdir()
+        source = workspace_root / "source.txt"
+        source.write_text("before", encoding="utf-8")
+        field = FieldDescriptor("workspace", Workspace)
+        ctx = _WorkspaceAdapterContext()
+        adapter = WorkspaceInputAdapter()
+        prepared = await adapter.prepare(field, Workspace(path=str(workspace_root)), ctx)
+        session = _WorkspaceTransportSession()
+        await adapter.mount(field, prepared, ctx, session)
+        session.sandbox_files["/sandbox/workspace/source.txt"] = b"final"
+        await adapter.finalize(field, prepared, ctx, session, None)
+        await adapter.finalize(field, prepared, ctx, session, None)
 
-    def test_input_workspace_type_replaced_with_str(self):
-        class Sig(dspy.Signature):
-            workspace: Workspace = dspy.InputField(desc="Mutable workspace")
-            answer: str = dspy.OutputField()
+        assert source.read_text(encoding="utf-8") == "final"
+        assert session.inspect_calls == ["/sandbox/workspace"]
+        assert session.collect_calls == [
+            ("/sandbox/workspace/source.txt", str(source.resolve()))
+        ]
 
-        rlm = self._make_rlm(Sig)
-        action, _ = rlm._build_signatures_with_files("## Files\ntest")
-        assert "`workspace`" in action.signature.instructions
+    @pytest.mark.asyncio
+    async def test_finalize_continues_after_list_item_conflict(self, tmp_path: Path):
+        first_root = tmp_path / "first"
+        second_root = tmp_path / "second"
+        first_root.mkdir()
+        second_root.mkdir()
+        first_source = first_root / "source.txt"
+        second_source = second_root / "source.txt"
+        first_source.write_text("base", encoding="utf-8")
+        second_source.write_text("base", encoding="utf-8")
+        field = FieldDescriptor("workspaces", list[Workspace])
+        ctx = _WorkspaceAdapterContext()
+        adapter = WorkspaceInputAdapter()
+        prepared = await adapter.prepare(
+            field,
+            [
+                Workspace(path=str(first_root), mount_path="/sandbox/first"),
+                Workspace(path=str(second_root), mount_path="/sandbox/second"),
+            ],
+            ctx,
+        )
+        session = _WorkspaceTransportSession()
+        await adapter.mount(field, prepared, ctx, session)
+        first_source.write_text("host concurrent change", encoding="utf-8")
+        session.sandbox_files["/sandbox/first/source.txt"] = b"sandbox change"
+        session.sandbox_files["/sandbox/second/source.txt"] = b"synced"
+        with pytest.raises(WorkspaceSyncConflictError, match="source.txt"):
+            await adapter.after_execution(
+                field,
+                prepared,
+                ctx,
+                session,
+                ExecutionResult(value="completed"),
+                None,
+            )
+
+        with pytest.raises(WorkspaceSyncConflictError, match="source.txt"):
+            await adapter.finalize(field, prepared, ctx, session, None)
+
+        assert first_source.read_text(encoding="utf-8") == "host concurrent change"
+        assert second_source.read_text(encoding="utf-8") == "synced"
+
+    @pytest.mark.asyncio
+    async def test_finalize_flushes_mirror_after_cancelled_execution(self, tmp_path: Path):
+        workspace_root = tmp_path / "workspace"
+        workspace_root.mkdir()
+        source = workspace_root / "source.txt"
+        source.write_text("before", encoding="utf-8")
+        field = FieldDescriptor("workspace", Workspace)
+        ctx = _WorkspaceAdapterContext()
+        adapter = WorkspaceInputAdapter()
+        prepared = await adapter.prepare(field, Workspace(path=str(workspace_root)), ctx)
+        session = _WorkspaceTransportSession()
+        await adapter.mount(field, prepared, ctx, session)
+        session.sandbox_files["/sandbox/workspace/source.txt"] = b"after cancellation"
+
+        await adapter.finalize(
+            field,
+            prepared,
+            ctx,
+            session,
+            asyncio.CancelledError(),
+        )
+
+        assert source.read_text(encoding="utf-8") == "after cancellation"
+        assert session.inspect_calls == ["/sandbox/workspace"]
+
+    @pytest.mark.asyncio
+    async def test_mirror_conflict_through_generic_transport_preserves_host_change(
+        self,
+        tmp_path: Path,
+    ):
+        workspace_root = tmp_path / "workspace"
+        workspace_root.mkdir()
+        source = workspace_root / "source.txt"
+        source.write_text("base", encoding="utf-8")
+        field = FieldDescriptor("workspace", Workspace)
+        ctx = _WorkspaceAdapterContext()
+        adapter = WorkspaceInputAdapter()
+        prepared = await adapter.prepare(field, Workspace(path=str(workspace_root)), ctx)
+        session = _WorkspaceTransportSession()
+        await adapter.mount(field, prepared, ctx, session)
+        source.write_text("host concurrent change", encoding="utf-8")
+        session.sandbox_files["/sandbox/workspace/source.txt"] = b"sandbox change"
+
+        with pytest.raises(WorkspaceSyncConflictError, match="source.txt"):
+            await adapter.after_execution(
+                field,
+                prepared,
+                ctx,
+                session,
+                None,
+                RuntimeError("generated code failed"),
+            )
+
+        assert source.read_text(encoding="utf-8") == "host concurrent change"
+        assert session.collect_calls == []
+
+    @pytest.mark.asyncio
+    async def test_missing_workspace_fails_during_adapter_preparation(self):
+        with pytest.raises(FileNotFoundError, match="/no/such/workspace"):
+            await WorkspaceInputAdapter().prepare(
+                FieldDescriptor("workspace", Workspace),
+                Workspace(path="/no/such/workspace"),
+                _WorkspaceAdapterContext(),
+            )
+
+
+class _WorkspaceMutationActions:
+    async def acall(self, *, iteration, **kwargs):
+        del kwargs
+        if iteration == "1/2":
+            return dspy.Prediction(
+                reasoning="persist a mutation from a failed generated attempt",
+                code=(
+                    "from pathlib import Path\n"
+                    "root = Path(workspace)\n"
+                    "(root / 'failed.txt').write_text('after failure')\n"
+                    "raise RuntimeError('expected generated failure')"
+                ),
+            )
+        return dspy.Prediction(
+            reasoning="complete the workspace mutation",
+            code=(
+                "from pathlib import Path\n"
+                "root = Path(workspace)\n"
+                "(root / 'source.txt').write_text('after success')\n"
+                "(root / 'created.txt').write_text('created')\n"
+                "(root / 'deleted.txt').unlink()\n"
+                "SUBMIT(answer='done')"
+            ),
+        )
+
+
+class _WorkspaceSignature(dspy.Signature):
+    workspace: Workspace = dspy.InputField()
+    answer: str = dspy.OutputField()
+
+
+async def _run_workspace_mutation(rlm: PredictRLM, workspace_root: Path) -> None:
+    rlm.generate_action = _WorkspaceMutationActions()
+    rlm._configure_run_predictors = MagicMock()
+
+    result = await rlm.aforward(workspace=Workspace(path=str(workspace_root)))
+
+    assert result.answer == "done"
+    assert (workspace_root / "source.txt").read_text(encoding="utf-8") == "after success"
+    assert (workspace_root / "failed.txt").read_text(encoding="utf-8") == "after failure"
+    assert (workspace_root / "created.txt").read_text(encoding="utf-8") == "created"
+    assert not (workspace_root / "deleted.txt").exists()
 
 
 @pytest.mark.integration
-class TestWorkspaceIOJspiIntegration:
-    def _mount_workspace(self, interpreter, workspace):
-        state = WorkspaceSyncState(workspace)
-        interpreter._ensure_deno_process()
-        interpreter.mkdir_p(workspace.mount_path)
-        for host_path, virtual_path in state.iter_mounts():
-            interpreter.mount_file_at(host_path, virtual_path)
-        interpreter.add_post_execute_hook(state.sync_from_sandbox)
-        return state
+@pytest.mark.skipif(shutil.which("deno") is None, reason="requires Deno")
+@pytest.mark.asyncio
+async def test_workspace_lifecycle_through_maintained_jspi(tmp_path: Path):
+    workspace_root = tmp_path / "workspace"
+    workspace_root.mkdir()
+    (workspace_root / "source.txt").write_text("before", encoding="utf-8")
+    (workspace_root / "deleted.txt").write_text("delete", encoding="utf-8")
+    rlm = PredictRLM(
+        _WorkspaceSignature,
+        lm=MagicMock(history=[]),
+        max_iterations=2,
+        verbose=False,
+    )
 
-    @pytest.mark.asyncio
-    async def test_sync_back_modifies_host_file_after_aexecute(self):
-        from predict_rlm.backends.jspi import JspiBackend
-
-        with tempfile.TemporaryDirectory() as tmpdir:
-            path = os.path.join(tmpdir, "README.md")
-            with open(path, "w") as f:
-                f.write("before")
-
-            interpreter = JspiBackend(preinstall_packages=False, extra_read_paths=[tmpdir])
-            try:
-                self._mount_workspace(interpreter, Workspace(path=tmpdir))
-                await interpreter.aexecute("""
-from pathlib import Path
-Path("/sandbox/workspace/README.md").write_text("after")
-print("changed")
-""")
-                with open(path) as f:
-                    assert f.read() == "after"
-            finally:
-                interpreter.shutdown()
-
-    @pytest.mark.asyncio
-    async def test_sync_back_propagates_created_file_and_deletion(self):
-        from predict_rlm.backends.jspi import JspiBackend
-
-        with tempfile.TemporaryDirectory() as tmpdir:
-            deleted = os.path.join(tmpdir, "delete.txt")
-            with open(deleted, "w") as f:
-                f.write("delete me")
-
-            interpreter = JspiBackend(preinstall_packages=False, extra_read_paths=[tmpdir])
-            try:
-                self._mount_workspace(interpreter, Workspace(path=tmpdir))
-                await interpreter.aexecute("""
-from pathlib import Path
-Path("/sandbox/workspace/created.txt").write_text("created")
-Path("/sandbox/workspace/delete.txt").unlink()
-print("done")
-""")
-                with open(os.path.join(tmpdir, "created.txt")) as f:
-                    assert f.read() == "created"
-                assert not os.path.exists(deleted)
-            finally:
-                interpreter.shutdown()
-
-    @pytest.mark.asyncio
-    async def test_sync_back_runs_after_failed_code_block(self):
-        from predict_rlm.backends.jspi import JspiBackend
-
-        with tempfile.TemporaryDirectory() as tmpdir:
-            path = os.path.join(tmpdir, "failed.txt")
-            with open(path, "w") as f:
-                f.write("before")
-
-            interpreter = JspiBackend(preinstall_packages=False, extra_read_paths=[tmpdir])
-            try:
-                self._mount_workspace(interpreter, Workspace(path=tmpdir))
-                with pytest.raises(CodeInterpreterError):
-                    await interpreter.aexecute("""
-from pathlib import Path
-Path("/sandbox/workspace/failed.txt").write_text("after failure")
-raise RuntimeError("boom")
-""")
-                with open(path) as f:
-                    assert f.read() == "after failure"
-            finally:
-                interpreter.shutdown()
-
-    @pytest.mark.asyncio
-    async def test_conflict_detection_does_not_clobber_host_change(self):
-        from predict_rlm.backends.jspi import JspiBackend
-
-        with tempfile.TemporaryDirectory() as tmpdir:
-            path = os.path.join(tmpdir, "conflict.txt")
-            with open(path, "w") as f:
-                f.write("base")
-
-            interpreter = JspiBackend(preinstall_packages=False, extra_read_paths=[tmpdir])
-            try:
-                self._mount_workspace(interpreter, Workspace(path=tmpdir))
-                with open(path, "w") as f:
-                    f.write("host concurrent change")
-
-                with pytest.raises(WorkspaceSyncConflictError):
-                    await interpreter.aexecute("""
-from pathlib import Path
-Path("/sandbox/workspace/conflict.txt").write_text("sandbox change")
-""")
-
-                with open(path) as f:
-                    assert f.read() == "host concurrent change"
-            finally:
-                interpreter.shutdown()
+    await _run_workspace_mutation(rlm, workspace_root)
 
 
-@pytest.mark.sbx
-class TestWorkspaceIOSbxLocalRunner:
-    def make_interpreter(self, tmp_path: Path) -> SbxBackend:
-        from predict_rlm.backends.sbx import SbxBackend, SbxConfig
+@pytest.mark.integration
+@pytest.mark.skipif(shutil.which("deno") is None, reason="requires Deno")
+@pytest.mark.asyncio
+async def test_workspace_conflict_through_maintained_jspi_preserves_host(tmp_path: Path):
+    workspace_root = tmp_path / "workspace"
+    workspace_root.mkdir()
+    source = workspace_root / "source.txt"
+    source.write_text("base", encoding="utf-8")
 
-        return SbxBackend(
-            config=SbxConfig(name="local-test"),
-            preinstall_packages=False,
-            _runner_command=[sys.executable, "-u", str(RUNNER_PATH)],
-            _staging_root=tmp_path / "staging",
+    async def change_host() -> str:
+        source.write_text("host concurrent change", encoding="utf-8")
+        return "changed"
+
+    rlm = PredictRLM(
+        _WorkspaceSignature,
+        lm=MagicMock(history=[]),
+        tools={"change_host": change_host},
+        max_iterations=1,
+        verbose=False,
+    )
+    rlm.generate_action.acall = AsyncMock(
+        return_value=dspy.Prediction(
+            reasoning="create a host/sandbox conflict",
+            code=(
+                "from pathlib import Path\n"
+                "await change_host()\n"
+                "Path(workspace, 'source.txt').write_text('sandbox change')\n"
+                "SUBMIT(answer='done')"
+            ),
         )
+    )
+    rlm._configure_run_predictors = MagicMock()
 
-    def mount_workspace(self, interpreter: SbxBackend, workspace: Workspace):
-        state = WorkspaceSyncState(workspace)
-        interpreter.mkdir_p(workspace.mount_path)
-        for host_path, virtual_path in state.iter_mounts():
-            interpreter.mount_file_at(host_path, virtual_path)
-        interpreter.add_post_execute_hook(state.sync_from_sandbox)
-        return state
+    with pytest.raises(WorkspaceSyncConflictError):
+        await rlm.aforward(workspace=Workspace(path=str(workspace_root)))
 
-    def test_sync_back_modifies_host_file(self, tmp_path: Path):
-        workspace_dir = tmp_path / "workspace"
-        workspace_dir.mkdir()
-        readme = workspace_dir / "README.md"
-        readme.write_text("before", encoding="utf-8")
+    assert source.read_text(encoding="utf-8") == "host concurrent change"
 
-        interpreter = self.make_interpreter(tmp_path)
-        try:
-            self.mount_workspace(interpreter, Workspace(path=str(workspace_dir)))
-            interpreter.execute(
-                "from pathlib import Path\n"
-                "Path('/sandbox/workspace/README.md').write_text('after')"
-            )
-        finally:
-            interpreter.shutdown()
 
-        assert readme.read_text(encoding="utf-8") == "after"
+@pytest.mark.integration
+@pytest.mark.sbx
+@pytest.mark.asyncio
+async def test_workspace_lifecycle_through_maintained_sbx_local_runner(
+    tmp_path: Path,
+):
+    from predict_rlm.backends.sbx import SbxBackend, SbxConfig
 
-    def test_sync_back_runs_after_failed_code_block(self, tmp_path: Path):
-        workspace_dir = tmp_path / "workspace"
-        workspace_dir.mkdir()
-        path = workspace_dir / "failed.txt"
-        path.write_text("before", encoding="utf-8")
+    workspace_root = tmp_path / "workspace"
+    workspace_root.mkdir()
+    (workspace_root / "source.txt").write_text("before", encoding="utf-8")
+    (workspace_root / "deleted.txt").write_text("delete", encoding="utf-8")
+    interpreter = SbxBackend(
+        config=SbxConfig(name="workspace-lifecycle-local"),
+        preinstall_packages=False,
+        _runner_command=[sys.executable, "-u", str(RUNNER_PATH)],
+        _staging_root=tmp_path / "staging",
+    )
+    rlm = PredictRLM(
+        _WorkspaceSignature,
+        lm=MagicMock(history=[]),
+        interpreter=interpreter,
+        max_iterations=2,
+        verbose=False,
+    )
 
-        interpreter = self.make_interpreter(tmp_path)
-        try:
-            self.mount_workspace(interpreter, Workspace(path=str(workspace_dir)))
-            with pytest.raises(CodeInterpreterError):
-                interpreter.execute(
-                    "from pathlib import Path\n"
-                    "Path('/sandbox/workspace/failed.txt').write_text('after failure')\n"
-                    "raise RuntimeError('boom')"
-                )
-        finally:
-            interpreter.shutdown()
+    try:
+        await _run_workspace_mutation(rlm, workspace_root)
+    finally:
+        interpreter.shutdown()
 
-        assert path.read_text(encoding="utf-8") == "after failure"
 
-    def test_sync_back_propagates_created_file_and_deletion(self, tmp_path: Path):
-        workspace_dir = tmp_path / "workspace"
-        workspace_dir.mkdir()
-        deleted = workspace_dir / "delete.txt"
-        deleted.write_text("delete me", encoding="utf-8")
+@pytest.mark.integration
+@pytest.mark.sbx
+@pytest.mark.skipif(
+    os.environ.get("PREDICT_RLM_RUN_SBX_TESTS") != "1" or shutil.which("sbx") is None,
+    reason="requires the real SBX service",
+)
+@pytest.mark.asyncio
+async def test_workspace_lifecycle_through_owned_sbx(tmp_path: Path):
+    from predict_rlm.backends.sbx import SbxConfig
+    from predict_rlm.backends.sbx.execution import SbxExecutionBackend
 
-        interpreter = self.make_interpreter(tmp_path)
-        try:
-            self.mount_workspace(interpreter, Workspace(path=str(workspace_dir)))
-            interpreter.execute(
-                "from pathlib import Path\n"
-                "Path('/sandbox/workspace/created.txt').write_text('created')\n"
-                "Path('/sandbox/workspace/delete.txt').unlink()"
-            )
-        finally:
-            interpreter.shutdown()
+    workspace_root = tmp_path / "workspace"
+    workspace_root.mkdir()
+    (workspace_root / "source.txt").write_text("before", encoding="utf-8")
+    (workspace_root / "deleted.txt").write_text("delete", encoding="utf-8")
+    rlm = PredictRLM(
+        _WorkspaceSignature,
+        lm=MagicMock(history=[]),
+        execution=SbxExecutionBackend(
+            config=SbxConfig(name=f"workspace-lifecycle-{os.getpid()}")
+        ),
+        max_iterations=2,
+        verbose=False,
+    )
 
-        assert (workspace_dir / "created.txt").read_text(encoding="utf-8") == "created"
-        assert not deleted.exists()
-
-    def test_sync_back_does_not_delete_host_when_mount_root_disappears(
-        self, tmp_path: Path
-    ):
-        workspace_dir = tmp_path / "workspace"
-        workspace_dir.mkdir()
-        readme = workspace_dir / "README.md"
-        readme.write_text("keep me", encoding="utf-8")
-
-        interpreter = self.make_interpreter(tmp_path)
-        try:
-            self.mount_workspace(interpreter, Workspace(path=str(workspace_dir)))
-            with pytest.raises(WorkspaceSyncConflictError, match="workspace mount"):
-                interpreter.execute(
-                    "import shutil\n"
-                    "from pathlib import Path\n"
-                    "shutil.rmtree(Path('/sandbox/workspace'))"
-                )
-        finally:
-            interpreter.shutdown()
-
-        assert readme.read_text(encoding="utf-8") == "keep me"
+    await _run_workspace_mutation(rlm, workspace_root)

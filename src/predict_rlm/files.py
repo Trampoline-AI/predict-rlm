@@ -31,41 +31,21 @@ from typing import Annotated, Any
 from pydantic import BaseModel, Field
 
 from .runtime import FieldDescriptor
-from .workspace import (
-    DEFAULT_WORKSPACE_EXCLUDES,
-    DirectWorkspaceMount,
-    Workspace,
-    WorkspaceFileInfo,
-    WorkspaceMode,
-    WorkspaceSyncConflict,
-    WorkspaceSyncConflictError,
-    WorkspaceSyncState,
-)
 
 __all__ = [
-    "DEFAULT_WORKSPACE_EXCLUDES",
     "File",
-    "DirectWorkspaceMount",
     "LocalDir",
     "LocalFile",
     "OutputDir",
     "OutputFile",
     "SyncedFile",
-    "Workspace",
-    "WorkspaceFileInfo",
-    "WorkspaceMode",
-    "WorkspaceSyncConflict",
-    "WorkspaceSyncConflictError",
-    "WorkspaceSyncState",
     "build_file_instructions",
     "build_file_plan",
     "get_synced_file_params",
     "is_file_type",
     "is_input_file_type",
     "is_output_file_type",
-    "is_workspace_type",
     "scan_file_fields",
-    "scan_workspace_fields",
 ]
 
 
@@ -136,11 +116,6 @@ def is_file_type(annotation: Any) -> bool:
     return FieldDescriptor("", annotation).matches(File)
 
 
-def is_workspace_type(annotation: Any) -> bool:
-    """Check if a field annotation is Workspace or list[Workspace]."""
-    return FieldDescriptor("", annotation).matches(Workspace)
-
-
 # Deprecated aliases
 is_input_file_type = is_file_type
 is_output_file_type = is_file_type
@@ -173,36 +148,9 @@ def scan_file_fields(
     return input_file_fields, output_file_fields
 
 
-def scan_workspace_fields(signature: Any) -> dict[str, str]:
-    """Scan a DSPy signature for Workspace-typed input fields."""
-    input_workspace_fields: dict[str, str] = {}
-
-    for name, field in signature.input_fields.items():
-        descriptor = FieldDescriptor(name, field.annotation)
-        if descriptor.matches(Workspace):
-            kind = "list_workspace" if descriptor.is_list else "workspace"
-            input_workspace_fields[name] = kind
-
-    output_workspace_fields = [
-        name
-        for name, field in signature.output_fields.items()
-        if is_workspace_type(field.annotation)
-    ]
-    if output_workspace_fields:
-        names = ", ".join(output_workspace_fields)
-        raise TypeError(
-            f"Workspace fields are input-only: {names}. Use Workspace as an "
-            "InputField for mutable directory edits, or File/list[File] as "
-            "OutputField for generated artifacts."
-        )
-
-    return input_workspace_fields
-
-
 def build_file_instructions(
     input_mounts: dict[str, str | list[str]],
     output_dirs: dict[str, str],
-    workspace_mounts: dict[str, str | list[str]] | None = None,
 ) -> str:
     """Generate the '## Files' instructions block for the RLM.
 
@@ -235,49 +183,7 @@ def build_file_instructions(
             lines.append(f"- `{field_name}`: write to {sandbox_dir}")
         lines.append("")
 
-    if workspace_mounts:
-        lines.append(
-            "Workspace directories (mutable host directories mounted in the sandbox):"
-        )
-        for field_name, sandbox_path in workspace_mounts.items():
-            if isinstance(sandbox_path, list):
-                lines.append(f"- `{field_name}`: workspaces at {', '.join(sandbox_path)}")
-            else:
-                lines.append(f"- `{field_name}`: workspace at {sandbox_path}")
-        lines.append(
-            "Edit workspace files using standard Python/os/pathlib APIs under the "
-            "mounted path. Mirror-mode workspace changes sync back to the host after "
-            "each code block, including failed code blocks when the sandbox remains "
-            "alive. Direct SBX workspaces update host files immediately. "
-            "Do not submit workspace files as `File` outputs; they sync automatically."
-        )
-        lines.append("")
-
     return "\n".join(lines)
-
-
-def _uses_default_workspace_mount_path(workspace: Workspace) -> bool:
-    return (
-        "mount_path" not in workspace.model_fields_set
-        and workspace.mount_path == Workspace.model_fields["mount_path"].default
-    )
-
-
-def _direct_workspace_sandbox_path(workspace: Workspace, workspace_root: str) -> str:
-    if os.path.islink(workspace_root):
-        raise ValueError(f"Workspace path cannot be a symlink: {workspace.path}")
-    if _uses_default_workspace_mount_path(workspace):
-        return workspace_root
-    mount_path = workspace.mount_path
-    if mount_path == "/sandbox" or mount_path.startswith("/sandbox/"):
-        raise ValueError(
-            "Workspace(mode='direct') mount_path must not be under /sandbox; "
-            "omit mount_path to use the SBX-mounted host path, or pass an absolute "
-            "sandbox path such as /workspace."
-        )
-    if not mount_path.startswith("/"):
-        raise ValueError("Workspace(mode='direct') mount_path must be absolute.")
-    return mount_path
 
 
 def build_file_plan(
@@ -285,7 +191,6 @@ def build_file_plan(
     input_file_fields: dict[str, str],
     output_file_fields: dict[str, str],
     output_dir: str | None = None,
-    input_workspace_fields: dict[str, str] | None = None,
 ) -> dict[str, Any] | None:
     """Build the file plan for mounting/syncing.
 
@@ -301,19 +206,14 @@ def build_file_plan(
             "instructions": str,
         }
     """
-    input_workspace_fields = input_workspace_fields or {}
-    if not input_file_fields and not output_file_fields and not input_workspace_fields:
+    if not input_file_fields and not output_file_fields:
         return None
 
     import tempfile
 
     mounts: list[tuple[str, str]] = []
     read_paths: list[str] = []
-    write_paths: list[str] = []
     input_mounts_for_instructions: dict[str, str | list[str]] = {}
-    workspace_mounts_for_instructions: dict[str, str | list[str]] = {}
-    workspace_states: list[WorkspaceSyncState] = []
-    direct_workspace_mounts: list[DirectWorkspaceMount] = []
 
     # Process input file fields
     for field_name, kind in input_file_fields.items():
@@ -369,62 +269,17 @@ def build_file_plan(
             "kind": kind,
         }
 
-    for field_name, kind in input_workspace_fields.items():
-        value = input_args.get(field_name)
-        if value is None:
-            continue
-
-        workspaces = value if kind == "list_workspace" else [value]
-        mount_paths: list[str] = []
-        for workspace in workspaces:
-            workspace_root = os.path.abspath(workspace.path)
-            if workspace.mode is WorkspaceMode.DIRECT:
-                sandbox_path = _direct_workspace_sandbox_path(workspace, workspace_root)
-                direct_workspace_mounts.append(
-                    DirectWorkspaceMount(
-                        host_path=workspace_root,
-                        sandbox_path=sandbox_path,
-                    )
-                )
-                mount_paths.append(sandbox_path)
-            else:
-                state = WorkspaceSyncState(workspace)
-                workspace_states.append(state)
-                mount_paths.append(workspace.mount_path)
-            read_paths.append(workspace_root)
-            write_paths.append(workspace_root)
-        workspace_mounts_for_instructions[field_name] = (
-            mount_paths if kind == "list_workspace" else mount_paths[0]
-        )
-
-    seen_mount_paths: dict[str, str] = {}
-    for field_name, mount_paths in workspace_mounts_for_instructions.items():
-        paths = mount_paths if isinstance(mount_paths, list) else [mount_paths]
-        for mount_path in paths:
-            if mount_path in seen_mount_paths:
-                raise ValueError(
-                    "Duplicate Workspace.mount_path values are not supported: "
-                    f"{mount_path!r} appears in both {seen_mount_paths[mount_path]!r} "
-                    f"and {field_name!r}"
-                )
-            seen_mount_paths[mount_path] = field_name
-
     instructions = build_file_instructions(
         input_mounts_for_instructions,
         output_dirs_for_instructions,
-        workspace_mounts_for_instructions,
     )
 
     return {
         "mounts": mounts,
         "read_paths": read_paths,
-        "write_paths": write_paths,
         "output_dirs": output_dirs_virtual,
         "write_dir": host_output_base,
         "output_field_map": output_field_map,
-        "workspace_states": workspace_states,
-        "direct_workspace_mounts": direct_workspace_mounts,
-        "workspace_mounts_for_instructions": workspace_mounts_for_instructions,
         "instructions": instructions,
     }
 

@@ -539,6 +539,16 @@ try {
   interruptTimerWorker = new Worker(URL.createObjectURL(new Blob([`
 let interruptBuffer = null;
 let timerId = null;
+let cancellationSignalReady = false;
+
+try {
+  Deno.addSignalListener("SIGUSR1", () => {
+    if (interruptBuffer) Atomics.store(interruptBuffer, 0, ${SIGINT});
+  });
+  cancellationSignalReady = true;
+} catch (_) {
+  cancellationSignalReady = false;
+}
 
 function clearTimer(resetSignal) {
   if (timerId !== null) {
@@ -556,6 +566,10 @@ self.onmessage = (event) => {
   if (data.buffer) {
     interruptBuffer = data.buffer;
   }
+  if (data.type === "init") {
+    self.postMessage({ type: "ready", cancellationSignalReady });
+    return;
+  }
   if (data.type === "arm") {
     clearTimer(true);
     const timeoutMs = Math.max(0, Number(data.timeoutMs) || 0);
@@ -570,17 +584,29 @@ self.onmessage = (event) => {
   }
 };
 `], { type: "application/javascript" })), { type: "module" });
-  interruptTimerWorker.onmessage = (event) => {
-    const data = event.data || {};
-    if (data.type !== "armed") return;
-    const pending = pendingInterruptArms.get(data.armId);
-    if (!pending) return;
-    clearTimeout(pending.timerId);
-    pendingInterruptArms.delete(data.armId);
-    pending.resolve(true);
-  };
+  const interruptWorkerReady = new Promise((resolve) => {
+    const timerId = setTimeout(() => resolve(false), 1000);
+    interruptTimerWorker.onmessage = (event) => {
+      const data = event.data || {};
+      if (data.type === "ready") {
+        clearTimeout(timerId);
+        resolve(data.cancellationSignalReady === true);
+        return;
+      }
+      if (data.type !== "armed") return;
+      const pending = pendingInterruptArms.get(data.armId);
+      if (!pending) return;
+      clearTimeout(pending.timerId);
+      pendingInterruptArms.delete(data.armId);
+      pending.resolve(true);
+    };
+  });
+  interruptTimerWorker.postMessage({ type: "init", buffer: interruptBuffer });
+  if (!await interruptWorkerReady) {
+    throw new Error("The interrupt worker did not install its cancellation signal");
+  }
 } catch (e) {
-  console.error(`[interrupt] Failed to initialize Pyodide interrupt buffer: ${e}`);
+  throw new Error(`[interrupt] Failed to initialize Pyodide interrupt buffer: ${e}`);
 }
 
 const armExecutionInterrupt = async (timeoutSeconds) => {

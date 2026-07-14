@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Sequence
 from contextlib import asynccontextmanager
 from typing import Any, Callable
 
@@ -12,8 +12,11 @@ from predict_rlm.runtime import (
     ArtifactBinding,
     ExecutionSession,
     ExecutionSpec,
+    HostDirectoryMount,
     RunContext,
+    SandboxRootReservation,
     SessionOwnership,
+    UnsupportedOperationError,
 )
 
 from .backend import JspiBackend
@@ -22,11 +25,17 @@ from .backend import JspiBackend
 class JspiExecutionSession(NativeInterpreterExecutionSession):
     """JSPI session with host-call-safe artifact transfer operations."""
 
-    def __init__(self, interpreter: JspiBackend) -> None:
+    def __init__(
+        self,
+        interpreter: JspiBackend,
+        *,
+        sandbox_roots: Sequence[SandboxRootReservation] = (),
+    ) -> None:
         super().__init__(
             interpreter,
             name="jspi",
             ownership=SessionOwnership.OWNED,
+            sandbox_roots=sandbox_roots,
         )
         self._running_code = False
 
@@ -56,14 +65,17 @@ class JspiExecutionSession(NativeInterpreterExecutionSession):
             return destination_path
         return await super().collect(artifact)
 
+    async def cancel(self) -> None:
+        if self._cancelled:
+            return
+        self._cancelled = True
+        await self.interpreter.acancel_execution()
+
 
 class JspiExecutionBackend:
     """Own one JSPI interpreter for each PredictRLM invocation."""
 
     name = "jspi"
-    supports_mirror_workspaces = True
-    supports_direct_workspaces = False
-    direct_workspace_error = "Workspace(mode='direct') requires the SBX backend."
 
     def __init__(
         self,
@@ -74,12 +86,27 @@ class JspiExecutionBackend:
         self.allowed_domains = allowed_domains
         self.telemetry_context = telemetry_context
 
+    async def validate_host_directory_mounts(
+        self,
+        mounts: Sequence[HostDirectoryMount],
+        ctx: RunContext,
+    ) -> None:
+        del ctx
+        if mounts:
+            raise UnsupportedOperationError(
+                "The JSPI backend does not support host directory mounts"
+            )
+
     @asynccontextmanager
     async def start(
         self,
         spec: ExecutionSpec,
         ctx: RunContext,
     ) -> AsyncIterator[ExecutionSession]:
+        if spec.host_directory_mounts:
+            raise UnsupportedOperationError(
+                "The JSPI backend does not support host directory mounts"
+            )
         interpreter = JspiBackend(
             tools=dict(spec.tools),
             output_fields=[dict(field) for field in spec.output_fields],
@@ -92,7 +119,10 @@ class JspiExecutionBackend:
                 self.telemetry_context() if self.telemetry_context is not None else None
             ),
         )
-        session = JspiExecutionSession(interpreter)
+        session = JspiExecutionSession(
+            interpreter,
+            sandbox_roots=spec.sandbox_roots,
+        )
         ctx.session = session
         ctx.ownership = SessionOwnership.OWNED
         try:

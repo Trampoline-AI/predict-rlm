@@ -48,7 +48,11 @@ from predict_rlm.backends.supervisor._payload import (  # noqa: E402
     _pickleable_globals_snapshot,
 )
 from predict_rlm.files import SyncedFile  # noqa: E402
-from predict_rlm.runtime import ExecutionSpec  # noqa: E402
+from predict_rlm.runtime import (  # noqa: E402
+    ExecutionSpec,
+    HostDirectoryMount,
+    UnsupportedOperationError,
+)
 from predict_rlm.workspace import DirectWorkspaceMount  # noqa: E402
 
 PAYLOAD_PATH = Path(__file__).parents[1] / "src" / "predict_rlm" / "backends" / "supervisor" / "_payload.py"
@@ -2531,6 +2535,46 @@ def test_owned_sbx_retirement_finishes_before_sync_loop_teardown(monkeypatch):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "spec",
+    [
+        ExecutionSpec(
+            host_directory_mounts=(
+                HostDirectoryMount("/host/workspace", "/workspace"),
+            )
+        ),
+        ExecutionSpec(allowed_domains=("service.internal",)),
+        ExecutionSpec(extra_read_paths=("/host/input",)),
+        ExecutionSpec(extra_write_paths=("/host/output",)),
+    ],
+)
+async def test_reused_sbx_rejects_invocation_policy_before_backend_construction(
+    monkeypatch,
+    spec: ExecutionSpec,
+):
+    constructions = 0
+
+    def construct_backend(**kwargs):
+        nonlocal constructions
+        constructions += 1
+        raise AssertionError("unsafe reused SBX policy reached backend construction")
+
+    monkeypatch.setattr(
+        "predict_rlm.backends.sbx.execution.SbxBackend",
+        construct_backend,
+    )
+    backend = SbxExecutionBackend(
+        config=SbxConfig(name="hot-box", reuse=True),
+    )
+
+    with pytest.raises(UnsupportedOperationError, match="reused SBX"):
+        async with backend.start(spec, SimpleNamespace(session=None, ownership=None)):
+            pass
+
+    assert constructions == 0
+
+
+@pytest.mark.asyncio
 async def test_cancelled_sync_tool_keeps_direct_synced_temp_until_worker_exits(
     tmp_path: Path,
 ):
@@ -3056,6 +3100,63 @@ class TestSbxCommandConstruction:
         workspace_arg = f"{tmp_path / 'staging'}:ro"
         assert create_cmd[:4] == ["sbx", "create", "shell", workspace_arg]
         assert create_cmd[4:6] == [str(extra_one), str(extra_two)]
+
+    def test_direct_workspace_flags_enforce_per_mount_read_only_access(
+        self, monkeypatch, tmp_path: Path
+    ):
+        commands: list[list[str]] = []
+        read_only = tmp_path / "dataset"
+        writable = tmp_path / "repository"
+        read_only.mkdir()
+        writable.mkdir()
+
+        def fake_run(command, **kwargs):
+            commands.append(command)
+            return subprocess.CompletedProcess(
+                command, 0, stdout="created-name\n", stderr=""
+            )
+
+        monkeypatch.setattr(shutil, "which", lambda name: "/usr/local/bin/sbx")
+        monkeypatch.setattr(subprocess, "run", fake_run)
+        interpreter = SbxBackend(
+            config=SbxConfig(name="created-name"),
+            preinstall_packages=False,
+            _staging_root=tmp_path / "staging",
+            direct_workspace_mounts=[
+                DirectWorkspaceMount(
+                    str(read_only), "/datasets/input", read_only=True
+                ),
+                DirectWorkspaceMount(str(writable), "/repository"),
+            ],
+        )
+
+        interpreter._start_sbx_and_build_supervisor_command()
+
+        create_cmd = commands[0]
+        assert f"{read_only}:ro" in create_cmd
+        assert str(writable) in create_cmd
+
+    def test_running_interpreter_accepts_semantically_reordered_direct_mounts(
+        self,
+        monkeypatch,
+        tmp_path: Path,
+    ):
+        first = HostDirectoryMount(str(tmp_path / "first"), "/first")
+        second = HostDirectoryMount(
+            str(tmp_path / "second"),
+            "/second",
+            read_only=True,
+        )
+        interpreter = SbxBackend(
+            preinstall_packages=False,
+            _staging_root=tmp_path / "staging",
+            direct_workspace_mounts=[first, second],
+        )
+        monkeypatch.setattr(interpreter, "_transport_running", lambda: True)
+
+        interpreter.configure_direct_workspace_mounts([second, first])
+
+        assert interpreter._direct_workspace_mounts == [first, second]
 
     def test_default_workspace_is_staging_root_not_repo(self, monkeypatch, tmp_path: Path):
         commands: list[list[str]] = []

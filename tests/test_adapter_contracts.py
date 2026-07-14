@@ -6,7 +6,7 @@ from typing import Annotated
 
 import pytest
 
-from predict_rlm import File
+from predict_rlm import ExecutionSpec, File, HostDirectoryMount
 from predict_rlm.compatibility import FileInputAdapter, FileOutputAdapter
 from predict_rlm.runtime import (
     ArtifactBinding,
@@ -55,6 +55,26 @@ def test_field_descriptor_does_not_flatten_arbitrary_unions_or_nested_lists():
     assert not FieldDescriptor("source", list[list[File]]).matches(File)
 
 
+def test_execution_spec_rejects_duplicate_host_mount_destinations(tmp_path):
+    with pytest.raises(ValueError, match="Duplicate host-directory sandbox destination"):
+        ExecutionSpec(
+            host_directory_mounts=(
+                HostDirectoryMount(str(tmp_path / "first"), "/dataset"),
+                HostDirectoryMount(str(tmp_path / "second"), "/dataset"),
+            )
+        )
+
+
+def test_execution_spec_rejects_conflicting_host_mount_access(tmp_path):
+    with pytest.raises(ValueError, match="conflicting access modes"):
+        ExecutionSpec(
+            host_directory_mounts=(
+                HostDirectoryMount(str(tmp_path), "/read", read_only=True),
+                HostDirectoryMount(str(tmp_path), "/write"),
+            )
+        )
+
+
 @pytest.mark.asyncio
 async def test_typed_adapter_bases_own_matching_and_output_preparation():
     class StringInput(InputAdapter[str]):
@@ -75,8 +95,28 @@ async def test_typed_adapter_bases_own_matching_and_output_preparation():
             raise NotImplementedError
 
     field = FieldDescriptor("message", str)
+    input_adapter = StringInput()
+    prepared = await input_adapter.prepare(field, "hello", object())
 
-    assert StringInput().supports(field, "hello")
+    assert input_adapter.supports(field, "hello")
+    assert await input_adapter.prepare_session(field, prepared, object(), object()) is None
+    mounted = await input_adapter.mount(field, prepared, object(), object())
+    assert mounted.model_value == "message:hello"
+    assert await input_adapter.after_execution(
+        field,
+        prepared,
+        object(),
+        object(),
+        None,
+        RuntimeError("failed"),
+    ) is None
+    assert await input_adapter.finalize(
+        field,
+        prepared,
+        object(),
+        object(),
+        None,
+    ) is None
     assert StringOutput().supports(field)
     assert await StringOutput().prepare_session(field, None, object()) is None
 

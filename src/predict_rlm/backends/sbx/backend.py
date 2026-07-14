@@ -56,6 +56,8 @@ from predict_rlm.execution_timeout import (
 )
 from predict_rlm.files import get_synced_file_params
 from predict_rlm.runtime import (
+    ArtifactFileInfo,
+    HostDirectoryMount,
     SyncWorkerTracker,
     host_sync_worker_policy,
     invoke_host_callable,
@@ -63,7 +65,6 @@ from predict_rlm.runtime import (
 from predict_rlm.runtime_hooks import RuntimeHook, RuntimeHookEvent
 from predict_rlm.serialization import to_plain_data
 from predict_rlm.trace import ToolCall, ms_since, record_tool_call
-from predict_rlm.workspace import DirectWorkspaceMount, WorkspaceFileInfo
 
 from ..base import (
     BackendExecutionGate,
@@ -133,7 +134,7 @@ class SbxBackend(SyncWorkerTracker, SupervisorClient, LegacyExecutionBackend):
         extra_read_paths: list[str] | None = None,
         extra_write_paths: list[str] | None = None,
         _supervisor_command: list[str] | None = None,
-        direct_workspace_mounts: list[DirectWorkspaceMount] | None = None,
+        direct_workspace_mounts: list[HostDirectoryMount] | None = None,
         runtime_hooks: list[RuntimeHook] | None = None,
         on_runtime_hook_event: Callable[[RuntimeHookEvent], Any] | None = None,
         _runner_command: list[str] | None = None,
@@ -473,18 +474,18 @@ class SbxBackend(SyncWorkerTracker, SupervisorClient, LegacyExecutionBackend):
                 files.append(self._sandbox_path_for_host_path(path))
         return files
 
-    def workspace_manifest(self, virtual_path: str) -> dict[str, WorkspaceFileInfo]:
+    def workspace_manifest(self, virtual_path: str) -> dict[str, ArtifactFileInfo]:
         root = self._host_path_for_sandbox_path(virtual_path)
         if not root.exists():
             raise FileNotFoundError(f"Workspace mount does not exist: {virtual_path}")
         if not root.is_dir():
             raise NotADirectoryError(f"Workspace mount is not a directory: {virtual_path}")
-        files: dict[str, WorkspaceFileInfo] = {}
+        files: dict[str, ArtifactFileInfo] = {}
         for path in sorted(root.rglob("*")):
             if not path.is_file():
                 continue
             rel_path = path.relative_to(root).as_posix()
-            files[rel_path] = WorkspaceFileInfo(
+            files[rel_path] = ArtifactFileInfo(
                 type="file",
                 sha256=self._sha256_file(path),
                 size=path.stat().st_size,
@@ -493,19 +494,19 @@ class SbxBackend(SyncWorkerTracker, SupervisorClient, LegacyExecutionBackend):
 
     async def aworkspace_manifest(
         self, virtual_path: str
-    ) -> dict[str, WorkspaceFileInfo]:
+    ) -> dict[str, ArtifactFileInfo]:
         root = self._host_path_for_sandbox_path(virtual_path)
         if not root.exists():
             raise FileNotFoundError(f"Workspace mount does not exist: {virtual_path}")
         if not root.is_dir():
             raise NotADirectoryError(f"Workspace mount is not a directory: {virtual_path}")
-        files: dict[str, WorkspaceFileInfo] = {}
+        files: dict[str, ArtifactFileInfo] = {}
         for path in sorted(root.rglob("*")):
             await asyncio.sleep(0)
             if not path.is_file():
                 continue
             rel_path = path.relative_to(root).as_posix()
-            files[rel_path] = WorkspaceFileInfo(
+            files[rel_path] = ArtifactFileInfo(
                 type="file",
                 sha256=await self._asha256_file(path),
                 size=path.stat().st_size,
@@ -625,7 +626,7 @@ class SbxBackend(SyncWorkerTracker, SupervisorClient, LegacyExecutionBackend):
         return Path() if rel.as_posix() == "." else rel
 
     def configure_direct_workspace_mounts(
-        self, mounts: list[DirectWorkspaceMount]
+        self, mounts: list[HostDirectoryMount]
     ) -> None:
         mounts = list(mounts)
         if self._same_direct_workspace_mounts(mounts):
@@ -638,7 +639,7 @@ class SbxBackend(SyncWorkerTracker, SupervisorClient, LegacyExecutionBackend):
         self._relocate_owned_staging_root_if_nested_in_direct_workspace()
 
     async def aconfigure_direct_workspace_mounts(
-        self, mounts: list[DirectWorkspaceMount]
+        self, mounts: list[HostDirectoryMount]
     ) -> None:
         mounts = list(mounts)
         if self._same_direct_workspace_mounts(mounts):
@@ -685,21 +686,24 @@ class SbxBackend(SyncWorkerTracker, SupervisorClient, LegacyExecutionBackend):
             return Path(tempfile.gettempdir()) / f"predict-rlm-sbx-{self.config.name}"
         return Path(tempfile.mkdtemp(prefix="predict-rlm-sbx-"))
 
-    def _same_direct_workspace_mounts(self, mounts: list[DirectWorkspaceMount]) -> bool:
+    def _same_direct_workspace_mounts(self, mounts: list[HostDirectoryMount]) -> bool:
         return self._direct_workspace_mount_keys(mounts) == self._direct_workspace_mount_keys(
             self._direct_workspace_mounts
         )
 
     def _direct_workspace_mount_keys(
-        self, mounts: list[DirectWorkspaceMount]
-    ) -> list[tuple[str, str]]:
-        return [
-            (
-                os.path.abspath(mount.host_path),
-                os.path.normpath(mount.sandbox_path),
+        self, mounts: list[HostDirectoryMount]
+    ) -> tuple[tuple[str, str, bool], ...]:
+        return tuple(
+            sorted(
+                (
+                    os.path.abspath(mount.host_path),
+                    os.path.normpath(mount.sandbox_path),
+                    mount.read_only,
+                )
+                for mount in mounts
             )
-            for mount in mounts
-        ]
+        )
 
     def configure_runtime(
         self,
@@ -1839,7 +1843,7 @@ class SbxBackend(SyncWorkerTracker, SupervisorClient, LegacyExecutionBackend):
             if mount.host_path in seen:
                 continue
             seen.add(mount.host_path)
-            args.append(mount.host_path)
+            args.append(f"{mount.host_path}:ro" if mount.read_only else mount.host_path)
         return args
 
     def _direct_workspace_aliases(self) -> list[tuple[str, str]]:

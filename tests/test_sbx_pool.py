@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+from contextlib import asynccontextmanager
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -11,6 +13,12 @@ import pytest
 pytest.importorskip("websockets")
 
 from predict_rlm.backends.sbx import SbxPool  # noqa: E402
+from predict_rlm.backends.sbx.execution import SbxPoolExecutionBackend  # noqa: E402
+from predict_rlm.runtime import (  # noqa: E402
+    ExecutionSpec,
+    SessionRequirements,
+    UnsupportedOperationError,
+)
 
 
 class AsyncFakeInterpreter:
@@ -503,5 +511,108 @@ async def test_alease_rejects_direct_workspace_before_start(tmp_path: Path, monk
         async with pool.alease(direct_workspace_mounts=[object()]):
             pass
 
-    assert pool.supports_direct_workspaces is False
     assert created == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "spec",
+    [
+        ExecutionSpec(
+            allowed_domains=("other.internal",),
+            extra_read_paths=("/host/input",),
+            extra_write_paths=("/host/output",),
+        ),
+        ExecutionSpec(
+            allowed_domains=("service.internal",),
+            extra_read_paths=("/host/other-input",),
+            extra_write_paths=("/host/output",),
+        ),
+        ExecutionSpec(
+            allowed_domains=("service.internal",),
+            extra_read_paths=("/host/input",),
+            extra_write_paths=("/host/other-output",),
+        ),
+    ],
+)
+async def test_pool_execution_rejects_policy_changes_before_lease(
+    spec: ExecutionSpec,
+):
+    class FixedPolicyPool:
+        session_requirements = SessionRequirements(
+            allowed_domains=("service.internal",),
+            extra_read_paths=("/host/input",),
+            extra_write_paths=("/host/output",),
+        )
+
+        def __init__(self) -> None:
+            self.acquisitions = 0
+
+        @asynccontextmanager
+        async def alease(self, **kwargs):
+            self.acquisitions += 1
+            raise AssertionError("mismatched policy reached pool lease")
+            yield
+
+    pool = FixedPolicyPool()
+    backend = SbxPoolExecutionBackend(pool)
+
+    with pytest.raises(UnsupportedOperationError, match="fixed policy"):
+        async with backend.start(
+            spec,
+            SimpleNamespace(session=None, ownership=None),
+        ):
+            pass
+
+    assert pool.acquisitions == 0
+
+
+@pytest.mark.asyncio
+async def test_pool_execution_accepts_semantically_reordered_fixed_policy():
+    class FixedPolicyPool:
+        session_requirements = SessionRequirements(
+            allowed_domains=("first.internal", "second.internal"),
+            extra_read_paths=("/host/first", "/host/second"),
+            extra_write_paths=("/host/output",),
+        )
+
+        def __init__(self) -> None:
+            self.acquisitions = 0
+
+        @asynccontextmanager
+        async def alease(self, **kwargs):
+            self.acquisitions += 1
+            yield object()
+
+    pool = FixedPolicyPool()
+    backend = SbxPoolExecutionBackend(pool)
+    spec = ExecutionSpec(
+        allowed_domains=("second.internal", "first.internal"),
+        extra_read_paths=("/host/second", "/host/first"),
+        extra_write_paths=("/host/output",),
+    )
+
+    async with backend.start(
+        spec,
+        SimpleNamespace(session=None, ownership=None),
+    ):
+        pass
+
+    assert pool.acquisitions == 1
+
+
+def test_pool_exposes_immutable_fixed_session_requirements(tmp_path: Path):
+    pool = SbxPool(
+        size=1,
+        allowed_domains=["service.internal"],
+        extra_read_paths=["/host/input"],
+        extra_write_paths=["/host/output"],
+        preinstall_packages=False,
+        _staging_root=tmp_path / "policy-pool",
+    )
+
+    assert pool.session_requirements == SessionRequirements(
+        allowed_domains=("service.internal",),
+        extra_read_paths=("/host/input",),
+        extra_write_paths=("/host/output",),
+    )
