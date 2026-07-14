@@ -2,7 +2,7 @@
 
 from predict_rlm.runtime import RuntimeContribution
 
-from .backends import execution_from_legacy_options
+from .backends import execution_from_options
 from .files import (
     FileInputAdapter,
     FileOutputAdapter,
@@ -34,7 +34,7 @@ __all__ = [
     "ValueInputAdapter",
     "WorkspaceInputAdapter",
     "files",
-    "execution_from_legacy_options",
+    "execution_from_options",
     "synced_files",
     "SyncedFileToolOperation",
     "validate_file_workspace_signature",
