@@ -47,6 +47,44 @@ Adapter names must be unique within each role; an input and output adapter may
 share a name. A configured adapter with the same name as a built-in compatibility
 adapter replaces that built-in only for the matching input or output role.
 
+### Input adapter lifecycle
+
+`InputAdapter` instances are construction-time configuration and may be shared by
+concurrent calls. Keep them stateless: put every invocation's mutable resources,
+baselines, retry/idempotence flags, and cleanup state in a typed `PreparedInput`
+subclass or in `RunContext`.
+
+For each invocation, callbacks run in this order:
+
+1. `prepare()` runs before acquisition and returns the model-visible plain value,
+   requirements, mounts, artifacts, and exclusive sandbox-root reservations.
+2. `prepare_session()` runs before backend acquisition. An adapter whose callback
+   was entered is finalized even if that callback raises.
+3. After acquisition, `mount()` binds the prepared value into the session.
+4. `after_execution()` runs in mount order after each completed generated-code
+   attempt, whether it succeeded or raised. It excludes framework bootstrap code
+   and is a durability hook, not execution telemetry. Cancelled attempts do not
+   invoke it.
+5. `finalize()` runs exactly once in reverse preparation order, before session
+   finalization and release. Cancellation first quiesces generated execution so
+   finalization can perform its last durable flush.
+
+Errors from `after_execution()` are fatal because durability is no longer known.
+Finalization errors preserve the original execution/cancellation error as primary,
+are attached to it, and make strict evidence incomplete. An adapter owns its
+provider resources and should release them in `finalize()` or a LIFO
+`ctx.add_cleanup()` callback; the framework owns session finalization and release.
+
+Declare host/network policy with `SessionRequirements`, direct mounts with
+`HostDirectoryMount`, and transfer-backed destinations with
+`SandboxRootReservation`. Requirements are validated before acquisition. Fresh
+owned sessions may apply supported per-invocation policy; reused or pooled sessions
+reject requirements that differ from their fixed policy rather than silently
+retaining broader or stale permissions. During mounting, test for the narrow
+capability needed (`HostDirectorySession`, `FileTransferSession`,
+`DirectoryCreationSession`, or `MutableDirectorySession`). Copy-in-only adapters do
+not need mutable-directory inspection or collection support.
+
 ### Verbose, debug, and trace output
 
 Verbose output is enabled by default for understanding the RLM's work product.

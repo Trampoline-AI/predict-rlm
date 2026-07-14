@@ -6,12 +6,15 @@ import asyncio
 import hashlib
 import os
 import stat
+from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol
 
 from pydantic import BaseModel, Field
+
+from predict_rlm.runtime import ArtifactFileInfo, HostDirectoryMount
 
 DEFAULT_WORKSPACE_EXCLUDES = [
     ".git",
@@ -70,17 +73,17 @@ class WorkspaceSyncConflictError(RuntimeError):
     """Raised when host and sandbox both changed a workspace path."""
 
 
-@dataclass(frozen=True)
-class DirectWorkspaceMount:
-    host_path: str
-    sandbox_path: str
+DirectWorkspaceMount = HostDirectoryMount
+WorkspaceFileInfo = ArtifactFileInfo
 
 
-@dataclass
-class WorkspaceFileInfo:
-    type: str
-    sha256: str
-    size: int
+class WorkspaceTransport(Protocol):
+    async def inspect_directory(
+        self,
+        sandbox_path: str,
+    ) -> Mapping[str, ArtifactFileInfo]: ...
+
+    async def collect_file(self, sandbox_path: str, host_path: str) -> None: ...
 
 
 @dataclass
@@ -300,11 +303,16 @@ class WorkspaceSyncState:
         self._finish_sync(sandbox_manifest=raw_sandbox_manifest)
         return []
 
-    async def async_sync_from_sandbox(self, repl: Any) -> list[WorkspaceSyncConflict]:
+    async def async_sync_from_sandbox(
+        self,
+        transport: WorkspaceTransport,
+    ) -> list[WorkspaceSyncConflict]:
         if not self.workspace.sync_back:
             return []
         try:
-            raw_sandbox_manifest = await repl.aworkspace_manifest(self.workspace.mount_path)
+            raw_sandbox_manifest = await transport.inspect_directory(
+                self.workspace.mount_path
+            )
         except Exception as exc:
             raise WorkspaceSyncConflictError(
                 "Workspace sync conflict: workspace mount could not be inspected "
@@ -319,7 +327,7 @@ class WorkspaceSyncState:
         self._apply_deletes(deletes)
         for rel_path, host_path, new_sandbox in writes:
             os.makedirs(os.path.dirname(host_path), exist_ok=True)
-            await repl.async_file_to(
+            await transport.collect_file(
                 f"{self.workspace.mount_path}/{rel_path}",
                 host_path,
             )

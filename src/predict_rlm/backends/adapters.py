@@ -14,11 +14,16 @@ from typing import Any
 from predict_rlm.runtime import (
     Artifact,
     ArtifactBinding,
+    ArtifactFileInfo,
     ExecutionResult,
     ExecutionSession,
     ExecutionSpec,
+    FileTransfer,
+    HostDirectoryMount,
     RunContext,
+    SandboxRootReservation,
     SessionOwnership,
+    UnsupportedOperationError,
 )
 
 
@@ -35,37 +40,24 @@ def _validate_sandbox_path(path: str) -> None:
         raise ValueError(f"Artifact sandbox path must be absolute and traversal-free: {path!r}")
 
 
-_UNSET_WORKSPACE_KEY = object()
-
-
-def _direct_workspace_key(ctx: RunContext) -> tuple[tuple[str, str], ...]:
-    return tuple(
-        sorted(
-            (
-                str(artifact.metadata["source_path"]),
-                str(artifact.metadata["sandbox_path"]),
-            )
-            for prepared in ctx.prepared_inputs.values()
-            for artifact in prepared.artifacts
-            if artifact.kind == "compat.workspace.direct"
+def _require_reserved_sandbox_path(
+    path: str,
+    reservations: Sequence[SandboxRootReservation],
+) -> None:
+    _validate_sandbox_path(path)
+    normalized = str(PurePosixPath(path))
+    if not any(
+        normalized == reservation.path
+        or normalized.startswith(reservation.path.rstrip("/") + "/")
+        for reservation in reservations
+    ):
+        raise UnsupportedOperationError(
+            f"Sandbox transfer path {path!r} is outside the input adapter's "
+            "declared sandbox roots"
         )
-    )
 
 
-def _validate_injected_workspace_reuse(
-    backend: Any,
-    ctx: RunContext,
-) -> tuple[tuple[str, str], ...] | None:
-    if backend._ownership is not SessionOwnership.INJECTED:
-        return None
-    current = _direct_workspace_key(ctx)
-    previous = backend._direct_workspace_key
-    if previous is not _UNSET_WORKSPACE_KEY and previous != current and (previous or current):
-        raise ValueError(
-            "Injected interpreters cannot change direct Workspace mounts across "
-            "sequential invocations"
-        )
-    return current
+_UNSET_MOUNT_SET = object()
 
 
 class InterpreterExecutionSession:
@@ -77,6 +69,8 @@ class InterpreterExecutionSession:
         *,
         name: str,
         ownership: SessionOwnership,
+        host_directory_mounts: Sequence[HostDirectoryMount] = (),
+        sandbox_roots: Sequence[SandboxRootReservation] = (),
     ) -> None:
         self.interpreter = interpreter
         self.name = name
@@ -84,8 +78,8 @@ class InterpreterExecutionSession:
         self._finalized = False
         self._cancelled = False
         self._sync_tasks: set[asyncio.Task[Any]] = set()
-        self._post_execute_hooks: list[Callable[[Any], Any]] = []
-        self._direct_workspace_mounts: list[Any] = []
+        self._host_directory_mounts = list(host_directory_mounts)
+        self._sandbox_roots = tuple(sandbox_roots)
 
     async def _run_sync(self, function: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
         task = asyncio.create_task(asyncio.to_thread(function, *args, **kwargs))
@@ -121,28 +115,7 @@ class InterpreterExecutionSession:
         sandbox_path = _artifact_path(artifact, "sandbox_path")
         _validate_sandbox_path(sandbox_path)
 
-        if artifact.kind == "compat.workspace.direct":
-            configure = getattr(self.interpreter, "configure_direct_workspace_mounts", None)
-            if not callable(configure):
-                raise ValueError("Workspace(mode='direct') requires the SBX backend.")
-            self._direct_workspace_mounts.append(artifact.metadata["workspace_binding"])
-            await self._run_sync(configure, self._direct_workspace_mounts)
-            directory = True
-        elif artifact.kind == "compat.workspace.mirror":
-            state = artifact.metadata["workspace_binding"]
-            await self._run_sync(self.interpreter.mkdir_p, sandbox_path)
-            for host_path, target in await self._run_sync(state.iter_mounts):
-                await self._run_sync(self.interpreter.mount_file_at, host_path, target)
-            add_hook = getattr(self.interpreter, "add_post_execute_hook", None)
-            if not callable(add_hook):
-                raise ValueError(
-                    "The selected interpreter does not support Workspace mirror sync."
-                )
-            hook = state.sync_from_sandbox
-            add_hook(hook)
-            self._post_execute_hooks.append(hook)
-            directory = True
-        elif artifact.kind == "compat.output.directory":
+        if artifact.kind == "compat.output.directory":
             await self._run_sync(self.interpreter.mkdir_p, sandbox_path)
             directory = True
         elif os.path.isdir(source_path):
@@ -198,12 +171,65 @@ class InterpreterExecutionSession:
         )
         return str(destination)
 
+    async def configure_host_directory_mounts(
+        self,
+        mounts: Sequence[HostDirectoryMount],
+    ) -> None:
+        if not mounts:
+            return
+        configure = getattr(self.interpreter, "configure_direct_workspace_mounts", None)
+        if not callable(configure):
+            raise UnsupportedOperationError(
+                f"Execution session {self.name!r} does not support host directory mounts"
+            )
+        await self._run_sync(configure, list(mounts))
+        self._host_directory_mounts = list(mounts)
+
+    async def mount_host_directory(self, mount: HostDirectoryMount) -> str:
+        if mount not in self._host_directory_mounts:
+            raise UnsupportedOperationError(
+                "Host directory mounts must be declared before backend acquisition"
+            )
+        return mount.sandbox_path
+
+    async def transfer_file(self, transfer: FileTransfer) -> str:
+        _require_reserved_sandbox_path(transfer.sandbox_path, self._sandbox_roots)
+        if not os.path.isfile(transfer.source_path):
+            raise FileNotFoundError(transfer.source_path)
+        await self._run_sync(
+            self.interpreter.mount_file_at,
+            transfer.source_path,
+            transfer.sandbox_path,
+        )
+        return transfer.sandbox_path
+
+    async def create_directory(self, sandbox_path: str) -> None:
+        _require_reserved_sandbox_path(sandbox_path, self._sandbox_roots)
+        await self._run_sync(self.interpreter.mkdir_p, sandbox_path)
+
+    async def inspect_directory(
+        self,
+        sandbox_path: str,
+    ) -> Mapping[str, ArtifactFileInfo]:
+        _require_reserved_sandbox_path(sandbox_path, self._sandbox_roots)
+        inspect_directory = getattr(self.interpreter, "workspace_manifest", None)
+        if not callable(inspect_directory):
+            raise UnsupportedOperationError(
+                f"Execution session {self.name!r} cannot inspect directories"
+            )
+        return await self._run_sync(inspect_directory, sandbox_path)
+
+    async def collect_file(self, sandbox_path: str, host_path: str) -> None:
+        _require_reserved_sandbox_path(sandbox_path, self._sandbox_roots)
+        destination = Path(host_path)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        await self._run_sync(
+            self.interpreter.sync_file_to,
+            sandbox_path,
+            str(destination),
+        )
+
     async def finalize(self) -> None:
-        remove_hook = getattr(self.interpreter, "remove_post_execute_hook", None)
-        if callable(remove_hook):
-            for hook in self._post_execute_hooks:
-                remove_hook(hook)
-        self._post_execute_hooks.clear()
         self._finalized = True
 
     async def cancel(self) -> None:
@@ -257,20 +283,34 @@ class InterpreterBackendAdapter:
         acquire: AcquireInterpreter,
         *,
         ownership: SessionOwnership,
-        supports_direct_workspaces: bool = False,
-        supports_mirror_workspaces: bool = False,
-        direct_workspace_error: str | None = None,
+        supports_host_directory_mounts: bool = False,
     ) -> None:
         self.name = name
         self._acquire = acquire
         self._ownership = ownership
+        self._supports_host_directory_mounts = supports_host_directory_mounts
         self._invocation_lock = (
             threading.Lock() if ownership is SessionOwnership.INJECTED else None
         )
-        self._direct_workspace_key: object = _UNSET_WORKSPACE_KEY
-        self.supports_direct_workspaces = supports_direct_workspaces
-        self.supports_mirror_workspaces = supports_mirror_workspaces
-        self.direct_workspace_error = direct_workspace_error
+        self._mount_set_key: object = _UNSET_MOUNT_SET
+
+    async def validate_host_directory_mounts(
+        self,
+        mounts: Sequence[HostDirectoryMount],
+        ctx: RunContext,
+    ) -> None:
+        del ctx
+        if self._ownership is SessionOwnership.POOLED:
+            if mounts:
+                raise UnsupportedOperationError(
+                    "Host directory mounts require a per-call interpreter; "
+                    "pooled interpreters cannot add mounts after creation"
+                )
+            return
+        if mounts and not self._supports_host_directory_mounts:
+            raise UnsupportedOperationError(
+                f"Execution backend {self.name!r} does not support host directory mounts"
+            )
 
     @asynccontextmanager
     async def start(
@@ -282,10 +322,22 @@ class InterpreterBackendAdapter:
         manager: AbstractContextManager[Any] | None = None
         entered = False
         try:
+            await self.validate_host_directory_mounts(spec.host_directory_mounts, ctx)
             if self._invocation_lock is not None:
                 await self._acquire_invocation_lock()
                 lock_acquired = True
-            workspace_key = _validate_injected_workspace_reuse(self, ctx)
+            mount_key = tuple(
+                sorted(
+                    spec.host_directory_mounts,
+                    key=lambda mount: (
+                        mount.host_path,
+                        mount.sandbox_path,
+                        mount.read_only,
+                    ),
+                )
+            )
+            if self._ownership is SessionOwnership.INJECTED:
+                self._validate_mount_key(mount_key)
             manager = self._acquire(spec, ctx)
             enter_task = asyncio.create_task(asyncio.to_thread(manager.__enter__))
             try:
@@ -297,13 +349,19 @@ class InterpreterBackendAdapter:
                 await self._exit_manager(manager, None, None, None)
                 raise
             entered = True
-            if workspace_key is not None and self._direct_workspace_key is _UNSET_WORKSPACE_KEY:
-                self._direct_workspace_key = workspace_key
             session = InterpreterExecutionSession(
                 interpreter,
                 name=self.name,
                 ownership=self._ownership,
+                host_directory_mounts=spec.host_directory_mounts,
+                sandbox_roots=spec.sandbox_roots,
             )
+            await session.configure_host_directory_mounts(spec.host_directory_mounts)
+            if (
+                self._ownership is SessionOwnership.INJECTED
+                and self._mount_set_key is _UNSET_MOUNT_SET
+            ):
+                self._mount_set_key = mount_key
             ctx.session = session
             ctx.ownership = self._ownership
             try:
@@ -332,6 +390,16 @@ class InterpreterBackendAdapter:
                 ctx.session = None
                 if lock_acquired and self._invocation_lock is not None:
                     self._invocation_lock.release()
+
+    def _validate_mount_key(
+        self,
+        mount_key: tuple[HostDirectoryMount, ...],
+    ) -> None:
+        if self._mount_set_key is not _UNSET_MOUNT_SET and self._mount_set_key != mount_key:
+            raise ValueError(
+                "Injected interpreters cannot change a host-directory mount set "
+                "across sequential invocations"
+            )
 
     async def _acquire_invocation_lock(self) -> None:
         if self._invocation_lock is None:
@@ -375,14 +443,16 @@ class NativeInterpreterExecutionSession:
         *,
         name: str,
         ownership: SessionOwnership,
+        host_directory_mounts: Sequence[HostDirectoryMount] = (),
+        sandbox_roots: Sequence[SandboxRootReservation] = (),
     ) -> None:
         self.interpreter = interpreter
         self.name = name
         self.ownership = ownership
         self._finalized = False
         self._cancelled = False
-        self._post_execute_hooks: list[Callable[[Any], Any]] = []
-        self._direct_workspace_mounts: list[Any] = []
+        self._host_directory_mounts = list(host_directory_mounts)
+        self._sandbox_roots = tuple(sandbox_roots)
 
     async def install_packages(self, packages: Sequence[str]) -> None:
         if packages:
@@ -393,22 +463,7 @@ class NativeInterpreterExecutionSession:
         sandbox_path = _artifact_path(artifact, "sandbox_path")
         _validate_sandbox_path(sandbox_path)
 
-        if artifact.kind == "compat.workspace.direct":
-            self._direct_workspace_mounts.append(artifact.metadata["workspace_binding"])
-            await self.interpreter.aconfigure_direct_workspace_mounts(
-                self._direct_workspace_mounts
-            )
-            directory = True
-        elif artifact.kind == "compat.workspace.mirror":
-            state = artifact.metadata["workspace_binding"]
-            await self.interpreter.amkdir_p(sandbox_path)
-            for host_path, target in await state.aiter_mounts():
-                await self.interpreter.amount_file_at(host_path, target)
-            hook = state.async_sync_from_sandbox
-            self.interpreter.add_post_execute_hook(hook)
-            self._post_execute_hooks.append(hook)
-            directory = True
-        elif artifact.kind == "compat.output.directory":
+        if artifact.kind == "compat.output.directory":
             await self.interpreter.amkdir_p(sandbox_path)
             directory = True
         elif os.path.isdir(source_path):
@@ -451,15 +506,65 @@ class NativeInterpreterExecutionSession:
         await self.interpreter.async_file_to(sandbox_path, str(destination))
         return str(destination)
 
+    async def configure_host_directory_mounts(
+        self,
+        mounts: Sequence[HostDirectoryMount],
+    ) -> None:
+        if not mounts:
+            return
+        configure = getattr(self.interpreter, "aconfigure_direct_workspace_mounts", None)
+        if not callable(configure):
+            raise UnsupportedOperationError(
+                f"Execution session {self.name!r} does not support host directory mounts"
+            )
+        await configure(list(mounts))
+        self._host_directory_mounts = list(mounts)
+
+    async def mount_host_directory(self, mount: HostDirectoryMount) -> str:
+        if mount not in self._host_directory_mounts:
+            raise UnsupportedOperationError(
+                "Host directory mounts must be declared before backend acquisition"
+            )
+        return mount.sandbox_path
+
+    async def transfer_file(self, transfer: FileTransfer) -> str:
+        _require_reserved_sandbox_path(transfer.sandbox_path, self._sandbox_roots)
+        if not os.path.isfile(transfer.source_path):
+            raise FileNotFoundError(transfer.source_path)
+        await self.interpreter.amount_file_at(
+            transfer.source_path,
+            transfer.sandbox_path,
+        )
+        return transfer.sandbox_path
+
+    async def create_directory(self, sandbox_path: str) -> None:
+        _require_reserved_sandbox_path(sandbox_path, self._sandbox_roots)
+        await self.interpreter.amkdir_p(sandbox_path)
+
+    async def inspect_directory(
+        self,
+        sandbox_path: str,
+    ) -> Mapping[str, ArtifactFileInfo]:
+        _require_reserved_sandbox_path(sandbox_path, self._sandbox_roots)
+        inspect_directory = getattr(self.interpreter, "aworkspace_manifest", None)
+        if not callable(inspect_directory):
+            raise UnsupportedOperationError(
+                f"Execution session {self.name!r} cannot inspect directories"
+            )
+        return await inspect_directory(sandbox_path)
+
+    async def collect_file(self, sandbox_path: str, host_path: str) -> None:
+        _require_reserved_sandbox_path(sandbox_path, self._sandbox_roots)
+        destination = Path(host_path)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        await self.interpreter.async_file_to(sandbox_path, str(destination))
+
     async def finalize(self) -> None:
         await_host_work = getattr(self.interpreter, "await_host_work", None)
         if callable(await_host_work):
             result = await_host_work(cancel=True)
             if inspect.isawaitable(result):
                 await result
-        for hook in self._post_execute_hooks:
-            self.interpreter.remove_post_execute_hook(hook)
-        self._post_execute_hooks.clear()
         self._finalized = True
 
     async def cancel(self) -> None:
@@ -502,3 +607,19 @@ class ExistingExecutionBackendAdapter:
 
     def start(self, spec: ExecutionSpec, ctx: RunContext) -> Any:
         return self.backend.start(spec, ctx)
+
+    async def validate_host_directory_mounts(
+        self,
+        mounts: Sequence[HostDirectoryMount],
+        ctx: RunContext,
+    ) -> None:
+        validate = getattr(self.backend, "validate_host_directory_mounts", None)
+        if not callable(validate):
+            if mounts:
+                raise UnsupportedOperationError(
+                    f"Execution backend {self.name!r} does not support host directory mounts"
+                )
+            return
+        result = validate(mounts, ctx)
+        if inspect.isawaitable(result):
+            await result

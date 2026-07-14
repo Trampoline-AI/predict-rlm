@@ -8,7 +8,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from predict_rlm.backends.base import SandboxFatalError
+from predict_rlm.backends.base import SandboxExecutionError, SandboxFatalError
 from predict_rlm.backends.jspi import JspiBackend
 from predict_rlm.backends.jspi.execution import JspiExecutionBackend
 from predict_rlm.execution_timeout import ITERATION_TIMEOUT_FAILURE_CLASS
@@ -166,6 +166,56 @@ async def test_ainterrupt_does_not_call_sync_interrupt(interpreter: JspiBackend)
     await interpreter.ainterrupt()
 
     interpreter._akill_sandbox.assert_awaited_once_with()
+
+
+@pytest.mark.asyncio
+async def test_cancel_execution_quiesces_without_killing_sandbox(interpreter: JspiBackend):
+    process = SimpleNamespace(poll=lambda: None, send_signal=MagicMock())
+    interpreter.deno_process = process
+    interpreter._active_execute_request_id = 7
+    interpreter._execute_async = AsyncMock(  # type: ignore[method-assign]
+        side_effect=SandboxExecutionError("KeyboardInterrupt")
+    )
+    interpreter._akill_sandbox = AsyncMock()  # type: ignore[method-assign]
+
+    await interpreter.acancel_execution()
+
+    process.send_signal.assert_called_once()
+    interpreter._execute_async.assert_awaited_once_with(7)
+    interpreter._akill_sandbox.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_cancel_execution_retries_interrupt_until_execution_quiesces(
+    interpreter: JspiBackend,
+):
+    interrupted = asyncio.Event()
+    signals = 0
+
+    def send_signal(signal_number):
+        del signal_number
+        nonlocal signals
+        signals += 1
+        if signals == 2:
+            interrupted.set()
+
+    async def finish_execution(request_id):
+        assert request_id == 7
+        await interrupted.wait()
+        raise SandboxExecutionError("KeyboardInterrupt")
+
+    interpreter.deno_process = SimpleNamespace(
+        poll=lambda: None,
+        send_signal=send_signal,
+    )
+    interpreter._active_execute_request_id = 7
+    interpreter._execute_async = finish_execution  # type: ignore[method-assign]
+    interpreter._akill_sandbox = AsyncMock()  # type: ignore[method-assign]
+
+    await interpreter.acancel_execution()
+
+    assert signals == 2
+    interpreter._akill_sandbox.assert_not_awaited()
 
 
 @pytest.mark.asyncio

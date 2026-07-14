@@ -22,6 +22,7 @@ import logging
 import os
 import select
 import shutil
+import signal
 import tempfile
 import time
 from pathlib import Path
@@ -55,6 +56,7 @@ from predict_rlm.execution_timeout import (
     resolve_execution_timeout,
 )
 from predict_rlm.runtime import (
+    ArtifactFileInfo,
     SyncWorker,
     SyncWorkerTracker,
     callable_has_sync_leaf,
@@ -67,7 +69,6 @@ from predict_rlm.telemetry import (
     reset_current_telemetry_context,
     set_current_telemetry_context,
 )
-from predict_rlm.workspace import WorkspaceFileInfo
 
 if TYPE_CHECKING:
     from os import PathLike
@@ -372,6 +373,7 @@ class JspiBackend(SyncWorkerTracker, PythonInterpreter):
         self._exec_timeout = exec_timeout
         self._execution_gate = BackendExecutionGate("JSPI backend")
         self._post_execute_hooks: list[Callable[[Any], Any]] = []
+        self._active_execute_request_id: int | None = None
 
     def configure_debug(self, enabled: bool) -> None:
         self._debug = enabled
@@ -1228,7 +1230,7 @@ class JspiBackend(SyncWorkerTracker, PythonInterpreter):
         )
         return response.get("result", {}).get("files", [])
 
-    def workspace_manifest(self, virtual_path: str) -> dict[str, WorkspaceFileInfo]:
+    def workspace_manifest(self, virtual_path: str) -> dict[str, ArtifactFileInfo]:
         """Return a recursive file manifest under a sandbox workspace path."""
         self._ensure_deno_process()
         response = self._send_request(
@@ -1238,7 +1240,7 @@ class JspiBackend(SyncWorkerTracker, PythonInterpreter):
         )
         files = response.get("result", {}).get("files", {})
         return {
-            rel_path: WorkspaceFileInfo(
+            rel_path: ArtifactFileInfo(
                 type=info["type"],
                 sha256=info["sha256"],
                 size=info["size"],
@@ -1249,7 +1251,7 @@ class JspiBackend(SyncWorkerTracker, PythonInterpreter):
     async def aworkspace_manifest(
         self,
         virtual_path: str,
-    ) -> dict[str, WorkspaceFileInfo]:
+    ) -> dict[str, ArtifactFileInfo]:
         await self._aensure_deno_process()
         response = await self._asend_request(
             "workspace_manifest",
@@ -1258,7 +1260,7 @@ class JspiBackend(SyncWorkerTracker, PythonInterpreter):
         )
         files = response.get("result", {}).get("files", {})
         return {
-            rel_path: WorkspaceFileInfo(
+            rel_path: ArtifactFileInfo(
                 type=info["type"],
                 sha256=info["sha256"],
                 size=info["size"],
@@ -1396,6 +1398,43 @@ class JspiBackend(SyncWorkerTracker, PythonInterpreter):
     async def ainterrupt(self) -> None:
         await self._akill_sandbox()
 
+    async def acancel_execution(self) -> None:
+        """Quiesce active generated code without destroying the sandbox filesystem."""
+        execute_request_id = self._active_execute_request_id
+        if execute_request_id is None:
+            return
+        process = self.deno_process
+        if process is None or process.poll() is not None:
+            raise SandboxFatalError(
+                "Deno stopped before generated execution could be quiesced"
+            )
+        response_task = asyncio.create_task(self._execute_async(execute_request_id))
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + 5
+        try:
+            while not response_task.done():
+                process.send_signal(signal.SIGUSR1)
+                remaining = deadline - loop.time()
+                if remaining <= 0:
+                    raise asyncio.TimeoutError
+                await asyncio.wait(
+                    (response_task,),
+                    timeout=min(0.05, remaining),
+                )
+            await response_task
+        except SandboxExecutionError:
+            pass
+        except asyncio.TimeoutError as exc:
+            await self._akill_sandbox()
+            raise SandboxFatalError(
+                "Deno did not quiesce cancelled generated execution; the sandbox "
+                "was force-killed and its filesystem was lost"
+            ) from exc
+        finally:
+            if not response_task.done():
+                response_task.cancel()
+                await asyncio.gather(response_task, return_exceptions=True)
+
     def _resolve_execution_timeout(self, timeout: float | None) -> tuple[float, str]:
         return resolve_execution_timeout(timeout, default_timeout=self._exec_timeout)
 
@@ -1484,17 +1523,28 @@ class JspiBackend(SyncWorkerTracker, PythonInterpreter):
                 "restored on a fresh process, so this run is unrecoverable."
             ) from e
 
-        if timeout is None:
+        self._active_execute_request_id = execute_request_id
+        try:
+            if timeout is None:
+                return await self._execute_with_timeout(
+                    execute_request_id,
+                    execute_start_time,
+                )
             return await self._execute_with_timeout(
                 execute_request_id,
                 execute_start_time,
+                timeout_seconds=timeout_seconds,
+                timeout_failure_class=timeout_failure_class,
             )
-        return await self._execute_with_timeout(
-            execute_request_id,
-            execute_start_time,
-            timeout_seconds=timeout_seconds,
-            timeout_failure_class=timeout_failure_class,
-        )
+        except asyncio.CancelledError as cancellation:
+            try:
+                await asyncio.shield(self.acancel_execution())
+            except BaseException as quiesce_error:
+                setattr(cancellation, "jspi_quiesce_error", quiesce_error)
+            raise
+        finally:
+            if self._active_execute_request_id == execute_request_id:
+                self._active_execute_request_id = None
 
     async def _execute_with_timeout(
         self,

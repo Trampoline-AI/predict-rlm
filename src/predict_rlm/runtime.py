@@ -6,6 +6,8 @@ import asyncio
 import concurrent.futures
 import contextvars
 import inspect
+import os
+import posixpath
 import threading
 import types
 import typing
@@ -19,13 +21,15 @@ from enum import Enum
 from types import MappingProxyType
 from typing import Any, ClassVar, Generic, Protocol, TypeVar, runtime_checkable
 
-RUNTIME_SPI_VERSION = "1"
-
 AdapterValue = TypeVar("AdapterValue")
 
 
 class ExecutionFatalError(RuntimeError):
     """The execution session is no longer safe to continue."""
+
+
+class UnsupportedOperationError(RuntimeError):
+    """The selected execution transport cannot perform an optional operation."""
 
 
 class SyncWorker:
@@ -227,9 +231,121 @@ class ArtifactBinding:
         object.__setattr__(self, "metadata", immutable_mapping(self.metadata))
 
 
-# The research document used MountedArtifact. ArtifactBinding is the final name,
-# while this alias keeps the documented draft import working.
-MountedArtifact = ArtifactBinding
+@dataclass(frozen=True)
+class HostDirectoryMount:
+    """Host directory exposed directly at a sandbox path for one invocation."""
+
+    host_path: str
+    sandbox_path: str
+    read_only: bool = False
+
+
+@dataclass(frozen=True)
+class FileTransfer:
+    """One host file copied into an invocation's sandbox filesystem."""
+
+    source_path: str
+    sandbox_path: str
+
+
+@dataclass(frozen=True)
+class ArtifactFileInfo:
+    """Portable manifest entry returned by directory inspection."""
+
+    type: str
+    sha256: str
+    size: int
+
+
+@dataclass(frozen=True)
+class SessionRequirements:
+    """Immutable execution requirements contributed by an adapter."""
+
+    allowed_domains: tuple[str, ...] = ()
+    extra_read_paths: tuple[str, ...] = ()
+    extra_write_paths: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "allowed_domains", tuple(self.allowed_domains))
+        object.__setattr__(self, "extra_read_paths", tuple(self.extra_read_paths))
+        object.__setattr__(self, "extra_write_paths", tuple(self.extra_write_paths))
+
+
+@dataclass(frozen=True)
+class SandboxRootReservation:
+    """Exclusive sandbox directory owned by one prepared input."""
+
+    path: str
+
+    def __post_init__(self) -> None:
+        if not self.path.startswith("/") or ".." in self.path.split("/"):
+            raise ValueError(
+                "Sandbox root reservations must be absolute and traversal-free: "
+                f"{self.path!r}"
+            )
+        path = posixpath.normpath(self.path)
+        if path == "/":
+            raise ValueError("Sandbox root reservations cannot reserve the filesystem root")
+        object.__setattr__(self, "path", path)
+
+
+def merge_session_requirements(
+    requirements: Sequence[SessionRequirements],
+) -> SessionRequirements:
+    return SessionRequirements(
+        allowed_domains=tuple(
+            dict.fromkeys(
+                domain for item in requirements for domain in item.allowed_domains
+            )
+        ),
+        extra_read_paths=tuple(
+            dict.fromkeys(
+                path for item in requirements for path in item.extra_read_paths
+            )
+        ),
+        extra_write_paths=tuple(
+            dict.fromkeys(
+                path for item in requirements for path in item.extra_write_paths
+            )
+        ),
+    )
+
+
+def normalize_host_directory_mounts(
+    mounts: Sequence[HostDirectoryMount],
+) -> tuple[HostDirectoryMount, ...]:
+    for mount in mounts:
+        if not mount.sandbox_path.startswith("/") or ".." in mount.sandbox_path.split("/"):
+            raise ValueError(
+                "Host directory mount paths must be absolute and traversal-free: "
+                f"{mount.sandbox_path!r}"
+            )
+    normalized = tuple(
+        HostDirectoryMount(
+            host_path=os.path.abspath(mount.host_path),
+            sandbox_path=posixpath.normpath(mount.sandbox_path),
+            read_only=mount.read_only,
+        )
+        for mount in mounts
+    )
+    destinations: dict[str, HostDirectoryMount] = {}
+    host_access: dict[str, bool] = {}
+    for mount in normalized:
+        previous = destinations.get(mount.sandbox_path)
+        if previous is not None:
+            raise ValueError(
+                "Duplicate host-directory sandbox destination: "
+                f"{mount.sandbox_path!r}"
+            )
+        destinations[mount.sandbox_path] = mount
+        previous_access = host_access.get(mount.host_path)
+        if previous_access is not None and previous_access != mount.read_only:
+            raise ValueError(
+                "A host directory cannot be exposed with conflicting access modes: "
+                f"{mount.host_path!r}"
+            )
+        host_access[mount.host_path] = mount.read_only
+    return normalized
 
 
 def _strip_annotated(annotation: Any) -> Any:
@@ -300,11 +416,80 @@ class PreparedInput:
     metadata: Mapping[str, Any] = field(default_factory=dict)
     instructions: tuple[str, ...] = ()
     artifacts: tuple[Artifact, ...] = ()
+    host_directory_mounts: tuple[HostDirectoryMount, ...] = ()
+    sandbox_roots: tuple[SandboxRootReservation, ...] = ()
+    requirements: SessionRequirements = field(default_factory=SessionRequirements)
 
     def __post_init__(self) -> None:
+        if not isinstance(self.requirements, SessionRequirements):
+            raise TypeError("PreparedInput.requirements must be SessionRequirements")
         object.__setattr__(self, "metadata", immutable_mapping(self.metadata))
         object.__setattr__(self, "instructions", tuple(self.instructions))
         object.__setattr__(self, "artifacts", tuple(self.artifacts))
+        object.__setattr__(self, "sandbox_roots", tuple(self.sandbox_roots))
+        if not all(
+            isinstance(reservation, SandboxRootReservation)
+            for reservation in self.sandbox_roots
+        ):
+            raise TypeError(
+                "PreparedInput.sandbox_roots must contain SandboxRootReservation values"
+            )
+        object.__setattr__(
+            self,
+            "host_directory_mounts",
+            normalize_host_directory_mounts(self.host_directory_mounts),
+        )
+
+
+@dataclass(frozen=True)
+class MountedInput:
+    """Model-visible value and bindings produced by an input adapter mount."""
+
+    model_value: Any
+    bindings: tuple[ArtifactBinding, ...] = ()
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "bindings", tuple(self.bindings))
+
+
+@dataclass
+class PreparedInputBinding:
+    """Invocation-local ownership record for one prepared input field."""
+
+    field: FieldDescriptor
+    adapter: InputAdapter[Any]
+    prepared: PreparedInput
+    prepare_session_entered: bool = False
+    mounted: bool = False
+    finalized: bool = False
+
+
+def validate_sandbox_root_reservations(
+    bindings: Mapping[str, PreparedInputBinding],
+) -> None:
+    """Reject cross-adapter sandbox destination overlap before acquisition."""
+    claimed: list[tuple[str, str]] = []
+    for field_name, binding in bindings.items():
+        destinations = {
+            *(reservation.path for reservation in binding.prepared.sandbox_roots),
+            *(
+                mount.sandbox_path
+                for mount in binding.prepared.host_directory_mounts
+            ),
+        }
+        for path in sorted(destinations):
+            for previous_field, previous_path in claimed:
+                if (
+                    path == previous_path
+                    or path.startswith(previous_path.rstrip("/") + "/")
+                    or previous_path.startswith(path.rstrip("/") + "/")
+                    ):
+                    raise ValueError(
+                        "Input sandbox destinations overlap: "
+                        f"{previous_field!r} reserves {previous_path!r} and "
+                        f"{field_name!r} reserves {path!r}"
+                    )
+            claimed.append((field_name, path))
 
 
 @dataclass(frozen=True)
@@ -330,6 +515,8 @@ class ExecutionSpec:
     allowed_domains: tuple[str, ...] = ()
     extra_read_paths: tuple[str, ...] = ()
     extra_write_paths: tuple[str, ...] = ()
+    host_directory_mounts: tuple[HostDirectoryMount, ...] = ()
+    sandbox_roots: tuple[SandboxRootReservation, ...] = ()
     debug: bool = False
     verbose: bool = False
     metadata: Mapping[str, Any] = field(default_factory=dict)
@@ -345,6 +532,19 @@ class ExecutionSpec:
         object.__setattr__(self, "allowed_domains", tuple(self.allowed_domains))
         object.__setattr__(self, "extra_read_paths", tuple(self.extra_read_paths))
         object.__setattr__(self, "extra_write_paths", tuple(self.extra_write_paths))
+        object.__setattr__(
+            self,
+            "host_directory_mounts",
+            normalize_host_directory_mounts(self.host_directory_mounts),
+        )
+        object.__setattr__(self, "sandbox_roots", tuple(self.sandbox_roots))
+        if not all(
+            isinstance(reservation, SandboxRootReservation)
+            for reservation in self.sandbox_roots
+        ):
+            raise TypeError(
+                "ExecutionSpec.sandbox_roots must contain SandboxRootReservation values"
+            )
         object.__setattr__(self, "metadata", immutable_mapping(self.metadata))
 
 
@@ -383,6 +583,58 @@ class InputAdapter(ABC, Generic[AdapterValue]):
         ctx: RunContext,
     ) -> PreparedInput: ...
 
+    async def prepare_session(
+        self,
+        field: FieldDescriptor,
+        prepared: PreparedInput,
+        ctx: RunContext,
+        backend: ExecutionBackend,
+    ) -> None:
+        """Perform adapter-owned setup before backend acquisition."""
+
+    async def mount(
+        self,
+        field: FieldDescriptor,
+        prepared: PreparedInput,
+        ctx: RunContext,
+        session: ExecutionSession,
+    ) -> MountedInput:
+        del field
+        model_value = prepared.model_value
+        bindings = []
+        for artifact in prepared.artifacts:
+            binding = await session.mount(artifact)
+            bindings.append(binding)
+        return MountedInput(model_value=model_value, bindings=tuple(bindings))
+
+    async def after_execution(
+        self,
+        field: FieldDescriptor,
+        prepared: PreparedInput,
+        ctx: RunContext,
+        session: ExecutionSession,
+        result: ExecutionResult | None,
+        error: BaseException | None,
+    ) -> None:
+        """Observe a completed generated-code attempt.
+
+        Framework bootstrap code is excluded. A cancelled attempt has no callback;
+        adapters that require a final flush perform it in ``finalize``.
+        """
+
+    async def finalize(
+        self,
+        field: FieldDescriptor,
+        prepared: PreparedInput,
+        ctx: RunContext,
+        session: ExecutionSession | None,
+        error: BaseException | None,
+    ) -> None:
+        """Release adapter state before session finalization.
+
+        ``session`` is ``None`` when preparation or backend acquisition failed.
+        """
+
 
 class OutputAdapter(ABC, Generic[AdapterValue]):
     """Base class for session-bound output destinations."""
@@ -398,7 +650,7 @@ class OutputAdapter(ABC, Generic[AdapterValue]):
         field: FieldDescriptor,
         value: AdapterValue | list[AdapterValue] | None,
         ctx: RunContext,
-    ) -> None:
+    ) -> SessionRequirements | None:
         """Contribute host paths or other requirements before session startup."""
 
     @abstractmethod
@@ -509,6 +761,39 @@ class ExecutionSession(Protocol):
 
 
 @runtime_checkable
+class HostDirectorySession(Protocol):
+    """Optional session operation for exposing host directories directly."""
+
+    async def mount_host_directory(self, mount: HostDirectoryMount) -> str: ...
+
+
+@runtime_checkable
+class FileTransferSession(Protocol):
+    """Optional session operation for copying typed host files into a sandbox."""
+
+    async def transfer_file(self, transfer: FileTransfer) -> str: ...
+
+
+@runtime_checkable
+class DirectoryCreationSession(Protocol):
+    """Optional session operation for creating a copy-in directory root."""
+
+    async def create_directory(self, sandbox_path: str) -> None: ...
+
+
+@runtime_checkable
+class MutableDirectorySession(Protocol):
+    """Optional session operations used to sync mutable directories back."""
+
+    async def inspect_directory(
+        self,
+        sandbox_path: str,
+    ) -> Mapping[str, ArtifactFileInfo]: ...
+
+    async def collect_file(self, sandbox_path: str, host_path: str) -> None: ...
+
+
+@runtime_checkable
 class ExecutionBackend(Protocol):
     name: str
 
@@ -576,7 +861,6 @@ class RuntimeSpec:
     events: tuple[EventSink, ...]
     validators: tuple[SignatureValidator, ...] = ()
     tool_operations: tuple[ToolOperation, ...] = ()
-    spi_version: str = RUNTIME_SPI_VERSION
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "instructions", tuple(self.instructions))
@@ -615,16 +899,25 @@ class RunContext:
     spec: RuntimeSpec
     input_values: Mapping[str, Any]
     run_id: str = field(default_factory=lambda: uuid.uuid4().hex)
-    prepared_inputs: dict[str, PreparedInput] = field(default_factory=dict)
+    input_bindings: dict[str, PreparedInputBinding] = field(default_factory=dict)
+    mounted_input_bindings: list[PreparedInputBinding] = field(
+        default_factory=list,
+        repr=False,
+    )
     artifact_bindings: dict[str, ArtifactBinding] = field(default_factory=dict)
     output_reservations: dict[str, OutputReservation] = field(default_factory=dict)
     output_adapters: dict[str, OutputAdapter[Any]] = field(default_factory=dict, repr=False)
+    output_requirements: dict[str, SessionRequirements] = field(
+        default_factory=dict,
+        repr=False,
+    )
     session: ExecutionSession | None = None
     ownership: SessionOwnership | None = None
     local_paths: dict[str, str] = field(default_factory=dict)
     credentials: dict[str, Any] = field(default_factory=dict, repr=False)
     cleanup_callbacks: list[Cleanup] = field(default_factory=list, repr=False)
     state: dict[str, Any] = field(default_factory=dict, repr=False)
+    session_finalized: bool = False
     evidence_complete: bool = True
     terminal_outcome: str | None = None
 

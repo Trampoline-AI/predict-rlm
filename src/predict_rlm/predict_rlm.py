@@ -23,6 +23,7 @@ from typing import (
     Iterator,
     List,
     Literal,
+    Mapping,
     Optional,
     Protocol,
     Sequence,
@@ -61,17 +62,16 @@ from .backends.adapters import (
 from .backends.base import LegacyExecutionBackend, SandboxFatalError
 from .backends.jspi import JspiBackend
 from .compatibility import (
-    FileInputAdapter,
-    FileOutputAdapter,
     SyncedFileToolOperation,
     ValueInputAdapter,
-    WorkspaceInputAdapter,
     execution_from_legacy_options,
-    validate_file_workspace_signature,
+)
+from .compatibility import (
+    files as file_compatibility,
 )
 from .evidence import EvidenceRecorder, RunEventKind
 from .execution_timeout import validate_execution_timeout
-from .files import File, build_file_plan, scan_file_fields, scan_workspace_fields
+from .files import File, build_file_plan, scan_file_fields
 from .rlm_skills import Skill, merge_skills
 from .runtime import (
     Artifact,
@@ -83,17 +83,21 @@ from .runtime import (
     FieldDescriptor,
     InputAdapter,
     OutputAdapter,
+    PreparedInputBinding,
     RunContext,
     RuntimeContribution,
     RuntimeModule,
     RuntimeSpec,
+    SessionRequirements,
     current_run_context,
     invoke_host_callable,
+    merge_session_requirements,
     preserve_sync_leaf,
     resolve_input_adapter,
     resolve_output_adapter,
     resolve_runtime_spec,
     use_run_context,
+    validate_sandbox_root_reservations,
 )
 from .runtime_hooks import RuntimeHook, RuntimeHookEvent
 from .telemetry import TelemetryContext, make_span_id
@@ -118,7 +122,6 @@ from .trace import (
     snapshot_lm_history_len,
     usage_since,
 )
-from .workspace import Workspace
 
 _CB_LOGGER = logging.getLogger("predict_rlm.callbacks")
 
@@ -165,8 +168,13 @@ class _RunStateField:
 class _ExecutionSessionRepl:
     """Compatibility view used while the iteration loop migrates to sessions."""
 
-    def __init__(self, session: Any) -> None:
+    def __init__(
+        self,
+        session: Any,
+        run_code: Callable[..., Any] | None = None,
+    ) -> None:
         self._session = session
+        self._run_code = run_code or session.run_code
 
     async def aexecute(
         self,
@@ -175,7 +183,7 @@ class _ExecutionSessionRepl:
         *,
         timeout: float | None = None,
     ) -> Any:
-        result = await self._session.run_code(code, variables, timeout=timeout)
+        result = await self._run_code(code, variables, timeout=timeout)
         return result.value if isinstance(result, ExecutionResult) else result
 
     def __getattr__(self, name: str) -> Any:
@@ -1270,18 +1278,19 @@ class PredictRLM(dspy.RLM):
             for module in expanded_modules
             for operation in module.tool_operations
         }
+        file_compatibility_contribution = file_compatibility(
+            output_dir=self._output_dir
+        )
         compatibility_inputs = tuple(
             adapter
-            for adapter in (
-                ValueInputAdapter(),
-                FileInputAdapter(),
-                WorkspaceInputAdapter(),
-            )
+            for adapter in (ValueInputAdapter(), *file_compatibility_contribution.adapters)
+            if isinstance(adapter, InputAdapter)
             if adapter.name not in configured_input_names
         )
         compatibility_outputs = tuple(
             adapter
-            for adapter in (FileOutputAdapter(self._output_dir),)
+            for adapter in file_compatibility_contribution.adapters
+            if isinstance(adapter, OutputAdapter)
             if adapter.name not in configured_output_names
         )
         compatibility_tool_operations = (
@@ -1289,7 +1298,7 @@ class PredictRLM(dspy.RLM):
             if SyncedFileToolOperation.name in configured_tool_operation_names
             else (SyncedFileToolOperation(),)
         )
-        self._runtime_spec = resolve_runtime_spec(
+        runtime_spec = resolve_runtime_spec(
             direct=RuntimeContribution(
                 instructions=(self._skill_instructions,) if self._skill_instructions else (),
                 adapters=(
@@ -1301,11 +1310,19 @@ class PredictRLM(dspy.RLM):
                 packages=tuple(self._skill_packages),
                 execution=resolved_execution,
                 events=tuple(events),
-                validators=(validate_file_workspace_signature,),
+                validators=file_compatibility_contribution.validators,
                 tool_operations=compatibility_tool_operations,
             ),
             modules=expanded_modules,
         )
+        if not callable(
+            getattr(runtime_spec.execution, "validate_host_directory_mounts", None)
+        ):
+            runtime_spec = replace(
+                runtime_spec,
+                execution=ExistingExecutionBackendAdapter(runtime_spec.execution),
+            )
+        self._runtime_spec = runtime_spec
         for validator in self._runtime_spec.validators:
             validator(self.signature)
         for field_name, field_info in self.signature.output_fields.items():
@@ -1950,44 +1967,70 @@ class PredictRLM(dspy.RLM):
             with self._interpreter_context(**kwargs) as repl:
                 yield repl
             return
-        execution_spec = ExecutionSpec(
-            tools=execution_tools,
-            output_fields=tuple(self._get_output_fields_info()),
-            packages=tuple(self.runtime_spec.packages),
-            allowed_domains=tuple(self._allowed_domains or ()),
-            extra_read_paths=tuple(
-                dict.fromkeys(
-                    (
-                        *ctx.state.get("extra_read_paths", ()),
-                        *(
-                            path
-                            for tool in self.runtime_spec.tools
-                            for path in getattr(tool, "extra_read_paths", ())
-                        ),
-                    )
+        await self._prepare_runtime_input_sessions(ctx)
+        try:
+            validate_sandbox_root_reservations(ctx.input_bindings)
+            requirements = merge_session_requirements(
+                (
+                    SessionRequirements(
+                        allowed_domains=tuple(self._allowed_domains or ()),
+                        extra_read_paths=tuple(self._skill_modules.values()),
+                    ),
+                    *(
+                        binding.prepared.requirements
+                        for binding in ctx.input_bindings.values()
+                    ),
+                    *ctx.output_requirements.values(),
+                    *(
+                        SessionRequirements(
+                            extra_read_paths=tuple(
+                                getattr(tool, "extra_read_paths", ())
+                            ),
+                            extra_write_paths=tuple(
+                                getattr(tool, "extra_write_paths", ())
+                            ),
+                        )
+                        for tool in self.runtime_spec.tools
+                    ),
                 )
-            ),
-            extra_write_paths=tuple(
-                dict.fromkeys(
-                    (
-                        *ctx.state.get("extra_write_paths", ()),
-                        *(
-                            path
-                            for tool in self.runtime_spec.tools
-                            for path in getattr(tool, "extra_write_paths", ())
-                        ),
-                    )
-                )
-            ),
-            debug=self._debug,
-            verbose=self._iteration_logging_enabled(),
-            metadata={"has_file_plan": file_plan is not None},
-        )
+            )
+            execution_spec = ExecutionSpec(
+                tools=execution_tools,
+                output_fields=tuple(self._get_output_fields_info()),
+                packages=tuple(self.runtime_spec.packages),
+                allowed_domains=requirements.allowed_domains,
+                extra_read_paths=requirements.extra_read_paths,
+                extra_write_paths=requirements.extra_write_paths,
+                host_directory_mounts=tuple(
+                    mount
+                    for binding in ctx.input_bindings.values()
+                    for mount in binding.prepared.host_directory_mounts
+                ),
+                sandbox_roots=tuple(
+                    root
+                    for binding in ctx.input_bindings.values()
+                    for root in binding.prepared.sandbox_roots
+                ),
+                debug=self._debug,
+                verbose=self._iteration_logging_enabled(),
+                metadata={"has_file_plan": file_plan is not None},
+            )
+        except BaseException as exc:
+            try:
+                await self._finalize_runtime_inputs(ctx, None, exc)
+            except BaseException as finalize_error:
+                setattr(exc, "input_adapter_finalize_error", finalize_error)
+                await self._record_pre_session_finalize_failure(finalize_error)
+            raise
         recorder = self._evidence()
         session_name: str | None = None
         primary: BaseException | None = None
         release_succeeded = False
         try:
+            await self.runtime_spec.execution.validate_host_directory_mounts(
+                execution_spec.host_directory_mounts,
+                ctx,
+            )
             async with self.runtime_spec.execution.start(execution_spec, ctx) as session:
                 session_name = session.name
                 ctx.session = session
@@ -2005,7 +2048,15 @@ class PredictRLM(dspy.RLM):
                             RunEventKind.PACKAGES_INSTALLED,
                             packages=list(self.runtime_spec.packages),
                         )
-                    repl = _ExecutionSessionRepl(session)
+                    repl = _ExecutionSessionRepl(
+                        session,
+                        lambda code, variables=None, timeout=None: self._run_session_code(
+                            ctx,
+                            code,
+                            variables,
+                            timeout=timeout,
+                        ),
+                    )
                     yield repl
                 except BaseException as exc:
                     primary = exc
@@ -2015,13 +2066,19 @@ class PredictRLM(dspy.RLM):
                         setattr(exc, "session_cancel_error", cancel_error)
                     raise
                 finally:
-                    finalize_task = asyncio.create_task(session.finalize())
+                    finalize_task = asyncio.create_task(
+                        self._finalize_runtime_inputs(ctx, session, primary)
+                    )
                     finalize_cancellation: asyncio.CancelledError | None = None
                     try:
                         try:
                             await asyncio.shield(finalize_task)
                         except asyncio.CancelledError as exc:
                             finalize_cancellation = exc
+                            if primary is None:
+                                primary = exc
+                            else:
+                                setattr(primary, "session_finalize_cancellation", exc)
                             await finalize_task
                         if recorder is not None:
                             await recorder.emit(
@@ -2041,16 +2098,22 @@ class PredictRLM(dspy.RLM):
                             except BaseException as evidence_error:
                                 setattr(finalize_error, "evidence_error", evidence_error)
                         if primary is not None:
-                            setattr(primary, "session_finalize_error", finalize_error)
+                            attribute = (
+                                "input_adapter_finalize_error"
+                                if getattr(
+                                    finalize_error,
+                                    "_predict_rlm_input_adapter_finalize",
+                                    False,
+                                )
+                                else "session_finalize_error"
+                            )
+                            setattr(primary, attribute, finalize_error)
                         else:
                             primary = finalize_error
                             raise
                     if finalize_cancellation is not None:
-                        if primary is not None:
+                        if primary is not finalize_cancellation:
                             setattr(primary, "session_finalize_cancellation", finalize_cancellation)
-                        else:
-                            primary = finalize_cancellation
-                            raise finalize_cancellation
             release_succeeded = True
         except BaseException as release_or_primary:
             if primary is release_or_primary:
@@ -2059,6 +2122,12 @@ class PredictRLM(dspy.RLM):
                 setattr(primary, "session_release_error", release_or_primary)
             else:
                 primary = release_or_primary
+            if session_name is None:
+                try:
+                    await self._finalize_runtime_inputs(ctx, None, primary)
+                except BaseException as finalize_error:
+                    setattr(primary, "input_adapter_finalize_error", finalize_error)
+                    await self._record_pre_session_finalize_failure(finalize_error)
             if not release_succeeded and recorder is not None and session_name is not None:
                 try:
                     await recorder.emit(
@@ -2856,15 +2925,11 @@ class PredictRLM(dspy.RLM):
                 )
                 await self._prepare_runtime_inputs(ctx, kwargs)
                 await self._prepare_runtime_outputs(ctx)
-                ctx.state.setdefault("extra_read_paths", []).extend(
-                    self._skill_modules.values()
-                )
-                self._validate_runtime_artifacts(ctx)
                 kwargs = {
                     **kwargs,
                     **{
-                        name: prepared.model_value
-                        for name, prepared in ctx.prepared_inputs.items()
+                        name: binding.prepared.model_value
+                        for name, binding in ctx.input_bindings.items()
                     },
                 }
                 with self._lm_context():
@@ -2954,7 +3019,11 @@ class PredictRLM(dspy.RLM):
                 value,
             )
             prepared = await adapter.prepare(field, value, ctx)
-            ctx.prepared_inputs[field_name] = prepared
+            ctx.input_bindings[field_name] = PreparedInputBinding(
+                field=field,
+                adapter=adapter,
+                prepared=prepared,
+            )
             if recorder is not None:
                 await recorder.emit(
                     RunEventKind.INPUT_PREPARED,
@@ -2962,6 +3031,45 @@ class PredictRLM(dspy.RLM):
                     adapter=adapter.name,
                     artifact_ids=[artifact.id for artifact in prepared.artifacts],
                 )
+
+    async def _prepare_runtime_input_sessions(self, ctx: RunContext) -> None:
+        for binding in ctx.input_bindings.values():
+            if binding.prepare_session_entered:
+                continue
+            binding.prepare_session_entered = True
+            try:
+                await binding.adapter.prepare_session(
+                    binding.field,
+                    binding.prepared,
+                    ctx,
+                    self.runtime_spec.execution,
+                )
+            except BaseException as exc:
+                try:
+                    await self._finalize_runtime_inputs(ctx, None, exc)
+                except BaseException as finalize_error:
+                    setattr(exc, "input_adapter_finalize_error", finalize_error)
+                    await self._record_pre_session_finalize_failure(finalize_error)
+                raise
+
+    async def _record_pre_session_finalize_failure(
+        self,
+        finalize_error: BaseException,
+    ) -> None:
+        recorder = self._evidence()
+        if recorder is None:
+            return
+        recorder.mark_incomplete(finalize_error)
+        try:
+            await recorder.emit(
+                RunEventKind.SESSION_FINALIZE_FAILED,
+                backend=self.runtime_spec.execution.name,
+                error_type=type(finalize_error).__name__,
+                error=str(finalize_error),
+            )
+        except BaseException as evidence_error:
+            setattr(finalize_error, "evidence_error", evidence_error)
+
     async def _prepare_runtime_outputs(self, ctx: RunContext) -> None:
         for field_name, field_info in self.signature.output_fields.items():
             field = FieldDescriptor(field_name, field_info.annotation)
@@ -2973,70 +3081,165 @@ class PredictRLM(dspy.RLM):
             if not matches:
                 continue
             adapter = resolve_output_adapter(matches, field)
-            await adapter.prepare_session(
+            requirements = await adapter.prepare_session(
                 field,
                 ctx.input_values.get(field_name),
                 ctx,
             )
+            if requirements is not None:
+                if not isinstance(requirements, SessionRequirements):
+                    raise TypeError(
+                        "OutputAdapter.prepare_session() must return "
+                        "SessionRequirements or None"
+                    )
+                ctx.output_requirements[field_name] = requirements
 
     async def _bind_runtime_inputs(self, ctx: RunContext) -> None:
         recorder = self._evidence()
         session = ctx.session
         if session is None:
             raise RuntimeError("Artifact binding requires an active execution session")
-        direct_bindings = {}
-        for prepared in ctx.prepared_inputs.values():
-            for artifact in prepared.artifacts:
-                if artifact.kind != "compat.workspace.direct":
-                    continue
-                binding = await session.mount(artifact)
-                ctx.bind(binding)
-                direct_bindings[artifact.id] = binding
+        for binding in ctx.input_bindings.values():
+            if binding.mounted:
+                continue
+            binding.mounted = True
+            ctx.mounted_input_bindings.append(binding)
+            mounted = await binding.adapter.mount(
+                binding.field,
+                binding.prepared,
+                ctx,
+                session,
+            )
+            for artifact_binding in mounted.bindings:
+                ctx.bind(artifact_binding)
                 if recorder is not None:
                     await recorder.emit(
                         RunEventKind.ARTIFACT_MOUNTED,
-                        artifact_id=artifact.id,
-                        path=binding.path,
+                        artifact_id=artifact_binding.artifact_id,
+                        path=artifact_binding.path,
                     )
-        for field_name, prepared in tuple(ctx.prepared_inputs.items()):
-            model_value = prepared.model_value
-            for artifact in prepared.artifacts:
-                binding = direct_bindings.get(artifact.id)
-                if binding is None:
-                    binding = await session.mount(artifact)
-                    ctx.bind(binding)
-                planned_path = artifact.metadata.get("sandbox_path")
-                if isinstance(planned_path, str):
-                    model_value = self._replace_bound_path(
-                        model_value,
-                        planned_path,
-                        binding.path,
-                    )
-                if recorder is not None and artifact.id not in direct_bindings:
-                    await recorder.emit(
-                        RunEventKind.ARTIFACT_MOUNTED,
-                        artifact_id=artifact.id,
-                        path=binding.path,
-                    )
-            if model_value != prepared.model_value:
-                ctx.prepared_inputs[field_name] = replace(
-                    prepared,
-                    model_value=model_value,
+            if mounted.model_value != binding.prepared.model_value:
+                binding.prepared = replace(
+                    binding.prepared,
+                    model_value=mounted.model_value,
                 )
 
-    def _replace_bound_path(self, value: Any, planned: str, actual: str) -> Any:
-        if value == planned:
-            return actual
-        if isinstance(value, list):
-            return [self._replace_bound_path(item, planned, actual) for item in value]
-        if isinstance(value, tuple):
-            return tuple(self._replace_bound_path(item, planned, actual) for item in value)
-        if isinstance(value, dict):
-            return {
-                key: self._replace_bound_path(item, planned, actual)
-                for key, item in value.items()
-            }
-        return value
+    async def _run_session_code(
+        self,
+        ctx: RunContext,
+        code: str,
+        variables: Mapping[str, Any] | None = None,
+        *,
+        timeout: float | None = None,
+    ) -> ExecutionResult:
+        session = ctx.session
+        if session is None:
+            raise RuntimeError("Input lifecycle requires an active execution session")
+        result: ExecutionResult | None = None
+        execution_error: BaseException | None = None
+        try:
+            result = await session.run_code(code, variables, timeout=timeout)
+        except asyncio.CancelledError:
+            raise
+        except BaseException as exc:
+            execution_error = exc
+
+        await self._after_runtime_input_execution(ctx, result, execution_error)
+        if execution_error is not None:
+            raise execution_error
+        assert result is not None
+        return result
+
+    async def _after_runtime_input_execution(
+        self,
+        ctx: RunContext,
+        result: ExecutionResult | None,
+        execution_error: BaseException | None,
+    ) -> None:
+        session = ctx.session
+        if session is None:
+            raise RuntimeError("Input lifecycle requires an active execution session")
+        after_error: BaseException | None = None
+        additional_errors = []
+        for binding in ctx.mounted_input_bindings:
+            try:
+                await binding.adapter.after_execution(
+                    binding.field,
+                    binding.prepared,
+                    ctx,
+                    session,
+                    result,
+                    execution_error,
+                )
+            except BaseException as exc:
+                if after_error is None:
+                    after_error = exc
+                else:
+                    additional_errors.append(exc)
+
+        if after_error is not None and additional_errors:
+            setattr(
+                after_error,
+                "input_adapter_after_execution_errors",
+                tuple(additional_errors),
+            )
+        if after_error is not None:
+            setattr(after_error, "_predict_rlm_input_adapter_after_execution", True)
+            if execution_error is not None:
+                setattr(
+                    execution_error,
+                    "input_adapter_after_execution_error",
+                    after_error,
+                )
+                setattr(
+                    execution_error,
+                    "_predict_rlm_input_adapter_after_execution",
+                    True,
+                )
+                return
+            raise after_error
+
+    async def _finalize_runtime_inputs(
+        self,
+        ctx: RunContext,
+        session: Any | None,
+        error: BaseException | None,
+    ) -> None:
+        adapter_error: BaseException | None = None
+        additional_errors = []
+        for binding in reversed(tuple(ctx.input_bindings.values())):
+            if not binding.prepare_session_entered or binding.finalized:
+                continue
+            binding.finalized = True
+            try:
+                await binding.adapter.finalize(
+                    binding.field,
+                    binding.prepared,
+                    ctx,
+                    session,
+                    error,
+                )
+            except BaseException as exc:
+                if adapter_error is None:
+                    adapter_error = exc
+                else:
+                    additional_errors.append(exc)
+        session_error: BaseException | None = None
+        if session is not None and not ctx.session_finalized:
+            ctx.session_finalized = True
+            try:
+                await session.finalize()
+            except BaseException as exc:
+                session_error = exc
+        if adapter_error is not None:
+            setattr(adapter_error, "_predict_rlm_input_adapter_finalize", True)
+            if additional_errors:
+                setattr(adapter_error, "input_finalize_errors", tuple(additional_errors))
+            if session_error is not None:
+                setattr(adapter_error, "session_finalize_error", session_error)
+            raise adapter_error
+        if session_error is not None:
+            raise session_error
 
     def _configure_run_predictors(
         self,
@@ -3045,8 +3248,8 @@ class PredictRLM(dspy.RLM):
     ) -> None:
         prepared_instructions = tuple(
             instruction
-            for prepared in ctx.prepared_inputs.values()
-            for instruction in prepared.instructions
+            for binding in ctx.input_bindings.values()
+            for instruction in binding.prepared.instructions
         )
         file_instructions = file_plan["instructions"] if file_plan else ""
         output_instructions = tuple(
@@ -3087,30 +3290,9 @@ class PredictRLM(dspy.RLM):
             )
             binding = await session.mount(artifact)
             ctx.bind(binding)
-        await session.run_code("import sys; sys.path.insert(0, '/sandbox/lib')")
-
-    def _validate_runtime_artifacts(self, ctx: RunContext) -> None:
-        artifacts = [
-            artifact
-            for prepared in ctx.prepared_inputs.values()
-            for artifact in prepared.artifacts
-        ]
-        direct = [artifact for artifact in artifacts if artifact.kind == "compat.workspace.direct"]
-        mirror = [artifact for artifact in artifacts if artifact.kind == "compat.workspace.mirror"]
-        backend = getattr(
-            self.runtime_spec.execution,
-            "backend",
-            self.runtime_spec.execution,
+        await session.run_code(
+            "import sys; sys.path.insert(0, '/sandbox/lib')",
         )
-        if direct and not getattr(backend, "supports_direct_workspaces", False):
-            message = getattr(backend, "direct_workspace_error", None) or (
-                "The selected execution backend does not support direct Workspace mounts."
-            )
-            raise ValueError(message)
-        if mirror and not getattr(backend, "supports_mirror_workspaces", False):
-            raise ValueError(
-                "The selected execution backend does not support Workspace mirror sync."
-            )
 
     async def _reserve_runtime_outputs(self, ctx: RunContext) -> None:
         session = ctx.session
@@ -3496,6 +3678,23 @@ class PredictRLM(dspy.RLM):
                 )
             raise
         except Exception as exc:
+            if getattr(exc, "_predict_rlm_input_adapter_after_execution", False):
+                self._log_iteration_execute_fatal(
+                    repl,
+                    iteration=iteration,
+                    execute_start=execute_start,
+                    exc=exc,
+                )
+                if recorder is not None:
+                    await recorder.emit(
+                        RunEventKind.CODE_EXECUTED,
+                        operation_id=operation_id,
+                        iteration=iteration + 1,
+                        error_type=type(exc).__name__,
+                        error=str(exc),
+                        fatal=True,
+                    )
+                raise
             output = self._format_iteration_execute_error(
                 repl,
                 iteration=iteration,
@@ -3743,8 +3942,7 @@ class PredictRLM(dspy.RLM):
         no file fields are present.
         """
         input_file_fields, output_file_fields = scan_file_fields(self.signature)
-        input_workspace_fields = scan_workspace_fields(self.signature)
-        if not input_file_fields and not output_file_fields and not input_workspace_fields:
+        if not input_file_fields and not output_file_fields:
             return None, input_args
 
         file_plan = build_file_plan(
@@ -3752,11 +3950,9 @@ class PredictRLM(dspy.RLM):
             input_file_fields,
             output_file_fields,
             self._output_dir,
-            input_workspace_fields=input_workspace_fields,
         )
         if not file_plan:
             return None, input_args
-        self._validate_file_plan_backend(file_plan)
 
         # Validate input files exist, then replace File values with sandbox path strings
         transformed = dict(input_args)
@@ -3789,51 +3985,11 @@ class PredictRLM(dspy.RLM):
                     )
                 transformed[field_name] = f"/sandbox/input/{field_name}"
 
-        for field_name, kind in input_workspace_fields.items():
-            value = transformed.get(field_name)
-            if value is None:
-                continue
-            if kind == "list_workspace":
-                for workspace in value:
-                    if not os.path.isdir(workspace.path):
-                        raise FileNotFoundError(
-                            f"Workspace for field '{field_name}' not found: {workspace.path}"
-                        )
-                transformed[field_name] = file_plan["workspace_mounts_for_instructions"][
-                    field_name
-                ]
-            elif kind == "workspace":
-                if not os.path.isdir(value.path):
-                    raise FileNotFoundError(
-                        f"Workspace for field '{field_name}' not found: {value.path}"
-                    )
-                transformed[field_name] = file_plan["workspace_mounts_for_instructions"][
-                    field_name
-                ]
-
         # Remove output file fields from input_args (they aren't RLM inputs)
         for field_name in output_file_fields:
             transformed.pop(field_name, None)
 
         return file_plan, transformed
-
-    def _validate_file_plan_backend(self, file_plan: dict[str, Any]) -> None:
-        direct_mounts = file_plan.get("direct_workspace_mounts") or []
-        mirror_workspaces = file_plan.get("workspace_states") or []
-        backend = getattr(
-            self.runtime_spec.execution,
-            "backend",
-            self.runtime_spec.execution,
-        )
-        if direct_mounts and not getattr(backend, "supports_direct_workspaces", False):
-            message = getattr(backend, "direct_workspace_error", None) or (
-                "The selected execution backend does not support direct Workspace mounts."
-            )
-            raise ValueError(message)
-        if mirror_workspaces and not getattr(backend, "supports_mirror_workspaces", False):
-            raise ValueError(
-                "The selected execution backend does not support Workspace mirror sync."
-            )
 
     def _setup_sandbox_files(
         self, repl: LegacyExecutionBackend, file_plan: dict[str, Any]
@@ -3846,12 +4002,6 @@ class PredictRLM(dspy.RLM):
             output_dirs=len(file_plan["output_dirs"]),
             skill_modules=len(self._skill_modules),
         )
-        direct_mounts = file_plan.get("direct_workspace_mounts") or []
-        if direct_mounts:
-            if not hasattr(repl, "configure_direct_workspace_mounts"):
-                raise ValueError("Workspace(mode='direct') requires the SBX backend.")
-            repl.configure_direct_workspace_mounts(direct_mounts)
-
         if hasattr(repl, "_ensure_deno_process"):
             repl._ensure_deno_process()
 
@@ -3862,22 +4012,6 @@ class PredictRLM(dspy.RLM):
                 backend=self._interpreter_backend_label(repl),
                 virtual_path=virtual_path,
             )
-
-        for state in file_plan.get("workspace_states", []):
-            repl.mkdir_p(state.workspace.mount_path)
-            self._log_lifecycle(
-                "sandbox.files.workspace.mkdir",
-                backend=self._interpreter_backend_label(repl),
-                virtual_path=state.workspace.mount_path,
-            )
-            for host_path, virtual_path in state.iter_mounts():
-                repl.mount_file_at(host_path, virtual_path)
-                self._log_lifecycle(
-                    "sandbox.files.workspace.mount",
-                    backend=self._interpreter_backend_label(repl),
-                    virtual_path=virtual_path,
-                )
-            repl.add_post_execute_hook(state.sync_from_sandbox)
 
         for virtual_dir in file_plan["output_dirs"]:
             repl.mkdir_p(virtual_dir)
@@ -4275,8 +4409,8 @@ class PredictRLM(dspy.RLM):
                     await self._reserve_runtime_outputs(run_ctx)
                     input_args.update(
                         {
-                            name: prepared.model_value
-                            for name, prepared in run_ctx.prepared_inputs.items()
+                            name: binding.prepared.model_value
+                            for name, binding in run_ctx.input_bindings.items()
                         }
                     )
                     for field_name in run_ctx.output_reservations:
@@ -4438,7 +4572,7 @@ class PredictRLM(dspy.RLM):
                 )
         for name, field in self.signature.input_fields.items():
             descriptor = FieldDescriptor(name, field.annotation)
-            if descriptor.matches(File) or descriptor.matches(Workspace):
+            if descriptor.matches(File):
                 replacement = descriptor.replace_type(str)
                 modified_sig = modified_sig.with_updated_fields(
                     name,

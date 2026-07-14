@@ -26,11 +26,9 @@ def execution_from_legacy_options(
             sandbox_backend.value,
             owner._acquire_runtime_interpreter,
             ownership=SessionOwnership.INJECTED,
-            supports_direct_workspaces=hasattr(
-                interpreter, "configure_direct_workspace_mounts"
+            supports_host_directory_mounts=callable(
+                getattr(interpreter, "configure_direct_workspace_mounts", None)
             ),
-            supports_mirror_workspaces=hasattr(interpreter, "add_post_execute_hook"),
-            direct_workspace_error="Workspace(mode='direct') requires the SBX backend.",
         )
 
     pool_kwargs = getattr(sbx_pool, "_interpreter_kwargs", None)
@@ -43,11 +41,6 @@ def execution_from_legacy_options(
             sandbox_backend.value,
             owner._acquire_runtime_interpreter,
             ownership=SessionOwnership.POOLED,
-            supports_mirror_workspaces=True,
-            direct_workspace_error=(
-                "Workspace(mode='direct') requires a per-call SBX interpreter; "
-                "prewarmed SbxPool instances cannot add workspace mounts after creation."
-            ),
         )
 
     if sbx_pool is not None:
