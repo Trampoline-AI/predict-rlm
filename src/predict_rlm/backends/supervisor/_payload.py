@@ -1269,13 +1269,17 @@ def _persistent_kernel_runner(
             return
         try:
             if request.get("op") == "snapshot":
-                result_queue.put({
-                    "ok": True,
-                    "snapshot": _pickleable_globals_snapshot(globals_dict),
-                })
+                _publish_kernel_result(
+                    result_queue,
+                    {
+                        "ok": True,
+                        "snapshot": _pickleable_globals_snapshot(globals_dict),
+                    },
+                )
                 continue
             if request.get("op") == "register_runtime_hooks":
-                result_queue.put(
+                _publish_kernel_result(
+                    result_queue,
                     {"ok": True, "result": _register_runtime_hooks(request["params"])}
                 )
                 continue
