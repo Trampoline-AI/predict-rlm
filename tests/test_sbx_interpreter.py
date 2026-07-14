@@ -1826,6 +1826,28 @@ class TestSbxBackendLocalWebSocketRunner:
 
         assert output == "dict T due\n"
 
+    def test_pydantic_enum_variable_is_plain_data(self, tmp_path: Path):
+        from enum import Enum
+
+        from pydantic import BaseModel
+
+        class WorkspaceMode(str, Enum):
+            DIRECT = "direct"
+
+        class PriorTurn(BaseModel):
+            workspace_mode: WorkspaceMode
+
+        interpreter = self.make_interpreter(tmp_path)
+        try:
+            output = interpreter.execute(
+                "print(prior_turn['workspace_mode'])",
+                variables={"prior_turn": PriorTurn(workspace_mode=WorkspaceMode.DIRECT)},
+            )
+        finally:
+            interpreter.shutdown()
+
+        assert output == "direct\n"
+
     def test_websocket_host_tool_round_trip(self, tmp_path: Path):
         def add(a: int, b: int) -> dict:
             return {"total": a + b}
