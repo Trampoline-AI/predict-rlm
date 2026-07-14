@@ -7,6 +7,7 @@ import base64
 import json
 import logging
 import os
+import queue
 import secrets
 import select
 import shutil
@@ -486,6 +487,57 @@ class TestPythonRunnerProtocol:
         response = json.loads(runner.proc.stdout.readline())
 
         assert response["result"]["output"] == "hello\n"
+        assert runner.request("shutdown")["result"] == {"shutdown": True}
+        runner.proc.wait(timeout=5)
+
+    def test_kernel_result_waits_for_tool_reader_handoff(self, monkeypatch):
+        from predict_rlm.backends.supervisor import _payload
+
+        class TrackingCondition(threading.Condition):
+            def __init__(self) -> None:
+                super().__init__()
+                self.publisher_waiting = threading.Event()
+
+            def wait(self, timeout=None):
+                self.publisher_waiting.set()
+                return super().wait(timeout)
+
+        condition = TrackingCondition()
+        release_reader = threading.Event()
+        reader_started = threading.Event()
+        result_queue: queue.Queue = queue.Queue()
+
+        def reader_loop() -> None:
+            reader_started.set()
+            release_reader.wait()
+            with condition:
+                _payload.TOOL_RESPONSE_READER_THREAD = None
+                condition.notify_all()
+
+        reader = threading.Thread(target=reader_loop)
+        monkeypatch.setattr(_payload, "TOOL_RESPONSE_CONDITION", condition)
+        monkeypatch.setattr(_payload, "WAITING_TOOL_RESPONSE_IDS", set())
+        monkeypatch.setattr(_payload, "TOOL_RESPONSE_READER_THREAD", reader)
+
+        reader.start()
+        assert reader_started.wait(timeout=1)
+        publisher = threading.Thread(
+            target=_payload._publish_kernel_result,
+            args=(result_queue, {"ok": True}),
+        )
+        publisher.start()
+
+        assert condition.publisher_waiting.wait(timeout=1)
+        with pytest.raises(queue.Empty):
+            result_queue.get_nowait()
+
+        release_reader.set()
+        publisher.join(timeout=1)
+        reader.join(timeout=1)
+
+        assert not publisher.is_alive()
+        assert not reader.is_alive()
+        assert result_queue.get_nowait() == {"ok": True}
 
     # TEMPORARY SKIP: drives many concurrent host-tool calls over a local _payload.py
     # subprocess and reads replies on tight (3s) select timeouts. On loaded CI runners
