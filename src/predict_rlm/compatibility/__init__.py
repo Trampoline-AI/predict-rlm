@@ -15,8 +15,11 @@ from .synced_files import SyncedFileToolOperation
 
 def files(*, output_dir: str | None = None) -> RuntimeContribution:
     return RuntimeContribution(
-        inputs=(FileInputAdapter(), WorkspaceInputAdapter()),
-        outputs=(FileOutputAdapter(output_dir),),
+        adapters=(
+            FileInputAdapter(),
+            WorkspaceInputAdapter(),
+            FileOutputAdapter(output_dir),
+        ),
         validators=(validate_file_workspace_signature,),
     )
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import shutil
 import threading
 from collections.abc import Sequence
@@ -18,7 +19,12 @@ from predict_rlm.backends.adapters import (
     InterpreterExecutionSession,
     NativeInterpreterExecutionSession,
 )
-from predict_rlm.compatibility import SyncedFileToolOperation, WorkspaceInputAdapter
+from predict_rlm.compatibility import (
+    FileInputAdapter,
+    FileOutputAdapter,
+    SyncedFileToolOperation,
+    WorkspaceInputAdapter,
+)
 from predict_rlm.evidence import (
     EvidenceIncompleteError,
     EvidenceRecorder,
@@ -132,12 +138,120 @@ class StubBackend:
 def make_spec(*, events=()) -> RuntimeSpec:
     return RuntimeSpec(
         instructions=(),
-        inputs=(),
-        outputs=(),
+        adapters=(),
         tools=(),
         packages=(),
         execution=StubBackend(),
         events=events,
+    )
+
+
+def test_predict_rlm_exposes_one_adapter_extension_parameter():
+    from predict_rlm import PredictRLM
+
+    parameters = inspect.signature(PredictRLM.__init__).parameters
+
+    assert "adapters" in parameters
+    assert "inputs" not in parameters
+    assert "outputs" not in parameters
+
+
+def test_runtime_spec_partitions_an_immutable_adapter_snapshot_by_role():
+    class SharedInputAdapter(InputAdapter[str]):
+        name = "shared"
+        value_type = str
+
+        async def prepare(self, field, value, ctx):
+            return PreparedInput(model_value=value)
+
+    class SharedOutputAdapter(OutputAdapter[str]):
+        name = "shared"
+        value_type = str
+
+        async def reserve(self, field, value, ctx, session):
+            raise NotImplementedError
+
+        async def materialize(self, reservation, submitted_value, ctx, session):
+            raise NotImplementedError
+
+    input_adapter = SharedInputAdapter()
+    output_adapter = SharedOutputAdapter()
+
+    def output_module():
+        return RuntimeContribution(adapters=[output_adapter])
+
+    contribution = RuntimeContribution(
+        adapters=[input_adapter],
+        execution=StubBackend(),
+    )
+    spec = resolve_runtime_spec(direct=contribution, modules=(output_module,))
+
+    assert isinstance(contribution.adapters, tuple)
+    assert isinstance(spec.adapters, tuple)
+    assert spec.adapters == (input_adapter, output_adapter)
+    assert spec.input_adapters == (input_adapter,)
+    assert spec.output_adapters == (output_adapter,)
+
+
+def test_runtime_spec_rejects_duplicate_adapter_names_within_one_role():
+    class DuplicateInputAdapter(InputAdapter[str]):
+        name = "duplicate"
+        value_type = str
+
+        async def prepare(self, field, value, ctx):
+            return PreparedInput(model_value=value)
+
+    with pytest.raises(ValueError, match="Duplicate input adapter name"):
+        resolve_runtime_spec(
+            direct=RuntimeContribution(
+                adapters=[DuplicateInputAdapter(), DuplicateInputAdapter()],
+                execution=StubBackend(),
+            )
+        )
+
+
+def test_configured_adapter_names_suppress_compatibility_defaults_per_role():
+    from predict_rlm import PredictRLM
+
+    class CustomFileInputAdapter(InputAdapter[RuntimeFile]):
+        name = "file"
+        value_type = RuntimeFile
+
+        async def prepare(self, field, value, ctx):
+            return PreparedInput(model_value=value)
+
+    class CustomFileOutputAdapter(OutputAdapter[RuntimeFile]):
+        name = "file"
+        value_type = RuntimeFile
+
+        async def reserve(self, field, value, ctx, session):
+            raise NotImplementedError
+
+        async def materialize(self, reservation, submitted_value, ctx, session):
+            raise NotImplementedError
+
+    custom_input = CustomFileInputAdapter()
+    input_override = PredictRLM(KernelFileSignature, adapters=[custom_input])
+    assert custom_input in input_override.runtime_spec.input_adapters
+    assert not any(
+        isinstance(adapter, FileInputAdapter)
+        for adapter in input_override.runtime_spec.input_adapters
+    )
+    assert any(
+        isinstance(adapter, FileOutputAdapter)
+        for adapter in input_override.runtime_spec.output_adapters
+    )
+
+    custom_output = CustomFileOutputAdapter()
+    output_override = PredictRLM(KernelFileSignature, adapters=[custom_output])
+    assert any(
+        isinstance(adapter, FileInputAdapter)
+        for adapter in output_override.runtime_spec.input_adapters
+    )
+    assert custom_output in output_override.runtime_spec.output_adapters
+    assert not any(
+        isinstance(adapter, FileOutputAdapter)
+        for adapter in output_override.runtime_spec.output_adapters
     )
 
 
@@ -1296,6 +1410,7 @@ def test_custom_contributions_drive_invocation_runtime():
         module_calls += 1
         return RuntimeContribution(
             instructions=("Module instruction.",),
+            adapters=[TransformInputAdapter()],
             tools=(CallableTool(name="extra_tool", function=extra_tool),),
             packages=("module-package",),
         )
@@ -1304,7 +1419,6 @@ def test_custom_contributions_drive_invocation_runtime():
         "question: str -> answer: str",
         lm=lm,
         execution=backend,
-        inputs=(TransformInputAdapter(),),
         modules=(module,),
         max_iterations=1,
         verbose=False,
@@ -1567,7 +1681,7 @@ def test_output_adapter_ambiguity_fails_before_backend_start():
             "question: str -> answer: str",
             lm=lm,
             execution=backend,
-            outputs=(StringOutputAdapter("first"), StringOutputAdapter("second")),
+            adapters=[StringOutputAdapter("first"), StringOutputAdapter("second")],
         )
 
     assert backend.spec is None

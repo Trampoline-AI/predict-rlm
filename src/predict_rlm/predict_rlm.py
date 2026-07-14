@@ -25,6 +25,7 @@ from typing import (
     Literal,
     Optional,
     Protocol,
+    Sequence,
     runtime_checkable,
 )
 
@@ -80,6 +81,8 @@ from .runtime import (
     ExecutionResult,
     ExecutionSpec,
     FieldDescriptor,
+    InputAdapter,
+    OutputAdapter,
     RunContext,
     RuntimeContribution,
     RuntimeModule,
@@ -1008,8 +1011,7 @@ class PredictRLM(dspy.RLM):
         on_runtime_hook_event: Callable[[RuntimeHookEvent], Any] | None = None,
         model_execution_timeout: bool = False,
         *,
-        inputs: tuple[Any, ...] | list[Any] = (),
-        outputs: tuple[Any, ...] | list[Any] = (),
+        adapters: Sequence[InputAdapter[Any] | OutputAdapter[Any]] = (),
         execution: ExecutionBackend | None = None,
         modules: tuple[RuntimeModule | RuntimeContribution, ...]
         | list[RuntimeModule | RuntimeContribution] = (),
@@ -1072,6 +1074,11 @@ class PredictRLM(dspy.RLM):
                        (``SbxConfig.exec_timeout`` / JSPI ``exec_timeout``, default
                        300s) remains as the hang guard. Set True to restore the
                        model-chosen timeout knob.
+            adapters: Additional input and output adapters contributed to the runtime.
+            execution: Small-kernel execution backend. Mutually exclusive with
+                       legacy interpreter and sandbox backend options.
+            modules: Runtime contribution factories or resolved contributions.
+            events: Runtime event sinks.
         """
         if execution is not None and any(
             value is not None
@@ -1244,16 +1251,20 @@ class PredictRLM(dspy.RLM):
             )
             for name, tool in self._user_tools.items()
         )
+        configured_adapters = (
+            *tuple(adapters),
+            *(adapter for module in expanded_modules for adapter in module.adapters),
+        )
         configured_input_names = {
             adapter.name
-            for module in expanded_modules
-            for adapter in module.inputs
-        } | {adapter.name for adapter in inputs}
+            for adapter in configured_adapters
+            if isinstance(adapter, InputAdapter)
+        }
         configured_output_names = {
             adapter.name
-            for module in expanded_modules
-            for adapter in module.outputs
-        } | {adapter.name for adapter in outputs}
+            for adapter in configured_adapters
+            if isinstance(adapter, OutputAdapter)
+        }
         configured_tool_operation_names = {
             operation.name
             for module in expanded_modules
@@ -1262,9 +1273,9 @@ class PredictRLM(dspy.RLM):
         compatibility_inputs = tuple(
             adapter
             for adapter in (
-            ValueInputAdapter(),
-            FileInputAdapter(),
-            WorkspaceInputAdapter(),
+                ValueInputAdapter(),
+                FileInputAdapter(),
+                WorkspaceInputAdapter(),
             )
             if adapter.name not in configured_input_names
         )
@@ -1281,8 +1292,11 @@ class PredictRLM(dspy.RLM):
         self._runtime_spec = resolve_runtime_spec(
             direct=RuntimeContribution(
                 instructions=(self._skill_instructions,) if self._skill_instructions else (),
-                inputs=(*compatibility_inputs, *tuple(inputs)),
-                outputs=(*compatibility_outputs, *tuple(outputs)),
+                adapters=(
+                    *compatibility_inputs,
+                    *compatibility_outputs,
+                    *tuple(adapters),
+                ),
                 tools=runtime_tools,
                 packages=tuple(self._skill_packages),
                 execution=resolved_execution,
@@ -1298,7 +1312,7 @@ class PredictRLM(dspy.RLM):
             field = FieldDescriptor(field_name, field_info.annotation)
             matches = [
                 adapter
-                for adapter in self._runtime_spec.outputs
+                for adapter in self._runtime_spec.output_adapters
                 if adapter.supports(field)
             ]
             if len(matches) > 1:
@@ -2935,7 +2949,7 @@ class PredictRLM(dspy.RLM):
             value = input_values[field_name]
             field = FieldDescriptor(field_name, field_info.annotation)
             adapter = resolve_input_adapter(
-                self.runtime_spec.inputs,
+                self.runtime_spec.input_adapters,
                 field,
                 value,
             )
@@ -2953,7 +2967,7 @@ class PredictRLM(dspy.RLM):
             field = FieldDescriptor(field_name, field_info.annotation)
             matches = [
                 adapter
-                for adapter in self.runtime_spec.outputs
+                for adapter in self.runtime_spec.output_adapters
                 if adapter.supports(field)
             ]
             if not matches:
@@ -3107,7 +3121,7 @@ class PredictRLM(dspy.RLM):
             field = FieldDescriptor(field_name, field_info.annotation)
             matches = [
                 adapter
-                for adapter in self.runtime_spec.outputs
+                for adapter in self.runtime_spec.output_adapters
                 if adapter.supports(field)
             ]
             if not matches:

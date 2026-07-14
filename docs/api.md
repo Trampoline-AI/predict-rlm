@@ -17,6 +17,7 @@ rlm = PredictRLM(
     max_output_chars=50_000,  # Max chars from REPL output
     verbose=True,             # Print human-readable iteration trace blocks
     tools=None,               # Additional tool functions
+    adapters=(),              # Input and output adapter instances
     skills=None,              # List of Skill instances
     allowed_domains=None,     # Domains the sandbox can access
     debug=False,              # Print timestamped lifecycle diagnostics
@@ -36,10 +37,15 @@ rlm = PredictRLM(
 | `max_output_chars` | `int` | `50_000` | Maximum characters to include from REPL output per iteration. |
 | `verbose` | `bool` | `True` | Print human-readable RLM iteration blocks to stderr: reasoning, generated code, output, tool calls, errors, and `SUBMIT` payloads. Pass `False` for quiet execution. |
 | `tools` | `dict[str, Callable] \| list[Callable] \| None` | `None` | Additional tool functions callable from the sandbox. Accepts a dict mapping names to callables, or a list of callables (names inferred from `__name__`). `predict` is added automatically. |
+| `adapters` | `Sequence[InputAdapter \| OutputAdapter]` | `()` | Input and output adapter instances. Pass a list such as `adapters=[MyInputAdapter(), MyOutputAdapter()]`; each adapter's base class determines its role. |
 | `skills` | `list[Skill] \| None` | `None` | [Skills](skills.md) providing domain-specific instructions, packages, and tools. Merged automatically. |
 | `allowed_domains` | `list[str] \| None` | `None` | Domains/IPs the sandbox can access via network. By default, no network access. Example: `["api.example.com", "192.168.1.100:8080"]` |
 | `debug` | `bool` | `False` | Print timestamped RLM and sandbox lifecycle diagnostics to stderr. Error-like debug records are colored red when the terminal supports ANSI colors. |
 | `output_dir` | `str \| Path \| None` | `None` | Host directory for output files. When set, `File` output fields without an explicit path are written here. If `None`, a temp directory is used. |
+
+Adapter names must be unique within each role; an input and output adapter may
+share a name. A configured adapter with the same name as a built-in compatibility
+adapter replaces that built-in only for the matching input or output role.
 
 ### Verbose, debug, and trace output
 
