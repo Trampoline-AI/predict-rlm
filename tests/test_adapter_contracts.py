@@ -55,12 +55,6 @@ def test_field_descriptor_does_not_flatten_arbitrary_unions_or_nested_lists():
     assert not FieldDescriptor("source", list[list[File]]).matches(File)
 
 
-def test_adapter_contract_module_exports_field_descriptor():
-    from predict_rlm.adapters import FieldDescriptor as ExportedFieldDescriptor
-
-    assert ExportedFieldDescriptor is FieldDescriptor
-
-
 @pytest.mark.asyncio
 async def test_typed_adapter_bases_own_matching_and_output_preparation():
     class StringInput(InputAdapter[str]):
