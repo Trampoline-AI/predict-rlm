@@ -420,6 +420,9 @@ class OutputAdapter(ABC, Generic[AdapterValue]):
     ) -> Any: ...
 
 
+Adapter = InputAdapter[Any] | OutputAdapter[Any]
+
+
 @runtime_checkable
 class RuntimeTool(Protocol):
     name: str
@@ -546,14 +549,16 @@ class RuntimeContribution:
     """Construction-time values contributed by a module factory."""
 
     instructions: tuple[str, ...] = ()
-    inputs: tuple[InputAdapter[Any], ...] = ()
-    outputs: tuple[OutputAdapter[Any], ...] = ()
+    adapters: Sequence[Adapter] = ()
     tools: tuple[RuntimeTool, ...] = ()
     packages: tuple[str, ...] = ()
     execution: ExecutionBackend | None = None
     events: tuple[EventSink, ...] = ()
     validators: tuple[SignatureValidator, ...] = ()
     tool_operations: tuple[ToolOperation, ...] = ()
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "adapters", tuple(self.adapters))
 
 
 RuntimeModule = Callable[[], RuntimeContribution]
@@ -564,8 +569,7 @@ class RuntimeSpec:
     """Immutable construction-time configuration consumed by every run."""
 
     instructions: tuple[str, ...]
-    inputs: tuple[InputAdapter[Any], ...]
-    outputs: tuple[OutputAdapter[Any], ...]
+    adapters: tuple[Adapter, ...]
     tools: tuple[RuntimeTool, ...]
     packages: tuple[str, ...]
     execution: ExecutionBackend
@@ -576,19 +580,29 @@ class RuntimeSpec:
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "instructions", tuple(self.instructions))
-        object.__setattr__(self, "inputs", tuple(self.inputs))
-        object.__setattr__(self, "outputs", tuple(self.outputs))
+        object.__setattr__(self, "adapters", tuple(self.adapters))
         object.__setattr__(self, "tools", tuple(self.tools))
         object.__setattr__(self, "packages", tuple(self.packages))
         object.__setattr__(self, "events", tuple(self.events))
         object.__setattr__(self, "validators", tuple(self.validators))
         object.__setattr__(self, "tool_operations", tuple(self.tool_operations))
-        _validate_adapters(self.inputs, InputAdapter, "input adapter")
-        _validate_adapters(self.outputs, OutputAdapter, "output adapter")
+        _validate_adapters(self.adapters)
         _validate_unique_names(self.tools, "tool")
-        _validate_unique_names(self.inputs, "input adapter")
-        _validate_unique_names(self.outputs, "output adapter")
+        _validate_unique_names(self.input_adapters, "input adapter")
+        _validate_unique_names(self.output_adapters, "output adapter")
         _validate_unique_names(self.tool_operations, "tool operation")
+
+    @property
+    def input_adapters(self) -> tuple[InputAdapter[Any], ...]:
+        return tuple(
+            adapter for adapter in self.adapters if isinstance(adapter, InputAdapter)
+        )
+
+    @property
+    def output_adapters(self) -> tuple[OutputAdapter[Any], ...]:
+        return tuple(
+            adapter for adapter in self.adapters if isinstance(adapter, OutputAdapter)
+        )
 
 
 Cleanup = Callable[[], Awaitable[None] | None]
@@ -725,8 +739,7 @@ def resolve_runtime_spec(
             for instruction in contribution.instructions
             if instruction
         ),
-        inputs=tuple(adapter for item in contributions for adapter in item.inputs),
-        outputs=tuple(adapter for item in contributions for adapter in item.outputs),
+        adapters=tuple(adapter for item in contributions for adapter in item.adapters),
         tools=tools,
         packages=tuple(packages),
         execution=executions[0],
@@ -783,13 +796,9 @@ def _validate_unique_names(values: Sequence[Any], kind: str) -> None:
         seen.add(name)
 
 
-def _validate_adapters(
-    adapters: Sequence[Any],
-    adapter_type: type[Any],
-    kind: str,
-) -> None:
+def _validate_adapters(adapters: Sequence[Any]) -> None:
     for adapter in adapters:
-        if not isinstance(adapter, adapter_type):
-            raise TypeError(f"{kind.capitalize()}s must inherit from {adapter_type.__name__}")
+        if not isinstance(adapter, (InputAdapter, OutputAdapter)):
+            raise TypeError("Adapters must inherit from InputAdapter or OutputAdapter")
         if not isinstance(getattr(adapter, "value_type", None), type):
-            raise TypeError(f"Each {kind} must define value_type as a class")
+            raise TypeError("Each adapter must define value_type as a class")
