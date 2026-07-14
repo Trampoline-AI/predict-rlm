@@ -512,6 +512,7 @@ def _tool_response_reader_loop() -> None:
             with TOOL_RESPONSE_CONDITION:
                 if not WAITING_TOOL_RESPONSE_IDS:
                     TOOL_RESPONSE_READER_THREAD = None
+                    TOOL_RESPONSE_CONDITION.notify_all()
                     return
             response = _read_protocol_response_line(timeout=0.05)
             if response is None:
@@ -528,7 +529,22 @@ def _tool_response_reader_loop() -> None:
     except BaseException as exc:
         with TOOL_RESPONSE_CONDITION:
             TOOL_RESPONSE_READER_ERROR = exc
+            TOOL_RESPONSE_READER_THREAD = None
             TOOL_RESPONSE_CONDITION.notify_all()
+
+
+def _wait_for_idle_tool_response_reader() -> None:
+    with TOOL_RESPONSE_CONDITION:
+        while (
+            TOOL_RESPONSE_READER_THREAD is not None
+            and not WAITING_TOOL_RESPONSE_IDS
+        ):
+            TOOL_RESPONSE_CONDITION.wait()
+
+
+def _publish_kernel_result(result_queue: multiprocessing.Queue, result: dict[str, Any]) -> None:
+    _wait_for_idle_tool_response_reader()
+    result_queue.put(result)
 
 
 def _reset_tool_protocol_state() -> None:
@@ -1274,26 +1290,32 @@ def _persistent_kernel_runner(
                     defer_final_output=bool(request.get("defer_final_output")),
                 )
             )
-            result_queue.put({"ok": True, "result": result})
+            _publish_kernel_result(result_queue, {"ok": True, "result": result})
             if _has_waiting_tool_responses():
                 return
         except KeyboardInterrupt:
             timeout_seconds = request.get("timeout_seconds")
             if timeout_seconds is None:
-                result_queue.put({"ok": False, "error": _exception_payload(KeyboardInterrupt())})
+                _publish_kernel_result(
+                    result_queue,
+                    {"ok": False, "error": _exception_payload(KeyboardInterrupt())},
+                )
                 if _has_waiting_tool_responses():
                     return
                 continue
             _terminate_descendant_processes()
-            result_queue.put({
-                "ok": True,
-                "result": {
-                    "timeout": {"seconds": timeout_seconds},
-                    "stdout": _read_capture_file(pathlib.Path(request["stdout_path"])),
-                    "stderr": _read_capture_file(pathlib.Path(request["stderr_path"])),
-                    "state": _live_kernel_state(),
+            _publish_kernel_result(
+                result_queue,
+                {
+                    "ok": True,
+                    "result": {
+                        "timeout": {"seconds": timeout_seconds},
+                        "stdout": _read_capture_file(pathlib.Path(request["stdout_path"])),
+                        "stderr": _read_capture_file(pathlib.Path(request["stderr_path"])),
+                        "state": _live_kernel_state(),
+                    },
                 },
-            })
+            )
             if _has_waiting_tool_responses():
                 return
         except BaseException as exc:
@@ -1303,7 +1325,7 @@ def _persistent_kernel_runner(
             )
             if output:
                 error["output"] = output
-            result_queue.put({"ok": False, "error": error})
+            _publish_kernel_result(result_queue, {"ok": False, "error": error})
             if _has_waiting_tool_responses():
                 return
 
