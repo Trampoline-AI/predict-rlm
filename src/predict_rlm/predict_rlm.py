@@ -64,7 +64,7 @@ from .backends.jspi import JspiBackend
 from .compatibility import (
     SyncedFileToolOperation,
     ValueInputAdapter,
-    execution_from_legacy_options,
+    execution_from_options,
 )
 from .compatibility import (
     files as file_compatibility,
@@ -76,6 +76,7 @@ from .rlm_skills import Skill, merge_skills
 from .runtime import (
     Artifact,
     CallableTool,
+    EventSink,
     ExecutionBackend,
     ExecutionFatalError,
     ExecutionResult,
@@ -1023,7 +1024,7 @@ class PredictRLM(dspy.RLM):
         execution: ExecutionBackend | None = None,
         modules: tuple[RuntimeModule | RuntimeContribution, ...]
         | list[RuntimeModule | RuntimeContribution] = (),
-        events: tuple[Any, ...] | list[Any] = (),
+        events: Sequence[EventSink] = (),
     ):
         """
         Args:
@@ -1084,7 +1085,7 @@ class PredictRLM(dspy.RLM):
                        model-chosen timeout knob.
             adapters: Additional input and output adapters contributed to the runtime.
             execution: Small-kernel execution backend. Mutually exclusive with
-                       legacy interpreter and sandbox backend options.
+                       interpreter and sandbox backend options.
             modules: Runtime contribution factories or resolved contributions.
             events: Runtime event sinks.
         """
@@ -1093,7 +1094,7 @@ class PredictRLM(dspy.RLM):
             for value in (interpreter, sandbox_backend, sbx_config, sbx_pool)
         ):
             raise ValueError(
-                "Pass execution or legacy interpreter/sandbox_backend/sbx_config/sbx_pool "
+                "Pass execution or interpreter/sandbox_backend/sbx_config/sbx_pool "
                 "options, not both."
             )
         if interpreter is not None and sbx_pool is not None:
@@ -1228,15 +1229,15 @@ class PredictRLM(dspy.RLM):
         module_selects_execution = any(
             module.execution is not None for module in expanded_modules
         )
-        legacy_execution_selected = any(
+        execution_options_selected = any(
             value is not None
             for value in (interpreter, sandbox_backend, sbx_config, sbx_pool)
         )
 
         if execution is None and not (
-            module_selects_execution and not legacy_execution_selected
+            module_selects_execution and not execution_options_selected
         ):
-            resolved_execution = execution_from_legacy_options(
+            resolved_execution = execution_from_options(
                 owner=self,
                 interpreter=interpreter,
                 sandbox_backend=self._sandbox_backend,

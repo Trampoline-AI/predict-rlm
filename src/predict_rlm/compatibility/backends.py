@@ -1,4 +1,4 @@
-"""Legacy constructor options compiled into final execution backends."""
+"""PredictRLM constructor options compiled into final execution backends."""
 
 from __future__ import annotations
 
@@ -10,7 +10,7 @@ from predict_rlm.backends.jspi import JspiExecutionBackend
 from predict_rlm.runtime import ExecutionBackend, SessionOwnership
 
 
-def execution_from_legacy_options(
+def execution_from_options(
     *,
     owner: Any,
     interpreter: Any,

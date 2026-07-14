@@ -152,6 +152,7 @@ def test_predict_rlm_exposes_one_adapter_extension_parameter():
     parameters = inspect.signature(PredictRLM.__init__).parameters
 
     assert "adapters" in parameters
+    assert parameters["events"].annotation == "Sequence[EventSink]"
     assert "inputs" not in parameters
     assert "outputs" not in parameters
 
@@ -451,7 +452,7 @@ async def test_code_cancellation_emits_paired_terminal_evidence():
         "question: str -> answer: str",
         lm=MagicMock(history=[]),
         execution=backend,
-        events=(sink,),
+        events=[sink],
         max_iterations=1,
         verbose=False,
     )
@@ -884,7 +885,7 @@ async def test_injected_backend_accepts_semantically_reordered_mount_aggregate(
 async def test_async_only_injected_mount_configuration_is_rejected_before_acquisition(
     tmp_path: Path,
 ):
-    from predict_rlm.compatibility.backends import execution_from_legacy_options
+    from predict_rlm.compatibility.backends import execution_from_options
 
     acquisitions = 0
 
@@ -900,7 +901,7 @@ async def test_async_only_injected_mount_configuration_is_rejected_before_acquis
 
     owner = MagicMock()
     owner._acquire_runtime_interpreter = acquire
-    backend = execution_from_legacy_options(
+    backend = execution_from_options(
         owner=owner,
         interpreter=AsyncOnlyInterpreter(),
         sandbox_backend=MagicMock(value="injected"),

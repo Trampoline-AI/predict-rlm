@@ -566,7 +566,12 @@ class SessionOwnership(str, Enum):
 
 
 class InputAdapter(ABC, Generic[AdapterValue]):
-    """Base class for values prepared before an execution session starts."""
+    """Shared configuration for invocation-local input lifecycles.
+
+    Keep mutable state in ``PreparedInput`` or ``RunContext``. The lifecycle is
+    prepare, optional pre-acquisition setup, mount, per-attempt durability, then
+    reverse-order finalization.
+    """
 
     name: ClassVar[str]
     value_type: ClassVar[type[Any]]
@@ -581,7 +586,14 @@ class InputAdapter(ABC, Generic[AdapterValue]):
         field: FieldDescriptor,
         value: AdapterValue | list[AdapterValue] | None,
         ctx: RunContext,
-    ) -> PreparedInput: ...
+    ) -> PreparedInput:
+        """Describe the model value and session needs before acquisition.
+
+        Finalization is guaranteed only after ``prepare_session`` is entered, so
+        clean up partial failures here, use ``ctx.add_cleanup``, or defer owned
+        resource acquisition to that hook.
+        """
+        ...
 
     async def prepare_session(
         self,
@@ -590,7 +602,10 @@ class InputAdapter(ABC, Generic[AdapterValue]):
         ctx: RunContext,
         backend: ExecutionBackend,
     ) -> None:
-        """Perform adapter-owned setup before backend acquisition."""
+        """Optionally acquire adapter-owned state before backend acquisition.
+
+        Once this hook is entered, ``finalize`` runs even when the hook raises.
+        """
 
     async def mount(
         self,
@@ -599,6 +614,11 @@ class InputAdapter(ABC, Generic[AdapterValue]):
         ctx: RunContext,
         session: ExecutionSession,
     ) -> MountedInput:
+        """Bind the prepared input after acquisition without owning the session.
+
+        The default mounts every prepared artifact. A failure still proceeds
+        through adapter and framework finalization.
+        """
         del field
         model_value = prepared.model_value
         bindings = []
@@ -616,10 +636,12 @@ class InputAdapter(ABC, Generic[AdapterValue]):
         result: ExecutionResult | None,
         error: BaseException | None,
     ) -> None:
-        """Observe a completed generated-code attempt.
+        """Durably observe a completed generated-code attempt.
 
-        Framework bootstrap code is excluded. A cancelled attempt has no callback;
-        adapters that require a final flush perform it in ``finalize``.
+        ``result`` or ``error`` describes its outcome. Framework bootstrap and
+        cancelled attempts are excluded. A hook failure aborts the run or is
+        attached to an execution failure; use ``finalize`` for the last flush
+        after cancellation.
         """
 
     async def finalize(
@@ -630,14 +652,22 @@ class InputAdapter(ABC, Generic[AdapterValue]):
         session: ExecutionSession | None,
         error: BaseException | None,
     ) -> None:
-        """Release adapter state before session finalization.
+        """Release adapter-owned state exactly once before session finalization.
 
-        ``session`` is ``None`` when preparation or backend acquisition failed.
+        Adapters whose ``prepare_session`` hook was entered finalize in reverse
+        preparation order on success, failure, or cancellation. Failures do not
+        skip later adapter or session finalization. ``session`` is ``None`` when
+        acquisition never completed; the framework owns its finalization and
+        release.
         """
 
 
 class OutputAdapter(ABC, Generic[AdapterValue]):
-    """Base class for session-bound output destinations."""
+    """Shared configuration for reserving and materializing output destinations.
+
+    Pre-acquisition requirements are followed by session-bound reservation before
+    generated execution and materialization after the final prediction.
+    """
 
     name: ClassVar[str]
     value_type: ClassVar[type[Any]]
@@ -651,7 +681,12 @@ class OutputAdapter(ABC, Generic[AdapterValue]):
         value: AdapterValue | list[AdapterValue] | None,
         ctx: RunContext,
     ) -> SessionRequirements | None:
-        """Contribute host paths or other requirements before session startup."""
+        """Contribute policy or prepare a host destination before acquisition.
+
+        Output adapters have no finalization hook: clean partial failures locally
+        and use ``ctx.add_cleanup`` for host or provider state that can outlive
+        the session.
+        """
 
     @abstractmethod
     async def reserve(
@@ -660,7 +695,12 @@ class OutputAdapter(ABC, Generic[AdapterValue]):
         value: AdapterValue | list[AdapterValue] | None,
         ctx: RunContext,
         session: ExecutionSession,
-    ) -> OutputReservation: ...
+    ) -> OutputReservation:
+        """Bind one destination after acquisition and before generated execution.
+
+        Return its artifact and model-visible value; a failure aborts the run.
+        """
+        ...
 
     @abstractmethod
     async def materialize(
@@ -669,7 +709,13 @@ class OutputAdapter(ABC, Generic[AdapterValue]):
         submitted_value: Any,
         ctx: RunContext,
         session: ExecutionSession,
-    ) -> Any: ...
+    ) -> Any:
+        """Collect or translate a submitted value while the session is active.
+
+        This runs after the final prediction and returns the public value that
+        replaces the submitted field; a failure aborts the run.
+        """
+        ...
 
 
 Adapter = InputAdapter[Any] | OutputAdapter[Any]
