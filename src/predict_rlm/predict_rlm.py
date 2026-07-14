@@ -2,16 +2,18 @@
 
 from __future__ import annotations
 
+import asyncio
+import functools
 import hashlib
 import inspect
 import logging
 import os
 import re
 import time
-import types
+import uuid
 from contextlib import asynccontextmanager, contextmanager
 from copy import deepcopy
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import (
     TYPE_CHECKING,
@@ -23,8 +25,6 @@ from typing import (
     Literal,
     Optional,
     Protocol,
-    get_args,
-    get_origin,
     runtime_checkable,
 )
 
@@ -53,18 +53,52 @@ from ._logging import (
 from ._shared import build_rlm_signatures, format_tool_docs_full, strip_code_fences
 from .backends import (
     BackendName,
-    ExecutionBackend,
 )
-from .backends.base import SandboxFatalError
+from .backends.adapters import (
+    ExistingExecutionBackendAdapter,
+)
+from .backends.base import LegacyExecutionBackend, SandboxFatalError
 from .backends.jspi import JspiBackend
+from .compatibility import (
+    FileInputAdapter,
+    FileOutputAdapter,
+    SyncedFileToolOperation,
+    ValueInputAdapter,
+    WorkspaceInputAdapter,
+    execution_from_legacy_options,
+    validate_file_workspace_signature,
+)
+from .evidence import EvidenceRecorder, RunEventKind
 from .execution_timeout import validate_execution_timeout
 from .files import File, build_file_plan, scan_file_fields, scan_workspace_fields
 from .rlm_skills import Skill, merge_skills
+from .runtime import (
+    Artifact,
+    CallableTool,
+    ExecutionBackend,
+    ExecutionFatalError,
+    ExecutionResult,
+    ExecutionSpec,
+    FieldDescriptor,
+    RunContext,
+    RuntimeContribution,
+    RuntimeModule,
+    RuntimeSpec,
+    current_run_context,
+    invoke_host_callable,
+    preserve_sync_leaf,
+    resolve_input_adapter,
+    resolve_output_adapter,
+    resolve_runtime_spec,
+    use_run_context,
+)
 from .runtime_hooks import RuntimeHook, RuntimeHookEvent
 from .telemetry import TelemetryContext, make_span_id
 from .trace import (
     IterationStep,
     LMUsage,
+    RunEvidence,
+    RunEvidenceEvent,
     RunTrace,
     TokenUsage,
     _RawPredictCall,
@@ -81,6 +115,7 @@ from .trace import (
     snapshot_lm_history_len,
     usage_since,
 )
+from .workspace import Workspace
 
 _CB_LOGGER = logging.getLogger("predict_rlm.callbacks")
 
@@ -100,6 +135,51 @@ class _TraceExportContext:
     lm_hist_start: int
     sub_hist_start: int
     run_start: float
+
+
+class _RunStateField:
+    """Store mutable invocation state on the active RunContext."""
+
+    def __init__(self, name: str) -> None:
+        self.name = name
+
+    def __get__(self, instance: Any, owner: type | None = None) -> Any:
+        if instance is None:
+            return self
+        ctx = current_run_context()
+        if ctx is not None and self.name in ctx.state:
+            return ctx.state[self.name]
+        return instance.__dict__.get(self.name)
+
+    def __set__(self, instance: Any, value: Any) -> None:
+        ctx = current_run_context()
+        if ctx is not None:
+            ctx.state[self.name] = value
+        else:
+            instance.__dict__[self.name] = value
+
+
+class _ExecutionSessionRepl:
+    """Compatibility view used while the iteration loop migrates to sessions."""
+
+    def __init__(self, session: Any) -> None:
+        self._session = session
+
+    async def aexecute(
+        self,
+        code: str,
+        variables: dict[str, Any] | None = None,
+        *,
+        timeout: float | None = None,
+    ) -> Any:
+        result = await self._session.run_code(code, variables, timeout=timeout)
+        return result.value if isinstance(result, ExecutionResult) else result
+
+    def __getattr__(self, name: str) -> Any:
+        raise AttributeError(
+            f"Execution session {type(self._session).__name__} does not expose legacy "
+            f"interpreter operation {name!r}"
+        )
 
 
 # Capture the real dspy.Image class at import time so type comparisons
@@ -230,17 +310,7 @@ _OUTPUT_VALIDATION_MODELS: dict[type[Any], type[Any]] = {}
 
 def _annotation_allows_none(annotation: Any) -> bool:
     """Return True when a type annotation explicitly accepts None."""
-    if annotation is Any:
-        return True
-    origin = get_origin(annotation)
-    if origin in (types.UnionType, getattr(types, "UnionType", object)):
-        return type(None) in get_args(annotation)
-
-    import typing as _typing
-
-    if origin is _typing.Union:
-        return type(None) in get_args(annotation)
-    return False
+    return annotation is Any or FieldDescriptor("", annotation).allows_none
 
 
 def _output_validation_model(signature: type[Any]) -> type[Any]:
@@ -902,8 +972,16 @@ class PredictRLM(dspy.RLM):
     # Override reserved tool names - we allow predict but not llm_query
     _RESERVED_TOOL_NAMES = frozenset({"SUBMIT", "print"})
 
-    # Captured context LM from forward() - used by predict() in thread pool
-    _context_lm: dspy.LM | None = None
+    _context_lm = _RunStateField("_context_lm")
+    _partial_history = _RunStateField("_partial_history")
+    _partial_pending_entry = _RunStateField("_partial_pending_entry")
+    _partial_pending_start = _RunStateField("_partial_pending_start")
+    _current_telemetry_context = _RunStateField("_current_telemetry_context")
+    _current_predictor_id = _RunStateField("_current_predictor_id")
+    _trace_export_context = _RunStateField("_trace_export_context")
+    _pending_submit_confirmation = _RunStateField("_pending_submit_confirmation")
+    _last_action_lm_usage = _RunStateField("_last_action_lm_usage")
+    _last_action_lm_metadata = _RunStateField("_last_action_lm_metadata")
 
     def __init__(
         self,
@@ -929,6 +1007,13 @@ class PredictRLM(dspy.RLM):
         runtime_hooks: list[RuntimeHook] | None = None,
         on_runtime_hook_event: Callable[[RuntimeHookEvent], Any] | None = None,
         model_execution_timeout: bool = False,
+        *,
+        inputs: tuple[Any, ...] | list[Any] = (),
+        outputs: tuple[Any, ...] | list[Any] = (),
+        execution: ExecutionBackend | None = None,
+        modules: tuple[RuntimeModule | RuntimeContribution, ...]
+        | list[RuntimeModule | RuntimeContribution] = (),
+        events: tuple[Any, ...] | list[Any] = (),
     ):
         """
         Args:
@@ -988,6 +1073,14 @@ class PredictRLM(dspy.RLM):
                        300s) remains as the hang guard. Set True to restore the
                        model-chosen timeout knob.
         """
+        if execution is not None and any(
+            value is not None
+            for value in (interpreter, sandbox_backend, sbx_config, sbx_pool)
+        ):
+            raise ValueError(
+                "Pass execution or legacy interpreter/sandbox_backend/sbx_config/sbx_pool "
+                "options, not both."
+            )
         if interpreter is not None and sbx_pool is not None:
             raise ValueError(
                 "Pass either interpreter or sbx_pool, not both. "
@@ -1114,6 +1207,157 @@ class PredictRLM(dspy.RLM):
             interpreter=interpreter,
         )
 
+        expanded_modules = tuple(module() if callable(module) else module for module in modules)
+        if not all(isinstance(module, RuntimeContribution) for module in expanded_modules):
+            raise TypeError("Runtime modules must return RuntimeContribution")
+        module_selects_execution = any(
+            module.execution is not None for module in expanded_modules
+        )
+        legacy_execution_selected = any(
+            value is not None
+            for value in (interpreter, sandbox_backend, sbx_config, sbx_pool)
+        )
+
+        if execution is None and not (
+            module_selects_execution and not legacy_execution_selected
+        ):
+            resolved_execution = execution_from_legacy_options(
+                owner=self,
+                interpreter=interpreter,
+                sandbox_backend=self._sandbox_backend,
+                sbx_config=self._sbx_config,
+                sbx_pool=self._sbx_pool,
+                allowed_domains=self._allowed_domains,
+                runtime_hooks=self._runtime_hooks,
+                on_runtime_hook_event=self._on_runtime_hook_event,
+            )
+        elif execution is not None:
+            resolved_execution = ExistingExecutionBackendAdapter(execution)
+        else:
+            resolved_execution = None
+        runtime_tools = tuple(
+            CallableTool(
+                name=name,
+                function=tool.func,
+                description=str(getattr(tool, "desc", "") or ""),
+                schema=getattr(tool, "args", {}) or {},
+            )
+            for name, tool in self._user_tools.items()
+        )
+        configured_input_names = {
+            adapter.name
+            for module in expanded_modules
+            for adapter in module.inputs
+        } | {adapter.name for adapter in inputs}
+        configured_output_names = {
+            adapter.name
+            for module in expanded_modules
+            for adapter in module.outputs
+        } | {adapter.name for adapter in outputs}
+        configured_tool_operation_names = {
+            operation.name
+            for module in expanded_modules
+            for operation in module.tool_operations
+        }
+        compatibility_inputs = tuple(
+            adapter
+            for adapter in (
+            ValueInputAdapter(),
+            FileInputAdapter(),
+            WorkspaceInputAdapter(),
+            )
+            if adapter.name not in configured_input_names
+        )
+        compatibility_outputs = tuple(
+            adapter
+            for adapter in (FileOutputAdapter(self._output_dir),)
+            if adapter.name not in configured_output_names
+        )
+        compatibility_tool_operations = (
+            ()
+            if SyncedFileToolOperation.name in configured_tool_operation_names
+            else (SyncedFileToolOperation(),)
+        )
+        self._runtime_spec = resolve_runtime_spec(
+            direct=RuntimeContribution(
+                instructions=(self._skill_instructions,) if self._skill_instructions else (),
+                inputs=(*compatibility_inputs, *tuple(inputs)),
+                outputs=(*compatibility_outputs, *tuple(outputs)),
+                tools=runtime_tools,
+                packages=tuple(self._skill_packages),
+                execution=resolved_execution,
+                events=tuple(events),
+                validators=(validate_file_workspace_signature,),
+                tool_operations=compatibility_tool_operations,
+            ),
+            modules=expanded_modules,
+        )
+        for validator in self._runtime_spec.validators:
+            validator(self.signature)
+        for field_name, field_info in self.signature.output_fields.items():
+            field = FieldDescriptor(field_name, field_info.annotation)
+            matches = [
+                adapter
+                for adapter in self._runtime_spec.outputs
+                if adapter.supports(field)
+            ]
+            if len(matches) > 1:
+                resolve_output_adapter(matches, field)
+        action_signature, extract_signature = self._build_signatures()
+        self.generate_action = dspy.Predict(action_signature)
+        self.extract = dspy.Predict(extract_signature)
+
+    @property
+    def runtime_spec(self) -> RuntimeSpec:
+        return self._runtime_spec
+
+    def _acquire_runtime_interpreter(
+        self,
+        spec: ExecutionSpec,
+        ctx: RunContext,
+    ):
+        return self._interpreter_context(execution_tools=dict(spec.tools))
+
+    def _new_run_context(self, input_values: dict[str, Any]) -> RunContext:
+        ctx = RunContext(self.runtime_spec, input_values)
+        ctx.state["lm"] = (
+            self._lm.copy() if isinstance(self._lm, dspy.LM) else self._lm
+        )
+        ctx.state["sub_lm"] = (
+            self._sub_lm.copy() if isinstance(self._sub_lm, dspy.LM) else self._sub_lm
+        )
+        return ctx
+
+    def _active_sub_lm(self) -> Any:
+        ctx = current_run_context()
+        return ctx.state.get("sub_lm") if ctx is not None else self._sub_lm
+
+    def _evidence(self) -> EvidenceRecorder | None:
+        ctx = current_run_context()
+        if ctx is None:
+            return None
+        recorder = ctx.state.get("evidence")
+        return recorder if isinstance(recorder, EvidenceRecorder) else None
+
+    def _runtime_packages(self) -> tuple[str, ...]:
+        spec = getattr(self, "_runtime_spec", None)
+        return spec.packages if spec is not None else tuple(self._skill_packages)
+
+    def _runtime_tool_functions(self) -> dict[str, Callable[..., Any]]:
+        spec = getattr(self, "_runtime_spec", None)
+        if spec is None:
+            return {name: tool.func for name, tool in self._user_tools.items()}
+        return {
+            tool.name: tool.function if isinstance(tool, CallableTool) else tool
+            for tool in spec.tools
+        }
+
+    def _runtime_instructions(self) -> str:
+        spec = getattr(self, "_runtime_spec", None)
+        if spec is None:
+            return self._skill_instructions
+        return "\n\n".join(spec.instructions)
+
     def _create_predict_tool(self) -> Callable[..., dict[str, Any]]:
         """Create the predict tool for running DSPy signatures."""
         # Capture self to access _sub_lm at call time
@@ -1220,8 +1464,14 @@ class PredictRLM(dspy.RLM):
                 )
                 print(result["tasks"])  # List of TaskItem dicts
             """
+            recorder = rlm_instance._evidence()
+            predict_call_id = uuid.uuid4().hex
             # Priority: sub_lm > captured context LM > current settings.lm
-            lm = rlm_instance._sub_lm or rlm_instance._context_lm or dspy.settings.lm
+            lm = (
+                rlm_instance._active_sub_lm()
+                or rlm_instance._context_lm
+                or dspy.settings.lm
+            )
             if lm is None:
                 raise RuntimeError(
                     "No LM available for predict. Either pass sub_lm to PredictRLM "
@@ -1333,6 +1583,15 @@ class PredictRLM(dspy.RLM):
             _call_start = time.perf_counter()
             _hist_len_before = snapshot_lm_history_len(lm)
             result: dict[str, Any] = {}
+            if recorder is not None:
+                await recorder.emit(
+                    RunEventKind.PREDICT_STARTED,
+                    call_id=predict_call_id,
+                    signature=signature,
+                    instructions=instructions,
+                    model=str(getattr(lm, "model", lm)),
+                    input=kwargs,
+                )
             try:
                 with dspy.context(lm=lm):
                     prediction = await predictor.acall(**wrapped_kwargs)
@@ -1411,7 +1670,7 @@ class PredictRLM(dspy.RLM):
                                 f"is acceptable."
                             )
                     result[field] = _to_serializable(value)
-            except Exception as exc:
+            except BaseException as exc:
                 record_predict_call(
                     _RawPredictCall(
                         signature=signature,
@@ -1425,6 +1684,18 @@ class PredictRLM(dspy.RLM):
                         lm=lm_finish_since(lm, _hist_len_before),
                     )
                 )
+                if recorder is not None:
+                    try:
+                        await recorder.emit(
+                            RunEventKind.PREDICT_FINISHED,
+                            call_id=predict_call_id,
+                            error_type=type(exc).__name__,
+                            error=str(exc),
+                            cancelled=isinstance(exc, asyncio.CancelledError),
+                            output=result,
+                        )
+                    except BaseException as evidence_error:
+                        setattr(exc, "evidence_error", evidence_error)
                 raise
             else:
                 record_predict_call(
@@ -1439,6 +1710,12 @@ class PredictRLM(dspy.RLM):
                         lm=lm_finish_since(lm, _hist_len_before),
                     )
                 )
+                if recorder is not None:
+                    await recorder.emit(
+                        RunEventKind.PREDICT_FINISHED,
+                        call_id=predict_call_id,
+                        output=result,
+                    )
                 return result
 
         return predict
@@ -1457,14 +1734,13 @@ class PredictRLM(dspy.RLM):
         """
         from dspy.primitives.code_interpreter import SIMPLE_TYPES
 
-        from .files import _is_list_annotation, is_file_type
-
         fields = []
         for name, field in self.signature.output_fields.items():
             annotation = getattr(field, "annotation", str)
+            descriptor = FieldDescriptor(name, annotation)
             field_info = {"name": name}
-            if is_file_type(annotation):
-                field_info["type"] = "list" if _is_list_annotation(annotation) else "str"
+            if descriptor.matches(File):
+                field_info["type"] = "list" if descriptor.is_list else "str"
             elif annotation in SIMPLE_TYPES:
                 field_info["type"] = annotation.__name__
             default = _get_field_default(field)
@@ -1486,18 +1762,19 @@ class PredictRLM(dspy.RLM):
         or a ``File`` instance, so we wrap bare strings before the parent's
         ``parse_value`` runs.
         """
-        from .files import _is_list_annotation, is_file_type
-
         raw = result.output
         if isinstance(raw, dict):
             for name in output_field_names:
                 if name not in raw:
                     continue
                 field = self.signature.output_fields.get(name)
-                if field is None or not is_file_type(field.annotation):
+                if field is None:
+                    continue
+                descriptor = FieldDescriptor(name, field.annotation)
+                if not descriptor.matches(File):
                     continue
                 val = raw[name]
-                if _is_list_annotation(field.annotation):
+                if descriptor.is_list:
                     if isinstance(val, list):
                         raw[name] = [{"path": v} if isinstance(v, str) else v for v in val]
                 elif isinstance(val, str):
@@ -1510,7 +1787,7 @@ class PredictRLM(dspy.RLM):
         self,
         execution_tools: dict[str, Callable],
         file_plan: dict[str, Any] | None = None,
-    ) -> Iterator[ExecutionBackend]:
+    ) -> Iterator[LegacyExecutionBackend]:
         """Yield interpreter, creating the configured backend if none provided."""
         if self._interpreter is not None:
             if self._runtime_hooks:
@@ -1568,7 +1845,7 @@ class PredictRLM(dspy.RLM):
                 "tools": execution_tools,
                 "output_fields": self._get_output_fields_info(),
                 "allowed_domains": self._allowed_domains,
-                "skill_packages": self._skill_packages or None,
+                "skill_packages": list(self._runtime_packages()) or None,
                 "debug": self._debug,
                 "verbose": self._iteration_logging_enabled(),
                 "extra_read_paths": extra_read or None,
@@ -1584,7 +1861,7 @@ class PredictRLM(dspy.RLM):
                 with self._sbx_pool.lease(
                     tools=execution_tools,
                     output_fields=self._get_output_fields_info(),
-                    skill_packages=self._skill_packages or None,
+                    skill_packages=list(self._runtime_packages()) or None,
                     debug=self._debug,
                     verbose=self._iteration_logging_enabled(),
                     runtime_hooks=self._runtime_hooks,
@@ -1613,7 +1890,7 @@ class PredictRLM(dspy.RLM):
                     tools=len(execution_tools),
                     output_fields=len(self._get_output_fields_info()),
                     allowed_domains=len(self._allowed_domains or []),
-                    skill_packages=len(self._skill_packages or []),
+                    skill_packages=len(self._runtime_packages()),
                 )
                 repl = SbxBackend(
                     config=self._sbx_config or SbxConfig(),
@@ -1628,7 +1905,7 @@ class PredictRLM(dspy.RLM):
                     tools=len(execution_tools),
                     output_fields=len(self._get_output_fields_info()),
                     allowed_domains=len(self._allowed_domains or []),
-                    skill_packages=len(self._skill_packages or []),
+                    skill_packages=len(self._runtime_packages()),
                 )
                 repl = JspiBackend(
                     **interpreter_kwargs,
@@ -1645,12 +1922,215 @@ class PredictRLM(dspy.RLM):
                 )
                 repl.shutdown()
 
+    @asynccontextmanager
+    async def _execution_session(
+        self,
+        execution_tools: dict[str, Callable[..., Any]],
+        file_plan: dict[str, Any] | None = None,
+    ) -> AsyncIterator[Any]:
+        ctx = current_run_context()
+        if ctx is None:
+            kwargs = {"execution_tools": execution_tools}
+            if file_plan is not None:
+                kwargs["file_plan"] = file_plan
+            with self._interpreter_context(**kwargs) as repl:
+                yield repl
+            return
+        execution_spec = ExecutionSpec(
+            tools=execution_tools,
+            output_fields=tuple(self._get_output_fields_info()),
+            packages=tuple(self.runtime_spec.packages),
+            allowed_domains=tuple(self._allowed_domains or ()),
+            extra_read_paths=tuple(
+                dict.fromkeys(
+                    (
+                        *ctx.state.get("extra_read_paths", ()),
+                        *(
+                            path
+                            for tool in self.runtime_spec.tools
+                            for path in getattr(tool, "extra_read_paths", ())
+                        ),
+                    )
+                )
+            ),
+            extra_write_paths=tuple(
+                dict.fromkeys(
+                    (
+                        *ctx.state.get("extra_write_paths", ()),
+                        *(
+                            path
+                            for tool in self.runtime_spec.tools
+                            for path in getattr(tool, "extra_write_paths", ())
+                        ),
+                    )
+                )
+            ),
+            debug=self._debug,
+            verbose=self._iteration_logging_enabled(),
+            metadata={"has_file_plan": file_plan is not None},
+        )
+        recorder = self._evidence()
+        session_name: str | None = None
+        primary: BaseException | None = None
+        release_succeeded = False
+        try:
+            async with self.runtime_spec.execution.start(execution_spec, ctx) as session:
+                session_name = session.name
+                ctx.session = session
+                ctx.ownership = session.ownership
+                try:
+                    if recorder is not None:
+                        await recorder.emit(
+                            RunEventKind.SESSION_STARTED,
+                            backend=session.name,
+                            ownership=getattr(session.ownership, "value", session.ownership),
+                        )
+                    await session.install_packages(self.runtime_spec.packages)
+                    if recorder is not None:
+                        await recorder.emit(
+                            RunEventKind.PACKAGES_INSTALLED,
+                            packages=list(self.runtime_spec.packages),
+                        )
+                    repl = _ExecutionSessionRepl(session)
+                    yield repl
+                except BaseException as exc:
+                    primary = exc
+                    try:
+                        await asyncio.shield(session.cancel())
+                    except BaseException as cancel_error:
+                        setattr(exc, "session_cancel_error", cancel_error)
+                    raise
+                finally:
+                    finalize_task = asyncio.create_task(session.finalize())
+                    finalize_cancellation: asyncio.CancelledError | None = None
+                    try:
+                        try:
+                            await asyncio.shield(finalize_task)
+                        except asyncio.CancelledError as exc:
+                            finalize_cancellation = exc
+                            await finalize_task
+                        if recorder is not None:
+                            await recorder.emit(
+                                RunEventKind.SESSION_FINALIZED,
+                                backend=session.name,
+                            )
+                    except BaseException as finalize_error:
+                        if recorder is not None:
+                            recorder.mark_incomplete(finalize_error)
+                            try:
+                                await recorder.emit(
+                                    RunEventKind.SESSION_FINALIZE_FAILED,
+                                    backend=session.name,
+                                    error_type=type(finalize_error).__name__,
+                                    error=str(finalize_error),
+                                )
+                            except BaseException as evidence_error:
+                                setattr(finalize_error, "evidence_error", evidence_error)
+                        if primary is not None:
+                            setattr(primary, "session_finalize_error", finalize_error)
+                        else:
+                            primary = finalize_error
+                            raise
+                    if finalize_cancellation is not None:
+                        if primary is not None:
+                            setattr(primary, "session_finalize_cancellation", finalize_cancellation)
+                        else:
+                            primary = finalize_cancellation
+                            raise finalize_cancellation
+            release_succeeded = True
+        except BaseException as release_or_primary:
+            if primary is release_or_primary:
+                release_succeeded = True
+            elif primary is not None:
+                setattr(primary, "session_release_error", release_or_primary)
+            else:
+                primary = release_or_primary
+            if not release_succeeded and recorder is not None and session_name is not None:
+                try:
+                    await recorder.emit(
+                        RunEventKind.SESSION_RELEASE_FAILED,
+                        backend=session_name,
+                        error_type=type(release_or_primary).__name__,
+                        error=str(release_or_primary),
+                    )
+                except BaseException as evidence_error:
+                    setattr(primary, "release_evidence_error", evidence_error)
+            raise primary
+        else:
+            if primary is not None:
+                raise primary
+        finally:
+            ctx.session = None
+            if release_succeeded and recorder is not None and session_name is not None:
+                try:
+                    await recorder.emit(
+                        RunEventKind.SESSION_RELEASED,
+                        backend=session_name,
+                    )
+                except BaseException as release_evidence_error:
+                    if primary is not None:
+                        setattr(primary, "release_evidence_error", release_evidence_error)
+                    else:
+                        raise
+
     def _prepare_execution_tools(self) -> dict[str, Callable]:
         """Return only user-provided tools (including predict).
 
         Override parent to skip the default llm_query and llm_query_batched tools.
         """
-        return {name: tool.func for name, tool in self._user_tools.items()}
+        tools = self._runtime_tool_functions()
+        return {
+            name: function
+            if name == "predict"
+            else self._wrap_evidence_tool(name, function)
+            for name, function in tools.items()
+        }
+
+    def _wrap_evidence_tool(
+        self,
+        name: str,
+        function: Callable[..., Any],
+    ) -> Callable[..., Any]:
+        @functools.wraps(function)
+        async def dispatch(*args: Any, **kwargs: Any) -> Any:
+            recorder = self._evidence()
+            call_id = uuid.uuid4().hex
+            if recorder is not None:
+                await recorder.emit(
+                    RunEventKind.TOOL_STARTED,
+                    call_id=call_id,
+                    name=name,
+                    args=list(args),
+                    kwargs=kwargs,
+                )
+            try:
+                result = await invoke_host_callable(function, *args, **kwargs)
+            except BaseException as exc:
+                if recorder is not None:
+                    try:
+                        await recorder.emit(
+                            RunEventKind.TOOL_FINISHED,
+                            call_id=call_id,
+                            name=name,
+                            error_type=type(exc).__name__,
+                            error=str(exc),
+                            cancelled=isinstance(exc, asyncio.CancelledError),
+                        )
+                    except BaseException as evidence_error:
+                        setattr(exc, "evidence_error", evidence_error)
+                raise
+            if recorder is not None:
+                await recorder.emit(
+                    RunEventKind.TOOL_FINISHED,
+                    call_id=call_id,
+                    name=name,
+                    result=result,
+                )
+            return result
+
+        dispatch.__name__ = name
+        preserve_sync_leaf(dispatch, function)
+        return dispatch
 
     def _debug_lm_metadata(self, metadata: Any | None) -> dict[str, Any]:
         if metadata is None:
@@ -1677,8 +2157,10 @@ class PredictRLM(dspy.RLM):
     def _lm_context(self):
         """Set the configured LM as active context and capture it for predict() calls."""
         context_kwargs: dict[str, Any] = {}
-        if self._lm is not None:
-            context_kwargs["lm"] = self._lm
+        run_ctx = current_run_context()
+        active_lm = run_ctx.state.get("lm") if run_ctx is not None else self._lm
+        if active_lm is not None:
+            context_kwargs["lm"] = active_lm
         if getattr(dspy.settings, "adapter", None) is None:
             context_kwargs["adapter"] = _ValidatingChatAdapter()
 
@@ -1819,12 +2301,13 @@ class PredictRLM(dspy.RLM):
         return self._configure_interpreter_logging(repl)
 
     def _ensure_interpreter_skill_packages(self, repl: Any) -> bool:
-        if not self._skill_packages:
+        packages = self._runtime_packages()
+        if not packages:
             return False
         ensure_skill_packages = self._declared_callable(repl, "ensure_skill_packages")
         if ensure_skill_packages is None:
             return False
-        ensure_skill_packages(self._skill_packages)
+        ensure_skill_packages(list(packages))
         return True
 
     def _configure_interpreter_logging(self, repl: Any) -> dict[str, bool]:
@@ -2120,9 +2603,26 @@ class PredictRLM(dspy.RLM):
         Handles File inputs by mounting them into the sandbox,
         and File outputs by syncing them back to the host.
         """
-        with self._lm_context():
-            file_plan, kwargs = self._prepare_file_io(kwargs)
-            return self._forward_traced(file_plan, **kwargs)
+        if type(self)._forward_traced is not _KERNEL_FORWARD_TRACED:
+            with self._lm_context():
+                return self._forward_traced(None, **kwargs)
+        bound_forward = getattr(self._aforward_traced, "__func__", None)
+        if bound_forward is not _KERNEL_AFORWARD_TRACED:
+            with self._lm_context():
+                result = self._aforward_traced(None, **kwargs)
+            return self._run_async(result) if inspect.isawaitable(result) else result
+        return self._run_async(self._aforward_kernel(kwargs, sync_callbacks=True))
+
+    def _run_async(self, awaitable: Any) -> Any:
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return asyncio.run(awaitable)
+
+        import nest_asyncio
+
+        nest_asyncio.apply(loop)
+        return loop.run_until_complete(awaitable)
 
     def _build_run_trace(
         self,
@@ -2321,14 +2821,354 @@ class PredictRLM(dspy.RLM):
         Uses aexecute() on the interpreter so asyncio.gather can run
         multiple rollouts concurrently.
         """
-        self._context_lm = dspy.settings.lm
+        return await self._aforward_kernel(kwargs, sync_callbacks=False)
 
-        try:
-            file_plan, kwargs = self._prepare_file_io(kwargs)
-            with self._lm_context():
-                return await self._aforward_traced(file_plan, **kwargs)
-        finally:
-            self._context_lm = None
+    async def _aforward_kernel(
+        self,
+        kwargs: dict[str, Any],
+        *,
+        sync_callbacks: bool,
+    ) -> dspy.Prediction:
+        ctx = self._new_run_context(kwargs)
+        ctx.state["sync_callbacks"] = sync_callbacks
+        recorder = EvidenceRecorder(ctx, self.runtime_spec.events)
+        ctx.state["evidence"] = recorder
+        async with use_run_context(ctx):
+            cleanup_complete = False
+            try:
+                await recorder.emit(
+                    RunEventKind.RUN_STARTED,
+                    inputs=dict(ctx.input_values),
+                )
+                await self._prepare_runtime_inputs(ctx, kwargs)
+                await self._prepare_runtime_outputs(ctx)
+                ctx.state.setdefault("extra_read_paths", []).extend(
+                    self._skill_modules.values()
+                )
+                self._validate_runtime_artifacts(ctx)
+                kwargs = {
+                    **kwargs,
+                    **{
+                        name: prepared.model_value
+                        for name, prepared in ctx.prepared_inputs.items()
+                    },
+                }
+                with self._lm_context():
+                    result = self._aforward_traced(None, **kwargs)
+                    prediction = await result if inspect.isawaitable(result) else result
+                await ctx.cleanup()
+                cleanup_complete = True
+            except BaseException as exc:
+                if not cleanup_complete:
+                    try:
+                        await ctx.cleanup()
+                    except BaseException as cleanup_error:
+                        setattr(exc, "cleanup_error", cleanup_error)
+                await recorder.finish_failure(exc)
+                self._attach_runtime_evidence(getattr(exc, "trace", None), recorder)
+                raise
+            else:
+                trace = getattr(prediction, "trace", None)
+                outputs = {
+                    name: getattr(prediction, name, None)
+                    for name in self.signature.output_fields
+                }
+                try:
+                    await recorder.finish_success(
+                        status=getattr(trace, "status", "completed"),
+                        outputs=outputs,
+                    )
+                except BaseException as exc:
+                    if trace is not None:
+                        trace.status = "error"
+                        setattr(exc, "trace", trace)
+                    self._attach_runtime_evidence(trace, recorder)
+                    raise
+                self._attach_runtime_evidence(trace, recorder)
+                return prediction
+
+    def _attach_runtime_evidence(
+        self,
+        trace: RunTrace | None,
+        recorder: EvidenceRecorder,
+    ) -> None:
+        if trace is None:
+            return
+        trace.evidence = RunEvidence(
+            run_id=recorder.ctx.run_id,
+            complete=recorder.complete,
+            terminal_outcome=recorder.ctx.terminal_outcome,
+            events=[
+                RunEvidenceEvent(
+                    sequence=event.sequence,
+                    kind=event.kind.value,
+                    timestamp_ns=event.timestamp_ns,
+                    data=dict(event.data),
+                )
+                for event in recorder.events
+            ],
+        )
+
+    @asynccontextmanager
+    async def _iteration_callback_scope_for_run(
+        self,
+        call_id: str | None,
+        iteration: int,
+    ) -> AsyncIterator[_IterationCallbackState]:
+        ctx = current_run_context()
+        if ctx is not None and ctx.state.get("sync_callbacks"):
+            with self._iteration_callback_scope(call_id, iteration) as state:
+                yield state
+            return
+        async with self._aiteration_callback_scope(call_id, iteration) as state:
+            yield state
+
+    async def _prepare_runtime_inputs(
+        self,
+        ctx: RunContext,
+        input_values: dict[str, Any],
+    ) -> None:
+        recorder = self._evidence()
+        for field_name, field_info in self.signature.input_fields.items():
+            if field_name not in input_values:
+                continue
+            value = input_values[field_name]
+            field = FieldDescriptor(field_name, field_info.annotation)
+            adapter = resolve_input_adapter(
+                self.runtime_spec.inputs,
+                field,
+                value,
+            )
+            prepared = await adapter.prepare(field, value, ctx)
+            ctx.prepared_inputs[field_name] = prepared
+            if recorder is not None:
+                await recorder.emit(
+                    RunEventKind.INPUT_PREPARED,
+                    field=field_name,
+                    adapter=adapter.name,
+                    artifact_ids=[artifact.id for artifact in prepared.artifacts],
+                )
+    async def _prepare_runtime_outputs(self, ctx: RunContext) -> None:
+        for field_name, field_info in self.signature.output_fields.items():
+            field = FieldDescriptor(field_name, field_info.annotation)
+            matches = [
+                adapter
+                for adapter in self.runtime_spec.outputs
+                if adapter.supports(field)
+            ]
+            if not matches:
+                continue
+            adapter = resolve_output_adapter(matches, field)
+            await adapter.prepare_session(
+                field,
+                ctx.input_values.get(field_name),
+                ctx,
+            )
+
+    async def _bind_runtime_inputs(self, ctx: RunContext) -> None:
+        recorder = self._evidence()
+        session = ctx.session
+        if session is None:
+            raise RuntimeError("Artifact binding requires an active execution session")
+        direct_bindings = {}
+        for prepared in ctx.prepared_inputs.values():
+            for artifact in prepared.artifacts:
+                if artifact.kind != "compat.workspace.direct":
+                    continue
+                binding = await session.mount(artifact)
+                ctx.bind(binding)
+                direct_bindings[artifact.id] = binding
+                if recorder is not None:
+                    await recorder.emit(
+                        RunEventKind.ARTIFACT_MOUNTED,
+                        artifact_id=artifact.id,
+                        path=binding.path,
+                    )
+        for field_name, prepared in tuple(ctx.prepared_inputs.items()):
+            model_value = prepared.model_value
+            for artifact in prepared.artifacts:
+                binding = direct_bindings.get(artifact.id)
+                if binding is None:
+                    binding = await session.mount(artifact)
+                    ctx.bind(binding)
+                planned_path = artifact.metadata.get("sandbox_path")
+                if isinstance(planned_path, str):
+                    model_value = self._replace_bound_path(
+                        model_value,
+                        planned_path,
+                        binding.path,
+                    )
+                if recorder is not None and artifact.id not in direct_bindings:
+                    await recorder.emit(
+                        RunEventKind.ARTIFACT_MOUNTED,
+                        artifact_id=artifact.id,
+                        path=binding.path,
+                    )
+            if model_value != prepared.model_value:
+                ctx.prepared_inputs[field_name] = replace(
+                    prepared,
+                    model_value=model_value,
+                )
+
+    def _replace_bound_path(self, value: Any, planned: str, actual: str) -> Any:
+        if value == planned:
+            return actual
+        if isinstance(value, list):
+            return [self._replace_bound_path(item, planned, actual) for item in value]
+        if isinstance(value, tuple):
+            return tuple(self._replace_bound_path(item, planned, actual) for item in value)
+        if isinstance(value, dict):
+            return {
+                key: self._replace_bound_path(item, planned, actual)
+                for key, item in value.items()
+            }
+        return value
+
+    def _configure_run_predictors(
+        self,
+        ctx: RunContext,
+        file_plan: dict[str, Any] | None,
+    ) -> None:
+        prepared_instructions = tuple(
+            instruction
+            for prepared in ctx.prepared_inputs.values()
+            for instruction in prepared.instructions
+        )
+        file_instructions = file_plan["instructions"] if file_plan else ""
+        output_instructions = tuple(
+            f"Output `{field_name}` is reserved as {reservation.model_value!r}."
+            for field_name, reservation in ctx.output_reservations.items()
+        )
+        invocation_instructions = "\n\n".join(
+            instruction
+            for instruction in (
+                file_instructions,
+                *prepared_instructions,
+                *output_instructions,
+            )
+            if instruction
+        )
+        if not invocation_instructions:
+            ctx.state["generate_action"] = self.generate_action
+            ctx.state["extract"] = self.extract
+            return
+        action, extract = self._build_signatures_with_files(invocation_instructions)
+        ctx.state["generate_action"] = action
+        ctx.state["extract"] = extract
+
+    async def _setup_runtime_modules(self, ctx: RunContext) -> None:
+        session = ctx.session
+        if session is None:
+            return
+        if not self._skill_modules:
+            return
+        for module_name, source_path in self._skill_modules.items():
+            artifact = Artifact(
+                id=f"skill-module-{module_name}-{ctx.run_id}",
+                kind="compat.module",
+                metadata={
+                    "source_path": source_path,
+                    "sandbox_path": f"/sandbox/lib/{module_name}.py",
+                },
+            )
+            binding = await session.mount(artifact)
+            ctx.bind(binding)
+        await session.run_code("import sys; sys.path.insert(0, '/sandbox/lib')")
+
+    def _validate_runtime_artifacts(self, ctx: RunContext) -> None:
+        artifacts = [
+            artifact
+            for prepared in ctx.prepared_inputs.values()
+            for artifact in prepared.artifacts
+        ]
+        direct = [artifact for artifact in artifacts if artifact.kind == "compat.workspace.direct"]
+        mirror = [artifact for artifact in artifacts if artifact.kind == "compat.workspace.mirror"]
+        backend = getattr(
+            self.runtime_spec.execution,
+            "backend",
+            self.runtime_spec.execution,
+        )
+        if direct and not getattr(backend, "supports_direct_workspaces", False):
+            message = getattr(backend, "direct_workspace_error", None) or (
+                "The selected execution backend does not support direct Workspace mounts."
+            )
+            raise ValueError(message)
+        if mirror and not getattr(backend, "supports_mirror_workspaces", False):
+            raise ValueError(
+                "The selected execution backend does not support Workspace mirror sync."
+            )
+
+    async def _reserve_runtime_outputs(self, ctx: RunContext) -> None:
+        session = ctx.session
+        if session is None:
+            raise RuntimeError("Output reservation requires an active execution session")
+        recorder = self._evidence()
+        for field_name, field_info in self.signature.output_fields.items():
+            field = FieldDescriptor(field_name, field_info.annotation)
+            matches = [
+                adapter
+                for adapter in self.runtime_spec.outputs
+                if adapter.supports(field)
+            ]
+            if not matches:
+                continue
+            adapter = resolve_output_adapter(matches, field)
+            reservation = await adapter.reserve(
+                field,
+                ctx.input_values.get(field_name),
+                ctx,
+                session,
+            )
+            if reservation.field != field:
+                raise ValueError(
+                    f"Output adapter {adapter.name!r} reserved field "
+                    f"{reservation.field.name!r} while preparing {field.name!r}"
+                )
+            ctx.reserve(reservation, adapter)
+            if recorder is not None:
+                binding = ctx.artifact_bindings.get(reservation.artifact.id)
+                if binding is not None:
+                    await recorder.emit(
+                        RunEventKind.ARTIFACT_MOUNTED,
+                        artifact_id=reservation.artifact.id,
+                        path=binding.path,
+                    )
+                await recorder.emit(
+                    RunEventKind.OUTPUT_RESERVED,
+                    field=field_name,
+                    adapter=adapter.name,
+                    artifact_id=reservation.artifact.id,
+                )
+
+    async def _materialize_runtime_outputs(
+        self,
+        ctx: RunContext,
+        prediction: dspy.Prediction,
+    ) -> None:
+        session = ctx.session
+        if session is None:
+            raise RuntimeError("Output materialization requires an active execution session")
+        recorder = self._evidence()
+        for field_name, reservation in ctx.output_reservations.items():
+            adapter = ctx.output_adapters[field_name]
+            value = await adapter.materialize(
+                reservation,
+                getattr(prediction, field_name, None),
+                ctx,
+                session,
+            )
+            setattr(prediction, field_name, value)
+            if recorder is not None:
+                await recorder.emit(
+                    RunEventKind.ARTIFACT_COLLECTED,
+                    artifact_id=reservation.artifact.id,
+                    field=field_name,
+                )
+                await recorder.emit(
+                    RunEventKind.OUTPUT_MATERIALIZED,
+                    field=field_name,
+                    adapter=adapter.name,
+                )
 
     def _begin_action_generation(self, variables, iteration: int) -> tuple[list[str], int]:
         variables_info = [variable.format() for variable in variables]
@@ -2532,7 +3372,7 @@ class PredictRLM(dspy.RLM):
                         variables=dict(input_args),
                         timeout=execution_timeout,
                     )
-        except SandboxFatalError as exc:
+        except (SandboxFatalError, ExecutionFatalError) as exc:
             self._log_iteration_execute_fatal(
                 repl,
                 iteration=iteration,
@@ -2571,6 +3411,15 @@ class PredictRLM(dspy.RLM):
             iteration=iteration,
             code=code,
         )
+        recorder = self._evidence()
+        operation_id = uuid.uuid4().hex
+        if recorder is not None:
+            await recorder.emit(
+                RunEventKind.CODE_GENERATED,
+                operation_id=operation_id,
+                iteration=iteration + 1,
+                code=code,
+            )
         try:
             with (
                 live_tool_call_logging(iteration_log_open),
@@ -2600,28 +3449,71 @@ class PredictRLM(dspy.RLM):
                             variables=dict(input_args),
                             timeout=execution_timeout,
                         )
-        except SandboxFatalError as exc:
+        except asyncio.CancelledError as exc:
+            if recorder is not None:
+                try:
+                    await recorder.emit(
+                        RunEventKind.CODE_EXECUTED,
+                        operation_id=operation_id,
+                        iteration=iteration + 1,
+                        error_type=type(exc).__name__,
+                        error=str(exc),
+                        cancelled=True,
+                        fatal=False,
+                    )
+                except BaseException as evidence_error:
+                    setattr(exc, "evidence_error", evidence_error)
+            raise
+        except (SandboxFatalError, ExecutionFatalError) as exc:
             self._log_iteration_execute_fatal(
                 repl,
                 iteration=iteration,
                 execute_start=execute_start,
                 exc=exc,
             )
+            if recorder is not None:
+                await recorder.emit(
+                    RunEventKind.CODE_EXECUTED,
+                    operation_id=operation_id,
+                    iteration=iteration + 1,
+                    error_type=type(exc).__name__,
+                    error=str(exc),
+                    fatal=True,
+                )
             raise
         except Exception as exc:
-            return self._format_iteration_execute_error(
+            output = self._format_iteration_execute_error(
                 repl,
                 iteration=iteration,
                 execute_start=execute_start,
                 code=code,
                 exc=exc,
             )
+            if recorder is not None:
+                await recorder.emit(
+                    RunEventKind.CODE_EXECUTED,
+                    operation_id=operation_id,
+                    iteration=iteration + 1,
+                    output=output,
+                    error_type=type(exc).__name__,
+                    error=str(exc),
+                    fatal=False,
+                )
+            return output
         self._log_iteration_execute_ok(
             repl,
             iteration=iteration,
             execute_start=execute_start,
             result=result,
         )
+        if recorder is not None:
+            await recorder.emit(
+                RunEventKind.CODE_EXECUTED,
+                operation_id=operation_id,
+                iteration=iteration + 1,
+                output=str(result),
+                final=isinstance(result, FinalOutput),
+            )
         return result
 
     def _complete_iteration_execution(
@@ -2731,17 +3623,37 @@ class PredictRLM(dspy.RLM):
         repl.aexecute() (available on JspiBackend) so the event loop
         stays free for other coroutines.
         """
+        bound_iteration = getattr(self._execute_iteration, "__func__", None)
+        if bound_iteration is not _KERNEL_EXECUTE_ITERATION:
+            return self._execute_iteration(
+                repl,
+                variables,
+                history,
+                iteration,
+                input_args,
+                output_field_names,
+            )
         variables_info, action_start_ns = self._begin_action_generation(
             variables,
             iteration,
         )
         try:
             lm_hist_before_action = snapshot_lm_history_len(dspy.settings.lm)
-            pred = await self.generate_action.acall(
-                variables_info=variables_info,
-                repl_history=history,
-                iteration=f"{iteration + 1}/{self.max_iterations}",
+            run_ctx = current_run_context()
+            generate_action = (
+                run_ctx.state.get("generate_action", self.generate_action)
+                if run_ctx is not None
+                else self.generate_action
             )
+            action_kwargs = {
+                "variables_info": variables_info,
+                "repl_history": history,
+                "iteration": f"{iteration + 1}/{self.max_iterations}",
+            }
+            if inspect.iscoroutinefunction(getattr(generate_action, "acall", None)):
+                pred = await generate_action.acall(**action_kwargs)
+            else:
+                pred = generate_action(**action_kwargs)
             self._validate_iteration_action(pred)
             execution_timeout = self._action_execution_timeout(pred)
         except BaseException as exc:
@@ -2781,6 +3693,32 @@ class PredictRLM(dspy.RLM):
             )
         finally:
             self._finish_iteration_log(iteration_log_open)
+
+    async def _aextract_fallback_for_run(
+        self,
+        variables: list[Any],
+        history: Any,
+        output_field_names: list[str],
+    ) -> dspy.Prediction:
+        bound_fallback = getattr(self._extract_fallback, "__func__", None)
+        if bound_fallback is not _KERNEL_EXTRACT_FALLBACK:
+            return self._extract_fallback(variables, history, output_field_names)
+        run_ctx = current_run_context()
+        extract = (
+            run_ctx.state.get("extract", self.extract)
+            if run_ctx is not None
+            else self.extract
+        )
+        variables_info = [variable.format() for variable in variables]
+        extract_pred = await extract.acall(
+            variables_info=variables_info,
+            repl_history=history,
+        )
+        return dspy.Prediction(
+            trajectory=[entry.model_dump() for entry in history],
+            final_reasoning="Extract forced final output",
+            **{name: getattr(extract_pred, name) for name in output_field_names},
+        )
 
     def _prepare_file_io(
         self, input_args: dict[str, Any]
@@ -2867,22 +3805,24 @@ class PredictRLM(dspy.RLM):
 
     def _validate_file_plan_backend(self, file_plan: dict[str, Any]) -> None:
         direct_mounts = file_plan.get("direct_workspace_mounts") or []
-        if not direct_mounts:
-            return
-        if self._sbx_pool is not None:
-            raise ValueError(
-                "Workspace(mode='direct') requires a per-call SBX interpreter; "
-                "prewarmed SbxPool instances cannot add workspace mounts after creation."
+        mirror_workspaces = file_plan.get("workspace_states") or []
+        backend = getattr(
+            self.runtime_spec.execution,
+            "backend",
+            self.runtime_spec.execution,
+        )
+        if direct_mounts and not getattr(backend, "supports_direct_workspaces", False):
+            message = getattr(backend, "direct_workspace_error", None) or (
+                "The selected execution backend does not support direct Workspace mounts."
             )
-        if self._interpreter is not None:
-            if not hasattr(self._interpreter, "configure_direct_workspace_mounts"):
-                raise ValueError("Workspace(mode='direct') requires the SBX backend.")
-            return
-        if self._sandbox_backend is not BackendName.SBX:
-            raise ValueError("Workspace(mode='direct') requires the SBX backend.")
+            raise ValueError(message)
+        if mirror_workspaces and not getattr(backend, "supports_mirror_workspaces", False):
+            raise ValueError(
+                "The selected execution backend does not support Workspace mirror sync."
+            )
 
     def _setup_sandbox_files(
-        self, repl: ExecutionBackend, file_plan: dict[str, Any]
+        self, repl: LegacyExecutionBackend, file_plan: dict[str, Any]
     ) -> None:
         """Mount input files, skill modules, and create output dirs in the sandbox."""
         self._log_lifecycle(
@@ -2952,7 +3892,7 @@ class PredictRLM(dspy.RLM):
 
     def _sync_output_files(
         self,
-        repl: ExecutionBackend,
+        repl: LegacyExecutionBackend,
         prediction: dspy.Prediction,
         output_file_fields: dict[str, str],
         file_plan: dict[str, Any],
@@ -3133,7 +4073,7 @@ class PredictRLM(dspy.RLM):
 
         run_start = time.perf_counter()
         lm = dspy.settings.lm
-        sub_lm = self._sub_lm
+        sub_lm = self._active_sub_lm()
         # Per-RLM instance ``lm`` has its own history (via ``lm.copy()``
         # in ``__init__``) so these snapshots are isolated from other
         # concurrent PredictRLM runs. No track_usage context needed —
@@ -3293,15 +4233,11 @@ class PredictRLM(dspy.RLM):
         """Execute aforward() with tracing and optional file I/O."""
         _, output_file_fields = scan_file_fields(self.signature) if file_plan else (None, {})
 
-        orig_action, orig_extract = self.generate_action, self.extract
-        if file_plan:
-            self.generate_action, self.extract = self._build_signatures_with_files(
-                file_plan["instructions"]
-            )
+        run_ctx = current_run_context()
 
         run_start = time.perf_counter()
         lm = dspy.settings.lm
-        sub_lm = self._sub_lm
+        sub_lm = self._active_sub_lm()
         # Snapshot lm.history lengths at run start so ``usage_since`` can
         # sum the delta at end. Per-RLM ``lm.copy()`` in __init__ means
         # each PredictRLM instance has its OWN history — concurrent runs
@@ -3317,16 +4253,22 @@ class PredictRLM(dspy.RLM):
             self._validate_inputs(input_args)
             output_field_names = list(self.signature.output_fields.keys())
             execution_tools = self._prepare_execution_tools()
-            variables = self._build_variables(**input_args)
 
-            ctx_kwargs = (
-                dict(execution_tools=execution_tools, file_plan=file_plan)
-                if file_plan
-                else dict(execution_tools=execution_tools)
-            )
-            with self._interpreter_context(**ctx_kwargs) as repl:
-                if file_plan:
-                    self._setup_sandbox_files(repl, file_plan)
+            async with self._execution_session(execution_tools=execution_tools) as repl:
+                if run_ctx is not None:
+                    await self._bind_runtime_inputs(run_ctx)
+                    await self._setup_runtime_modules(run_ctx)
+                    await self._reserve_runtime_outputs(run_ctx)
+                    input_args.update(
+                        {
+                            name: prepared.model_value
+                            for name, prepared in run_ctx.prepared_inputs.items()
+                        }
+                    )
+                    for field_name in run_ctx.output_reservations:
+                        input_args.pop(field_name, None)
+                    self._configure_run_predictors(run_ctx, None)
+                variables = self._build_variables(**input_args)
 
                 from dspy.primitives.repl_types import REPLHistory
 
@@ -3357,7 +4299,7 @@ class PredictRLM(dspy.RLM):
 
                     for iteration in range(self.max_iterations):
                         iter_start = time.perf_counter()
-                        async with self._aiteration_callback_scope(
+                        async with self._iteration_callback_scope_for_run(
                             call_id, iteration
                         ) as state:
                             self._pending_submit_confirmation = pending_submit_confirmation
@@ -3403,25 +4345,27 @@ class PredictRLM(dspy.RLM):
                                 action_lm_metadata,
                             )
                             steps.append(state.step)
+                            recorder = self._evidence()
+                            if recorder is not None:
+                                await recorder.emit(
+                                    RunEventKind.ITERATION_RECORDED,
+                                    step=state.step.model_dump(mode="python"),
+                                )
                             self._export_current_trace("in_progress")
 
                         if state.is_final:
                             status = "completed"
                             prediction = result
-                            if output_file_fields:
-                                self._sync_output_files(
-                                    repl, prediction, output_file_fields, file_plan
-                                )
+                            if run_ctx is not None and run_ctx.output_reservations:
+                                await self._materialize_runtime_outputs(run_ctx, prediction)
                             break
                         history = result
                     else:
-                        prediction = await self._aextract_fallback(
+                        prediction = await self._aextract_fallback_for_run(
                             variables, history, output_field_names
                         )
-                        if output_file_fields:
-                            self._sync_output_files(
-                                repl, prediction, output_file_fields, file_plan
-                            )
+                        if run_ctx is not None and run_ctx.output_reservations:
+                            await self._materialize_runtime_outputs(run_ctx, prediction)
 
                     prediction.trace = self._build_run_trace(
                         status=status,
@@ -3456,8 +4400,6 @@ class PredictRLM(dspy.RLM):
         finally:
             self._clear_telemetry_execution()
             self._trace_export_context = None
-            if file_plan:
-                self.generate_action, self.extract = orig_action, orig_extract
 
     def _build_signatures_with_files(
         self, file_instructions: str
@@ -3468,17 +4410,12 @@ class PredictRLM(dspy.RLM):
         submits a path string, not a JSON object. The framework wraps the
         path in File after syncing.
         """
-        from .files import (
-            _is_list_annotation,
-            is_input_file_type,
-            is_output_file_type,
-        )
-
         # Replace file-typed fields with str/list[str] for the RLM's view
         modified_sig = self.signature
         for name, field in self.signature.output_fields.items():
-            if is_output_file_type(field.annotation):
-                replacement = list[str] if _is_list_annotation(field.annotation) else str
+            descriptor = FieldDescriptor(name, field.annotation)
+            if descriptor.matches(File):
+                replacement = descriptor.replace_type(str)
                 modified_sig = modified_sig.with_updated_fields(
                     name,
                     desc=f"{field.json_schema_extra.get('desc', '')} "
@@ -3486,21 +4423,22 @@ class PredictRLM(dspy.RLM):
                     type_=replacement,
                 )
         for name, field in self.signature.input_fields.items():
-            if is_input_file_type(field.annotation):
-                replacement = list[str] if _is_list_annotation(field.annotation) else str
+            descriptor = FieldDescriptor(name, field.annotation)
+            if descriptor.matches(File) or descriptor.matches(Workspace):
+                replacement = descriptor.replace_type(str)
                 modified_sig = modified_sig.with_updated_fields(
                     name,
                     desc=field.json_schema_extra.get("desc", ""),
                     type_=replacement,
                 )
 
-        raw_tools = {name: tool.func for name, tool in self._user_tools.items()}
+        raw_tools = self._runtime_tool_functions()
         action_sig, extract_sig = build_rlm_signatures(
             modified_sig,
             PREDICT_RLM_INSTRUCTIONS,
             raw_tools,
             self._format_tool_docs,
-            skill_instructions=self._skill_instructions,
+            skill_instructions=self._runtime_instructions(),
             file_instructions=file_instructions,
             model_execution_timeout=self._model_execution_timeout,
             max_output_chars=self.max_output_chars,
@@ -3509,13 +4447,19 @@ class PredictRLM(dspy.RLM):
 
     def _build_signatures(self) -> tuple[Signature, Signature]:
         """Build action and extract signatures with predict documentation."""
-        raw_tools = {name: tool.func for name, tool in self._user_tools.items()}
+        raw_tools = self._runtime_tool_functions()
         return build_rlm_signatures(
             self.signature,
             PREDICT_RLM_INSTRUCTIONS,
             raw_tools,
             self._format_tool_docs,
-            skill_instructions=self._skill_instructions,
+            skill_instructions=self._runtime_instructions(),
             model_execution_timeout=self._model_execution_timeout,
             max_output_chars=self.max_output_chars,
         )
+
+
+_KERNEL_FORWARD_TRACED = PredictRLM._forward_traced
+_KERNEL_AFORWARD_TRACED = PredictRLM._aforward_traced
+_KERNEL_EXECUTE_ITERATION = PredictRLM._execute_iteration
+_KERNEL_EXTRACT_FALLBACK = PredictRLM._extract_fallback

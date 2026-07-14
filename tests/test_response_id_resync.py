@@ -170,7 +170,6 @@ def _build_execute_loop_interp(stdout_lines: list[str]):
     interp = JspiBackend.__new__(JspiBackend)
     interp._pending_file_ops = {}
     interp._debug = False
-    interp._sync_files = lambda: None
     interp.deno_process = types.SimpleNamespace(
         stderr=types.SimpleNamespace(read=lambda: ""),
     )
@@ -184,6 +183,10 @@ def _build_execute_loop_interp(stdout_lines: list[str]):
     async def _noop_responses(pending):
         return None
 
+    async def _noop_sync_files():
+        return None
+
+    interp._async_files = _noop_sync_files  # type: ignore[assignment]
     interp._read_with_timeout_async = _mock_read  # type: ignore[assignment]
     interp._send_completed_responses = _noop_responses  # type: ignore[assignment]
     interp._wait_and_send_all_responses = _noop_responses  # type: ignore[assignment]

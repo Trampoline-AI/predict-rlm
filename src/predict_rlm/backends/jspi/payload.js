@@ -684,6 +684,24 @@ console.log = originalLog;
 pyodide.setStdout({ batched: (msg) => console.log(msg) });
 
 const stdinReader = readLines(Deno.stdin);
+let pendingStdinRead = null;
+
+function nextStdinRead() {
+  if (!pendingStdinRead) {
+    pendingStdinRead = stdinReader.next();
+  }
+  return pendingStdinRead;
+}
+
+async function consumeStdinLine() {
+  const read = nextStdinRead();
+  const result = await read;
+  if (pendingStdinRead === read) {
+    pendingStdinRead = null;
+  }
+  return result;
+}
+
 let requestIdCounter = 0;
 
 // Store registered tools so we can re-inject them before each execution
@@ -758,9 +776,6 @@ function sleep(ms) {
 // Reads tool responses and routes them to pending requests
 // Uses non-blocking reads with timeout to allow fast cancellation
 async function responseReader() {
-  // Track if we have an in-flight read that needs to be resolved
-  let pendingRead = null;
-
   while (
     !responseReaderCancelled &&
     (codeExecutionInProgress || pendingToolCalls.size > 0)
@@ -772,15 +787,12 @@ async function responseReader() {
       continue;
     }
 
-    // Start a read if we don't have one pending
-    if (!pendingRead) {
-      pendingRead = stdinReader.next();
-    }
+    const read = nextStdinRead();
 
     // Race between the read and a timeout
     // This allows us to check the cancellation flag periodically
     const result = await Promise.race([
-      pendingRead.then((r) => ({ ...r, timeout: false })),
+      read.then((r) => ({ ...r, timeout: false })),
       sleep(100).then(() => ({ timeout: true })),
     ]);
 
@@ -789,8 +801,9 @@ async function responseReader() {
       continue;
     }
 
-    // Got a result, clear the pending read
-    pendingRead = null;
+    if (pendingStdinRead === read) {
+      pendingStdinRead = null;
+    }
 
     if (result.done) {
       // stdin closed, reject all pending
@@ -890,7 +903,7 @@ os.environ[${JSON.stringify(key)}] = ${JSON.stringify(val)}
 // =============================================================================
 
 while (true) {
-  const { value: line, done } = await stdinReader.next();
+  const { value: line, done } = await consumeStdinLine();
   if (done) break;
 
   let input;
@@ -1166,6 +1179,49 @@ while (true) {
         tools: toolNames,
         outputs: params.outputs ? params.outputs.map((o) => o.name) : [],
       }, requestId));
+      continue;
+    }
+
+    // install_packages — install runtime-contributed pure-Python packages.
+    if (method === "install_packages") {
+      const packages = [...new Set(params.packages || [])];
+      const installed = [];
+      const skipped = [];
+      const originalLog = console.log;
+      try {
+        console.log = () => {};
+        pyodide.setStdout({ batched: () => {} });
+        await pyodide.loadPackage("micropip");
+        for (const packageName of packages) {
+          pyodide.globals.set("__predict_rlm_package", packageName);
+          try {
+            await pyodide.runPythonAsync(`
+import micropip
+await micropip.install([__predict_rlm_package], verbose=False)
+`);
+            installed.push(packageName);
+          } catch (e) {
+            if (e.type === "ValueError") {
+              skipped.push(packageName);
+              continue;
+            }
+            throw e;
+          }
+        }
+      } catch (e) {
+        console.log = originalLog;
+        pyodide.setStdout({ batched: (msg) => console.log(msg) });
+        console.log(jsonrpcError(
+          JSONRPC_APP_ERRORS.RuntimeError,
+          "Failed to install packages: " + (e.message || String(e)),
+          requestId,
+        ));
+        continue;
+      } finally {
+        console.log = originalLog;
+        pyodide.setStdout({ batched: (msg) => console.log(msg) });
+      }
+      console.log(jsonrpcResult({ installed, skipped }, requestId));
       continue;
     }
 

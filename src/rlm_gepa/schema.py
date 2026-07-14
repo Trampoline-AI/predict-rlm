@@ -349,6 +349,9 @@ def validate_example_result(result: RLMGepaExampleResult) -> None:
             "RLMGepaExampleResult.traces must contain at least one RunTrace "
             "unless error is populated"
         )
+    evidence = [getattr(trace, "evidence", None) for trace in result.traces]
+    if any(item is not None and not item.complete for item in evidence):
+        raise ValueError("RLMGepaExampleResult contains incomplete strict evidence")
 
 
 def _serialize_lm(value: Any) -> str:

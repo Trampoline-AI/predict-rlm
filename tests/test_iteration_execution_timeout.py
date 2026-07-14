@@ -259,7 +259,11 @@ async def test_jspi_per_iteration_timeout_has_recoverable_host_grace():
     )
     interpreter._telemetry_pending_tool_count = lambda: 0
     interpreter._telemetry_pending_file_ops_count = lambda: 0
-    interpreter._kill_sandbox = lambda: killed.append(True)
+
+    async def _kill_sandbox():
+        killed.append(True)
+
+    interpreter._akill_sandbox = _kill_sandbox
 
     async def _slow_execute(_request_id):
         await asyncio.sleep(1.05)
@@ -310,7 +314,11 @@ async def test_jspi_silent_iteration_timeout_recovery_failure_is_bounded(monkeyp
     )
     interpreter._telemetry_pending_tool_count = lambda: 0
     interpreter._telemetry_pending_file_ops_count = lambda: 0
-    interpreter._kill_sandbox = lambda: killed.append(True)
+
+    async def _kill_sandbox():
+        killed.append(True)
+
+    interpreter._akill_sandbox = _kill_sandbox
 
     async def _silent_execute(_request_id):
         await asyncio.sleep(30)

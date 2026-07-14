@@ -209,7 +209,11 @@ def build_rlm_signatures(
             + task_instructions
             + "\n"
         )
-    full_extract_instructions = extended_task_instructions + extract_instructions
+    full_extract_instructions = extended_task_instructions + extract_instructions + tool_docs
+    if file_instructions:
+        full_extract_instructions += f"\n\n{file_instructions}"
+    if skill_instructions:
+        full_extract_instructions += f"\n\n## Skills\n\n{skill_instructions}"
 
     extract_sig = dspy.Signature(
         {**signature.output_fields},

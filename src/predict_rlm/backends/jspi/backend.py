@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
-import contextvars
+import contextlib
 import inspect
 import json
 import logging
@@ -23,7 +23,6 @@ import os
 import select
 import shutil
 import tempfile
-import threading
 import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -54,6 +53,13 @@ from predict_rlm.execution_timeout import (
     format_recoverable_timeout_result,
     recoverable_timeout_host_deadline_seconds,
     resolve_execution_timeout,
+)
+from predict_rlm.runtime import (
+    SyncWorker,
+    SyncWorkerTracker,
+    callable_has_sync_leaf,
+    host_sync_worker_policy,
+    invoke_host_callable,
 )
 from predict_rlm.telemetry import (
     TelemetryContext,
@@ -159,7 +165,7 @@ def _needs_jspi_flag() -> bool:
     return True
 
 
-class JspiBackend(PythonInterpreter):
+class JspiBackend(SyncWorkerTracker, PythonInterpreter):
     """PythonInterpreter with JSPI and concurrent async tool execution.
 
     JSPI (JavaScript Promise Integration) allows Python code running in the
@@ -303,6 +309,11 @@ class JspiBackend(PythonInterpreter):
 
         self._debug = debug
         self._verbose = verbose
+        self._preinstall_packages = preinstall_packages
+        self.skill_packages = list(dict.fromkeys(skill_packages or ()))
+        self._installed_skill_packages = (
+            set(self.skill_packages) if preinstall_packages else set()
+        )
         configure_predict_rlm_logging(
             debug=True if debug else None,
             verbose=True if verbose else None,
@@ -319,6 +330,8 @@ class JspiBackend(PythonInterpreter):
             from predict_rlm.files import get_synced_file_params
 
             for tool_fn in tools.values():
+                if getattr(tool_fn, "__predict_rlm_synced_file_operation__", False):
+                    continue
                 for sf in get_synced_file_params(tool_fn).values():
                     if sf.host_dir is not None:
                         all_write_paths.append(sf.host_dir)
@@ -353,6 +366,7 @@ class JspiBackend(PythonInterpreter):
         # Pending file-sync operations requested by tools during execution.
         # Maps request ID → asyncio.Future resolved by the execute loop.
         self._pending_file_ops: dict[int, asyncio.Future] = {}
+        self._host_tool_tasks: set[asyncio.Task[Any]] = set()
         self._active_tool_count = 0
         # Per-execute wall-clock timeout (see __init__ docstring).
         self._exec_timeout = exec_timeout
@@ -427,8 +441,84 @@ class JspiBackend(PythonInterpreter):
         return len(pending_file_ops) if pending_file_ops is not None else 0
 
     def _telemetry_pending_tool_count(self) -> int:
-        active_tool_count = getattr(self, "_active_tool_count", 0)
-        return active_tool_count if isinstance(active_tool_count, int) else 0
+        return len(self._live_host_tool_tasks())
+
+    def _host_tool_task_set(self) -> set[asyncio.Task[Any]]:
+        tasks = getattr(self, "_host_tool_tasks", None)
+        if tasks is None:
+            tasks = set()
+            self._host_tool_tasks = tasks
+        return tasks
+
+    def _live_host_tool_tasks(self) -> tuple[asyncio.Task[Any], ...]:
+        return tuple(
+            task
+            for task in JspiBackend._host_tool_task_set(self)
+            if not task.done()
+        )
+
+    def _track_host_tool_task(self, task: asyncio.Task[Any]) -> None:
+        tasks = JspiBackend._host_tool_task_set(self)
+        tasks.add(task)
+        task.add_done_callback(tasks.discard)
+
+    def _live_host_sync_workers(self) -> tuple[SyncWorker, ...]:
+        live_sync_workers = getattr(self, "_live_sync_workers", None)
+        return live_sync_workers() if callable(live_sync_workers) else ()
+
+    async def await_host_work(self, *, cancel: bool = False) -> None:
+        async def wait() -> None:
+            while True:
+                tasks = JspiBackend._live_host_tool_tasks(self)
+                if cancel:
+                    for task in tasks:
+                        task.cancel()
+                if tasks:
+                    await asyncio.gather(*tasks, return_exceptions=True)
+
+                workers = JspiBackend._live_host_sync_workers(self)
+                if workers:
+                    await asyncio.gather(
+                        *(worker.wait() for worker in workers),
+                        return_exceptions=True,
+                    )
+
+                if (
+                    not JspiBackend._live_host_tool_tasks(self)
+                    and not JspiBackend._live_host_sync_workers(self)
+                ):
+                    return
+
+        if not cancel:
+            await wait()
+            return
+
+        cleanup = asyncio.create_task(wait())
+        try:
+            await asyncio.shield(cleanup)
+        except asyncio.CancelledError:
+            await cleanup
+            raise
+
+    def _wait_for_host_work_sync(self, *, cancel: bool = False) -> None:
+        tasks = JspiBackend._live_host_tool_tasks(self)
+        workers = JspiBackend._live_host_sync_workers(self)
+        if not tasks and not workers:
+            return
+        if not tasks:
+            for worker in workers:
+                try:
+                    worker.future.result()
+                except BaseException:
+                    pass
+            return
+        loop = tasks[0].get_loop()
+        if loop.is_closed():
+            raise RuntimeError("JSPI host tool cleanup outlived its event loop")
+        import nest_asyncio
+
+        nest_asyncio.apply(loop)
+        loop.run_until_complete(JspiBackend.await_host_work(self, cancel=cancel))
 
     def _telemetry_attrs(self, extra: dict[str, Any] | None = None) -> dict[str, Any]:
         attrs: dict[str, Any] = {
@@ -482,6 +572,9 @@ class JspiBackend(PythonInterpreter):
             self._stdin_fd = -1
             self._stdout_fd = -1
             self._read_buf = ""
+            self._installed_skill_packages = (
+                set(self.skill_packages) if self._preinstall_packages else set()
+            )
             self._log_lifecycle("jspi.deno.starting")
         super()._ensure_deno_process()
         if self.deno_process is not None and self.deno_process is not prev:
@@ -499,6 +592,76 @@ class JspiBackend(PythonInterpreter):
             self._write_telemetry_span("sandbox.deno.start")
             self._log_lifecycle("jspi.deno.started")
 
+    async def _aensure_deno_process(self) -> None:
+        """Start Deno and complete its health check without sync RPC helpers."""
+        process = self.deno_process
+        if process is not None and process.poll() is None:
+            return
+
+        loop = asyncio.get_running_loop()
+        if self._stdout_fd >= 0:
+            loop.remove_reader(self._stdout_fd)
+        if self._stdin_fd >= 0:
+            loop.remove_writer(self._stdin_fd)
+
+        self._stdin_fd = -1
+        self._stdout_fd = -1
+        self._read_buf = ""
+        self._tools_registered = False
+        self._mounted_files = False
+        self._installed_skill_packages = (
+            set(self.skill_packages) if self._preinstall_packages else set()
+        )
+        self._log_lifecycle("jspi.deno.starting")
+
+        import subprocess
+
+        try:
+            self.deno_process = subprocess.Popen(
+                self.deno_command,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding="UTF-8",
+                env=os.environ.copy(),
+            )
+        except FileNotFoundError as exc:
+            raise CodeInterpreterError(
+                "Deno executable not found. Please install Deno to proceed.\n"
+                "Installation instructions:\n"
+                "> curl -fsSL https://deno.land/install.sh | sh\n"
+                "*or*, on macOS with Homebrew:\n"
+                "> brew install deno\n"
+                "For additional configurations: "
+                "https://docs.deno.com/runtime/getting_started/installation/"
+            ) from exc
+
+        if self.deno_process.stdin is None or self.deno_process.stdout is None:
+            raise CodeInterpreterError("Deno subprocess did not expose stdin/stdout pipes")
+        self._stdout_fd = self.deno_process.stdout.fileno()
+        self._stdin_fd = self.deno_process.stdin.fileno()
+        import fcntl
+
+        flags = fcntl.fcntl(self._stdin_fd, fcntl.F_GETFL)
+        fcntl.fcntl(self._stdin_fd, fcntl.F_SETFL, flags | os.O_NONBLOCK)
+        self._executor.shutdown(wait=False)
+        self._executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        try:
+            await self._ahealth_check()
+        except BaseException:
+            await self._akill_sandbox()
+            raise
+        self._write_telemetry_span("sandbox.deno.start")
+        self._log_lifecycle("jspi.deno.started")
+
+    async def aensure_ready(self) -> None:
+        """Ensure the Deno/Pyodide runtime is ready to accept control requests."""
+        await self._aensure_deno_process()
+
+    async def astart(self) -> None:
+        await self._aensure_deno_process()
+
     def shutdown(self) -> None:
         """Shut down the Deno subprocess with timeout guards.
 
@@ -506,6 +669,8 @@ class JspiBackend(PythonInterpreter):
         stdin.flush() or .wait(), causing hangs when Deno is unresponsive.
         """
         import subprocess
+
+        self._wait_for_host_work_sync(cancel=True)
 
         process = self.deno_process
         if process and process.poll() is None:
@@ -558,6 +723,70 @@ class JspiBackend(PythonInterpreter):
         self._owner_thread = None
         if hasattr(self, "_executor"):
             self._executor.shutdown(wait=False)
+
+    async def ashutdown(self) -> None:
+        """Shut down Deno without blocking the event loop on process waits."""
+        await self.await_host_work(cancel=True)
+        process = self.deno_process
+        if process is not None and process.poll() is None:
+            self._write_telemetry_span("sandbox.shutdown.start")
+            self._log_lifecycle("jspi.shutdown.start")
+            killed = False
+            try:
+                message = json.dumps({"jsonrpc": "2.0", "method": "shutdown"}) + "\n"
+                await self._write_stdin_async(message)
+            except (BrokenPipeError, OSError, CodeInterpreterError):
+                pass
+
+            if self._stdin_fd >= 0:
+                try:
+                    process.stdin.close()
+                except (AttributeError, OSError):
+                    pass
+                self._stdin_fd = -1
+
+            shutdown_wait_timeout = (
+                0.2
+                if getattr(self, "_prefer_fast_shutdown", False)
+                or type(process).__module__ == "subprocess"
+                else 5.0
+            )
+            if not await self._await_process_exit(process, shutdown_wait_timeout):
+                try:
+                    process.kill()
+                    killed = True
+                except Exception:
+                    pass
+                await self._await_process_exit(process, 1.0)
+            self._write_telemetry_span(
+                "sandbox.shutdown.complete",
+                attributes={"process.kill_result": "killed" if killed else "not_needed"},
+            )
+            self._log_lifecycle(
+                "jspi.shutdown.complete",
+                kill_result="killed" if killed else "not_needed",
+            )
+
+        self.deno_process = None
+        self._owner_thread = None
+        self._stdin_fd = -1
+        self._stdout_fd = -1
+        self._read_buf = ""
+        for future in list(self._pending_file_ops.values()):
+            if not future.done():
+                future.cancel()
+        self._pending_file_ops.clear()
+        if hasattr(self, "_executor"):
+            self._executor.shutdown(wait=False)
+
+    async def _await_process_exit(self, process: Any, timeout: float) -> bool:
+        deadline = time.monotonic() + timeout
+        while process.poll() is None:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+            await asyncio.sleep(min(0.01, remaining))
+        return True
 
     def _build_deno_command(
         self,
@@ -644,6 +873,23 @@ class JspiBackend(PythonInterpreter):
                 }
             )
             self._write_stdin(msg + "\n")
+
+    async def _async_files(self) -> None:
+        if not self.enable_write_paths or not self.sync_files:
+            return
+        for path in self.enable_write_paths:
+            virtual_path = f"/sandbox/{os.path.basename(path)}"
+            message = json.dumps(
+                {
+                    "jsonrpc": "2.0",
+                    "method": "sync_file",
+                    "params": {
+                        "virtual_path": virtual_path,
+                        "host_path": str(path),
+                    },
+                }
+            )
+            await self._write_stdin_async(message + "\n")
 
     def _send_request(self, method: str, params: dict, context: str) -> dict:
         """Send a JSON-RPC request without blocking the OS pipe.
@@ -753,6 +999,99 @@ class JspiBackend(PythonInterpreter):
             )
         return response
 
+    async def _asend_request(self, method: str, params: dict, context: str) -> dict:
+        """Send one JSON-RPC control request through the nonblocking fd path."""
+        self._request_id += 1
+        request_id = self._request_id
+        start_time = time.time_ns()
+        if method == "health_check":
+            self._write_telemetry_span(
+                "sandbox.health_check.start",
+                attributes={
+                    "rpc.request_id": request_id,
+                    "timeout.seconds": DENO_REQUEST_TIMEOUT_SEC,
+                },
+            )
+        message = json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "method": method,
+                "params": params,
+                "id": request_id,
+            }
+        )
+        await self._write_stdin_async(message + "\n")
+
+        max_stale_discards = STALE_RESPONSE_DISCARD_LIMIT
+        for _attempt in range(max_stale_discards + 1):
+            response_line = await self._read_with_timeout_async(DENO_REQUEST_TIMEOUT_SEC)
+            if not response_line:
+                process = self.deno_process
+                exit_code = process.poll() if process is not None else None
+                if exit_code is not None:
+                    stderr = getattr(process, "stderr", None)
+                    stderr_text = stderr.read() if stderr is not None else ""
+                    detail = f" {stderr_text}" if stderr_text else ""
+                    raise CodeInterpreterError(
+                        f"Deno exited (code {exit_code}) {context}{detail}"
+                    )
+                if method == "health_check":
+                    self._write_telemetry_span(
+                        "sandbox.health_check.no_response",
+                        status={"code": "ERROR", "message": f"No response {context}"},
+                        attributes={
+                            "rpc.request_id": request_id,
+                            "timeout.seconds": DENO_REQUEST_TIMEOUT_SEC,
+                            "failure.class": "sandbox_lifecycle_failure",
+                        },
+                        start_time_unix_nano=start_time,
+                    )
+                raise CodeInterpreterError(f"No response {context}")
+            if not response_line.startswith("{"):
+                continue
+            try:
+                response = json.loads(response_line)
+            except json.JSONDecodeError:
+                continue
+            if response.get("id") == request_id:
+                break
+            logger.warning(
+                "Discarding stale deno response (id=%s, expected %s) in %s "
+                "- likely a prior request's late arrival",
+                response.get("id"),
+                request_id,
+                context,
+            )
+        else:
+            raise CodeInterpreterError(
+                f"Too many stale responses in {context}: couldn't resync to "
+                f"id={request_id} after {max_stale_discards} discards"
+            )
+
+        if "error" in response:
+            raise CodeInterpreterError(
+                f"Error {context}: {response['error'].get('message', 'Unknown error')}"
+            )
+        if method == "health_check":
+            self._write_telemetry_span(
+                "sandbox.health_check.ok",
+                attributes={
+                    "rpc.request_id": request_id,
+                    "timeout.seconds": DENO_REQUEST_TIMEOUT_SEC,
+                },
+                start_time_unix_nano=start_time,
+            )
+        return response
+
+    async def _ahealth_check(self) -> None:
+        response = await self._asend_request(
+            "execute",
+            {"code": "print(1+1)"},
+            "during health check",
+        )
+        if response.get("result", {}).get("output", "").strip() != "2":
+            raise CodeInterpreterError(f"Unexpected ping response: {response}")
+
     def _get_deno_dir(self) -> list[str]:
         """Get Deno cache directory paths (may have multiple on different platforms)."""
         dirs = []
@@ -771,10 +1110,89 @@ class JspiBackend(PythonInterpreter):
 
     # --- File I/O helpers (for LocalFile/OutputFile support) ---
 
+    def ensure_skill_packages(self, packages: list[str]) -> None:
+        requested = list(dict.fromkeys(packages))
+        missing = [package for package in requested if package not in self._installed_skill_packages]
+        if not missing:
+            return
+        self._ensure_deno_process()
+        response = self._send_request(
+            "install_packages",
+            {"packages": missing},
+            "installing skill packages",
+        )
+        self._installed_skill_packages.update(response.get("result", {}).get("installed", ()))
+
+    async def aensure_skill_packages(self, packages: list[str]) -> None:
+        requested = list(dict.fromkeys(packages))
+        missing = [package for package in requested if package not in self._installed_skill_packages]
+        if not missing:
+            return
+        await self._aensure_deno_process()
+        response = await self._asend_request(
+            "install_packages",
+            {"packages": missing},
+            "installing skill packages",
+        )
+        self._installed_skill_packages.update(response.get("result", {}).get("installed", ()))
+
+    async def _amount_files(self) -> None:
+        if self._mounted_files:
+            return
+        paths_to_mount = [*self.enable_read_paths, *self.enable_write_paths]
+        if not paths_to_mount:
+            return
+        for path in paths_to_mount:
+            if not path:
+                continue
+            if not os.path.exists(path):
+                if path in self.enable_write_paths:
+                    Path(path).touch()
+                else:
+                    raise FileNotFoundError(f"Cannot mount non-existent file: {path}")
+            virtual_path = f"/sandbox/{os.path.basename(path)}"
+            await self._asend_request(
+                "mount_file",
+                {"host_path": str(path), "virtual_path": virtual_path},
+                f"mounting {path}",
+            )
+        self._mounted_files = True
+
+    async def _aregister_tools(self) -> None:
+        if self._tools_registered:
+            return
+        params: dict[str, Any] = {}
+        if self.tools:
+            params["tools"] = [
+                {"name": name, "parameters": self._extract_parameters(function)}
+                for name, function in self.tools.items()
+            ]
+        if self.output_fields:
+            params["outputs"] = self.output_fields
+        if params:
+            await self._asend_request("register", params, "registering tools/outputs")
+        self._tools_registered = True
+
+    async def _ainject_pending_variables(self) -> None:
+        for name, value in self._pending_large_vars.items():
+            await self._asend_request(
+                "inject_var",
+                {"name": name, "value": value},
+                f"injecting variable {name!r}",
+            )
+
     def mount_file_at(self, host_path: str, virtual_path: str) -> None:
         """Mount a host file at a specific virtual path in the sandbox."""
         self._ensure_deno_process()
         self._send_request(
+            "mount_file",
+            {"host_path": host_path, "virtual_path": virtual_path},
+            f"mounting {host_path} at {virtual_path}",
+        )
+
+    async def amount_file_at(self, host_path: str, virtual_path: str) -> None:
+        await self._aensure_deno_process()
+        await self._asend_request(
             "mount_file",
             {"host_path": host_path, "virtual_path": virtual_path},
             f"mounting {host_path} at {virtual_path}",
@@ -785,11 +1203,28 @@ class JspiBackend(PythonInterpreter):
         self._ensure_deno_process()
         self._send_request("mkdir_p", {"path": virtual_path}, f"creating dir {virtual_path}")
 
+    async def amkdir_p(self, virtual_path: str) -> None:
+        await self._aensure_deno_process()
+        await self._asend_request(
+            "mkdir_p",
+            {"path": virtual_path},
+            f"creating dir {virtual_path}",
+        )
+
     def list_dir(self, virtual_path: str) -> list[str]:
         """Recursively list all files under a virtual directory."""
         self._ensure_deno_process()
         response = self._send_request(
             "list_dir", {"path": virtual_path}, f"listing {virtual_path}"
+        )
+        return response.get("result", {}).get("files", [])
+
+    async def alist_dir(self, virtual_path: str) -> list[str]:
+        await self._aensure_deno_process()
+        response = await self._asend_request(
+            "list_dir",
+            {"path": virtual_path},
+            f"listing {virtual_path}",
         )
         return response.get("result", {}).get("files", [])
 
@@ -811,13 +1246,43 @@ class JspiBackend(PythonInterpreter):
             for rel_path, info in files.items()
         }
 
+    async def aworkspace_manifest(
+        self,
+        virtual_path: str,
+    ) -> dict[str, WorkspaceFileInfo]:
+        await self._aensure_deno_process()
+        response = await self._asend_request(
+            "workspace_manifest",
+            {"path": virtual_path},
+            f"building workspace manifest for {virtual_path}",
+        )
+        files = response.get("result", {}).get("files", {})
+        return {
+            rel_path: WorkspaceFileInfo(
+                type=info["type"],
+                sha256=info["sha256"],
+                size=info["size"],
+            )
+            for rel_path, info in files.items()
+        }
+
     def add_post_execute_hook(self, hook: Callable[[Any], Any]) -> None:
         """Register a hook called after each completed sandbox execution."""
         self._post_execute_hooks.append(hook)
 
+    def remove_post_execute_hook(self, hook: Callable[[Any], Any]) -> None:
+        if hook in self._post_execute_hooks:
+            self._post_execute_hooks.remove(hook)
+
     def _run_post_execute_hooks(self) -> None:
         for hook in getattr(self, "_post_execute_hooks", ()):
             hook(self)
+
+    async def _arun_post_execute_hooks(self) -> None:
+        for hook in getattr(self, "_post_execute_hooks", ()):
+            result = hook(self)
+            if inspect.isawaitable(result):
+                await result
 
     def sync_file_to(self, virtual_path: str, host_path: str) -> None:
         """Sync a single file from the sandbox MEMFS back to the host.
@@ -829,6 +1294,14 @@ class JspiBackend(PythonInterpreter):
         """
         self._ensure_deno_process()
         self._send_request(
+            "sync_file",
+            {"virtual_path": virtual_path, "host_path": host_path},
+            f"syncing {virtual_path} to {host_path}",
+        )
+
+    async def async_file_to(self, virtual_path: str, host_path: str) -> None:
+        await self._aensure_deno_process()
+        await self._asend_request(
             "sync_file",
             {"virtual_path": virtual_path, "host_path": host_path},
             f"syncing {virtual_path} to {host_path}",
@@ -879,6 +1352,7 @@ class JspiBackend(PythonInterpreter):
         code = self._inject_variables(code, variables)
 
         async with self._execution_gate.atop_level():
+            await self.await_host_work()
             # Limit concurrent Deno sandboxes to prevent OOM.
             # Acquired per-execute, released when done — allows other
             # interpreters to run between iterations.
@@ -897,12 +1371,30 @@ class JspiBackend(PythonInterpreter):
             }
             try:
                 if timeout is None:
-                    return await self._aexecute_inner(code, variables)
-                return await self._aexecute_inner(code, variables, timeout=timeout)
+                    result = await self._aexecute_inner(code, variables)
+                else:
+                    result = await self._aexecute_inner(code, variables, timeout=timeout)
+            except (asyncio.CancelledError, SandboxFatalError):
+                raise
+            except BaseException as exc:
+                try:
+                    await self._arun_post_execute_hooks()
+                except BaseException as post_execute_error:
+                    setattr(exc, "post_execute_error", post_execute_error)
+                raise
+            else:
+                await self._arun_post_execute_hooks()
+                return result
             finally:
                 self._last_semaphore_attrs = {}
                 sem.release()
-                self._run_post_execute_hooks()
+
+    def interrupt(self) -> None:
+        """Abort in-flight work by invalidating the current Deno session."""
+        self._kill_sandbox()
+
+    async def ainterrupt(self) -> None:
+        await self._akill_sandbox()
 
     def _resolve_execution_timeout(self, timeout: float | None) -> tuple[float, str]:
         return resolve_execution_timeout(timeout, default_timeout=self._exec_timeout)
@@ -943,9 +1435,10 @@ class JspiBackend(PythonInterpreter):
     ) -> Any:
         """Inner async execute — runs within the sandbox semaphore."""
         timeout_seconds, timeout_failure_class = self._resolve_execution_timeout(timeout)
-        self._ensure_deno_process()
-        self._mount_files()
-        self._register_tools()
+        await self._aensure_deno_process()
+        await self._amount_files()
+        await self._aregister_tools()
+        await self._ainject_pending_variables()
 
         self._request_id += 1
         execute_request_id = self._request_id
@@ -984,7 +1477,7 @@ class JspiBackend(PythonInterpreter):
                 request_id=execute_request_id,
                 status="error",
             )
-            self._kill_sandbox()
+            await self._akill_sandbox()
             raise SandboxFatalError(
                 "Sandbox subprocess died before receiving the execute "
                 "request (BrokenPipeError). Per-run mounts cannot be "
@@ -1134,7 +1627,7 @@ class JspiBackend(PythonInterpreter):
                 pending_file_op_count=self._telemetry_pending_file_ops_count(),
                 status="error",
             )
-            self._kill_sandbox()
+            await self._akill_sandbox()
             if timeout_failure_class == ITERATION_TIMEOUT_FAILURE_CLASS:
                 raise SandboxFatalError(
                     f"Sandbox failed to recover from iteration timeout after "
@@ -1196,6 +1689,42 @@ class JspiBackend(PythonInterpreter):
                 fut.cancel()
         self._pending_file_ops.clear()
 
+    async def _akill_sandbox(self) -> None:
+        """Force-kill Deno and reap it without a blocking process wait."""
+        process = self.deno_process
+        if process is not None:
+            self._write_telemetry_span("sandbox.shutdown.start")
+            self._log_lifecycle("jspi.kill.start")
+            kill_result = "sent"
+            try:
+                process.kill()
+            except Exception:
+                kill_result = "error"
+            await self._await_process_exit(process, 0.2)
+            self._write_telemetry_span(
+                "sandbox.shutdown.kill",
+                attributes={"process.kill_result": kill_result},
+                status="OK" if kill_result == "sent" else "ERROR",
+            )
+            self._write_telemetry_span(
+                "sandbox.shutdown.complete",
+                attributes={"process.kill_result": kill_result},
+                status="OK" if kill_result == "sent" else "ERROR",
+            )
+            self._log_lifecycle(
+                "jspi.kill.complete",
+                kill_result=kill_result,
+                status="ok" if kill_result == "sent" else "error",
+            )
+        self.deno_process = None
+        self._stdin_fd = -1
+        self._stdout_fd = -1
+        self._read_buf = ""
+        for future in list(self._pending_file_ops.values()):
+            if not future.done():
+                future.cancel()
+        self._pending_file_ops.clear()
+
     def execute(
         self,
         code: str,
@@ -1209,10 +1738,20 @@ class JspiBackend(PythonInterpreter):
         are executed concurrently on the host side.
         """
         with self._execution_gate.top_level():
+            self._wait_for_host_work_sync()
             try:
-                return self._execute_top_level(code, variables, timeout=timeout)
-            finally:
+                result = self._execute_top_level(code, variables, timeout=timeout)
+            except SandboxFatalError:
+                raise
+            except BaseException as exc:
+                try:
+                    self._run_post_execute_hooks()
+                except BaseException as post_execute_error:
+                    setattr(exc, "post_execute_error", post_execute_error)
+                raise
+            else:
                 self._run_post_execute_hooks()
+                return result
 
     def _execute_top_level(
         self,
@@ -1290,7 +1829,30 @@ class JspiBackend(PythonInterpreter):
         timeout_failure_class: str = "sandbox_exec_timeout",
     ) -> Any:
         """Read messages and handle tool calls concurrently using asyncio."""
+        await JspiBackend.await_host_work(self)
         pending_tasks: dict[str, asyncio.Task] = {}  # request_id -> Task
+        try:
+            return await self._execute_async_loop(
+                execute_request_id,
+                pending_tasks,
+                timeout_seconds=timeout_seconds,
+                timeout_failure_class=timeout_failure_class,
+            )
+        finally:
+            for task in pending_tasks.values():
+                task.cancel()
+            if pending_tasks:
+                await asyncio.gather(*pending_tasks.values(), return_exceptions=True)
+            self._active_tool_count = len(JspiBackend._live_host_tool_tasks(self))
+
+    async def _execute_async_loop(
+        self,
+        execute_request_id: int,
+        pending_tasks: dict[str, asyncio.Task],
+        *,
+        timeout_seconds: float | None = None,
+        timeout_failure_class: str = "sandbox_exec_timeout",
+    ) -> Any:
         stale_discards = 0
         pending_tool_deadline = (
             time.monotonic() + timeout_seconds
@@ -1315,7 +1877,7 @@ class JspiBackend(PythonInterpreter):
                     )
                     await self._write_stdin_async(response + "\n")
                 pending_tasks.clear()
-                self._active_tool_count = 0
+                self._active_tool_count = len(JspiBackend._live_host_tool_tasks(self))
                 return self._format_recoverable_timeout_result({
                     "timeout": {"seconds": timeout_seconds},
                     "stdout": "",
@@ -1347,7 +1909,7 @@ class JspiBackend(PythonInterpreter):
                     continue
 
             if not output_line:
-                self._kill_sandbox()
+                await self._akill_sandbox()
                 raise SandboxFatalError(
                     "Deno subprocess stopped producing stdout during async execute. "
                     "The sandbox was force-killed; per-run mounts are gone, so "
@@ -1395,6 +1957,7 @@ class JspiBackend(PythonInterpreter):
                     task = asyncio.create_task(
                         self._execute_tool_async(params["name"], params, request_id)
                     )
+                    JspiBackend._track_host_tool_task(self, task)
                     pending_tasks[request_id] = task
                     self._active_tool_count = len(pending_tasks)
                     continue
@@ -1459,7 +2022,7 @@ class JspiBackend(PythonInterpreter):
                     for task in pending_tasks.values():
                         task.cancel()
                     pending_tasks.clear()
-                    self._active_tool_count = 0
+                    self._active_tool_count = len(JspiBackend._live_host_tool_tasks(self))
                     return self._format_recoverable_timeout_result(res)
 
             # Before returning, ensure all pending tool calls complete
@@ -1469,7 +2032,7 @@ class JspiBackend(PythonInterpreter):
             # JSON-RPC success response
             if "result" in result:
                 res = result["result"]
-                self._sync_files()
+                await self._async_files()
                 if interpreter_result_logging_enabled(getattr(self, "_verbose", False)):
                     emit_trace_result(res)
                 if "final" in res:
@@ -1551,30 +2114,46 @@ class JspiBackend(PythonInterpreter):
     async def _read_with_timeout_async(self, timeout: float | None) -> str | None:
         """Async read using event loop fd watching — zero threads.
 
-        Uses ``loop.add_reader()`` to watch the raw stdout fd, then reads
-        with ``os.read()`` when data arrives.  Fully non-blocking: the
-        event loop stays free for other coroutines while waiting.
+        Each ``os.read()`` is preceded by an fd-readiness notification, including
+        when a line arrives in multiple chunks.
         """
-        # Check residual buffer first (instant, no I/O)
         if "\n" in self._read_buf:
             line, self._read_buf = self._read_buf.split("\n", 1)
             return line.strip()
 
-        if timeout is not None:
-            loop = asyncio.get_running_loop()
+        if self._stdout_fd < 0:
+            raise CodeInterpreterError("Deno stdout fd is unavailable for async reads")
+
+        deadline = None if timeout is None else time.monotonic() + timeout
+        loop = asyncio.get_running_loop()
+        while "\n" not in self._read_buf:
+            remaining = None if deadline is None else deadline - time.monotonic()
+            if remaining is not None and remaining <= 0:
+                return None
             ready = asyncio.Event()
             loop.add_reader(self._stdout_fd, ready.set)
             try:
-                await asyncio.wait_for(ready.wait(), timeout=timeout)
+                if remaining is None:
+                    await ready.wait()
+                else:
+                    await asyncio.wait_for(ready.wait(), timeout=remaining)
             except asyncio.TimeoutError:
                 return None
             finally:
                 loop.remove_reader(self._stdout_fd)
 
-        try:
-            return self._read_line_raw(timeout=timeout)
-        except TimeoutError:
-            return None
+            try:
+                chunk = os.read(self._stdout_fd, 65536)
+            except (BlockingIOError, InterruptedError):
+                continue
+            if not chunk:
+                remainder = self._read_buf
+                self._read_buf = ""
+                return remainder.strip()
+            self._read_buf += chunk.decode("utf-8", errors="replace")
+
+        line, self._read_buf = self._read_buf.split("\n", 1)
+        return line.strip()
 
     def _read_line_raw(self, timeout: float | None = None) -> str:
         """Read one line from the raw stdout fd, accumulating in _read_buf.
@@ -1724,7 +2303,11 @@ class JspiBackend(PythonInterpreter):
             # to host before calling, and mount modified files back after.
             from predict_rlm.files import get_synced_file_params
 
-            synced_params = get_synced_file_params(tool_fn)
+            synced_params = (
+                {}
+                if getattr(tool_fn, "__predict_rlm_synced_file_operation__", False)
+                else get_synced_file_params(tool_fn)
+            )
             temp_dir = None
             # (sandbox_path, host_path, writeback) for each synced param
             synced_entries: list[tuple[str, str, bool]] = []
@@ -1778,7 +2361,16 @@ class JspiBackend(PythonInterpreter):
                 telemetry_context = getattr(self, "_telemetry_context", None)
                 token = set_current_telemetry_context(telemetry_context)
                 try:
-                    with self._execution_gate.async_tool_callback():
+                    policy = (
+                        host_sync_worker_policy(
+                            self,
+                            timeout=TOOL_CALL_TIMEOUT_SEC,
+                            detach_on_cancel=True,
+                        )
+                        if callable_has_sync_leaf(tool_fn)
+                        else contextlib.nullcontext()
+                    )
+                    with self._execution_gate.async_tool_callback(), policy:
                         result = await asyncio.wait_for(
                             tool_fn(*args, **kwargs),
                             timeout=TOOL_CALL_TIMEOUT_SEC,
@@ -1791,39 +2383,35 @@ class JspiBackend(PythonInterpreter):
                 finally:
                     reset_current_telemetry_context(token)
             else:
-                loop = asyncio.get_running_loop()
                 telemetry_context = getattr(self, "_telemetry_context", None)
                 token = set_current_telemetry_context(telemetry_context)
-                ctx = contextvars.copy_context()
-                reset_current_telemetry_context(token)
 
                 def call_tool() -> Any:
                     with self._execution_gate.tool_callback():
                         return tool_fn(*args, **kwargs)
 
-                future: asyncio.Future[Any] = loop.create_future()
+                try:
+                    with host_sync_worker_policy(
+                        self,
+                        timeout=TOOL_CALL_TIMEOUT_SEC,
+                        detach_on_cancel=True,
+                    ):
+                        result = await invoke_host_callable(call_tool)
+                except TimeoutError as e:
+                    raise TimeoutError(
+                        f"tool {tool_name!r} timed out after "
+                        f"{TOOL_CALL_TIMEOUT_SEC}s (per-call budget)"
+                    ) from e
+                finally:
+                    reset_current_telemetry_context(token)
 
-                def run_tool() -> None:
-                    try:
-                        value = ctx.run(call_tool)
-                    except BaseException as exc:
-                        loop.call_soon_threadsafe(_set_future_exception, future, exc)
-                    else:
-                        loop.call_soon_threadsafe(_set_future_result, future, value)
-
-                thread = threading.Thread(
-                    target=run_tool,
-                    name="predict-rlm-jspi-host-tool",
-                    daemon=True,
-                )
-                thread.start()
+            if inspect.isawaitable(result):
                 try:
                     result = await asyncio.wait_for(
-                        future,
+                        result,
                         timeout=TOOL_CALL_TIMEOUT_SEC,
                     )
                 except asyncio.TimeoutError as e:
-                    future.cancel()
                     raise TimeoutError(
                         f"tool {tool_name!r} timed out after "
                         f"{TOOL_CALL_TIMEOUT_SEC}s (per-call budget)"
@@ -1874,10 +2462,27 @@ class JspiBackend(PythonInterpreter):
                 duration_ms=ms_since(call_start),
             )
             return response
+        except asyncio.CancelledError as cancellation:
+            if temp_dir:
+                worker = getattr(cancellation, "sync_worker", None)
+                deferred_dir = temp_dir
+                if not self.defer_until_sync_workers_finish(
+                    lambda: shutil.rmtree(deferred_dir, ignore_errors=True),
+                    worker,
+                ):
+                    shutil.rmtree(temp_dir, ignore_errors=True)
+            raise
         except Exception as e:
             # Clean up any SyncedFile temp dir before returning
             if temp_dir:
-                shutil.rmtree(temp_dir, ignore_errors=True)
+                worker = getattr(e, "sync_worker", None)
+                if worker is not None and not worker.done:
+                    deferred_dir = temp_dir
+                    worker.add_done_callback(
+                        lambda _worker: shutil.rmtree(deferred_dir, ignore_errors=True)
+                    )
+                else:
+                    shutil.rmtree(temp_dir, ignore_errors=True)
             if tool_name != "predict":
                 record_tool_call(
                     ToolCall(

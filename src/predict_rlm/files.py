@@ -24,13 +24,13 @@ Example::
 from __future__ import annotations
 
 import os
-import types
 import typing
 from dataclasses import dataclass
 from typing import Annotated, Any
 
 from pydantic import BaseModel, Field
 
+from .runtime import FieldDescriptor
 from .workspace import (
     DEFAULT_WORKSPACE_EXCLUDES,
     DirectWorkspaceMount,
@@ -96,10 +96,6 @@ class File(BaseModel):
         return files
 
 
-def _is_optional_union_origin(origin: Any) -> bool:
-    return origin is typing.Union or origin is types.UnionType
-
-
 # Deprecated aliases — kept for backwards compatibility
 LocalFile = File
 LocalDir = File
@@ -135,44 +131,14 @@ class SyncedFile:
     as-is and not cleaned up."""
 
 
-def _unwrap_annotation(annotation: Any) -> Any:
-    """Unwrap Optional/Annotated/list to get the inner file type."""
-    origin = typing.get_origin(annotation)
-    if _is_optional_union_origin(origin):
-        args = [a for a in typing.get_args(annotation) if a is not type(None)]
-        if len(args) == 1:
-            return _unwrap_annotation(args[0])
-    if origin is typing.Annotated:
-        return _unwrap_annotation(typing.get_args(annotation)[0])
-    if origin is list:
-        args = typing.get_args(annotation)
-        if args:
-            return _unwrap_annotation(args[0])
-    return annotation
-
-
-def _is_list_annotation(annotation: Any) -> bool:
-    """Check if an annotation is list[...] (possibly wrapped in Optional)."""
-    origin = typing.get_origin(annotation)
-    if _is_optional_union_origin(origin):
-        args = [a for a in typing.get_args(annotation) if a is not type(None)]
-        if len(args) == 1:
-            return _is_list_annotation(args[0])
-    if origin is typing.Annotated:
-        return _is_list_annotation(typing.get_args(annotation)[0])
-    return origin is list
-
-
 def is_file_type(annotation: Any) -> bool:
     """Check if a field annotation is File or list[File]."""
-    inner = _unwrap_annotation(annotation)
-    return isinstance(inner, type) and issubclass(inner, File)
+    return FieldDescriptor("", annotation).matches(File)
 
 
 def is_workspace_type(annotation: Any) -> bool:
     """Check if a field annotation is Workspace or list[Workspace]."""
-    inner = _unwrap_annotation(annotation)
-    return isinstance(inner, type) and issubclass(inner, Workspace)
+    return FieldDescriptor("", annotation).matches(Workspace)
 
 
 # Deprecated aliases
@@ -193,15 +159,15 @@ def scan_file_fields(
     output_file_fields: dict[str, str] = {}
 
     for name, field in signature.input_fields.items():
-        annotation = field.annotation
-        if is_file_type(annotation):
-            kind = "list_file" if _is_list_annotation(annotation) else "file"
+        descriptor = FieldDescriptor(name, field.annotation)
+        if descriptor.matches(File):
+            kind = "list_file" if descriptor.is_list else "file"
             input_file_fields[name] = kind
 
     for name, field in signature.output_fields.items():
-        annotation = field.annotation
-        if is_file_type(annotation):
-            kind = "list_file" if _is_list_annotation(annotation) else "file"
+        descriptor = FieldDescriptor(name, field.annotation)
+        if descriptor.matches(File):
+            kind = "list_file" if descriptor.is_list else "file"
             output_file_fields[name] = kind
 
     return input_file_fields, output_file_fields
@@ -212,9 +178,9 @@ def scan_workspace_fields(signature: Any) -> dict[str, str]:
     input_workspace_fields: dict[str, str] = {}
 
     for name, field in signature.input_fields.items():
-        annotation = field.annotation
-        if is_workspace_type(annotation):
-            kind = "list_workspace" if _is_list_annotation(annotation) else "workspace"
+        descriptor = FieldDescriptor(name, field.annotation)
+        if descriptor.matches(Workspace):
+            kind = "list_workspace" if descriptor.is_list else "workspace"
             input_workspace_fields[name] = kind
 
     output_workspace_fields = [

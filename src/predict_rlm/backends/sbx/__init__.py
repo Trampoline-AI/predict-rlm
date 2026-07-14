@@ -7,6 +7,8 @@ __all__ = [
     "SbxBackend",
     "SbxConfig",
     "SbxPool",
+    "SbxExecutionBackend",
+    "SbxPoolExecutionBackend",
 ]
 
 
@@ -19,4 +21,11 @@ def __getattr__(name: str):
         from .pool import SbxPool
 
         return SbxPool
+    if name in {"SbxExecutionBackend", "SbxPoolExecutionBackend"}:
+        from .execution import SbxExecutionBackend, SbxPoolExecutionBackend
+
+        return {
+            "SbxExecutionBackend": SbxExecutionBackend,
+            "SbxPoolExecutionBackend": SbxPoolExecutionBackend,
+        }[name]
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
