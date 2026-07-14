@@ -381,6 +381,7 @@ class TestPredictRLMWorkspacePreparation:
             assert args["workspace"] == "/sandbox/project"
             assert len(plan["workspace_states"]) == 1
 
+    @pytest.mark.sbx
     def test_direct_workspace_transformed_to_effective_sandbox_path(self):
         class Sig(dspy.Signature):
             workspace: Workspace = dspy.InputField()
