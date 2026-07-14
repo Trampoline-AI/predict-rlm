@@ -12,7 +12,7 @@ import re
 import time
 import uuid
 from contextlib import asynccontextmanager, contextmanager
-from copy import deepcopy
+from copy import copy, deepcopy
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import (
@@ -90,6 +90,7 @@ from .runtime import (
     RuntimeModule,
     RuntimeSpec,
     SessionRequirements,
+    _discover_annotation_prompt_contributors,
     current_run_context,
     invoke_host_callable,
     merge_session_requirements,
@@ -199,6 +200,7 @@ class _ExecutionSessionRepl:
 _ImageType = dspy.Image
 
 _PARENT_TAKES_CODE = "code" in inspect.signature(dspy.RLM._process_execution_result).parameters
+_DSPY_EXTRACT_FALLBACK = dspy.RLM._extract_fallback
 logger = logging.getLogger(__name__)
 
 _NO_FIELD_DEFAULT = object()
@@ -1223,7 +1225,12 @@ class PredictRLM(dspy.RLM):
             interpreter=interpreter,
         )
 
-        expanded_modules = tuple(module() if callable(module) else module for module in modules)
+        self._annotation_prompt_contributors = _discover_annotation_prompt_contributors(
+            self.signature
+        )
+        expanded_modules = tuple(
+            module() if callable(module) else module for module in modules
+        )
         if not all(isinstance(module, RuntimeContribution) for module in expanded_modules):
             raise TypeError("Runtime modules must return RuntimeContribution")
         module_selects_execution = any(
@@ -3266,13 +3273,45 @@ class PredictRLM(dspy.RLM):
             )
             if instruction
         )
-        if not invocation_instructions:
-            ctx.state["generate_action"] = self.generate_action
-            ctx.state["extract"] = self.extract
-            return
-        action, extract = self._build_signatures_with_files(invocation_instructions)
+        if invocation_instructions:
+            action, extract = self._build_signatures_with_files(invocation_instructions)
+        else:
+            action, extract = self.generate_action, self.extract
+
+        prompt_sections: list[str] = []
+        for contributor in self._annotation_prompt_contributors:
+            prepared_inputs = {
+                name: binding.prepared for name, binding in ctx.input_bindings.items()
+            }
+            sections = contributor.contribute(self.signature, prepared_inputs, ctx)
+            if isinstance(sections, str):
+                raise TypeError(
+                    f"Prompt contributor {contributor.name!r} must return tuple[str, ...]"
+                )
+            for section in sections:
+                if not isinstance(section, str):
+                    raise TypeError(
+                        f"Prompt contributor {contributor.name!r} returned a non-string section"
+                    )
+                if section:
+                    prompt_sections.append(section)
+
+        if prompt_sections:
+            appendix = "\n\n".join(prompt_sections)
+            action = self._with_prompt_appendix(action, appendix)
+            extract = self._with_prompt_appendix(extract, appendix)
         ctx.state["generate_action"] = action
         ctx.state["extract"] = extract
+
+    def _with_prompt_appendix(self, predictor: dspy.Predict, appendix: str) -> dspy.Predict:
+        run_predictor = predictor.deepcopy()
+        instructions = "\n\n".join(
+            instruction
+            for instruction in (str(predictor.signature.instructions), appendix)
+            if instruction
+        )
+        run_predictor.signature = predictor.signature.with_instructions(instructions)
+        return run_predictor
 
     async def _setup_runtime_modules(self, ctx: RunContext) -> None:
         session = ctx.session
@@ -3776,7 +3815,13 @@ class PredictRLM(dspy.RLM):
         )
         try:
             lm_hist_before_action = snapshot_lm_history_len(dspy.settings.lm)
-            pred = self.generate_action(
+            run_ctx = current_run_context()
+            generate_action = (
+                run_ctx.state.get("generate_action", self.generate_action)
+                if run_ctx is not None
+                else self.generate_action
+            )
+            pred = generate_action(
                 variables_info=variables_info,
                 repl_history=history,
                 iteration=f"{iteration + 1}/{self.max_iterations}",
@@ -3908,30 +3953,48 @@ class PredictRLM(dspy.RLM):
         finally:
             self._finish_iteration_log(iteration_log_open)
 
-    async def _aextract_fallback_for_run(
-        self,
-        variables: list[Any],
-        history: Any,
-        output_field_names: list[str],
-    ) -> dspy.Prediction:
-        bound_fallback = getattr(self._extract_fallback, "__func__", None)
-        if bound_fallback is not _KERNEL_EXTRACT_FALLBACK:
-            return self._extract_fallback(variables, history, output_field_names)
+    def _copy_with_run_extract(self) -> PredictRLM:
         run_ctx = current_run_context()
         extract = (
             run_ctx.state.get("extract", self.extract)
             if run_ctx is not None
             else self.extract
         )
-        variables_info = [variable.format() for variable in variables]
-        extract_pred = await extract.acall(
-            variables_info=variables_info,
-            repl_history=history,
+        run_rlm = copy(self)
+        run_rlm.extract = extract
+        return run_rlm
+
+    def _extract_fallback_for_run(
+        self,
+        variables: list[Any],
+        history: Any,
+        output_field_names: list[str],
+    ) -> dspy.Prediction:
+        run_rlm = self._copy_with_run_extract()
+        return run_rlm._extract_fallback(
+            variables,
+            history,
+            output_field_names,
         )
-        return dspy.Prediction(
-            trajectory=[entry.model_dump() for entry in history],
-            final_reasoning="Extract forced final output",
-            **{name: getattr(extract_pred, name) for name in output_field_names},
+
+    async def _aextract_fallback_for_run(
+        self,
+        variables: list[Any],
+        history: Any,
+        output_field_names: list[str],
+    ) -> dspy.Prediction:
+        run_rlm = self._copy_with_run_extract()
+        bound_fallback = getattr(run_rlm._extract_fallback, "__func__", None)
+        if bound_fallback is not _DSPY_EXTRACT_FALLBACK:
+            return run_rlm._extract_fallback(
+                variables,
+                history,
+                output_field_names,
+            )
+        return await run_rlm._aextract_fallback(
+            variables,
+            history,
+            output_field_names,
         )
 
     def _prepare_file_io(
@@ -4332,7 +4395,7 @@ class PredictRLM(dspy.RLM):
                             break
                         history = result
                     else:
-                        prediction = self._extract_fallback(
+                        prediction = self._extract_fallback_for_run(
                             variables, history, output_field_names
                         )
                         if output_file_fields:
@@ -4553,7 +4616,7 @@ class PredictRLM(dspy.RLM):
     def _build_signatures_with_files(
         self, file_instructions: str
     ) -> tuple[dspy.Predict, dspy.Predict]:
-        """Build signatures with file instructions.
+        """Build signatures with per-call file instructions.
 
         File output fields are replaced with str in the signature so the RLM
         submits a path string, not a JSON object. The framework wraps the
@@ -4611,4 +4674,3 @@ class PredictRLM(dspy.RLM):
 _KERNEL_FORWARD_TRACED = PredictRLM._forward_traced
 _KERNEL_AFORWARD_TRACED = PredictRLM._aforward_traced
 _KERNEL_EXECUTE_ITERATION = PredictRLM._execute_iteration
-_KERNEL_EXTRACT_FALLBACK = PredictRLM._extract_fallback

@@ -351,7 +351,7 @@ same handlers fire for every `PredictRLM` instance.
 - [Architecture](ARCHITECTURE.md) — compare backend component and
   state/recovery semantics
 - [API reference](docs/api.md) — constructor params for `PredictRLM`, `File`,
-  and `Skill`
+  `CtxStr`, and `Skill`
 - [Skills](docs/skills.md) — define, compose, and mount custom skills
 - [RLM-GEPA](src/rlm_gepa/README.md) — optimize RLM skills from traces and
   configure `AgentSpec`

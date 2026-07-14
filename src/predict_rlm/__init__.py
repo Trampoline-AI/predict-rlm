@@ -8,6 +8,7 @@ File I/O:
     File — Unified file type for inputs (mount into sandbox) and outputs
            (sync from sandbox). Use ``list[File]`` for multiple files.
     Workspace — Mutable input directory mounted into the sandbox and synced back.
+    CtxStr — String input whose prepared value is injected into the outer prompt.
 
 Lifecycle callbacks:
     IterationStep — payload passed to ``on_rlm_iteration_end`` callbacks.
@@ -29,6 +30,7 @@ from .evidence import (
     RunEventKind,
 )
 from .files import File, LocalDir, LocalFile, OutputDir, OutputFile, SyncedFile
+from .in_context import CtxStr
 from .predict_rlm import PredictRLM, SubmitConfirmationContext
 from .rlm_skills import Skill
 from .runtime import (
@@ -104,6 +106,7 @@ __all__ = [
     "ArtifactBinding",
     "ArtifactFileInfo",
     "CallableTool",
+    "CtxStr",
     "DirectoryCreationSession",
     "DirectPythonBackend",
     "IterationStep",
