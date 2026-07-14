@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import os
 import stat
@@ -151,6 +152,49 @@ def _host_workspace_manifest(workspace: Workspace) -> dict[str, WorkspaceFileInf
     return manifest
 
 
+async def _ahost_workspace_manifest(
+    workspace: Workspace,
+) -> dict[str, WorkspaceFileInfo]:
+    root = os.path.abspath(workspace.path)
+    manifest: dict[str, WorkspaceFileInfo] = {}
+    for dirpath, dirnames, filenames in os.walk(root):
+        rel_dir = _workspace_rel_path(root, dirpath)
+        dirnames[:] = [
+            directory
+            for directory in sorted(dirnames)
+            if not _is_excluded_relpath(
+                f"{rel_dir}/{directory}" if rel_dir else directory,
+                workspace.exclude,
+            )
+            and not os.path.islink(os.path.join(dirpath, directory))
+        ]
+        for filename in sorted(filenames):
+            rel_path = f"{rel_dir}/{filename}" if rel_dir else filename
+            if _is_excluded_relpath(rel_path, workspace.exclude):
+                continue
+            host_path = os.path.join(root, *Path(rel_path).parts)
+            try:
+                file_stat = os.lstat(host_path)
+            except FileNotFoundError:
+                continue
+            if not stat.S_ISREG(file_stat.st_mode):
+                continue
+            if workspace.max_file_bytes is not None and file_stat.st_size > workspace.max_file_bytes:
+                continue
+            digest = hashlib.sha256()
+            with open(host_path, "rb") as file:
+                while chunk := file.read(1024 * 1024):
+                    digest.update(chunk)
+                    await asyncio.sleep(0)
+            manifest[rel_path] = WorkspaceFileInfo(
+                type="file",
+                sha256=digest.hexdigest(),
+                size=file_stat.st_size,
+            )
+            await asyncio.sleep(0)
+    return manifest
+
+
 class WorkspaceSyncState:
     """Tracks host/sandbox manifests and syncs one workspace safely."""
 
@@ -166,6 +210,18 @@ class WorkspaceSyncState:
 
     def iter_mounts(self) -> list[tuple[str, str]]:
         self.original_host_manifest = _host_workspace_manifest(self.workspace)
+        self.last_host_manifest = dict(self.original_host_manifest)
+        self.last_sandbox_manifest = dict(self.original_host_manifest)
+        return [
+            (
+                os.path.join(self.root, *Path(rel_path).parts),
+                f"{self.workspace.mount_path}/{rel_path}",
+            )
+            for rel_path in sorted(self.original_host_manifest)
+        ]
+
+    async def aiter_mounts(self) -> list[tuple[str, str]]:
+        self.original_host_manifest = await _ahost_workspace_manifest(self.workspace)
         self.last_host_manifest = dict(self.original_host_manifest)
         self.last_sandbox_manifest = dict(self.original_host_manifest)
         return [
@@ -235,12 +291,63 @@ class WorkspaceSyncState:
                 f"at {self.workspace.mount_path!r}: {exc}"
             ) from exc
 
+        host_manifest, writes, deletes = self._plan_sync(raw_sandbox_manifest)
+        self._apply_deletes(deletes)
+        for rel_path, host_path, new_sandbox in writes:
+            os.makedirs(os.path.dirname(host_path), exist_ok=True)
+            repl.sync_file_to(f"{self.workspace.mount_path}/{rel_path}", host_path)
+            host_manifest[rel_path] = new_sandbox
+        self._finish_sync(sandbox_manifest=raw_sandbox_manifest)
+        return []
+
+    async def async_sync_from_sandbox(self, repl: Any) -> list[WorkspaceSyncConflict]:
+        if not self.workspace.sync_back:
+            return []
+        try:
+            raw_sandbox_manifest = await repl.aworkspace_manifest(self.workspace.mount_path)
+        except Exception as exc:
+            raise WorkspaceSyncConflictError(
+                "Workspace sync conflict: workspace mount could not be inspected "
+                f"at {self.workspace.mount_path!r}: {exc}"
+            ) from exc
+
+        host_manifest = await _ahost_workspace_manifest(self.workspace)
+        host_manifest, writes, deletes = self._plan_sync(
+            raw_sandbox_manifest,
+            host_manifest=host_manifest,
+        )
+        self._apply_deletes(deletes)
+        for rel_path, host_path, new_sandbox in writes:
+            os.makedirs(os.path.dirname(host_path), exist_ok=True)
+            await repl.async_file_to(
+                f"{self.workspace.mount_path}/{rel_path}",
+                host_path,
+            )
+            host_manifest[rel_path] = new_sandbox
+        self.last_sandbox_manifest = {
+            rel: info
+            for rel, info in raw_sandbox_manifest.items()
+            if not _is_excluded_relpath(rel, self.workspace.exclude)
+        }
+        self.last_host_manifest = await _ahost_workspace_manifest(self.workspace)
+        return []
+
+    def _plan_sync(
+        self,
+        raw_sandbox_manifest: dict[str, WorkspaceFileInfo],
+        *,
+        host_manifest: dict[str, WorkspaceFileInfo] | None = None,
+    ) -> tuple[
+        dict[str, WorkspaceFileInfo],
+        list[tuple[str, str, WorkspaceFileInfo]],
+        list[str],
+    ]:
         sandbox_manifest = {
             rel: info
             for rel, info in raw_sandbox_manifest.items()
             if not _is_excluded_relpath(rel, self.workspace.exclude)
         }
-        host_manifest = self.current_host_manifest()
+        host_manifest = host_manifest or self.current_host_manifest()
         conflicts: list[WorkspaceSyncConflict] = []
         writes: list[tuple[str, str, WorkspaceFileInfo]] = []
         deletes: list[str] = []
@@ -307,15 +414,21 @@ class WorkspaceSyncState:
             details = ", ".join(f"{c.path} ({c.reason})" for c in conflicts)
             raise WorkspaceSyncConflictError(f"Workspace sync conflict: {details}")
 
+        return host_manifest, writes, deletes
+
+    def _apply_deletes(self, deletes: list[str]) -> None:
         for host_path in deletes:
             if os.path.lexists(host_path):
                 os.remove(host_path)
 
-        for rel_path, host_path, new_sandbox in writes:
-            os.makedirs(os.path.dirname(host_path), exist_ok=True)
-            repl.sync_file_to(f"{self.workspace.mount_path}/{rel_path}", host_path)
-            host_manifest[rel_path] = new_sandbox
-
-        self.last_sandbox_manifest = dict(sandbox_manifest)
+    def _finish_sync(
+        self,
+        *,
+        sandbox_manifest: dict[str, WorkspaceFileInfo],
+    ) -> None:
+        self.last_sandbox_manifest = {
+            rel: info
+            for rel, info in sandbox_manifest.items()
+            if not _is_excluded_relpath(rel, self.workspace.exclude)
+        }
         self.last_host_manifest = self.current_host_manifest()
-        return []

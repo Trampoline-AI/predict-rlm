@@ -152,7 +152,7 @@ class SandboxExecutionError(CodeInterpreterError):
 
 
 class ExecutionBackend(Protocol):
-    """Runtime methods PredictRLM needs from an execution backend."""
+    """Runtime methods PredictRLM needs from an interpreter backend."""
 
     def execute(
         self,
@@ -179,6 +179,9 @@ class ExecutionBackend(Protocol):
     def sync_file_to(self, virtual_path: str, host_path: str) -> None: ...
 
     def shutdown(self) -> None: ...
+
+
+LegacyExecutionBackend = ExecutionBackend
 
 
 class SupervisorProcess(Protocol):

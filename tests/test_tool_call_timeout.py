@@ -29,12 +29,14 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
+import inspect
 import time
 
 import pytest
 
 import predict_rlm.backends.jspi.backend as rlm_interpreter
 from predict_rlm.backends import JspiBackend
+from predict_rlm.predict_rlm import PredictRLM
 
 
 def _build_interp_with_tool(tool_fn, tool_name: str = "slow_tool"):
@@ -157,3 +159,40 @@ def test_sync_tool_timeout_does_not_poison_executor(monkeypatch):
         assert time.monotonic() - started < 0.3
     finally:
         interp._executor.shutdown(wait=False, cancel_futures=True)
+
+
+def test_evidence_wrapped_sync_tool_deadline_does_not_wait_for_worker(monkeypatch):
+    monkeypatch.setattr(rlm_interpreter, "TOOL_CALL_TIMEOUT_SEC", 0.02)
+    started = __import__("threading").Event()
+    release = __import__("threading").Event()
+
+    def _blocked_tool():
+        started.set()
+        release.wait()
+        return "late"
+
+    owner = type("EvidenceOwner", (), {"_evidence": lambda self: None})()
+    wrapped = PredictRLM._wrap_evidence_tool(owner, "slow_tool", _blocked_tool)
+    interp = _build_interp_with_tool(wrapped)
+
+    assert not inspect.iscoroutinefunction(inspect.unwrap(wrapped))
+
+    async def _run():
+        started_at = time.monotonic()
+        response = await interp._execute_tool_async(
+            "slow_tool",
+            {"args": [], "kwargs": {}},
+        )
+        return response, time.monotonic() - started_at
+
+    timer = __import__("threading").Timer(0.4, release.set)
+    timer.start()
+    try:
+        response, elapsed = asyncio.run(_run())
+    finally:
+        release.set()
+        timer.cancel()
+
+    assert elapsed < 0.15
+    assert "timed out" in response["error"]
+    assert interp.has_live_sync_workers()

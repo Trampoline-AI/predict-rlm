@@ -1,7 +1,18 @@
 """Execution backends for predict-rlm."""
 
-from .base import BackendName, ExecutionBackend
-from .jspi import JspiBackend
+from predict_rlm.runtime import (
+    ExecutionBackend,
+    ExecutionSession,
+)
+
+from .adapters import (
+    ExistingExecutionBackendAdapter,
+    InterpreterBackendAdapter,
+    InterpreterExecutionSession,
+    NativeInterpreterExecutionSession,
+)
+from .base import BackendName, LegacyExecutionBackend
+from .jspi import JspiBackend, JspiExecutionBackend, JspiExecutionSession
 from .supervisor import DirectPythonBackend, PythonSupervisor
 
 _SBX_EXTRA_INSTALL_HINT = (
@@ -38,7 +49,15 @@ __all__ = [
     "DEFAULT_SBX_TEMPLATE",
     "DirectPythonBackend",
     "ExecutionBackend",
+    "ExecutionSession",
+    "ExistingExecutionBackendAdapter",
+    "InterpreterBackendAdapter",
+    "InterpreterExecutionSession",
+    "NativeInterpreterExecutionSession",
     "JspiBackend",
+    "JspiExecutionBackend",
+    "JspiExecutionSession",
+    "LegacyExecutionBackend",
     "PythonSupervisor",
     "BackendName",
     "SbxConfig",

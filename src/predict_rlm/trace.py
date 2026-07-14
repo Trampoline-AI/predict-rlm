@@ -202,6 +202,33 @@ class ProposerIterationStep(BaseModel):
     )
 
 
+class RunEvidenceEvent(BaseModel):
+    sequence: int
+    kind: str
+    timestamp_ns: int
+    data: dict[str, Any] = Field(default_factory=dict)
+
+
+class RunEvidence(BaseModel):
+    run_id: str
+    complete: bool
+    terminal_outcome: str | None = None
+    events: list[RunEvidenceEvent] = Field(default_factory=list)
+
+
+class ProposerRunEvidenceEvent(BaseModel):
+    sequence: int
+    kind: str
+    data: dict[str, Any] = Field(default_factory=dict)
+
+
+class ProposerRunEvidence(BaseModel):
+    run_id: str
+    complete: bool
+    terminal_outcome: str | None = None
+    events: list[ProposerRunEvidenceEvent] = Field(default_factory=list)
+
+
 class ProposerRunTrace(BaseModel):
     """Subset of RunTrace intended for instruction proposer inputs.
 
@@ -224,6 +251,7 @@ class ProposerRunTrace(BaseModel):
     steps: list[ProposerIterationStep] = Field(
         default_factory=list, description="Per-iteration execution steps"
     )
+    evidence: ProposerRunEvidence | None = None
 
 
 class LMUsage(BaseModel):
@@ -302,6 +330,10 @@ class RunTrace(BaseModel):
     )
     steps: list[IterationStep] = Field(
         default_factory=list, description="Per-iteration execution steps"
+    )
+    evidence: RunEvidence | None = Field(
+        default=None,
+        description="Strict lifecycle evidence completed after session release",
     )
 
     def __repr__(self) -> str:
@@ -385,6 +417,23 @@ class RunTrace(BaseModel):
                 )
                 for step in self.steps
             ],
+            evidence=(
+                ProposerRunEvidence(
+                    run_id=self.evidence.run_id,
+                    complete=self.evidence.complete,
+                    terminal_outcome=self.evidence.terminal_outcome,
+                    events=[
+                        ProposerRunEvidenceEvent(
+                            sequence=event.sequence,
+                            kind=event.kind,
+                            data=_proposer_evidence_data(event),
+                        )
+                        for event in self.evidence.events
+                    ],
+                )
+                if self.evidence is not None
+                else None
+            ),
         )
 
     def to_proposer_json(self, path: str | Path | None = None, indent: int = 2) -> str:
@@ -400,6 +449,43 @@ class RunTrace(BaseModel):
 # ---------------------------------------------------------------------------
 
 _BASE64_DATA_RE = re.compile(r"data:image/([^;]+);base64,([A-Za-z0-9+/=]+)")
+
+_PROPOSER_ACCOUNTING_KEYS = {
+    "cache_hits",
+    "cost",
+    "duration_ms",
+    "input_tokens",
+    "output_tokens",
+    "total_tokens",
+    "total_usage",
+    "usage",
+}
+
+
+def _proposer_evidence_data(event: RunEvidenceEvent) -> dict[str, Any]:
+    data = dict(event.data)
+    if event.kind == "run.started":
+        data.pop("inputs", None)
+    elif event.kind == "iteration.recorded":
+        step = data.get("step")
+        return (
+            {"iteration": step["iteration"]}
+            if isinstance(step, dict) and "iteration" in step
+            else {}
+        )
+    return _sanitize_for_trace(_without_accounting(data))
+
+
+def _without_accounting(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {
+            key: _without_accounting(item)
+            for key, item in value.items()
+            if key not in _PROPOSER_ACCOUNTING_KEYS
+        }
+    if isinstance(value, list):
+        return [_without_accounting(item) for item in value]
+    return value
 
 
 def _sanitize_for_trace(value: Any) -> Any:

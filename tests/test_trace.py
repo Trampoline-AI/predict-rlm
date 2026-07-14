@@ -14,6 +14,8 @@ from predict_rlm.trace import (
     PredictCallDetail,
     PredictCallGroup,
     ProposerRunTrace,
+    RunEvidence,
+    RunEvidenceEvent,
     RunTrace,
     TokenUsage,
     ToolCall,
@@ -450,6 +452,90 @@ class TestRunTrace:
         assert result.count("<IMAGE_BASE_64_ENCODED(40000)>") == 4
         full = trace.model_dump()
         assert b64 in full["steps"][0]["reasoning"]
+
+    def test_to_proposer_projects_strict_evidence_without_raw_or_accounting_data(self):
+        b64 = "A" * 40000
+        trace = RunTrace(
+            status="error",
+            model="openai/gpt-5",
+            iterations=1,
+            max_iterations=5,
+            duration_ms=100,
+            evidence=RunEvidence(
+                run_id="run",
+                complete=False,
+                terminal_outcome="error",
+                events=[
+                    RunEvidenceEvent(
+                        sequence=1,
+                        kind="run.started",
+                        timestamp_ns=1,
+                        data={"inputs": {"image": f"data:image/png;base64,{b64}"}},
+                    ),
+                    RunEvidenceEvent(
+                        sequence=2,
+                        kind="iteration.recorded",
+                        timestamp_ns=2,
+                        data={
+                            "step": {
+                                "iteration": 1,
+                                "duration_ms": 100,
+                                "usage": {"input_tokens": 10, "cost": 0.2},
+                                "predict_calls": [
+                                    {
+                                        "total_usage": {
+                                            "output_tokens": 3,
+                                            "cache_hits": 1,
+                                        }
+                                    }
+                                ],
+                            }
+                        },
+                    ),
+                    RunEvidenceEvent(
+                        sequence=3,
+                        kind="tool.finished",
+                        timestamp_ns=3,
+                        data={
+                            "name": "inspect",
+                            "result": {"image": f"data:image/png;base64,{b64}"},
+                            "error": "failed usefully",
+                            "duration_ms": 9,
+                            "cost": 0.1,
+                        },
+                    ),
+                ],
+            ),
+        )
+
+        proposer = trace.to_proposer().model_dump()
+        serialized = trace.to_proposer_json()
+
+        assert proposer["evidence"]["complete"] is False
+        assert [event["kind"] for event in proposer["evidence"]["events"]] == [
+            "run.started",
+            "iteration.recorded",
+            "tool.finished",
+        ]
+        assert proposer["evidence"]["events"][0]["data"] == {}
+        assert proposer["evidence"]["events"][1]["data"] == {"iteration": 1}
+        assert proposer["evidence"]["events"][2]["data"]["name"] == "inspect"
+        assert proposer["evidence"]["events"][2]["data"]["error"] == "failed usefully"
+        assert "AAAA" not in serialized
+        assert "<IMAGE_BASE_64_ENCODED(40000)>" in serialized
+        for field in (
+            "timestamp_ns",
+            "inputs",
+            "step",
+            "duration_ms",
+            "usage",
+            "cost",
+            "cache_hits",
+            "total_usage",
+            "input_tokens",
+            "output_tokens",
+        ):
+            assert f'"{field}"' not in serialized
 
     def test_to_exportable_json_writes_file(self, tmp_path):
         trace = RunTrace(

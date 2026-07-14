@@ -24,7 +24,7 @@ from dspy.primitives.code_interpreter import CodeInterpreterError
 from predict_rlm._shared import strip_code_fences
 from predict_rlm.backends.base import (
     BackendExecutionGate,
-    ExecutionBackend,
+    LegacyExecutionBackend,
     SandboxFatalError,
     SupervisorClient,
     SupervisorProcess,
@@ -315,7 +315,7 @@ class _DirectProcessRunnerAdapter:
         )
 
 
-class PythonSupervisor(SupervisorClient, ExecutionBackend):
+class PythonSupervisor(SupervisorClient, LegacyExecutionBackend):
     _LIST_DIR_SCRIPT = (
         "import json, pathlib, sys; "
         "root = pathlib.Path(sys.argv[1]); "

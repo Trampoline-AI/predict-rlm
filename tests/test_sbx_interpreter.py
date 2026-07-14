@@ -37,11 +37,17 @@ from predict_rlm.backends import (  # noqa: E402
     SbxConfig,
     SbxPool,
 )
-from predict_rlm.backends.base import SandboxExecutionError, SandboxFatalError  # noqa: E402
+from predict_rlm.backends.base import (  # noqa: E402
+    BackendExecutionGate,
+    SandboxExecutionError,
+    SandboxFatalError,
+)
+from predict_rlm.backends.sbx.execution import SbxExecutionBackend  # noqa: E402
 from predict_rlm.backends.supervisor._payload import (  # noqa: E402
     _pickleable_globals_snapshot,
 )
 from predict_rlm.files import SyncedFile  # noqa: E402
+from predict_rlm.runtime import ExecutionSpec  # noqa: E402
 from predict_rlm.workspace import DirectWorkspaceMount  # noqa: E402
 
 PAYLOAD_PATH = Path(__file__).parents[1] / "src" / "predict_rlm" / "backends" / "supervisor" / "_payload.py"
@@ -2169,6 +2175,334 @@ class TestSbxBackendLocalWebSocketRunner:
         finally:
             interpreter.shutdown()
 
+    @pytest.mark.asyncio
+    async def _async_operations_do_not_delegate_to_sync_or_to_thread(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        async def add(a: int, b: int) -> dict:
+            await asyncio.sleep(0)
+            return {"total": a + b}
+
+        interpreter = self.make_interpreter(tmp_path, tools={"add": add})
+        source = tmp_path / "input.txt"
+        source.write_text("hello", encoding="utf-8")
+        output = tmp_path / "output.txt"
+
+        def forbidden(*args, **kwargs):
+            raise AssertionError("async SBX operation delegated to a sync API")
+
+        monkeypatch.setattr(interpreter, "execute", forbidden)
+        monkeypatch.setattr(interpreter, "interrupt", forbidden)
+        monkeypatch.setattr(interpreter, "shutdown", forbidden)
+        monkeypatch.setattr(asyncio, "to_thread", forbidden)
+        try:
+            await interpreter.amount_file_at(
+                str(source),
+                "/sandbox/input/source/input.txt",
+            )
+            await interpreter.amkdir_p("/sandbox/output/result")
+            result = await interpreter.aexecute(
+                "result = await add(2, 3)\n"
+                "print(result['total'])\n"
+                "from pathlib import Path\n"
+                "Path('/sandbox/output/result/output.txt').write_text('done')"
+            )
+            files = await interpreter.alist_dir("/sandbox/output/result")
+            manifest = await interpreter.aworkspace_manifest("/sandbox/output/result")
+            await interpreter.async_file_to(
+                "/sandbox/output/result/output.txt",
+                str(output),
+            )
+        finally:
+            await interpreter.ashutdown()
+
+        assert result == "5\n"
+        assert files == ["/sandbox/output/result/output.txt"]
+        assert manifest["output.txt"].size == 4
+        assert output.read_text(encoding="utf-8") == "done"
+
+    @pytest.mark.asyncio
+    async def _ainterrupt_does_not_call_sync_interrupt_or_to_thread(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        interpreter = self.make_interpreter(tmp_path, startup_timeout=5)
+
+        def forbidden(*args, **kwargs):
+            raise AssertionError("async interrupt delegated to a sync API")
+
+        monkeypatch.setattr(interpreter, "interrupt", forbidden)
+        monkeypatch.setattr(asyncio, "to_thread", forbidden)
+        try:
+            await interpreter.aexecute("kept = 99")
+            task = asyncio.create_task(
+                interpreter.aexecute("import time\ntime.sleep(120)\nprint('done')")
+            )
+            while not interpreter._execution_gate.is_running():
+                await asyncio.sleep(0.01)
+            await asyncio.sleep(0.2)
+
+            assert await interpreter.ainterrupt(timeout=10) is True
+            result = await task
+
+            assert "done" not in str(result)
+            assert await interpreter.aexecute("print(kept)") == "99\n"
+        finally:
+            await interpreter.ashutdown()
+
+    @pytest.mark.asyncio
+    async def _aexecute_cancellation_uses_native_interrupt_and_recovers(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        interpreter = self.make_interpreter(tmp_path, startup_timeout=5)
+
+        def forbidden(*args, **kwargs):
+            raise AssertionError("async cancellation delegated to a sync API")
+
+        monkeypatch.setattr(interpreter, "execute", forbidden)
+        monkeypatch.setattr(interpreter, "interrupt", forbidden)
+        monkeypatch.setattr(asyncio, "to_thread", forbidden)
+        try:
+            await interpreter.aexecute("seed = 5")
+            task = asyncio.create_task(
+                interpreter.aexecute("import time\ntime.sleep(120)\nprint('done')")
+            )
+            while not interpreter._execution_gate.is_running():
+                await asyncio.sleep(0.01)
+            await asyncio.sleep(0.2)
+
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+            assert await interpreter.aexecute("print(seed)") == "5\n"
+        finally:
+            await interpreter.ashutdown()
+
+
+class TestSbxBackendAsyncNative:
+    make_interpreter = TestSbxBackendLocalWebSocketRunner.make_interpreter
+    test_async_operations_do_not_delegate_to_sync_or_to_thread = (
+        TestSbxBackendLocalWebSocketRunner._async_operations_do_not_delegate_to_sync_or_to_thread
+    )
+    test_ainterrupt_does_not_call_sync_interrupt_or_to_thread = (
+        TestSbxBackendLocalWebSocketRunner._ainterrupt_does_not_call_sync_interrupt_or_to_thread
+    )
+    test_aexecute_cancellation_uses_native_interrupt_and_recovers = (
+        TestSbxBackendLocalWebSocketRunner._aexecute_cancellation_uses_native_interrupt_and_recovers
+    )
+
+
+@pytest.mark.asyncio
+async def test_cancelled_async_tool_tasks_remain_quarantined_until_done(tmp_path: Path):
+    interpreter = SbxBackend.__new__(SbxBackend)
+    interpreter._async_pending_tool_calls = {}
+    interpreter._quarantined_async_tool_calls = set()
+    release = asyncio.Event()
+
+    async def stubborn_tool_task():
+        try:
+            await asyncio.Future()
+        except asyncio.CancelledError:
+            await release.wait()
+
+    task = asyncio.create_task(stubborn_tool_task())
+    interpreter._async_pending_tool_calls[task] = 1
+    await asyncio.sleep(0)
+
+    await interpreter._acancel_async_tool_calls(timeout=0.01)
+
+    assert not task.done()
+    assert interpreter._pending_tool_count() == 1
+
+    release.set()
+    await task
+    await asyncio.sleep(0)
+
+    assert interpreter._pending_tool_count() == 0
+
+
+@pytest.mark.asyncio
+async def test_aexecute_skips_post_hooks_after_fatal_failure():
+    interpreter = SbxBackend.__new__(SbxBackend)
+    interpreter._execution_gate = BackendExecutionGate("SBX backend")
+    interpreter._post_execute_hooks = []
+    interpreter._uses_websocket_transport = lambda: True  # type: ignore[method-assign]
+    interpreter._aexecute_top_level = AsyncMock(  # type: ignore[method-assign]
+        side_effect=SandboxFatalError("fatal")
+    )
+    hook = AsyncMock()
+    interpreter.add_post_execute_hook(hook)
+
+    with pytest.raises(SandboxFatalError, match="fatal"):
+        await interpreter.aexecute("raise SystemExit")
+
+    hook.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_aexecute_cancellation_skips_failing_post_hook():
+    interpreter = SbxBackend.__new__(SbxBackend)
+    interpreter._execution_gate = BackendExecutionGate("SBX backend")
+    interpreter._post_execute_hooks = []
+    interpreter._active_async_request = None
+    interpreter._uses_websocket_transport = lambda: True  # type: ignore[method-assign]
+    started = asyncio.Event()
+
+    async def block(code, variables, *, timeout=None):
+        started.set()
+        await asyncio.Future()
+
+    async def fail_hook(_backend):
+        raise OSError("unsafe workspace sync")
+
+    interpreter._aexecute_top_level = block  # type: ignore[method-assign]
+    interpreter.add_post_execute_hook(fail_hook)
+    execution = asyncio.create_task(interpreter.aexecute("await work()"))
+    await started.wait()
+    execution.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await execution
+
+
+@pytest.mark.asyncio
+async def test_aexecute_preserves_primary_error_when_post_hook_fails():
+    interpreter = SbxBackend.__new__(SbxBackend)
+    interpreter._execution_gate = BackendExecutionGate("SBX backend")
+    interpreter._post_execute_hooks = []
+    interpreter._uses_websocket_transport = lambda: True  # type: ignore[method-assign]
+    interpreter._aexecute_top_level = AsyncMock(  # type: ignore[method-assign]
+        side_effect=ValueError("primary")
+    )
+
+    async def fail_hook(_backend):
+        raise OSError("sync failed")
+
+    interpreter.add_post_execute_hook(fail_hook)
+
+    with pytest.raises(ValueError, match="primary") as raised:
+        await interpreter.aexecute("bad code")
+
+    assert isinstance(raised.value.post_execute_error, OSError)
+
+
+def test_execute_skips_post_hooks_after_fatal_failure():
+    interpreter = SbxBackend.__new__(SbxBackend)
+    interpreter._execution_gate = BackendExecutionGate("SBX backend")
+    interpreter._post_execute_hooks = []
+    interpreter._execute_top_level = MagicMock(  # type: ignore[method-assign]
+        side_effect=SandboxFatalError("fatal")
+    )
+    hook = MagicMock()
+    interpreter.add_post_execute_hook(hook)
+
+    with pytest.raises(SandboxFatalError, match="fatal"):
+        interpreter.execute("raise SystemExit")
+
+    hook.assert_not_called()
+
+
+def test_execute_preserves_primary_error_when_post_hook_fails():
+    interpreter = SbxBackend.__new__(SbxBackend)
+    interpreter._execution_gate = BackendExecutionGate("SBX backend")
+    interpreter._post_execute_hooks = []
+    interpreter._execute_top_level = MagicMock(  # type: ignore[method-assign]
+        side_effect=ValueError("primary")
+    )
+    interpreter.add_post_execute_hook(MagicMock(side_effect=OSError("sync failed")))
+
+    with pytest.raises(ValueError, match="primary") as raised:
+        interpreter.execute("bad code")
+
+    assert isinstance(raised.value.post_execute_error, OSError)
+
+
+def test_owned_sbx_retirement_finishes_before_sync_loop_teardown(monkeypatch):
+    interpreter = SbxBackend.__new__(SbxBackend)
+    interpreter._async_pending_tool_calls = {}
+    interpreter._quarantined_async_tool_calls = set()
+    interpreter._pending_tool_calls = {}
+    interpreter._quarantined_tool_calls = set()
+    cleanup_finished = threading.Event()
+    shutdown_finished = threading.Event()
+
+    async def stubborn_tool_task():
+        try:
+            await asyncio.Future()
+        except asyncio.CancelledError:
+            await asyncio.sleep(0)
+            cleanup_finished.set()
+
+    async def shutdown():
+        shutdown_finished.set()
+
+    interpreter.ashutdown = shutdown  # type: ignore[method-assign]
+    monkeypatch.setattr(
+        "predict_rlm.backends.sbx.execution.SbxBackend",
+        lambda **kwargs: interpreter,
+    )
+    backend = SbxExecutionBackend()
+
+    async def run_owned_session():
+        context = SimpleNamespace(session=None, ownership=None)
+        async with backend.start(ExecutionSpec(), context):
+            task = asyncio.create_task(stubborn_tool_task())
+            interpreter._async_pending_tool_calls[task] = 1
+            await asyncio.sleep(0)
+
+    asyncio.run(run_owned_session())
+
+    assert cleanup_finished.is_set()
+    assert shutdown_finished.is_set()
+
+
+@pytest.mark.asyncio
+async def test_cancelled_sync_tool_keeps_direct_synced_temp_until_worker_exits(
+    tmp_path: Path,
+):
+    interpreter = SbxBackend.__new__(SbxBackend)
+    interpreter.verbose = False
+    interpreter._execution_gate = BackendExecutionGate("SBX backend")
+    started = threading.Event()
+    release = threading.Event()
+    temporary_root = tmp_path / "tool-file-sync"
+    temporary_root.mkdir()
+    temporary_file = temporary_root / "input.txt"
+    temporary_file.write_text("input", encoding="utf-8")
+
+    def block() -> str:
+        started.set()
+        release.wait()
+        assert temporary_file.exists()
+        return "done"
+
+    async def prepare(tool, args, kwargs):
+        return args, kwargs, [], str(temporary_root)
+
+    interpreter.tools = {"block": block}
+    interpreter._aprepare_synced_file_tool_args = prepare  # type: ignore[method-assign]
+    invocation = asyncio.create_task(
+        interpreter._abuild_tool_response(
+            {"id": 1, "params": {"name": "block", "args": [], "kwargs": {}}}
+        )
+    )
+    await asyncio.to_thread(started.wait)
+
+    invocation.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await invocation
+
+    assert temporary_file.exists()
+    worker = next(iter(interpreter._sync_worker_set()))
+    release.set()
+    await asyncio.wait_for(worker.wait(), timeout=1)
+    for _ in range(100):
+        if not temporary_root.exists():
+            break
+        await asyncio.sleep(0.01)
+
+    assert not temporary_root.exists()
+
 
 class TestSbxBackendInterrupt(TestSbxBackendLocalWebSocketRunner):
     """On-demand interrupt and cancellation-safe async execution."""
@@ -2256,13 +2590,13 @@ class TestSbxBackendInterrupt(TestSbxBackendLocalWebSocketRunner):
             interpreter.shutdown()
 
     @pytest.mark.local
-    def test_aexecute_cancellation_is_prompt_and_keeps_sandbox_warm(
+    @pytest.mark.asyncio
+    async def test_aexecute_cancellation_is_prompt_and_keeps_sandbox_warm(
         self, tmp_path: Path
     ):
         interpreter = self.make_interpreter(tmp_path, startup_timeout=5)
-
-        async def scenario() -> float:
-            interpreter.execute("seed = 5")
+        try:
+            await interpreter.aexecute("seed = 5")
             task = asyncio.ensure_future(
                 interpreter.aexecute("import time\ntime.sleep(120)\nprint('done')")
             )
@@ -2271,14 +2605,11 @@ class TestSbxBackendInterrupt(TestSbxBackendLocalWebSocketRunner):
             task.cancel()
             with pytest.raises(asyncio.CancelledError):
                 await task
-            return time.monotonic() - start
-
-        try:
-            elapsed = asyncio.run(scenario())
+            elapsed = time.monotonic() - start
             assert elapsed < 30, f"cancellation did not unwind promptly: {elapsed:.1f}s"
-            assert interpreter.execute("print(seed)") == "5\n"
+            assert await interpreter.aexecute("print(seed)") == "5\n"
         finally:
-            interpreter.shutdown()
+            await interpreter.ashutdown()
 
 
 class TestSupervisorPayloadInterruptMethod:
@@ -3310,6 +3641,29 @@ class TestSbxBackendRealSbx:
             output = interpreter.execute("print(2 + 3)")
         finally:
             interpreter.shutdown()
+
+        assert output.strip() == "5"
+
+    @pytest.mark.asyncio
+    async def test_real_sbx_async_transport_does_not_delegate_to_sync(
+        self, monkeypatch: pytest.MonkeyPatch
+    ):
+        interpreter = SbxBackend(
+            config=SbxConfig(name=f"predict-rlm-test-async-{os.getpid()}"),
+            preinstall_packages=False,
+        )
+
+        def forbidden(*args, **kwargs):
+            raise AssertionError("real async SBX delegated to a sync API")
+
+        monkeypatch.setattr(interpreter, "execute", forbidden)
+        monkeypatch.setattr(interpreter, "interrupt", forbidden)
+        monkeypatch.setattr(interpreter, "shutdown", forbidden)
+        monkeypatch.setattr(asyncio, "to_thread", forbidden)
+        try:
+            output = await interpreter.aexecute("print(2 + 3)")
+        finally:
+            await interpreter.ashutdown()
 
         assert output.strip() == "5"
 

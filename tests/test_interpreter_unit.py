@@ -263,6 +263,7 @@ class TestJspiTelemetry:
         interp._pending_file_ops = {}
         interp.deno_process = types.SimpleNamespace(
             kill=lambda: None,
+            poll=lambda: 0,
             wait=lambda timeout=None: None,
             pid=4321,
         )
@@ -327,7 +328,11 @@ class TestAsyncExecuteEof:
         async def stdout_eof(_timeout):
             return ""
 
-        interp.deno_process = SimpleNamespace(stderr=BlockingStderr())
+        interp.deno_process = SimpleNamespace(
+            stderr=BlockingStderr(),
+            kill=lambda: None,
+            poll=lambda: 0,
+        )
         interp._pending_file_ops = {}
         interp._send_completed_responses = no_completed_responses
         interp._read_with_timeout_async = stdout_eof
