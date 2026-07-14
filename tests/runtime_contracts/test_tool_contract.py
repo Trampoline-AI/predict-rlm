@@ -204,17 +204,13 @@ def test_timeout_during_concurrent_host_tool_calls_is_recoverable(
         pytest.skip(payload[0])
     assert status == "ready", payload
 
-    # Recovery intentionally quarantines the interpreter until both synchronous
-    # workers finish.  They each sleep for five seconds above, so leave enough
-    # scheduling grace for a loaded full-suite run without weakening the
-    # requirement that recovery is bounded.
     status, *payload = _get_repro_message(
         process=process,
         result_queue=queue,
-        timeout=10,
+        timeout=6,
         runtime=runtime,
         failure_message=(
-            f"{runtime.spec.name} runtime hung after iteration timeout while awaiting "
+            "SBX supervisor hung after iteration timeout while awaiting "
             "concurrent host tool calls"
         ),
     )
