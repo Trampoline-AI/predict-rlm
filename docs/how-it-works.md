@@ -23,7 +23,7 @@ factories into one runtime configuration. Each invocation then prepares typed
 inputs, acquires one execution session, runs the RLM loop, materializes typed
 outputs, and finalizes adapters and the session.
 
-Host paths returned through `PreparedInput.path()`, `paths()`, or `glob()` are
+Host paths returned through `PreparedInput.path()` / `.paths()` / `.glob()` are
 compiled before acquisition into destination claims and backend bindings. The
 adapter does not manage transfer capabilities or sandbox permissions itself.
 

@@ -713,8 +713,8 @@ def _replace_prepared_path(value: Any, planned: str, actual: str) -> Any:
 
 
 @dataclass(frozen=True)
-class MountedInput:
-    """Model-visible value and bindings produced by an input adapter mount."""
+class BoundInput:
+    """Model-visible value and bindings produced by an input adapter bind."""
 
     model_value: Any
     bindings: tuple[ArtifactBinding, ...] = ()
@@ -730,8 +730,8 @@ class PreparedInputBinding:
     field: FieldDescriptor
     adapter: InputAdapter[Any]
     prepared: PreparedInput
-    prepare_session_entered: bool = False
-    mounted: bool = False
+    open_entered: bool = False
+    bound: bool = False
     finalized: bool = False
 
 
@@ -889,7 +889,7 @@ class InputAdapter(ABC, Generic[AdapterValue]):
     """Shared configuration for invocation-local input lifecycles.
 
     Keep mutable state in ``PreparedInput`` or ``RunContext``. The lifecycle is
-    prepare, optional pre-acquisition setup, mount, per-attempt durability, then
+    prepare, open, bind, per-attempt durability, then
     reverse-order finalization.
     """
 
@@ -909,13 +909,13 @@ class InputAdapter(ABC, Generic[AdapterValue]):
     ) -> PreparedInput:
         """Describe the model value and session needs before acquisition.
 
-        Finalization is guaranteed only after ``prepare_session`` is entered, so
+        Finalization is guaranteed only after ``open`` is entered, so
         clean up partial failures here, use ``ctx.add_cleanup``, or defer owned
         resource acquisition to that hook.
         """
         ...
 
-    async def prepare_session(
+    async def open(
         self,
         field: FieldDescriptor,
         prepared: PreparedInput,
@@ -927,13 +927,13 @@ class InputAdapter(ABC, Generic[AdapterValue]):
         Once this hook is entered, ``finalize`` runs even when the hook raises.
         """
 
-    async def mount(
+    async def bind(
         self,
         field: FieldDescriptor,
         prepared: PreparedInput,
         ctx: RunContext,
         session: ExecutionSession,
-    ) -> MountedInput:
+    ) -> BoundInput:
         """Bind the prepared input after acquisition without owning the session.
 
         The default mounts every prepared artifact. A failure still proceeds
@@ -969,7 +969,7 @@ class InputAdapter(ABC, Generic[AdapterValue]):
                 mount.sandbox_path,
                 path,
             )
-        return MountedInput(model_value=model_value, bindings=tuple(bindings))
+        return BoundInput(model_value=model_value, bindings=tuple(bindings))
 
     async def after_execution(
         self,
@@ -998,7 +998,7 @@ class InputAdapter(ABC, Generic[AdapterValue]):
     ) -> None:
         """Release adapter-owned state exactly once before session finalization.
 
-        Adapters whose ``prepare_session`` hook was entered finalize in reverse
+        Adapters whose ``open`` hook was entered finalize in reverse
         preparation order on success, failure, or cancellation. Failures do not
         skip later adapter or session finalization. ``session`` is ``None`` when
         acquisition never completed; the framework owns its finalization and
@@ -1350,7 +1350,7 @@ class RunContext:
     input_values: Mapping[str, Any]
     run_id: str = field(default_factory=lambda: uuid.uuid4().hex)
     input_bindings: dict[str, PreparedInputBinding] = field(default_factory=dict)
-    mounted_input_bindings: list[PreparedInputBinding] = field(
+    bound_input_bindings: list[PreparedInputBinding] = field(
         default_factory=list,
         repr=False,
     )

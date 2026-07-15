@@ -22,9 +22,9 @@ construction
 
 invocation
   prepare inputs
-      -> prepare adapter-owned sessions
+      -> open adapter-owned resources
       -> validate requirements and acquire one ExecutionSession
-      -> mount inputs and reserve outputs
+      -> bind inputs and reserve outputs
       -> run generated-code attempts
            -> after_execution hooks
       -> materialize outputs
@@ -36,33 +36,63 @@ This ordering is the extension contract. Preparation that affects backend policy
 must finish before acquisition. Session operations happen only after acquisition.
 Adapter finalization does not replace framework-owned session finalization.
 
+## Choose a binding pattern
+
+### Pattern 1: The backend opens it from a description
+
+Use this when an ID, URI, or host path contains everything the backend needs.
+`prepare()` records that description as an `Artifact`. Once the execution environment
+is ready, the default `bind()` gives the artifact to the backend through
+`session.mount(artifact)`. The backend opens the resource and returns its sandbox
+path. The adapter does not override `open()` or `bind()`.
+
+### Pattern 2: The adapter opens it first
+
+Use this when opening the resource requires a provider client, login, lease, or other
+live handle. `prepare()` records the configuration, `open()` obtains the handle and
+stores it in `ctx.state`, and a custom `bind()` passes both to a backend-specific
+method on `session`. That method attaches the resource and returns its sandbox path.
+
 ## The adapter contracts
 
 An `InputAdapter` selects fields through `value_type` and returns a
-`PreparedInput`. Its hooks are:
+`PreparedInput`. Use its hooks to:
 
-- `prepare`: describe the model-visible value, artifacts, sandbox destinations,
-  and requirements without relying on an acquired execution session;
-- `prepare_session`: acquire adapter-owned provider state before backend
-  acquisition;
-- `mount`: bind the prepared value into the acquired session;
-- `after_execution`: durably observe changes after each completed generated-code
-  attempt; and
-- `finalize`: flush and release adapter-owned state exactly once.
+- `prepare`: choose the value the RLM receives and declare files or directories to
+  copy or mount;
+- `open`: open a client, lease, or synchronization handle needed for the
+  whole call;
+- `bind`: attach a resource that cannot be represented as a host path by using a
+  custom execution-session capability, then return the value the RLM should
+  receive;
+- `after_execution`: persist changes after each completed generated-code block; and
+- `finalize`: perform the final save and release adapter-owned resources.
+
+Backend and session access follows the lifecycle:
+
+- `prepare()` receives neither; it returns declarative requirements;
+- `open()` receives the selected `ExecutionBackend`, but no session exists yet;
+- `bind()` and `after_execution()` receive the active `ExecutionSession`; and
+- `finalize()` receives that session when acquisition succeeded, otherwise `None`.
+
+Adapters may use these objects to check compatibility or call supported session
+capabilities, but they never acquire, finalize, or release the execution session.
+See [Input adapter lifecycle](api.md#input-adapter-lifecycle) for the exact signatures
+and parameter roles.
 
 An `OutputAdapter` contributes pre-acquisition requirements, reserves a
 session-bound destination, and materializes the final value after execution.
 Host/provider cleanup that can outlive a session belongs on `RunContext`.
 
-The framework guarantees `finalize` after `prepare_session` is entered, including
+The framework guarantees `finalize` after `open` is entered, including
 setup failure, backend acquisition failure, execution failure, and cancellation.
 Hooks must still clean up resources acquired before that point if
-`prepare_session` itself never begins.
+`open` itself never begins.
 
 ## Advanced input example
 
-The example below is schematic: provider and backend-specific operations are
-ellipsed, while the kernel hooks and ownership boundaries are real.
+The example below implements Pattern 2. It is schematic: provider and backend-specific
+operations are ellipsed, while the kernel hooks and ownership boundaries are real.
 
 ```python
 from typing import Protocol, runtime_checkable
@@ -72,8 +102,8 @@ from pydantic import BaseModel, Field
 from predict_rlm import (
     ArtifactBinding,
     FieldDescriptor,
+    BoundInput,
     InputAdapter,
-    MountedInput,
     PreparedInput,
     RunContext,
     SandboxRootReservation,
@@ -123,11 +153,11 @@ class RemoteWorkspaceAdapter(InputAdapter[RemoteWorkspace]):
             sandbox_roots=(SandboxRootReservation(sandbox_path),),
         )
 
-    async def prepare_session(self, field, prepared, ctx, backend) -> None:
+    async def open(self, field, prepared, ctx, backend) -> None:
         lease = await self.provider.acquire(prepared.metadata["uri"])
         ctx.state[self._state_key(field)] = lease
 
-    async def mount(self, field, prepared, ctx, session) -> MountedInput:
+    async def bind(self, field, prepared, ctx, session) -> BoundInput:
         if not isinstance(session, RemoteWorkspaceSession):
             raise TypeError("The execution session cannot mount remote workspaces")
         binding = await session.mount_remote_workspace(
@@ -136,7 +166,7 @@ class RemoteWorkspaceAdapter(InputAdapter[RemoteWorkspace]):
             sandbox_path=prepared.model_value,
             writable=prepared.metadata["writable"],
         )
-        return MountedInput(model_value=binding.path, bindings=(binding,))
+        return BoundInput(model_value=binding.path, bindings=(binding,))
 
     async def after_execution(
         self,
@@ -158,8 +188,11 @@ class RemoteWorkspaceAdapter(InputAdapter[RemoteWorkspace]):
 
 The Pydantic value contains caller-facing configuration. The prepared value
 contains only model-visible data and non-secret metadata. The provider lease stays
-in the invocation-local context. The execution backend implements the custom
-session capability; the adapter never owns or finalizes that session.
+in the invocation-local context. `bind()` uses the kernel-owned execution session
+to attach that leased workspace to the execution environment; it does not expose
+the session to the RLM. The returned `BoundInput.model_value` becomes the
+signature field's value before generated code starts. In this example that value is
+the mounted sandbox path. The adapter never owns or finalizes the session.
 
 ## Output adapters
 

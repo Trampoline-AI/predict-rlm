@@ -1977,7 +1977,7 @@ class PredictRLM(dspy.RLM):
             with self._interpreter_context(**kwargs) as repl:
                 yield repl
             return
-        await self._prepare_runtime_input_sessions(ctx)
+        await self._open_runtime_inputs(ctx)
         try:
             validate_sandbox_root_reservations(ctx.input_bindings)
             requirements = merge_session_requirements(
@@ -3045,13 +3045,13 @@ class PredictRLM(dspy.RLM):
                     artifact_ids=[artifact.id for artifact in prepared.artifacts],
                 )
 
-    async def _prepare_runtime_input_sessions(self, ctx: RunContext) -> None:
+    async def _open_runtime_inputs(self, ctx: RunContext) -> None:
         for binding in ctx.input_bindings.values():
-            if binding.prepare_session_entered:
+            if binding.open_entered:
                 continue
-            binding.prepare_session_entered = True
+            binding.open_entered = True
             try:
-                await binding.adapter.prepare_session(
+                await binding.adapter.open(
                     binding.field,
                     binding.prepared,
                     ctx,
@@ -3113,17 +3113,17 @@ class PredictRLM(dspy.RLM):
         if session is None:
             raise RuntimeError("Artifact binding requires an active execution session")
         for binding in ctx.input_bindings.values():
-            if binding.mounted:
+            if binding.bound:
                 continue
-            binding.mounted = True
-            ctx.mounted_input_bindings.append(binding)
-            mounted = await binding.adapter.mount(
+            binding.bound = True
+            ctx.bound_input_bindings.append(binding)
+            bound = await binding.adapter.bind(
                 binding.field,
                 binding.prepared,
                 ctx,
                 session,
             )
-            for artifact_binding in mounted.bindings:
+            for artifact_binding in bound.bindings:
                 ctx.bind(artifact_binding)
                 if recorder is not None:
                     await recorder.emit(
@@ -3131,10 +3131,10 @@ class PredictRLM(dspy.RLM):
                         artifact_id=artifact_binding.artifact_id,
                         path=artifact_binding.path,
                     )
-            if mounted.model_value != binding.prepared.model_value:
+            if bound.model_value != binding.prepared.model_value:
                 binding.prepared = replace(
                     binding.prepared,
-                    model_value=mounted.model_value,
+                    model_value=bound.model_value,
                 )
 
     async def _run_session_code(
@@ -3174,7 +3174,7 @@ class PredictRLM(dspy.RLM):
             raise RuntimeError("Input lifecycle requires an active execution session")
         after_error: BaseException | None = None
         additional_errors = []
-        for binding in ctx.mounted_input_bindings:
+        for binding in ctx.bound_input_bindings:
             try:
                 await binding.adapter.after_execution(
                     binding.field,
@@ -3221,7 +3221,7 @@ class PredictRLM(dspy.RLM):
         adapter_error: BaseException | None = None
         additional_errors = []
         for binding in reversed(tuple(ctx.input_bindings.values())):
-            if not binding.prepare_session_entered or binding.finalized:
+            if not binding.open_entered or binding.finalized:
                 continue
             binding.finalized = True
             try:
