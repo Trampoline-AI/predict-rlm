@@ -17,7 +17,11 @@ rlm = PredictRLM(
     max_output_chars=50_000,  # Max chars from REPL output
     verbose=True,             # Print human-readable iteration trace blocks
     tools=None,               # Additional tool functions
+    interpreter=None,         # Legacy interpreter compatibility option
     adapters=(),              # Input and output adapter instances
+    execution=None,           # Custom root execution backend
+    modules=(),               # Runtime contributions or factories
+    events=(),                # Ordered lifecycle event sinks
     skills=None,              # List of Skill instances
     allowed_domains=None,     # Domains the sandbox can access
     debug=False,              # Print timestamped lifecycle diagnostics
@@ -37,7 +41,11 @@ rlm = PredictRLM(
 | `max_output_chars` | `int` | `50_000` | Maximum characters to include from REPL output per iteration. |
 | `verbose` | `bool` | `True` | Print human-readable RLM iteration blocks to stderr: reasoning, generated code, output, tool calls, errors, and `SUBMIT` payloads. Pass `False` for quiet execution. |
 | `tools` | `dict[str, Callable] \| list[Callable] \| None` | `None` | Additional tool functions callable from the sandbox. Accepts a dict mapping names to callables, or a list of callables (names inferred from `__name__`). `predict` is added automatically. |
+| `interpreter` | `CodeInterpreter \| None` | `None` | Legacy interpreter-shaped backend adapted to the runtime kernel. `DirectPythonBackend` belongs here. |
 | `adapters` | `Sequence[InputAdapter \| OutputAdapter]` | `()` | Input and output adapter instances. Pass a list such as `adapters=[MyInputAdapter(), MyOutputAdapter()]`; each adapter's base class determines its role. |
+| `execution` | `ExecutionBackend \| None` | `None` | Custom root session-based execution backend. Interpreter-shaped compatibility backends belong under `interpreter=`. |
+| `modules` | `Sequence[RuntimeContribution \| RuntimeModule]` | `()` | Runtime contributions or zero-argument factories. Factories expand once at construction. |
+| `events` | `Sequence[EventSink]` | `()` | Ordered lifecycle event sinks. Strict sinks are correctness-critical; non-strict sinks are best effort. |
 | `skills` | `list[Skill] \| None` | `None` | [Skills](skills.md) providing domain-specific instructions, packages, and tools. Merged automatically. |
 | `allowed_domains` | `list[str] \| None` | `None` | Domains/IPs the sandbox can access via network. By default, no network access. Example: `["api.example.com", "192.168.1.100:8080"]` |
 | `debug` | `bool` | `False` | Print timestamped RLM and sandbox lifecycle diagnostics to stderr. Error-like debug records are colored red when the terminal supports ANSI colors. |
@@ -46,6 +54,9 @@ rlm = PredictRLM(
 Adapter names must be unique within each role; an input and output adapter may
 share a name. A configured adapter with the same name as a built-in compatibility
 adapter replaces that built-in only for the matching input or output role.
+See [Custom path inputs](custom-path-inputs.md) for file-like boundaries and
+[Custom adapters and the runtime kernel](custom-adapters.md) for advanced
+lifecycle ownership and runtime composition.
 
 ### Input adapter lifecycle
 
@@ -56,8 +67,9 @@ subclass or in `RunContext`.
 
 For each invocation, callbacks run in this order:
 
-1. `prepare()` runs before acquisition and returns the model-visible plain value,
-   requirements, mounts, artifacts, and exclusive sandbox-root reservations.
+1. `prepare()` runs before acquisition and returns the model-visible plain value
+   or declarative paths through `PreparedInput.path()`, `paths()`, or `glob()`.
+   The kernel derives filesystem policy, destination claims, and backend bindings.
 2. `prepare_session()` runs before backend acquisition. An adapter whose callback
    was entered is finalized even if that callback raises.
 3. After acquisition, `mount()` binds the prepared value into the session.
@@ -75,15 +87,17 @@ are attached to it, and make strict evidence incomplete. An adapter owns its
 provider resources and should release them in `finalize()` or a LIFO
 `ctx.add_cleanup()` callback; the framework owns session finalization and release.
 
-Declare host/network policy with `SessionRequirements`, direct mounts with
-`HostDirectoryMount`, and transfer-backed destinations with
-`SandboxRootReservation`. Requirements are validated before acquisition. Fresh
-owned sessions may apply supported per-invocation policy; reused or pooled sessions
-reject requirements that differ from their fixed policy rather than silently
-retaining broader or stale permissions. During mounting, test for the narrow
-capability needed (`HostDirectorySession`, `FileTransferSession`,
-`DirectoryCreationSession`, or `MutableDirectorySession`). Copy-in-only adapters do
-not need mutable-directory inspection or collection support.
+`PreparedInput.path()` copies one host file or directory by default. Pass
+`mode="mount"` for an explicit live view; unsupported backends fail rather than
+silently copying. `PreparedInput.paths()` handles an explicit list, while
+`PreparedInput.glob()` expands include/exclude patterns on the host and copies a
+deterministically ordered filtered snapshot. `at=` is always relative to
+`/sandbox`.
+
+These helpers own the common mount implementation. Override `mount()` only for a
+boundary they cannot express. Network access and stateful provider lifecycles
+remain explicit advanced concerns. Reused or pooled sessions reject incompatible
+per-invocation policy instead of retaining broader or stale permissions.
 
 ### Verbose, debug, and trace output
 
@@ -293,7 +307,7 @@ File.from_dir("docs/")         # all files in a directory -> list[File]
 
 | Field  | Type          | Default | Description                                                                                                                                             |
 | ------ | ------------- | ------- | ------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `path` | `str \| None` | `None`  | Path to the file. For inputs, the host path to mount into the sandbox. For outputs, populated after execution with the host path of the generated file. |
+| `path` | `str \| None` | `None`  | Path to the file. For inputs, the host path copied into the sandbox. For outputs, populated after execution with the host path of the generated file. |
 
 ### Methods
 
@@ -303,7 +317,7 @@ File.from_dir("docs/")         # all files in a directory -> list[File]
 
 ### Input vs output behavior
 
-As an **input field**, the file is mounted from the host into the sandbox at
+As an **input field**, the file is copied from the host into the sandbox at
 `/sandbox/input/{field_name}/`. The RLM can read it with standard Python file
 I/O.
 
@@ -313,8 +327,8 @@ with the host path.
 
 ```python
 class MySignature(dspy.Signature):
-    source: File = dspy.InputField()            # mounted into sandbox
-    docs: list[File] = dspy.InputField()        # multiple files mounted
+    source: File = dspy.InputField()            # copied into sandbox
+    docs: list[File] = dspy.InputField()        # multiple files copied
     result: File = dspy.OutputField()           # single file synced back
     outputs: list[File] = dspy.OutputField()    # multiple files synced back
 ```
@@ -356,6 +370,9 @@ automatically; no extra runtime configuration is required.
 `CtxStr` is input-only and currently supports class-based DSPy signatures
 only. Use `field: CtxStr`, not `list[CtxStr]`, `CtxStr | None`, or string
 signatures such as `"criteria: CtxStr -> answer"`.
+
+See [How it works](how-it-works.md#signatures-file-io-and-in-context-inputs) for
+how `CtxStr` composes with ordinary sandbox variables.
 
 ---
 

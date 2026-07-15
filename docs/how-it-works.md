@@ -2,7 +2,8 @@
 
 1. You define **inputs**, **outputs**, and **tools** — what the RLM receives,
    what it should produce, and what actions it can take
-2. The outer LLM writes Python code in a sandboxed Pyodide/WASM REPL
+2. The outer LLM writes Python code in a stateful execution session. The default
+   JSPI backend runs that session in a sandboxed Pyodide/WASM REPL
 3. Inside the sandbox, it calls `await predict(signature, **kwargs)` to invoke
    the sub-LM for understanding and extraction
 4. It iterates — exploring data, calling tools, building up intermediate
@@ -14,6 +15,24 @@ decides what to do next, and writes more code. State persists between
 iterations, so it can accumulate findings across many steps. See
 [predict-rlm Architecture](../ARCHITECTURE.md) for the backend component model
 and timeout/state guarantees.
+
+## Runtime kernel
+
+PredictRLM resolves constructor options and reusable `RuntimeContribution`
+factories into one runtime configuration. Each invocation then prepares typed
+inputs, acquires one execution session, runs the RLM loop, materializes typed
+outputs, and finalizes adapters and the session.
+
+Host paths returned through `PreparedInput.path()`, `paths()`, or `glob()` are
+compiled before acquisition into destination claims and backend bindings. The
+adapter does not manage transfer capabilities or sandbox permissions itself.
+
+Most users interact with this kernel through `CtxStr`, `File`, skills, and host
+tools. Add an input or output adapter for a new typed data boundary, package
+reusable runtime behavior through `modules=`, or pass `execution=` only when
+introducing a new execution substrate. See [Custom path inputs](custom-path-inputs.md)
+for file-like boundaries and [Custom adapters and the runtime kernel](custom-adapters.md)
+for advanced lifecycle extensions.
 
 ## Observability
 
@@ -32,13 +51,18 @@ If sandbox code prints output and then raises, the printed output is preserved
 before the formatted `[Error] ...` line in both the verbose stream and the
 structured run trace.
 
+Implementations that need ordered lifecycle events can provide an `EventSink`;
+see [Runtime observability](observability.md).
+
 ## Signatures, file I/O, and in-context inputs
 
 The DSPy signature defines the **inputs**, **outputs**, and **strategy** (via
-the docstring). Use `File` for file-typed fields — input files are mounted into
+the docstring). Use `File` for file-typed fields — input files are copied into
 the sandbox, output files are synced back (see [API](api.md#file) for details).
 Use `CtxStr` for string inputs like criteria or rubrics whose adapter-prepared
-value should be visible in the outer RLM prompt for the invocation.
+value should be visible in full in the outer RLM prompt for the invocation. The
+caller still passes a normal `str`, and the value remains available as a Python
+variable inside the execution session.
 
 ```python
 from predict_rlm import CtxStr, File, PredictRLM, Skill

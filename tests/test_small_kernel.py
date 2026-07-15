@@ -1799,6 +1799,40 @@ async def test_input_sandbox_root_collision_is_rejected_before_acquisition():
 
 
 @pytest.mark.asyncio
+async def test_output_reservation_rejects_prepared_input_overlap(tmp_path: Path):
+    from predict_rlm import PredictRLM
+
+    source = tmp_path / "source.txt"
+    source.write_text("source", encoding="utf-8")
+
+    class CollidingFileInputAdapter(FileInputAdapter):
+        async def prepare(self, field, value, ctx):
+            item = field.unpack(value)[0]
+            assert isinstance(item, RuntimeFile)
+            assert item.path is not None
+            return PreparedInput.path(item.path, at="output/result")
+
+    rlm = PredictRLM(
+        KernelFileSignature,
+        lm=MagicMock(history=[]),
+        execution=FinalBackend(),
+        adapters=[CollidingFileInputAdapter()],
+    )
+    ctx = rlm._new_run_context({"source": RuntimeFile(path=str(source))})
+
+    async with use_run_context(ctx):
+        await rlm._prepare_runtime_inputs(ctx, dict(ctx.input_values))
+        await rlm._prepare_runtime_outputs(ctx)
+        async with rlm._execution_session({}):
+            await rlm._bind_runtime_inputs(ctx)
+            with pytest.raises(
+                ValueError,
+                match="Input/output sandbox destinations overlap",
+            ):
+                await rlm._reserve_runtime_outputs(ctx)
+
+
+@pytest.mark.asyncio
 async def test_transfer_root_host_mount_collision_is_rejected_before_acquisition(
     tmp_path: Path,
 ):
@@ -2605,7 +2639,7 @@ def test_explicit_backend_mounts_and_collects_file_artifacts(tmp_path: Path):
     assert Path(prediction.result.path).read_text(encoding="utf-8") == "generated"
     assert len(backend.session.mounted) == 2
     assert {artifact.kind for artifact in backend.session.mounted} == {
-        "compat.file",
+        "runtime.path",
         "compat.output.directory",
     }
     rlm._prepare_file_io.assert_not_called()

@@ -5,15 +5,22 @@ from types import SimpleNamespace
 from typing import Annotated
 
 import pytest
+from pydantic import BaseModel
 
 from predict_rlm import ExecutionSpec, File, HostDirectoryMount
 from predict_rlm.compatibility import FileInputAdapter, FileOutputAdapter
 from predict_rlm.runtime import (
+    Artifact,
     ArtifactBinding,
     FieldDescriptor,
     InputAdapter,
     OutputAdapter,
+    OutputReservation,
     PreparedInput,
+    PreparedInputBinding,
+    compile_prepared_input,
+    validate_output_sandbox_root_reservation,
+    validate_sandbox_root_reservations,
 )
 
 
@@ -73,6 +80,217 @@ def test_execution_spec_rejects_conflicting_host_mount_access(tmp_path):
                 HostDirectoryMount(str(tmp_path), "/write"),
             )
         )
+
+
+def test_prepared_path_compiles_copy_without_adapter_plumbing(tmp_path):
+    source = tmp_path / "report.txt"
+    source.write_text("report", encoding="utf-8")
+
+    prepared = compile_prepared_input(
+        FieldDescriptor("source", str),
+        PreparedInput.path(source),
+    )
+
+    assert prepared.model_value == "/sandbox/input/source/report.txt"
+    assert [dict(artifact.metadata) for artifact in prepared.artifacts] == [
+        {
+            "source_path": str(source.resolve()),
+            "sandbox_path": "/sandbox/input/source/report.txt",
+        }
+    ]
+    assert prepared.requirements.extra_read_paths == (str(source.resolve()),)
+    assert [reservation.path for reservation in prepared.sandbox_roots] == [
+        "/sandbox/input/source/report.txt"
+    ]
+
+
+def test_prepared_path_and_paths_honor_relative_destinations(tmp_path):
+    first = tmp_path / "first.csv"
+    second = tmp_path / "second.csv"
+    first.write_text("first", encoding="utf-8")
+    second.write_text("second", encoding="utf-8")
+
+    single = compile_prepared_input(
+        FieldDescriptor("source", str),
+        PreparedInput.path(first, at="reports/latest.csv"),
+    )
+    multiple = compile_prepared_input(
+        FieldDescriptor("sources", list[str]),
+        PreparedInput.paths([second, first], at="datasets/current"),
+    )
+
+    assert single.model_value == "/sandbox/reports/latest.csv"
+    assert multiple.model_value == [
+        "/sandbox/datasets/current/second.csv",
+        "/sandbox/datasets/current/first.csv",
+    ]
+
+    with pytest.raises(ValueError, match="relative and traversal-free"):
+        PreparedInput.path(first, at="../escape.csv")
+
+
+def test_prepared_paths_reject_duplicate_destinations_within_one_field(tmp_path):
+    first = tmp_path / "first" / "report.csv"
+    second = tmp_path / "second" / "report.csv"
+    first.parent.mkdir()
+    second.parent.mkdir()
+    first.write_text("first", encoding="utf-8")
+    second.write_text("second", encoding="utf-8")
+    field = FieldDescriptor("documents", list[str])
+    prepared = compile_prepared_input(
+        field,
+        PreparedInput.paths([first, second], at="documents"),
+    )
+
+    with pytest.raises(ValueError, match="sandbox destinations overlap"):
+        validate_sandbox_root_reservations({
+            field.name: PreparedInputBinding(field, FileInputAdapter(), prepared)
+        })
+
+
+def test_output_reservation_rejects_overlap_with_prepared_input(tmp_path):
+    source = tmp_path / "report.csv"
+    source.write_text("report", encoding="utf-8")
+    field = FieldDescriptor("source", str)
+    prepared = compile_prepared_input(
+        field,
+        PreparedInput.path(source, at="output/report"),
+    )
+    input_bindings = {
+        field.name: PreparedInputBinding(field, FileInputAdapter(), prepared)
+    }
+    output_field = FieldDescriptor("report", File)
+    output = OutputReservation(
+        field=output_field,
+        artifact=Artifact(
+            id="output",
+            kind="test.output",
+            metadata={"sandbox_path": "/sandbox/output/report"},
+        ),
+        model_value="/sandbox/output/report/",
+    )
+
+    with pytest.raises(ValueError, match="Input/output sandbox destinations overlap"):
+        validate_output_sandbox_root_reservation(input_bindings, {}, output)
+
+
+@pytest.mark.asyncio
+async def test_pydantic_input_adapter_only_prepares_a_path(tmp_path):
+    source = tmp_path / "object.json"
+    source.write_text("{}", encoding="utf-8")
+
+    class S3File(BaseModel):
+        uri: str
+
+    class S3FileAdapter(InputAdapter[S3File]):
+        name = "s3-file"
+        value_type = S3File
+
+        async def prepare(self, field, value, ctx):
+            return PreparedInput.path(source)
+
+    class Session:
+        async def mount(self, artifact):
+            return ArtifactBinding(artifact.id, artifact.metadata["sandbox_path"])
+
+    field = FieldDescriptor("document", S3File)
+    adapter = S3FileAdapter()
+    prepared = compile_prepared_input(
+        field,
+        await adapter.prepare(field, S3File(uri="s3://bucket/object.json"), object()),
+    )
+    mounted = await adapter.mount(field, prepared, object(), Session())
+
+    assert mounted.model_value == "/sandbox/input/document/object.json"
+    assert [binding.path for binding in mounted.bindings] == [mounted.model_value]
+
+
+@pytest.mark.asyncio
+async def test_prepared_directory_mount_uses_default_adapter_mount(tmp_path):
+    source = tmp_path / "dataset"
+    source.mkdir()
+
+    class DatasetAdapter(InputAdapter[str]):
+        name = "dataset"
+        value_type = str
+
+        async def prepare(self, field, value, ctx):
+            return PreparedInput.path(value, mode="mount", read_only=True)
+
+    class Session:
+        async def mount_host_directory(self, mount):
+            assert mount.host_path == str(source.resolve())
+            assert mount.sandbox_path == "/sandbox/input/dataset"
+            assert mount.read_only is True
+            return mount.sandbox_path
+
+    field = FieldDescriptor("dataset", str)
+    adapter = DatasetAdapter()
+    prepared = compile_prepared_input(
+        field,
+        await adapter.prepare(field, str(source), object()),
+    )
+    mounted = await adapter.mount(field, prepared, object(), Session())
+    mounted_again = await adapter.mount(field, prepared, object(), Session())
+
+    assert mounted.model_value == "/sandbox/input/dataset"
+    assert [binding.path for binding in mounted.bindings] == [
+        "/sandbox/input/dataset"
+    ]
+    assert mounted.bindings[0].artifact_id != mounted_again.bindings[0].artifact_id
+
+
+def test_prepared_glob_is_sorted_filtered_and_preserves_relative_paths(tmp_path):
+    root = tmp_path / "dataset"
+    (root / "nested").mkdir(parents=True)
+    (root / "archive").mkdir()
+    (root / "z.csv").write_text("z", encoding="utf-8")
+    (root / "nested" / "a.csv").write_text("a", encoding="utf-8")
+    (root / "archive" / "old.csv").write_text("old", encoding="utf-8")
+    (root / "ignored.txt").write_text("ignored", encoding="utf-8")
+
+    prepared = compile_prepared_input(
+        FieldDescriptor("files", list[str]),
+        PreparedInput.glob(
+            root,
+            include="**/*.csv",
+            exclude="archive/**",
+            at="datasets/current",
+        ),
+    )
+
+    assert prepared.model_value == [
+        "/sandbox/datasets/current/nested/a.csv",
+        "/sandbox/datasets/current/z.csv",
+    ]
+    assert [artifact.metadata["sandbox_path"] for artifact in prepared.artifacts] == (
+        prepared.model_value
+    )
+
+
+def test_prepared_glob_rejects_empty_matches_by_default(tmp_path):
+    with pytest.raises(ValueError, match="did not match any files"):
+        PreparedInput.glob(tmp_path, include="**/*.csv")
+
+    prepared = PreparedInput.glob(
+        tmp_path,
+        include="**/*.csv",
+        allow_empty=True,
+    )
+    assert compile_prepared_input(
+        FieldDescriptor("files", list[str]), prepared
+    ).model_value == []
+
+
+def test_prepared_glob_rejects_symlinks_outside_source_root(tmp_path):
+    root = tmp_path / "dataset"
+    root.mkdir()
+    outside = tmp_path / "outside.csv"
+    outside.write_text("outside", encoding="utf-8")
+    (root / "linked.csv").symlink_to(outside)
+
+    with pytest.raises(ValueError, match="escapes source root"):
+        PreparedInput.glob(root, include="*.csv")
 
 
 @pytest.mark.asyncio

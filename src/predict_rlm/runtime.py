@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import concurrent.futures
 import contextvars
+import fnmatch
 import inspect
 import os
 import posixpath
@@ -16,10 +17,13 @@ from abc import ABC, abstractmethod
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from contextlib import asynccontextmanager, contextmanager
 from contextvars import ContextVar, Token
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import Enum
+from pathlib import Path, PurePosixPath
 from types import MappingProxyType
-from typing import Any, ClassVar, Generic, Protocol, TypeVar, runtime_checkable
+from typing import Any, ClassVar, Generic, Literal, Protocol, TypeVar, runtime_checkable
+
+from pydantic import BaseModel, ConfigDict, field_validator
 
 AdapterValue = TypeVar("AdapterValue")
 
@@ -348,6 +352,84 @@ def normalize_host_directory_mounts(
     return normalized
 
 
+class PathMode(str, Enum):
+    COPY = "copy"
+    MOUNT = "mount"
+
+
+class PreparedPath(BaseModel):
+    """One host path the kernel will expose inside an execution session."""
+
+    model_config = ConfigDict(frozen=True)
+
+    source: Path
+    target: str | None = None
+    relative_target: str | None = None
+    mode: PathMode = PathMode.COPY
+    read_only: bool = True
+
+    @field_validator("source")
+    @classmethod
+    def normalize_source(cls, source: Path) -> Path:
+        return source.expanduser().resolve(strict=True)
+
+    @field_validator("target", "relative_target")
+    @classmethod
+    def normalize_target(cls, target: str | None) -> str | None:
+        if target is None:
+            return None
+        path = PurePosixPath(target)
+        if path.is_absolute() or ".." in path.parts:
+            raise ValueError("Sandbox destinations must be relative and traversal-free")
+        normalized = posixpath.normpath(target)
+        if normalized in ("", "."):
+            raise ValueError("Sandbox destinations cannot be empty")
+        return normalized
+
+
+def _glob_patterns(value: str | Sequence[str], *, name: str) -> tuple[str, ...]:
+    patterns = (value,) if isinstance(value, str) else tuple(value)
+    if not patterns:
+        raise ValueError(f"PreparedInput.glob() {name} patterns cannot be empty")
+    for pattern in patterns:
+        parsed = PurePosixPath(pattern)
+        if not pattern or parsed == PurePosixPath("."):
+            raise ValueError(f"PreparedInput.glob() {name} patterns cannot be empty")
+        if parsed.is_absolute() or ".." in parsed.parts:
+            raise ValueError(f"Glob {name} patterns must stay under the source root")
+    return patterns
+
+
+def _glob_paths(
+    root: Path,
+    *,
+    include: str | Sequence[str],
+    exclude: str | Sequence[str],
+) -> tuple[tuple[Path, str], ...]:
+    root = root.expanduser().resolve(strict=True)
+    if not root.is_dir():
+        raise ValueError("PreparedInput.glob() source_root must be a directory")
+    include_patterns = _glob_patterns(include, name="include")
+    exclude_patterns = () if not exclude else _glob_patterns(exclude, name="exclude")
+    matches: dict[str, Path] = {}
+    for pattern in include_patterns:
+        for candidate in root.glob(pattern):
+            if not candidate.is_file():
+                continue
+            relative = candidate.relative_to(root).as_posix()
+            if any(fnmatch.fnmatchcase(relative, item) for item in exclude_patterns):
+                continue
+            resolved = candidate.resolve(strict=True)
+            try:
+                resolved.relative_to(root)
+            except ValueError as exc:
+                raise ValueError(
+                    f"Glob match escapes source root through a symlink: {candidate}"
+                ) from exc
+            matches[relative] = resolved
+    return tuple((matches[relative], relative) for relative in sorted(matches))
+
+
 def _strip_annotated(annotation: Any) -> Any:
     while typing.get_origin(annotation) is typing.Annotated:
         annotation = typing.get_args(annotation)[0]
@@ -419,6 +501,103 @@ class PreparedInput:
     host_directory_mounts: tuple[HostDirectoryMount, ...] = ()
     sandbox_roots: tuple[SandboxRootReservation, ...] = ()
     requirements: SessionRequirements = field(default_factory=SessionRequirements)
+    prepared_paths: tuple[PreparedPath, ...] = field(default=(), repr=False)
+    path_model_value: Literal["single", "list"] | None = field(
+        default=None,
+        repr=False,
+    )
+
+    @classmethod
+    def path(
+        cls,
+        source: str | os.PathLike[str],
+        *,
+        at: str | None = None,
+        mode: PathMode | Literal["copy", "mount"] = PathMode.COPY,
+        read_only: bool = True,
+        metadata: Mapping[str, Any] | None = None,
+        instructions: Sequence[str] = (),
+    ) -> PreparedInput:
+        """Expose one host path and pass its sandbox path to the model."""
+
+        return cls(
+            model_value=None,
+            metadata=metadata or {},
+            instructions=tuple(instructions),
+            prepared_paths=(
+                PreparedPath(
+                    source=Path(source),
+                    target=at,
+                    mode=PathMode(mode),
+                    read_only=read_only,
+                ),
+            ),
+            path_model_value="single",
+        )
+
+    @classmethod
+    def paths(
+        cls,
+        sources: Sequence[str | os.PathLike[str]],
+        *,
+        at: str | None = None,
+        mode: PathMode | Literal["copy", "mount"] = PathMode.COPY,
+        read_only: bool = True,
+        metadata: Mapping[str, Any] | None = None,
+        instructions: Sequence[str] = (),
+    ) -> PreparedInput:
+        """Expose explicit host paths and pass their sandbox paths as a list."""
+
+        return cls(
+            model_value=[],
+            metadata=metadata or {},
+            instructions=tuple(instructions),
+            prepared_paths=tuple(
+                PreparedPath(
+                    source=Path(source),
+                    target=at,
+                    relative_target=Path(source).name,
+                    mode=PathMode(mode),
+                    read_only=read_only,
+                )
+                for source in sources
+            ),
+            path_model_value="list",
+        )
+
+    @classmethod
+    def glob(
+        cls,
+        root: str | os.PathLike[str],
+        *,
+        include: str | Sequence[str],
+        exclude: str | Sequence[str] = (),
+        at: str | None = None,
+        allow_empty: bool = False,
+        metadata: Mapping[str, Any] | None = None,
+        instructions: Sequence[str] = (),
+    ) -> PreparedInput:
+        """Copy a deterministic host-side glob and pass sandbox paths as a list."""
+
+        matches = _glob_paths(Path(root), include=include, exclude=exclude)
+        if not matches and not allow_empty:
+            raise ValueError(
+                f"PreparedInput.glob() did not match any files under {Path(root)!s}"
+            )
+        return cls(
+            model_value=[],
+            metadata=metadata or {},
+            instructions=tuple(instructions),
+            prepared_paths=tuple(
+                PreparedPath(
+                    source=source,
+                    target=at,
+                    relative_target=relative,
+                )
+                for source, relative in matches
+            ),
+            path_model_value="list",
+        )
 
     def __post_init__(self) -> None:
         if not isinstance(self.requirements, SessionRequirements):
@@ -426,6 +605,7 @@ class PreparedInput:
         object.__setattr__(self, "metadata", immutable_mapping(self.metadata))
         object.__setattr__(self, "instructions", tuple(self.instructions))
         object.__setattr__(self, "artifacts", tuple(self.artifacts))
+        object.__setattr__(self, "prepared_paths", tuple(self.prepared_paths))
         object.__setattr__(self, "sandbox_roots", tuple(self.sandbox_roots))
         if not all(
             isinstance(reservation, SandboxRootReservation)
@@ -439,6 +619,97 @@ class PreparedInput:
             "host_directory_mounts",
             normalize_host_directory_mounts(self.host_directory_mounts),
         )
+
+
+def _prepared_path_destination(field: FieldDescriptor, path: PreparedPath) -> str:
+    root = f"/sandbox/{path.target}" if path.target else f"/sandbox/input/{field.name}"
+    if path.relative_target:
+        return posixpath.join(root, path.relative_target)
+    if path.target is None and path.source.is_file():
+        return posixpath.join(root, path.source.name)
+    return root
+
+
+def compile_prepared_input(
+    field: FieldDescriptor,
+    prepared: PreparedInput,
+) -> PreparedInput:
+    """Lower adapter-authored paths into backend-facing execution state."""
+
+    if prepared.path_model_value is None:
+        return prepared
+
+    destinations = tuple(
+        _prepared_path_destination(field, path) for path in prepared.prepared_paths
+    )
+    artifacts = list(prepared.artifacts)
+    mounts = list(prepared.host_directory_mounts)
+    reservations = list(prepared.sandbox_roots)
+    read_paths = list(prepared.requirements.extra_read_paths)
+    write_paths = list(prepared.requirements.extra_write_paths)
+
+    for path, destination in zip(prepared.prepared_paths, destinations, strict=True):
+        source = str(path.source)
+        reservations.append(SandboxRootReservation(destination))
+        read_paths.append(source)
+        if path.mode is PathMode.COPY:
+            artifacts.append(
+                Artifact(
+                    id=f"prepared-path-{uuid.uuid4().hex}",
+                    kind="runtime.path",
+                    metadata={
+                        "source_path": source,
+                        "sandbox_path": destination,
+                    },
+                )
+            )
+            continue
+        if not path.read_only:
+            write_paths.append(source)
+        mounts.append(
+            HostDirectoryMount(
+                host_path=source,
+                sandbox_path=destination,
+                read_only=path.read_only,
+            )
+        )
+
+    if prepared.path_model_value == "single":
+        if len(destinations) != 1:
+            raise ValueError("PreparedInput.path() must resolve exactly one path")
+        model_value: Any = destinations[0]
+    else:
+        model_value = list(destinations)
+
+    return replace(
+        prepared,
+        model_value=model_value,
+        artifacts=tuple(artifacts),
+        host_directory_mounts=tuple(mounts),
+        sandbox_roots=tuple(reservations),
+        requirements=SessionRequirements(
+            allowed_domains=prepared.requirements.allowed_domains,
+            extra_read_paths=tuple(dict.fromkeys(read_paths)),
+            extra_write_paths=tuple(dict.fromkeys(write_paths)),
+        ),
+        prepared_paths=(),
+        path_model_value=None,
+    )
+
+
+def _replace_prepared_path(value: Any, planned: str, actual: str) -> Any:
+    if value == planned:
+        return actual
+    if isinstance(value, list):
+        return [_replace_prepared_path(item, planned, actual) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_replace_prepared_path(item, planned, actual) for item in value)
+    if isinstance(value, dict):
+        return {
+            key: _replace_prepared_path(item, planned, actual)
+            for key, item in value.items()
+        }
+    return value
 
 
 @dataclass(frozen=True)
@@ -470,8 +741,16 @@ def validate_sandbox_root_reservations(
     """Reject cross-adapter sandbox destination overlap before acquisition."""
     claimed: list[tuple[str, str]] = []
     for field_name, binding in bindings.items():
+        reservation_paths = [
+            reservation.path for reservation in binding.prepared.sandbox_roots
+        ]
+        if len(reservation_paths) != len(set(reservation_paths)):
+            raise ValueError(
+                "Input sandbox destinations overlap: "
+                f"{field_name!r} reserves the same path more than once"
+            )
         destinations = {
-            *(reservation.path for reservation in binding.prepared.sandbox_roots),
+            *reservation_paths,
             *(
                 mount.sandbox_path
                 for mount in binding.prepared.host_directory_mounts
@@ -479,17 +758,21 @@ def validate_sandbox_root_reservations(
         }
         for path in sorted(destinations):
             for previous_field, previous_path in claimed:
-                if (
-                    path == previous_path
-                    or path.startswith(previous_path.rstrip("/") + "/")
-                    or previous_path.startswith(path.rstrip("/") + "/")
-                    ):
+                if _sandbox_paths_overlap(path, previous_path):
                     raise ValueError(
                         "Input sandbox destinations overlap: "
                         f"{previous_field!r} reserves {previous_path!r} and "
                         f"{field_name!r} reserves {path!r}"
                     )
             claimed.append((field_name, path))
+
+
+def _sandbox_paths_overlap(first: str, second: str) -> bool:
+    return (
+        first == second
+        or first.startswith(second.rstrip("/") + "/")
+        or second.startswith(first.rstrip("/") + "/")
+    )
 
 
 @dataclass(frozen=True)
@@ -503,6 +786,43 @@ class OutputReservation:
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "metadata", immutable_mapping(self.metadata))
+
+
+def validate_output_sandbox_root_reservation(
+    input_bindings: Mapping[str, PreparedInputBinding],
+    output_reservations: Mapping[str, OutputReservation],
+    candidate: OutputReservation,
+) -> None:
+    """Reject an output destination that overlaps an input or prior output."""
+    sandbox_path = candidate.artifact.metadata.get("sandbox_path")
+    if not isinstance(sandbox_path, str):
+        return
+    candidate_path = SandboxRootReservation(sandbox_path).path
+    for field_name, binding in input_bindings.items():
+        paths = {
+            *(reservation.path for reservation in binding.prepared.sandbox_roots),
+            *(
+                mount.sandbox_path
+                for mount in binding.prepared.host_directory_mounts
+            ),
+        }
+        for path in paths:
+            if _sandbox_paths_overlap(candidate_path, path):
+                raise ValueError(
+                    "Input/output sandbox destinations overlap: "
+                    f"input {field_name!r} reserves {path!r} and output "
+                    f"{candidate.field.name!r} reserves {candidate_path!r}"
+                )
+    for field_name, reservation in output_reservations.items():
+        path = reservation.artifact.metadata.get("sandbox_path")
+        if isinstance(path, str) and _sandbox_paths_overlap(
+            candidate_path,
+            SandboxRootReservation(path).path,
+        ):
+            raise ValueError(
+                "Output sandbox destinations overlap: "
+                f"{field_name!r} and {candidate.field.name!r}"
+            )
 
 
 @dataclass(frozen=True)
@@ -625,6 +945,30 @@ class InputAdapter(ABC, Generic[AdapterValue]):
         for artifact in prepared.artifacts:
             binding = await session.mount(artifact)
             bindings.append(binding)
+            planned = artifact.metadata.get("sandbox_path")
+            if isinstance(planned, str):
+                model_value = _replace_prepared_path(
+                    model_value,
+                    planned,
+                    binding.path,
+                )
+        for mount in prepared.host_directory_mounts:
+            if not isinstance(session, HostDirectorySession):
+                raise UnsupportedOperationError(
+                    f"Input {mount.sandbox_path!r} requires a live host-path mount"
+                )
+            path = await session.mount_host_directory(mount)
+            bindings.append(
+                ArtifactBinding(
+                    artifact_id=f"host-path-{uuid.uuid4().hex}",
+                    path=path,
+                )
+            )
+            model_value = _replace_prepared_path(
+                model_value,
+                mount.sandbox_path,
+                path,
+            )
         return MountedInput(model_value=model_value, bindings=tuple(bindings))
 
     async def after_execution(

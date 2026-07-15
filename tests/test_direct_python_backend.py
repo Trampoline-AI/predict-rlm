@@ -40,6 +40,28 @@ def test_sandbox_path_global_does_not_poison_later_execute(tmp_path: Path) -> No
     assert second == "second ok\n"
 
 
+def test_direct_backend_copies_directory_to_sandbox_path(tmp_path: Path) -> None:
+    source = tmp_path / "workspace"
+    (source / "nested").mkdir(parents=True)
+    (source / "nested" / "value.txt").write_text("directory copy", encoding="utf-8")
+    backend = DirectPythonBackend(
+        runner_path=str(tmp_path / "predict_rlm_runner.py"),
+        workdir=str(tmp_path),
+        exec_timeout=10,
+    )
+    try:
+        backend.mount_file_at(str(source), "/sandbox/input/workspace")
+        output = backend.execute(
+            "from pathlib import Path\n"
+            "print(Path('/sandbox/input/workspace/nested/value.txt').read_text())",
+            timeout=10,
+        )
+    finally:
+        backend.shutdown()
+
+    assert output == "directory copy\n"
+
+
 def test_regular_path_global_survives_timeout_recovery_as_path(tmp_path: Path) -> None:
     backend = DirectPythonBackend(
         runner_path=str(tmp_path / "predict_rlm_runner.py"),
