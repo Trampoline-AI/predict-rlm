@@ -33,11 +33,11 @@ from predict_rlm.files import SyncedFile
 from predict_rlm.runtime import (
     Artifact,
     ArtifactBinding,
+    BoundInput,
     CallableTool,
     ExecutionSpec,
     HostDirectoryMount,
     InputAdapter,
-    MountedInput,
     OutputAdapter,
     PreparedInput,
     RunContext,
@@ -1404,7 +1404,7 @@ async def test_input_adapter_finalization_is_reverse_and_idempotent():
 
     async with use_run_context(ctx):
         await rlm._prepare_runtime_inputs(ctx, ctx.input_values)
-        await rlm._prepare_runtime_input_sessions(ctx)
+        await rlm._open_runtime_inputs(ctx)
         await rlm._bind_runtime_inputs(ctx)
         await rlm._finalize_runtime_inputs(ctx, backend.session, None)
         await rlm._finalize_runtime_inputs(ctx, backend.session, None)
@@ -1503,14 +1503,14 @@ async def test_external_input_adapter_owns_session_lifecycle():
                 host_directory_mounts=(host_mount,),
             )
 
-        async def prepare_session(self, field, prepared, ctx, backend):
-            calls.append(("prepare_session", field.name, backend.name))
+        async def open(self, field, prepared, ctx, backend):
+            calls.append(("open", field.name, backend.name))
 
-        async def mount(self, field, prepared, ctx, session):
-            calls.append("mount")
+        async def bind(self, field, prepared, ctx, session):
+            calls.append("bind")
             path = await session.mount_host_directory(host_mount)
-            return MountedInput(
-                model_value="mounted",
+            return BoundInput(
+                model_value="bound",
                 bindings=(ArtifactBinding(artifact_id="external", path=path),),
             )
 
@@ -1562,15 +1562,15 @@ async def test_external_input_adapter_owns_session_lifecycle():
         await rlm._prepare_runtime_inputs(ctx, ctx.input_values)
         async with rlm._execution_session({}) as repl:
             await rlm._bind_runtime_inputs(ctx)
-            assert ctx.input_bindings["value"].prepared.model_value == "mounted"
+            assert ctx.input_bindings["value"].prepared.model_value == "bound"
             await repl.aexecute("print('run')")
 
     assert calls[:5] == [
         "prepare",
-        ("prepare_session", "value", "final"),
+        ("open", "value", "final"),
         ("validate_host_directory_mounts", (host_mount,)),
         "start",
-        "mount",
+        "bind",
     ]
     assert calls[5][0] == "after_execution"
     assert calls[6:] == [("finalize", "value", None), "release"]
@@ -1635,13 +1635,13 @@ async def test_session_finalizes_after_input_adapter_failure_in_reverse_order():
 @pytest.mark.parametrize(
     ("failure_stage", "expected_fields", "session_available"),
     [
-        ("prepare_session", ["second", "first"], False),
+        ("open", ["second", "first"], False),
         ("acquisition", ["third", "second", "first"], False),
         ("install", ["third", "second", "first"], True),
-        ("mount", ["third", "second", "first"], True),
+        ("bind", ["third", "second", "first"], True),
     ],
 )
-async def test_all_prepare_session_adapters_finalize_after_startup_failure(
+async def test_all_open_adapters_finalize_after_startup_failure(
     failure_stage: str,
     expected_fields: list[str],
     session_available: bool,
@@ -1658,15 +1658,15 @@ async def test_all_prepare_session_adapters_finalize_after_startup_failure(
         async def prepare(self, field, value, ctx):
             return PreparedInput(model_value=value)
 
-        async def prepare_session(self, field, prepared, ctx, backend):
+        async def open(self, field, prepared, ctx, backend):
             entered.append(field.name)
-            if failure_stage == "prepare_session" and field.name == "second":
-                raise RuntimeError("prepare session failed")
+            if failure_stage == "open" and field.name == "second":
+                raise RuntimeError("open failed")
 
-        async def mount(self, field, prepared, ctx, session):
-            if failure_stage == "mount" and field.name == "second":
-                raise RuntimeError("mount failed")
-            return MountedInput(model_value=prepared.model_value)
+        async def bind(self, field, prepared, ctx, session):
+            if failure_stage == "bind" and field.name == "second":
+                raise RuntimeError("bind failed")
+            return BoundInput(model_value=prepared.model_value)
 
         async def finalize(self, field, prepared, ctx, session, error):
             finalized.append((field.name, session is not None))
@@ -1703,26 +1703,26 @@ async def test_all_prepare_session_adapters_finalize_after_startup_failure(
     assert finalized == [
         (field_name, session_available) for field_name in expected_fields
     ]
-    if failure_stage == "prepare_session":
+    if failure_stage == "open":
         assert entered == ["first", "second"]
 
 
 @pytest.mark.asyncio
-async def test_pre_session_finalize_failure_is_recorded_as_incomplete_evidence():
+async def test_pre_acquisition_finalize_failure_is_recorded_as_incomplete_evidence():
     from predict_rlm import PredictRLM
 
     finalized = []
 
     class LifecycleAdapter(InputAdapter[object]):
-        name = "pre-session-evidence"
+        name = "pre-acquisition-evidence"
         value_type = object
 
         async def prepare(self, field, value, ctx):
             return PreparedInput(model_value=value)
 
-        async def prepare_session(self, field, prepared, ctx, backend):
+        async def open(self, field, prepared, ctx, backend):
             if field.name == "second":
-                raise RuntimeError("prepare failed")
+                raise RuntimeError("open failed")
 
         async def finalize(self, field, prepared, ctx, session, error):
             finalized.append(field.name)
@@ -1736,7 +1736,7 @@ async def test_pre_session_finalize_failure_is_recorded_as_incomplete_evidence()
         adapters=[LifecycleAdapter()],
     )
 
-    with pytest.raises(RuntimeError, match="prepare failed") as raised:
+    with pytest.raises(RuntimeError, match="open failed") as raised:
         await rlm.aforward(first="one", second=2)
 
     assert finalized == ["second", "first"]

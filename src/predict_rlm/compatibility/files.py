@@ -14,6 +14,7 @@ from predict_rlm.files import File
 from predict_rlm.runtime import (
     Artifact,
     ArtifactBinding,
+    BoundInput,
     DirectoryCreationSession,
     ExecutionResult,
     ExecutionSession,
@@ -23,7 +24,6 @@ from predict_rlm.runtime import (
     HostDirectoryMount,
     HostDirectorySession,
     InputAdapter,
-    MountedInput,
     MutableDirectorySession,
     OutputAdapter,
     OutputReservation,
@@ -36,26 +36,26 @@ from predict_rlm.workspace import Workspace, WorkspaceMode, WorkspaceSyncState
 
 
 @dataclass
-class _WorkspaceMountState:
+class _WorkspaceBindingState:
     artifact: Artifact
     sandbox_path: str
     sync_state: WorkspaceSyncState | None
     host_directory_mount: HostDirectoryMount | None = None
-    mounted: bool = False
+    bound: bool = False
     finalized: bool = False
 
 
 @dataclass(frozen=True, kw_only=True)
 class _WorkspacePreparedInput(PreparedInput):
-    mount_states: tuple[_WorkspaceMountState, ...]
+    binding_states: tuple[_WorkspaceBindingState, ...]
 
 
-def _workspace_mount_states(
+def _workspace_binding_states(
     prepared: PreparedInput,
-) -> tuple[_WorkspaceMountState, ...]:
+) -> tuple[_WorkspaceBindingState, ...]:
     if not isinstance(prepared, _WorkspacePreparedInput):
         raise TypeError("WorkspaceInputAdapter requires typed Workspace prepared state")
-    return prepared.mount_states
+    return prepared.binding_states
 
 
 def _uses_default_workspace_mount_path(workspace: Workspace) -> bool:
@@ -265,11 +265,11 @@ class WorkspaceInputAdapter(InputAdapter[Workspace]):
             if field.allows_none:
                 return _WorkspacePreparedInput(
                     model_value=None,
-                    mount_states=(),
+                    binding_states=(),
                 )
             raise ValueError(f"Workspace input {field.name!r} cannot be None")
 
-        mount_states = []
+        binding_states = []
         host_directory_mounts = []
         workspace_roots = []
         writable_workspace_roots = []
@@ -314,8 +314,8 @@ class WorkspaceInputAdapter(InputAdapter[Workspace]):
                 kind="compat.workspace",
                 metadata={"sandbox_path": sandbox_path},
             )
-            mount_states.append(
-                _WorkspaceMountState(
+            binding_states.append(
+                _WorkspaceBindingState(
                     artifact=artifact,
                     sandbox_path=sandbox_path,
                     sync_state=sync_state,
@@ -327,8 +327,8 @@ class WorkspaceInputAdapter(InputAdapter[Workspace]):
         model_value = field.pack(model_paths)
         return _WorkspacePreparedInput(
             model_value=model_value,
-            mount_states=tuple(mount_states),
-            artifacts=tuple(state.artifact for state in mount_states),
+            binding_states=tuple(binding_states),
+            artifacts=tuple(state.artifact for state in binding_states),
             host_directory_mounts=tuple(host_directory_mounts),
             sandbox_roots=tuple(sandbox_roots),
             requirements=SessionRequirements(
@@ -342,15 +342,15 @@ class WorkspaceInputAdapter(InputAdapter[Workspace]):
             ),
         )
 
-    async def mount(
+    async def bind(
         self,
         field: FieldDescriptor,
         prepared: PreparedInput,
         ctx: RunContext,
         session: ExecutionSession,
-    ) -> MountedInput:
+    ) -> BoundInput:
         del field, ctx
-        states = _workspace_mount_states(prepared)
+        states = _workspace_binding_states(prepared)
         bindings = []
         model_value = prepared.model_value
         for state in states:
@@ -384,7 +384,7 @@ class WorkspaceInputAdapter(InputAdapter[Workspace]):
                             sandbox_path=target_path,
                         )
                     )
-            state.mounted = True
+            state.bound = True
             model_value = _replace_model_path(
                 model_value,
                 state.sandbox_path,
@@ -396,7 +396,7 @@ class WorkspaceInputAdapter(InputAdapter[Workspace]):
                     path=sandbox_path,
                 )
             )
-        return MountedInput(model_value=model_value, bindings=tuple(bindings))
+        return BoundInput(model_value=model_value, bindings=tuple(bindings))
 
     async def after_execution(
         self,
@@ -408,7 +408,7 @@ class WorkspaceInputAdapter(InputAdapter[Workspace]):
         error: BaseException | None,
     ) -> None:
         del field, ctx, result, error
-        states = _workspace_mount_states(prepared)
+        states = _workspace_binding_states(prepared)
         mirror_states = [
             state
             for state in states
@@ -446,7 +446,7 @@ class WorkspaceInputAdapter(InputAdapter[Workspace]):
         error: BaseException | None,
     ) -> None:
         del field, ctx, error
-        states = _workspace_mount_states(prepared)
+        states = _workspace_binding_states(prepared)
         first_error: BaseException | None = None
         additional_errors = []
         for state in states:
@@ -456,7 +456,7 @@ class WorkspaceInputAdapter(InputAdapter[Workspace]):
                 if (
                     state.sync_state is not None
                     and state.sync_state.workspace.sync_back
-                    and state.mounted
+                    and state.bound
                 ):
                     if not isinstance(session, MutableDirectorySession):
                         raise TypeError(

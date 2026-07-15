@@ -99,6 +99,28 @@ acquisition.
 Use `glob()` when selection is naturally expressed relative to one host root:
 
 ```python
+@classmethod
+def glob(
+    cls,
+    root: str | os.PathLike[str],
+    *,
+    include: str | Sequence[str],
+    exclude: str | Sequence[str] = (),
+    at: str | None = None,
+    allow_empty: bool = False,
+    metadata: Mapping[str, Any] | None = None,
+    instructions: Sequence[str] = (),
+) -> PreparedInput: ...
+```
+
+`root` must resolve to a host directory. `include` accepts one pattern or a sequence
+of patterns relative to that directory; it cannot be empty. `exclude` accepts the
+same forms and is applied after inclusion. Absolute patterns, empty patterns, and
+patterns containing `..` are rejected. Include patterns use Python `pathlib` glob
+syntax. Exclude patterns are matched case-sensitively against each relative POSIX
+path. Files matched by several include patterns appear only once.
+
+```python
 return PreparedInput.glob(
     extracted_root,
     include=("**/*.csv", "**/*.json"),
@@ -115,8 +137,20 @@ Glob expansion happens on the host before acquisition. It:
 - fails on an empty result unless `allow_empty=True`; and
 - rejects traversal and symlink escapes from the source root.
 
+The model receives a deterministically sorted `list[str]` containing one sandbox
+path per selected file. With `allow_empty=True`, it receives an empty list when
+nothing matches. `at=` is the destination root relative to `/sandbox`; when omitted,
+the root is `/sandbox/input/{field_name}`. `metadata` stores adapter-owned, call-local
+data that later hooks can read; it is not the value passed to the RLM. Each string in
+`instructions` is added to the RLM's input instructions for the call.
+
 `glob()` is a copy operation. If data must remain live, mount the complete
 directory and select files inside the sandbox.
+
+Selection and validation errors are raised by `prepare()` before backend acquisition;
+adapters should let them propagate. The adapter does not clean up files copied into
+the sandbox: the framework owns their execution-session lifecycle. Host source files
+are not modified.
 
 ## Live workspaces
 
@@ -142,7 +176,7 @@ mode when backend portability matters.
 
 ## What the kernel owns
 
-For `path()`, `paths()`, and `glob()`, adapters do not implement `mount()` or
+For `path()`, `paths()`, and `glob()`, adapters do not implement `bind()` or
 inspect backend capabilities. The kernel owns:
 
 1. sandbox destination normalization;

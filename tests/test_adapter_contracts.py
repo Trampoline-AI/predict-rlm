@@ -199,14 +199,14 @@ async def test_pydantic_input_adapter_only_prepares_a_path(tmp_path):
         field,
         await adapter.prepare(field, S3File(uri="s3://bucket/object.json"), object()),
     )
-    mounted = await adapter.mount(field, prepared, object(), Session())
+    bound = await adapter.bind(field, prepared, object(), Session())
 
-    assert mounted.model_value == "/sandbox/input/document/object.json"
-    assert [binding.path for binding in mounted.bindings] == [mounted.model_value]
+    assert bound.model_value == "/sandbox/input/document/object.json"
+    assert [binding.path for binding in bound.bindings] == [bound.model_value]
 
 
 @pytest.mark.asyncio
-async def test_prepared_directory_mount_uses_default_adapter_mount(tmp_path):
+async def test_prepared_directory_mount_uses_default_adapter_bind(tmp_path):
     source = tmp_path / "dataset"
     source.mkdir()
 
@@ -230,14 +230,14 @@ async def test_prepared_directory_mount_uses_default_adapter_mount(tmp_path):
         field,
         await adapter.prepare(field, str(source), object()),
     )
-    mounted = await adapter.mount(field, prepared, object(), Session())
-    mounted_again = await adapter.mount(field, prepared, object(), Session())
+    bound = await adapter.bind(field, prepared, object(), Session())
+    bound_again = await adapter.bind(field, prepared, object(), Session())
 
-    assert mounted.model_value == "/sandbox/input/dataset"
-    assert [binding.path for binding in mounted.bindings] == [
+    assert bound.model_value == "/sandbox/input/dataset"
+    assert [binding.path for binding in bound.bindings] == [
         "/sandbox/input/dataset"
     ]
-    assert mounted.bindings[0].artifact_id != mounted_again.bindings[0].artifact_id
+    assert bound.bindings[0].artifact_id != bound_again.bindings[0].artifact_id
 
 
 def test_prepared_glob_is_sorted_filtered_and_preserves_relative_paths(tmp_path):
@@ -317,9 +317,9 @@ async def test_typed_adapter_bases_own_matching_and_output_preparation():
     prepared = await input_adapter.prepare(field, "hello", object())
 
     assert input_adapter.supports(field, "hello")
-    assert await input_adapter.prepare_session(field, prepared, object(), object()) is None
-    mounted = await input_adapter.mount(field, prepared, object(), object())
-    assert mounted.model_value == "message:hello"
+    assert await input_adapter.open(field, prepared, object(), object()) is None
+    bound = await input_adapter.bind(field, prepared, object(), object())
+    assert bound.model_value == "message:hello"
     assert await input_adapter.after_execution(
         field,
         prepared,

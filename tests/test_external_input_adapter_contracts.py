@@ -13,13 +13,13 @@ import dspy
 import pytest
 
 from predict_rlm import (
+    BoundInput,
     DirectoryCreationSession,
     FileTransfer,
     FileTransferSession,
     HostDirectoryMount,
     HostDirectorySession,
     InputAdapter,
-    MountedInput,
     MutableDirectorySession,
     PredictRLM,
     PreparedInput,
@@ -70,7 +70,7 @@ class MutableRepositoryAdapter(InputAdapter[str]):
             ),
         )
 
-    async def mount(self, field, prepared, ctx, session):
+    async def bind(self, field, prepared, ctx, session):
         del field, ctx
         prepared = self._prepared(prepared)
         if not isinstance(session, DirectoryCreationSession):
@@ -85,7 +85,7 @@ class MutableRepositoryAdapter(InputAdapter[str]):
             await session.transfer_file(
                 FileTransfer(str(source), f"/repository/{relative}")
             )
-        return MountedInput(model_value="/repository")
+        return BoundInput(model_value="/repository")
 
     async def after_execution(self, field, prepared, ctx, session, result, error):
         del field, ctx, result
@@ -334,11 +334,11 @@ class ReadOnlyDatasetAdapter(InputAdapter[CachedDataset]):
             requirements=SessionRequirements(extra_read_paths=(value.path,)),
         )
 
-    async def mount(self, field, prepared, ctx, session):
+    async def bind(self, field, prepared, ctx, session):
         del field, ctx
         if not isinstance(session, HostDirectorySession):
             raise TypeError("read-only datasets require host-directory mounts")
-        return MountedInput(
+        return BoundInput(
             model_value=await session.mount_host_directory(
                 prepared.host_directory_mounts[0]
             )

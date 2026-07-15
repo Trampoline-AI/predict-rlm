@@ -127,14 +127,14 @@ src/predict_rlm/
 ## Invocation lifecycle and ownership
 
 `RuntimeSpec` is immutable construction-time configuration. Every call creates a
-fresh `RunContext`, which owns invocation state, prepared inputs, mounted
+fresh `RunContext`, which owns invocation state, prepared inputs, bound
 bindings, output reservations, cleanup callbacks, and evidence status.
 
 ```text
 prepare inputs
-    -> prepare adapter sessions
+    -> open adapter-owned resources
     -> validate requirements and acquire one execution session
-    -> mount inputs and reserve outputs
+    -> bind inputs and reserve outputs
     -> execute the RLM loop
     -> materialize outputs
     -> finalize adapters

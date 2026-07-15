@@ -266,7 +266,7 @@ class TestWorkspaceInputAdapterLifecycle:
     @pytest.mark.asyncio
     async def test_workspace_lifecycle_rejects_prepared_input_without_typed_state(self):
         with pytest.raises(TypeError, match="typed Workspace prepared state"):
-            await WorkspaceInputAdapter().mount(
+            await WorkspaceInputAdapter().bind(
                 FieldDescriptor("workspace", Workspace),
                 PreparedInput(model_value="/sandbox/workspace"),
                 _WorkspaceAdapterContext(),
@@ -291,10 +291,10 @@ class TestWorkspaceInputAdapterLifecycle:
         )
         session = _CopyInOnlyWorkspaceSession()
 
-        mounted = await adapter.mount(field, prepared, ctx, session)
+        bound = await adapter.bind(field, prepared, ctx, session)
         await adapter.finalize(field, prepared, ctx, session, None)
 
-        assert mounted.model_value == "/sandbox/workspace"
+        assert bound.model_value == "/sandbox/workspace"
         assert session.created_directories == ["/sandbox/workspace"]
         assert [transfer.sandbox_path for transfer in session.transfers] == [
             "/sandbox/workspace/source.txt"
@@ -353,7 +353,7 @@ class TestWorkspaceInputAdapterLifecycle:
         session = _WorkspaceTransportSession()
         session.direct_mount_path = "/mounted/workspace"
 
-        mounted = await adapter.mount(field, prepared, ctx, session)
+        bound = await adapter.bind(field, prepared, ctx, session)
 
         assert session.direct_mounts == [
             HostDirectoryMount(
@@ -362,8 +362,8 @@ class TestWorkspaceInputAdapterLifecycle:
             )
         ]
         assert session.transfers == []
-        assert mounted.model_value == "/mounted/workspace"
-        assert [binding.path for binding in mounted.bindings] == [
+        assert bound.model_value == "/mounted/workspace"
+        assert [binding.path for binding in bound.bindings] == [
             "/mounted/workspace"
         ]
 
@@ -395,7 +395,7 @@ class TestWorkspaceInputAdapterLifecycle:
             )
 
     @pytest.mark.asyncio
-    async def test_mirror_mount_and_sync_use_generic_transport_after_success_and_failure(
+    async def test_mirror_bind_and_sync_use_generic_transport_after_success_and_failure(
         self,
         tmp_path: Path,
     ):
@@ -411,14 +411,14 @@ class TestWorkspaceInputAdapterLifecycle:
         prepared = await adapter.prepare(field, Workspace(path=str(workspace_root)), ctx)
         session = _WorkspaceTransportSession()
 
-        mounted = await adapter.mount(field, prepared, ctx, session)
+        bound = await adapter.bind(field, prepared, ctx, session)
 
         assert session.created_directories == ["/sandbox/workspace"]
         assert {transfer.sandbox_path for transfer in session.transfers} == {
             "/sandbox/workspace/deleted.txt",
             "/sandbox/workspace/original.txt",
         }
-        assert mounted.model_value == "/sandbox/workspace"
+        assert bound.model_value == "/sandbox/workspace"
 
         session.sandbox_files["/sandbox/workspace/original.txt"] = b"after success"
         session.sandbox_files["/sandbox/workspace/created.txt"] = b"created"
@@ -461,7 +461,7 @@ class TestWorkspaceInputAdapterLifecycle:
         adapter = WorkspaceInputAdapter()
         prepared = await adapter.prepare(field, Workspace(path=str(workspace_root)), ctx)
         session = _WorkspaceTransportSession()
-        await adapter.mount(field, prepared, ctx, session)
+        await adapter.bind(field, prepared, ctx, session)
         session.sandbox_files["/sandbox/workspace/source.txt"] = b"final"
         await adapter.finalize(field, prepared, ctx, session, None)
         await adapter.finalize(field, prepared, ctx, session, None)
@@ -494,7 +494,7 @@ class TestWorkspaceInputAdapterLifecycle:
             ctx,
         )
         session = _WorkspaceTransportSession()
-        await adapter.mount(field, prepared, ctx, session)
+        await adapter.bind(field, prepared, ctx, session)
         first_source.write_text("host concurrent change", encoding="utf-8")
         session.sandbox_files["/sandbox/first/source.txt"] = b"sandbox change"
         session.sandbox_files["/sandbox/second/source.txt"] = b"synced"
@@ -525,7 +525,7 @@ class TestWorkspaceInputAdapterLifecycle:
         adapter = WorkspaceInputAdapter()
         prepared = await adapter.prepare(field, Workspace(path=str(workspace_root)), ctx)
         session = _WorkspaceTransportSession()
-        await adapter.mount(field, prepared, ctx, session)
+        await adapter.bind(field, prepared, ctx, session)
         session.sandbox_files["/sandbox/workspace/source.txt"] = b"after cancellation"
 
         await adapter.finalize(
@@ -553,7 +553,7 @@ class TestWorkspaceInputAdapterLifecycle:
         adapter = WorkspaceInputAdapter()
         prepared = await adapter.prepare(field, Workspace(path=str(workspace_root)), ctx)
         session = _WorkspaceTransportSession()
-        await adapter.mount(field, prepared, ctx, session)
+        await adapter.bind(field, prepared, ctx, session)
         source.write_text("host concurrent change", encoding="utf-8")
         session.sandbox_files["/sandbox/workspace/source.txt"] = b"sandbox change"
 
