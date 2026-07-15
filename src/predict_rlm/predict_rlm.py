@@ -91,6 +91,7 @@ from .runtime import (
     RuntimeSpec,
     SessionRequirements,
     _discover_annotation_prompt_contributors,
+    compile_prepared_input,
     current_run_context,
     invoke_host_callable,
     merge_session_requirements,
@@ -99,6 +100,7 @@ from .runtime import (
     resolve_output_adapter,
     resolve_runtime_spec,
     use_run_context,
+    validate_output_sandbox_root_reservation,
     validate_sandbox_root_reservations,
 )
 from .runtime_hooks import RuntimeHook, RuntimeHookEvent
@@ -3026,7 +3028,10 @@ class PredictRLM(dspy.RLM):
                 field,
                 value,
             )
-            prepared = await adapter.prepare(field, value, ctx)
+            prepared = compile_prepared_input(
+                field,
+                await adapter.prepare(field, value, ctx),
+            )
             ctx.input_bindings[field_name] = PreparedInputBinding(
                 field=field,
                 adapter=adapter,
@@ -3360,6 +3365,11 @@ class PredictRLM(dspy.RLM):
                     f"Output adapter {adapter.name!r} reserved field "
                     f"{reservation.field.name!r} while preparing {field.name!r}"
                 )
+            validate_output_sandbox_root_reservation(
+                ctx.input_bindings,
+                ctx.output_reservations,
+                reservation,
+            )
             ctx.reserve(reservation, adapter)
             if recorder is not None:
                 binding = ctx.artifact_bindings.get(reservation.artifact.id)

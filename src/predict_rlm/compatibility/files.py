@@ -189,6 +189,27 @@ class FileInputAdapter(InputAdapter[File]):
                 return PreparedInput(model_value=None)
             raise ValueError(f"File input {field.name!r} cannot be None")
 
+        items = field.unpack(value)
+        for item in items:
+            if item is None and field.item_allows_none:
+                continue
+            if not isinstance(item, File) or not item.path:
+                raise TypeError("File inputs must contain File values with a path")
+            if not os.path.isfile(item.path):
+                raise FileNotFoundError(item.path)
+        if all(item is not None for item in items):
+            sources = [
+                item.path
+                for item in items
+                if isinstance(item, File) and item.path is not None
+            ]
+            instructions = (
+                f"Input file field `{field.name}` is available at its sandbox path.",
+            )
+            if field.is_list:
+                return PreparedInput.paths(sources, instructions=instructions)
+            return PreparedInput.path(sources[0], instructions=instructions)
+
         artifacts: list[Artifact] = []
         read_paths: list[str] = []
         model_paths: list[str | None] = []
@@ -223,7 +244,7 @@ class FileInputAdapter(InputAdapter[File]):
             ),
             requirements=SessionRequirements(extra_read_paths=tuple(read_paths)),
             instructions=(
-                f"Input file field `{field.name}` is mounted at {model_value!r}.",
+                f"Input file field `{field.name}` is available at {model_value!r}.",
             ),
         )
 

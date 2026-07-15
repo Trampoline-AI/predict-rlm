@@ -137,13 +137,13 @@ Then ask your agent to build an RLM:
 
 ```python
 import dspy
-from predict_rlm import File, PredictRLM
+from predict_rlm import CtxStr, File, PredictRLM
 
 class AnalyzeImages(dspy.Signature):
     """Analyze images and answer the query. Load each image as a base64 data
     URI and use predict() with dspy.Image to extract visual information."""
     images: list[File] = dspy.InputField()
-    query: str = dspy.InputField()
+    query: CtxStr = dspy.InputField()
     answer: str = dspy.OutputField()
 
 rlm = PredictRLM(
@@ -159,6 +159,12 @@ result = rlm(
 
 print(result.answer)
 ```
+
+Use `CtxStr` for criteria, rubrics, and requests the outer RLM should read before
+writing code. Callers still pass a normal string; the value is available both in
+the prompt and as a Python variable in the REPL. See [Custom path
+inputs](docs/custom-path-inputs.md) when adding file-, workspace-, or glob-like
+signature inputs.
 
 ### Observability
 
@@ -228,7 +234,7 @@ inside its sandbox.
 ```python
 import dspy
 
-from predict_rlm import File, PredictRLM
+from predict_rlm import CtxStr, File, PredictRLM
 from predict_rlm.skills import spreadsheet
 
 
@@ -240,7 +246,7 @@ class UpdateWorkbook(dspy.Signature):
     """
 
     workbook: File = dspy.InputField(desc="Input .xlsx workbook")
-    request: str = dspy.InputField(desc="Requested spreadsheet changes")
+    request: CtxStr = dspy.InputField(desc="Requested spreadsheet changes")
     updated_workbook: File = dspy.OutputField(desc="Updated .xlsx workbook")
 
 
@@ -332,10 +338,16 @@ same handlers fire for every `PredictRLM` instance.
 
 ## Next steps
 
+- [Custom path inputs](docs/custom-path-inputs.md) — add file-, workspace-, or
+  glob-like signature inputs
+- [Custom adapters and the runtime kernel](docs/custom-adapters.md) — implement
+  an advanced typed lifecycle or execution capability
+- [Runtime observability](docs/observability.md) — connect monitoring, logging,
+  GEPA evidence, or another event consumer
+- [Architecture](ARCHITECTURE.md) — understand and review runtime components,
+  process boundaries, state ownership, and recovery
 - [How it works](docs/how-it-works.md) — understand the sandbox, REPL loop,
   signatures, and file I/O
-- [Architecture](ARCHITECTURE.md) — compare backend component and
-  state/recovery semantics
 - [API reference](docs/api.md) — constructor params for `PredictRLM`, `File`,
   `CtxStr`, and `Skill`
 - [Skills](docs/skills.md) — define, compose, and mount custom skills

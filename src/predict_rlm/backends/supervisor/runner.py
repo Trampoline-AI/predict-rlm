@@ -259,15 +259,28 @@ class _DirectProcessRunnerAdapter:
         destination = self._path_for_runtime_path(container_path)
         if source.resolve() == destination.resolve():
             return
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(source, destination)
+        self._copy_path(source, destination)
 
     def copy_from(self, container_path: str, host_path: str) -> None:
         source = self._path_for_runtime_path(container_path)
         destination = Path(host_path)
         if source.resolve() == destination.resolve():
             return
+        self._copy_path(source, destination)
+
+    @staticmethod
+    def _copy_path(source: Path, destination: Path) -> None:
         destination.parent.mkdir(parents=True, exist_ok=True)
+        if source.is_dir():
+            if destination.exists():
+                if destination.is_dir():
+                    shutil.rmtree(destination)
+                else:
+                    destination.unlink()
+            shutil.copytree(source, destination)
+            return
+        if destination.is_dir():
+            shutil.rmtree(destination)
         shutil.copy2(source, destination)
 
     def exec(self, command: list[str], *, timeout: float | None = None) -> Any:

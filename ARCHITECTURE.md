@@ -3,6 +3,12 @@
 This document describes the implemented execution architecture for PredictRLM
 execution backends.
 
+For extension workflows, see [Custom path inputs](docs/custom-path-inputs.md),
+[Custom adapters and the runtime kernel](docs/custom-adapters.md), and
+[Runtime observability](docs/observability.md). The interpreter-shaped protocol
+in `backends/base.py` is retained behind the compatibility bridge; it is not the
+root `execution=` contract.
+
 ## Execution backend feature matrix
 
 | Mode | Boundary | Payload | Transport | State owner |
@@ -31,12 +37,14 @@ Code map:
 ```text
 src/predict_rlm/
 ├── predict_rlm.py             PredictRLM
+├── runtime.py                 runtime contributions, adapters, root execution
+│                              backend and session contracts
 ├── _shared.py                 build_rlm_signatures()
 ├── rlm_skills.py              Skill, merge_skills()
 ├── files.py                   File, SyncedFile
 ├── trace.py                   IterationStep, RunTrace
 ├── backends/
-│   ├── base.py                BackendName, ExecutionBackend
+│   ├── base.py                BackendName, legacy interpreter backend
 │   │                          SupervisorClient, SupervisorProcess
 │   ├── jspi/
 │   │   ├── __init__.py        public JSPI reexports
@@ -69,8 +77,10 @@ src/predict_rlm/
 
 - `BackendName` (`backends/base.py`) is the public runtime selector used by
   `sandbox_backend`; currently `jspi` and `sbx`.
-- `ExecutionBackend` (`backends/base.py`) is the protocol PredictRLM needs:
-  execute code, mount/list/sync files, and shut down.
+- The root `ExecutionBackend` (`runtime.py`) starts one invocation-scoped
+  `ExecutionSession`; this is the protocol accepted by `execution=`.
+- `ExecutionBackend` (`backends/base.py`) is the legacy interpreter-shaped
+  execute/file/shutdown protocol adapted through `interpreter=`.
 - `SbxConfig` (`backends/sbx/config.py`) carries Docker Sandboxes
   configuration such as name, resources, template, persistence, and WebSocket
   settings.
@@ -113,6 +123,38 @@ src/predict_rlm/
   RLM inputs, outputs, and host-tool file writeback.
 - `IterationStep` and `RunTrace` (`trace.py`) are the structured record of an
   RLM run: generated code, observations, tool calls, timing, and usage metadata.
+
+## Invocation lifecycle and ownership
+
+`RuntimeSpec` is immutable construction-time configuration. Every call creates a
+fresh `RunContext`, which owns invocation state, prepared inputs, mounted
+bindings, output reservations, cleanup callbacks, and evidence status.
+
+```text
+prepare inputs
+    -> prepare adapter sessions
+    -> validate requirements and acquire one execution session
+    -> mount inputs and reserve outputs
+    -> execute the RLM loop
+    -> materialize outputs
+    -> finalize adapters
+    -> finalize and release the execution session
+```
+
+The ordering preserves four boundaries:
+
+- adapters declare policy and sandbox destinations before acquisition;
+- adapters may bind values after acquisition but do not own the session;
+- adapter-owned resources finalize in reverse preparation order; and
+- framework-owned session finalization and release still run after adapter
+  failure or cancellation.
+
+Path declarations are compiled by the kernel before acquisition. Input overlaps
+are rejected at that boundary; input/output overlaps are checked when outputs are
+reserved, before generated code runs. Portable copies or explicit live mounts are
+lowered to backend operations. This keeps path-transfer mechanics out of ordinary
+input adapters while leaving custom session capabilities available to advanced
+adapters.
 
 ## Default JSPI / Deno / Pyodide path
 
