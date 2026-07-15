@@ -368,9 +368,8 @@ class TestWorkspaceInputAdapterLifecycle:
         ]
 
     @pytest.mark.asyncio
-    async def test_direct_mount_is_rejected_by_jspi_and_pooled_sbx(self, tmp_path: Path):
+    async def test_direct_mount_is_rejected_by_jspi(self, tmp_path: Path):
         from predict_rlm.backends.jspi import JspiExecutionBackend
-        from predict_rlm.backends.sbx import SbxPoolExecutionBackend
 
         mount = HostDirectoryMount(str(tmp_path), "/workspace")
         ctx = MagicMock(spec=None)
@@ -380,6 +379,15 @@ class TestWorkspaceInputAdapterLifecycle:
                 (mount,),
                 ctx,
             )
+
+    @pytest.mark.sbx
+    @pytest.mark.asyncio
+    async def test_direct_mount_is_rejected_by_pooled_sbx(self, tmp_path: Path):
+        from predict_rlm.backends.sbx import SbxPoolExecutionBackend
+
+        mount = HostDirectoryMount(str(tmp_path), "/workspace")
+        ctx = MagicMock(spec=None)
+
         with pytest.raises(UnsupportedOperationError, match="SbxPool"):
             await SbxPoolExecutionBackend(MagicMock()).validate_host_directory_mounts(
                 (mount,),
