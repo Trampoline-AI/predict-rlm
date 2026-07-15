@@ -263,6 +263,7 @@ def test_service_plain_value_and_requirement_reach_real_jspi(monkeypatch):
     assert captured["allowed_domains"] == ["snapshot.internal:8443"]
 
 
+@pytest.mark.sbx
 @pytest.mark.asyncio
 async def test_service_requirement_is_rejected_before_reused_or_pooled_sbx_acquisition():
     from predict_rlm.backends.sbx import SbxConfig
