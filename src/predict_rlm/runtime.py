@@ -23,6 +23,7 @@ from pathlib import Path, PurePosixPath
 from types import MappingProxyType
 from typing import Any, ClassVar, Generic, Literal, Protocol, TypeVar, runtime_checkable
 
+import dspy
 from pydantic import BaseModel, ConfigDict, field_validator
 
 AdapterValue = TypeVar("AdapterValue")
@@ -900,6 +901,26 @@ class InputAdapter(ABC, Generic[AdapterValue]):
     def supports(self, field: FieldDescriptor, value: Any) -> bool:
         return field.matches(self.value_type)
 
+    def append_prompt(
+        self,
+        prompt: str,
+        field: FieldDescriptor,
+        prepared: PreparedInput,
+        ctx: RunContext,
+    ) -> str:
+        """Return this invocation's prompt after optional adapter customization."""
+        return prompt
+
+    def _transform_prompt_signature(
+        self,
+        signature: type[dspy.Signature],
+        field: FieldDescriptor,
+        prepared: PreparedInput,
+        ctx: RunContext,
+    ) -> type[dspy.Signature]:
+        """Return the invocation-local signature used only to construct prompts."""
+        return signature
+
     @abstractmethod
     async def prepare(
         self,
@@ -1210,20 +1231,6 @@ class EventSink(Protocol):
 SignatureValidator = Callable[[Any], None]
 
 
-@runtime_checkable
-class _PromptContributor(Protocol):
-    """Build invocation-specific prompt sections from prepared inputs."""
-
-    name: str
-
-    def contribute(
-        self,
-        signature: Any,
-        prepared_inputs: Mapping[str, PreparedInput],
-        ctx: RunContext,
-    ) -> tuple[str, ...]: ...
-
-
 class ToolOperation(ABC):
     """Construction-time operation that wraps host tools portably."""
 
@@ -1251,52 +1258,6 @@ class RuntimeContribution:
 
 
 RuntimeModule = Callable[[], RuntimeContribution]
-
-
-def _discover_annotation_prompt_contributors(
-    signature: Any,
-) -> tuple[_PromptContributor, ...]:
-    contributors: list[_PromptContributor] = []
-    seen_providers: set[Any] = set()
-    fields = (*signature.input_fields.values(), *signature.output_fields.values())
-
-    for field_info in fields:
-        for annotation in _walk_annotations(field_info.annotation):
-            if not isinstance(annotation, type):
-                continue
-            provider = getattr(annotation, "_predict_rlm_prompt_contributor", None)
-            if provider is None:
-                continue
-            if not callable(provider):
-                raise TypeError(
-                    "_predict_rlm_prompt_contributor must be callable"
-                )
-            provider_identity = (annotation, getattr(provider, "__func__", provider))
-            if provider_identity in seen_providers:
-                continue
-            contributor = provider()
-            if not isinstance(contributor, _PromptContributor):
-                raise TypeError(
-                    "_predict_rlm_prompt_contributor must return a prompt contributor"
-                )
-            seen_providers.add(provider_identity)
-            if any(existing is contributor for existing in contributors):
-                continue
-            validator = getattr(contributor, "validate_signature", None)
-            if validator is not None:
-                if not callable(validator):
-                    raise TypeError("Prompt contributor signature validator must be callable")
-                validator(signature)
-            contributors.append(contributor)
-
-    return tuple(contributors)
-
-
-def _walk_annotations(annotation: Any):
-    yield annotation
-    for argument in typing.get_args(annotation):
-        if argument is not type(None):
-            yield from _walk_annotations(argument)
 
 
 @dataclass(frozen=True)

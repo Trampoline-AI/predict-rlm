@@ -1,6 +1,7 @@
 """Tests for CtxStr prompt-injected string inputs."""
 
 import asyncio
+from types import MethodType
 from unittest.mock import MagicMock
 
 import dspy
@@ -10,7 +11,14 @@ import predict_rlm
 import predict_rlm.in_context as in_context_module
 from predict_rlm import CtxStr, PredictRLM, Skill
 from predict_rlm.in_context import _build_in_context_instructions
-from predict_rlm.runtime import InputAdapter, PreparedInput, use_run_context
+from predict_rlm.runtime import (
+    BoundInput,
+    FieldDescriptor,
+    InputAdapter,
+    PreparedInput,
+    RunContext,
+    use_run_context,
+)
 
 
 class InContextSignature(dspy.Signature):
@@ -150,6 +158,17 @@ async def test_runtime_in_context_instructions_follow_files_and_skills():
 
 @pytest.mark.asyncio
 async def test_in_context_preserves_invocation_signature_builder_override():
+    class TransformAdapter(InputAdapter[CtxStr]):
+        name = "transform_ctx"
+        value_type = CtxStr
+
+        async def prepare(self, field, value, ctx):
+            return PreparedInput(model_value=value)
+
+        def _transform_prompt_signature(self, signature, field, prepared, ctx):
+            signature.instructions = f"transformed:{prepared.model_value}"
+            return signature
+
     class TrackingPredictRLM(PredictRLM):
         def _build_signatures_with_files(self, file_instructions):
             self.file_builder_calls = getattr(self, "file_builder_calls", 0) + 1
@@ -161,6 +180,7 @@ async def test_in_context_preserves_invocation_signature_builder_override():
     rlm = TrackingPredictRLM(
         InContextSignature,
         sub_lm=MagicMock(),
+        adapters=[TransformAdapter()],
         max_iterations=1,
     )
 
@@ -173,6 +193,10 @@ async def test_in_context_preserves_invocation_signature_builder_override():
     assert rlm.file_builder_calls == 1
     assert ctx.state["generate_action"].builder_marker == "action"
     assert ctx.state["extract"].builder_marker == "extract"
+    for predictor_name in ("generate_action", "extract"):
+        assert "transformed:Criteria block" in str(
+            ctx.state[predictor_name].signature.instructions
+        )
 
 
 @pytest.mark.asyncio
@@ -219,6 +243,247 @@ async def test_string_input_adapter_owns_in_context_prompt_value():
     assert ctx.input_bindings["criteria"].prepared.model_value == "prepared:RAW-RULE"
     assert "prepared:RAW-RULE" in action
     assert "\nRAW-RULE\n" not in action
+
+
+@pytest.mark.asyncio
+async def test_ctx_str_prompt_uses_final_bound_custom_adapter_value():
+    class BindingAdapter(InputAdapter[CtxStr]):
+        name = "binding_ctx"
+        value_type = CtxStr
+
+        async def prepare(self, field, value, ctx):
+            return PreparedInput(model_value=f"prepared:{value}")
+
+        async def bind(self, field, prepared, ctx, session):
+            return BoundInput(model_value=f"bound:{prepared.model_value}")
+
+    rlm = PredictRLM(
+        InContextSignature,
+        sub_lm=MagicMock(),
+        adapters=[BindingAdapter()],
+        max_iterations=1,
+    )
+    input_values = {"criteria": "RULE", "query": "QUESTION"}
+    ctx = rlm._new_run_context(input_values)
+    await rlm._prepare_runtime_inputs(ctx, input_values)
+    ctx.session = MagicMock()
+    await rlm._bind_runtime_inputs(ctx)
+    rlm._configure_run_predictors(ctx, None)
+
+    action = str(ctx.state["generate_action"].signature.instructions)
+    assert "bound:prepared:RULE" in action
+    assert "\nprepared:RULE\n" not in action
+
+
+@pytest.mark.asyncio
+async def test_input_adapter_append_prompt_sees_current_prompt_for_action_and_extract():
+    seen = []
+
+    class PromptAdapter(PrefixStringInputAdapter):
+        def append_prompt(self, prompt, field, prepared, ctx):
+            seen.append((prompt, field.name, prepared.model_value, ctx.run_id))
+            return f"{prompt}\n\nHOOK:{field.name}:{prepared.model_value}"
+
+    rlm = PredictRLM(
+        InContextSignature,
+        sub_lm=MagicMock(),
+        adapters=[PromptAdapter()],
+        max_iterations=1,
+    )
+    ctx = await _prepare_run(
+        rlm,
+        {"criteria": "RULE", "query": "QUESTION"},
+    )
+
+    action = str(ctx.state["generate_action"].signature.instructions)
+    extract = str(ctx.state["extract"].signature.instructions)
+    assert len(seen) == 4
+    assert all("HOOK:" not in prompt for prompt, field, *_ in seen if field == "criteria")
+    assert [(field, value) for _, field, value, _ in seen] == [
+        ("criteria", "prepared:RULE"),
+        ("criteria", "prepared:RULE"),
+        ("query", "prepared:QUESTION"),
+        ("query", "prepared:QUESTION"),
+    ]
+    assert all(run_id == ctx.run_id for *_, run_id in seen)
+    assert "HOOK:criteria:prepared:RULE" in action
+    assert "HOOK:criteria:prepared:RULE" in extract
+
+
+@pytest.mark.asyncio
+async def test_prompt_hooks_chain_in_signature_field_order():
+    class CriteriaAdapter(InputAdapter[CtxStr]):
+        name = "criteria_prompt"
+        value_type = CtxStr
+
+        async def prepare(self, field, value, ctx):
+            return PreparedInput(model_value=value)
+
+        def append_prompt(self, prompt, field, prepared, ctx):
+            return f"{prompt}\nFIRST"
+
+    class QueryAdapter(InputAdapter[str]):
+        name = "value"
+        value_type = str
+        fallback = True
+
+        async def prepare(self, field, value, ctx):
+            return PreparedInput(model_value=value)
+
+        def append_prompt(self, prompt, field, prepared, ctx):
+            assert "FIRST" in prompt
+            return f"{prompt}\nSECOND"
+
+    rlm = PredictRLM(
+        InContextSignature,
+        sub_lm=MagicMock(),
+        adapters=[QueryAdapter(), CriteriaAdapter()],
+        max_iterations=1,
+    )
+    ctx = await _prepare_run(rlm, {"criteria": "RULE", "query": "QUESTION"})
+
+    for key in ("generate_action", "extract"):
+        prompt = str(ctx.state[key].signature.instructions)
+        assert prompt.index("FIRST") < prompt.index("SECOND")
+
+
+@pytest.mark.asyncio
+async def test_in_place_prompt_signature_transform_is_run_local():
+    transformed_signatures = {}
+
+    class TransformAdapter(InputAdapter[CtxStr]):
+        name = "transform_ctx"
+        value_type = CtxStr
+
+        async def prepare(self, field, value, ctx):
+            return PreparedInput(model_value=f"prepared:{value}")
+
+        def _transform_prompt_signature(self, signature, field, prepared, ctx):
+            run_value = prepared.model_value
+            signature.instructions = f"run instructions:{run_value}"
+            signature.input_fields["query"].json_schema_extra["desc"] = f"run:{run_value}"
+            transformed_signatures[run_value] = signature
+            return signature
+
+    rlm = PredictRLM(
+        InContextSignature,
+        sub_lm=MagicMock(),
+        adapters=[TransformAdapter()],
+        max_iterations=1,
+    )
+    original_instructions = str(rlm.signature.instructions)
+    original_description = rlm.signature.input_fields["query"].json_schema_extra["desc"]
+
+    first, second = await asyncio.gather(
+        _prepare_run(rlm, {"criteria": "FIRST", "query": "one"}),
+        _prepare_run(rlm, {"criteria": "SECOND", "query": "two"}),
+    )
+    third = await _prepare_run(rlm, {"criteria": "THIRD", "query": "three"})
+
+    for ctx, own_value, sibling_values in (
+        (first, "FIRST", ("SECOND", "THIRD")),
+        (second, "SECOND", ("FIRST", "THIRD")),
+        (third, "THIRD", ("FIRST", "SECOND")),
+    ):
+        for predictor_name in ("generate_action", "extract"):
+            signature = ctx.state[predictor_name].signature
+            prompt = str(signature.instructions)
+            assert f"run instructions:prepared:{own_value}" in prompt
+            for sibling_value in sibling_values:
+                assert f"run instructions:prepared:{sibling_value}" not in prompt
+
+        transformed = transformed_signatures[f"prepared:{own_value}"]
+        assert transformed is not rlm.signature
+        assert transformed.input_fields["query"].json_schema_extra["desc"] == (
+            f"run:prepared:{own_value}"
+        )
+
+    assert rlm.signature is InContextSignature
+    assert str(rlm.signature.instructions) == original_instructions
+    assert rlm.signature.input_fields["query"].json_schema_extra["desc"] == original_description
+
+
+@pytest.mark.asyncio
+async def test_instance_bound_prompt_signature_transform_is_applied():
+    adapter = PrefixStringInputAdapter()
+
+    def transform_prompt_signature(self, signature, field, prepared, ctx):
+        signature.instructions += f"\ninstance:{field.name}:{prepared.model_value}"
+        return signature
+
+    adapter._transform_prompt_signature = MethodType(transform_prompt_signature, adapter)
+    rlm = PredictRLM(
+        InContextSignature,
+        sub_lm=MagicMock(),
+        adapters=[adapter],
+        max_iterations=1,
+    )
+
+    ctx = await _prepare_run(rlm, {"criteria": "RULE", "query": "QUESTION"})
+
+    for predictor_name in ("generate_action", "extract"):
+        prompt = str(ctx.state[predictor_name].signature.instructions)
+        assert "instance:criteria:prepared:RULE" in prompt
+        assert "instance:query:prepared:QUESTION" in prompt
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("hook", ["append_prompt", "_transform_prompt_signature"])
+async def test_invalid_prompt_hook_return_type_fails_clearly(hook):
+    class InvalidAdapter(PrefixStringInputAdapter):
+        pass
+
+    setattr(InvalidAdapter, hook, lambda *args: None)
+    rlm = PredictRLM(
+        InContextSignature,
+        sub_lm=MagicMock(),
+        adapters=[InvalidAdapter()],
+        max_iterations=1,
+    )
+
+    with pytest.raises(TypeError, match=hook):
+        await _prepare_run(rlm, {"criteria": "RULE", "query": "QUESTION"})
+
+
+def test_removed_prompt_contributor_magic_is_absent():
+    import predict_rlm.runtime as runtime_module
+
+    assert not hasattr(runtime_module, "_PromptContributor")
+    assert not hasattr(runtime_module, "_discover_annotation_prompt_contributors")
+    assert not hasattr(CtxStr, "_predict_rlm_prompt_contributor")
+
+
+def test_input_adapter_prompt_hook_defaults_are_noops():
+    adapter = PrefixStringInputAdapter()
+    prepared = PreparedInput(model_value="value")
+    field = FieldDescriptor("query", str)
+    ctx = RunContext(MagicMock(), {})
+
+    assert adapter.append_prompt("prompt", field, prepared, ctx) == "prompt"
+    assert adapter._transform_prompt_signature(InContextSignature, field, prepared, ctx) is InContextSignature
+
+
+@pytest.mark.asyncio
+async def test_default_prompt_hook_preserves_custom_action_predictor():
+    class PlainSignature(dspy.Signature):
+        query: str = dspy.InputField()
+        answer: str = dspy.OutputField()
+
+    class CustomAction:
+        pass
+
+    action = CustomAction()
+    rlm = PredictRLM(
+        PlainSignature,
+        sub_lm=MagicMock(),
+        adapters=[PrefixStringInputAdapter()],
+        max_iterations=1,
+    )
+    rlm.generate_action = action
+
+    ctx = await _prepare_run(rlm, {"query": "QUESTION"})
+
+    assert ctx.state["generate_action"] is action
 
 
 @pytest.mark.asyncio

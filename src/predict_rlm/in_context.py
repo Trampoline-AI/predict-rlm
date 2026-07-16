@@ -11,15 +11,9 @@ from pydantic import GetCoreSchemaHandler, GetJsonSchemaHandler
 from pydantic.json_schema import JsonSchemaValue
 from pydantic_core import core_schema
 
-from .runtime import PreparedInput, RunContext
-
 
 class CtxStr(str):
-    """String input whose adapter-prepared value is injected into the outer prompt."""
-
-    @classmethod
-    def _predict_rlm_prompt_contributor(cls) -> _InContextPromptContributor:
-        return _IN_CONTEXT_PROMPT_CONTRIBUTOR
+    """String input whose final bound model value is injected into the outer prompt."""
 
     @classmethod
     def __get_pydantic_core_schema__(
@@ -99,7 +93,7 @@ def _build_in_context_instructions(
     lines = [
         "## In-Context Inputs",
         "",
-        "The final adapter-prepared strings for these input fields are provided as "
+        "The final bound model strings for these input fields are provided as "
         "task context. Each value is also available in the REPL as the same-named "
         "Python string variable.",
     ]
@@ -125,28 +119,6 @@ def _build_in_context_instructions(
         )
 
     return "\n".join(lines)
-
-
-class _InContextPromptContributor:
-    name = "in_context"
-
-    def validate_signature(self, signature: type[dspy.Signature]) -> None:
-        _in_context_field_names(signature)
-
-    def contribute(
-        self,
-        signature: type[dspy.Signature],
-        prepared_inputs: Mapping[str, PreparedInput],
-        _ctx: RunContext,
-    ) -> tuple[str, ...]:
-        instructions = _build_in_context_instructions(
-            signature,
-            {name: prepared.model_value for name, prepared in prepared_inputs.items()},
-        )
-        return (instructions,) if instructions else ()
-
-
-_IN_CONTEXT_PROMPT_CONTRIBUTOR = _InContextPromptContributor()
 
 
 __all__ = ["CtxStr"]
