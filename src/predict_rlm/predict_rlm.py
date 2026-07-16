@@ -12,6 +12,7 @@ import re
 import time
 import uuid
 from contextlib import asynccontextmanager, contextmanager
+from contextvars import ContextVar
 from copy import copy, deepcopy
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -90,7 +91,6 @@ from .runtime import (
     RuntimeModule,
     RuntimeSpec,
     SessionRequirements,
-    _discover_annotation_prompt_contributors,
     compile_prepared_input,
     current_run_context,
     invoke_host_callable,
@@ -206,6 +206,9 @@ _DSPY_EXTRACT_FALLBACK = dspy.RLM._extract_fallback
 logger = logging.getLogger(__name__)
 
 _NO_FIELD_DEFAULT = object()
+_RUN_PROMPT_SIGNATURE: ContextVar[tuple[object, Any] | None] = ContextVar(
+    "predict_rlm_run_prompt_signature", default=None
+)
 
 
 def _get_field_default(field: Any) -> Any:
@@ -1066,9 +1069,10 @@ class PredictRLM(dspy.RLM):
                    in the sandbox, and tools are exposed alongside predict().
             debug: If True, enable interpreter debug output and lifecycle
                   diagnostics. Debug does not imply verbose RLM trace output.
-            output_dir: Default host directory for output files. When set,
-                       File output fields without an explicit path
-                       are written here. If None, a temp directory is used.
+            output_dir: Constructor convenience that collects generated File and
+                       list[File] outputs under ``<output_dir>/<field>/``. It does
+                       not redirect scalar or JSON outputs, logs, or traces. If
+                       None, generated files are collected in a temp directory.
             telemetry_context: Optional run/case telemetry context for
                        OTel-shaped local JSONL events. Disabled/failed
                        telemetry writes are always ignored.
@@ -1227,9 +1231,9 @@ class PredictRLM(dspy.RLM):
             interpreter=interpreter,
         )
 
-        self._annotation_prompt_contributors = _discover_annotation_prompt_contributors(
-            self.signature
-        )
+        from .in_context import _in_context_field_names
+
+        _in_context_field_names(self.signature)
         expanded_modules = tuple(
             module() if callable(module) else module for module in modules
         )
@@ -3278,35 +3282,83 @@ class PredictRLM(dspy.RLM):
             )
             if instruction
         )
-        if invocation_instructions:
-            action, extract = self._build_signatures_with_files(invocation_instructions)
-        else:
-            action, extract = self.generate_action, self.extract
-
-        prompt_sections: list[str] = []
-        for contributor in self._annotation_prompt_contributors:
-            prepared_inputs = {
-                name: binding.prepared for name, binding in ctx.input_bindings.items()
-            }
-            sections = contributor.contribute(self.signature, prepared_inputs, ctx)
-            if isinstance(sections, str):
+        prompt_signature = dspy.Signature(
+            deepcopy(self.signature.fields),
+            str(self.signature.instructions),
+        )
+        has_prompt_signature_transform = False
+        for binding in ctx.input_bindings.values():
+            transform_prompt_signature = binding.adapter._transform_prompt_signature
+            has_prompt_signature_transform |= (
+                getattr(transform_prompt_signature, "__func__", transform_prompt_signature)
+                is not InputAdapter._transform_prompt_signature
+            )
+            prompt_signature = transform_prompt_signature(
+                prompt_signature, binding.field, binding.prepared, ctx
+            )
+            if not (
+                isinstance(prompt_signature, type)
+                and issubclass(prompt_signature, dspy.Signature)
+            ):
                 raise TypeError(
-                    f"Prompt contributor {contributor.name!r} must return tuple[str, ...]"
+                    f"Input adapter {binding.adapter.name!r} "
+                    "_transform_prompt_signature must return a dspy.Signature class"
                 )
-            for section in sections:
-                if not isinstance(section, str):
-                    raise TypeError(
-                        f"Prompt contributor {contributor.name!r} returned a non-string section"
-                    )
-                if section:
-                    prompt_sections.append(section)
 
-        if prompt_sections:
-            appendix = "\n\n".join(prompt_sections)
-            action = self._with_prompt_appendix(action, appendix)
-            extract = self._with_prompt_appendix(extract, appendix)
+        if not has_prompt_signature_transform:
+            if invocation_instructions:
+                action, extract = self._build_signatures_with_files(invocation_instructions)
+            else:
+                action, extract = self.generate_action, self.extract
+        else:
+            token = _RUN_PROMPT_SIGNATURE.set((self, prompt_signature))
+            try:
+                action, extract = self._build_signatures_with_files(invocation_instructions)
+            finally:
+                _RUN_PROMPT_SIGNATURE.reset(token)
+
+        for binding in ctx.input_bindings.values():
+            action = self._with_adapter_prompt(action, binding, ctx)
+            extract = self._with_adapter_prompt(extract, binding, ctx)
+
+        from .in_context import _build_in_context_instructions
+
+        in_context = _build_in_context_instructions(
+            self.signature,
+            {
+                name: binding.prepared.model_value
+                for name, binding in ctx.input_bindings.items()
+            },
+        )
+        if in_context:
+            action = self._with_prompt_appendix(action, in_context)
+            extract = self._with_prompt_appendix(extract, in_context)
         ctx.state["generate_action"] = action
         ctx.state["extract"] = extract
+
+    def _with_adapter_prompt(
+        self,
+        predictor: dspy.Predict,
+        binding: PreparedInputBinding,
+        ctx: RunContext,
+    ) -> dspy.Predict:
+        append_prompt = binding.adapter.append_prompt
+        if (
+            getattr(append_prompt, "__func__", append_prompt)
+            is InputAdapter.append_prompt
+        ):
+            return predictor
+        prompt = str(predictor.signature.instructions)
+        transformed = append_prompt(prompt, binding.field, binding.prepared, ctx)
+        if not isinstance(transformed, str):
+            raise TypeError(
+                f"Input adapter {binding.adapter.name!r} append_prompt must return str"
+            )
+        if transformed == prompt:
+            return predictor
+        run_predictor = predictor.deepcopy()
+        run_predictor.signature = predictor.signature.with_instructions(transformed)
+        return run_predictor
 
     def _with_prompt_appendix(self, predictor: dspy.Predict, appendix: str) -> dspy.Predict:
         run_predictor = predictor.deepcopy()
@@ -4632,9 +4684,22 @@ class PredictRLM(dspy.RLM):
         submits a path string, not a JSON object. The framework wraps the
         path in File after syncing.
         """
+        scoped_prompt_signature = _RUN_PROMPT_SIGNATURE.get()
+        prompt_signature = (
+            scoped_prompt_signature[1]
+            if scoped_prompt_signature is not None and scoped_prompt_signature[0] is self
+            else self.signature
+        )
+        return self._build_signatures_for_prompt_signature(prompt_signature, file_instructions)
+
+    def _build_signatures_for_prompt_signature(
+        self,
+        prompt_signature: type[dspy.Signature],
+        file_instructions: str,
+    ) -> tuple[dspy.Predict, dspy.Predict]:
         # Replace file-typed fields with str/list[str] for the RLM's view
-        modified_sig = self.signature
-        for name, field in self.signature.output_fields.items():
+        modified_sig = prompt_signature
+        for name, field in prompt_signature.output_fields.items():
             descriptor = FieldDescriptor(name, field.annotation)
             if descriptor.matches(File):
                 replacement = descriptor.replace_type(str)
@@ -4644,7 +4709,7 @@ class PredictRLM(dspy.RLM):
                     f"(submit the sandbox path you wrote to)",
                     type_=replacement,
                 )
-        for name, field in self.signature.input_fields.items():
+        for name, field in prompt_signature.input_fields.items():
             descriptor = FieldDescriptor(name, field.annotation)
             if descriptor.matches(File):
                 replacement = descriptor.replace_type(str)
