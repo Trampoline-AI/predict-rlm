@@ -17,7 +17,7 @@ rlm = PredictRLM(
     max_output_chars=50_000,  # Max chars from REPL output
     verbose=True,             # Print human-readable iteration trace blocks
     tools=None,               # Additional tool functions
-    interpreter=None,         # Legacy interpreter compatibility option
+    interpreter=None,         # CodeInterpreter-shaped compatibility option
     adapters=(),              # Input and output adapter instances
     execution=None,           # Custom root execution backend
     modules=(),               # Runtime contributions or factories
@@ -25,7 +25,7 @@ rlm = PredictRLM(
     skills=None,              # List of Skill instances
     allowed_domains=None,     # Domains the sandbox can access
     debug=False,              # Print timestamped lifecycle diagnostics
-    output_dir=None,          # Host directory for output files
+    output_dir=None,          # Collection root for generated File outputs
 )
 ```
 
@@ -41,15 +41,15 @@ rlm = PredictRLM(
 | `max_output_chars` | `int`                                            | `50_000` | Maximum characters to include from REPL output per iteration.                                                                                                                                                     |
 | `verbose`          | `bool`                                           | `True`   | Print human-readable RLM iteration blocks to stderr: reasoning, generated code, output, tool calls, errors, and `SUBMIT` payloads. Pass `False` for quiet execution.                                              |
 | `tools`            | `dict[str, Callable] \| list[Callable] \| None`  | `None`   | Additional tool functions callable from the sandbox. Accepts a dict mapping names to callables, or a list of callables (names inferred from `__name__`). `predict` is added automatically.                        |
-| `interpreter`      | `CodeInterpreter \| None`                        | `None`   | Legacy interpreter-shaped backend adapted to the runtime kernel. `DirectPythonBackend` belongs here.                                                                                                              |
+| `interpreter`      | `CodeInterpreter \| None`                        | `None`   | Compatibility option for CodeInterpreter-shaped integrations, including the current `DirectPythonBackend`.                                                                                                       |
 | `adapters`         | `Sequence[InputAdapter \| OutputAdapter]`        | `()`     | Input and output adapter instances. Pass a list such as `adapters=[MyInputAdapter(), MyOutputAdapter()]`; each adapter's base class determines its role.                                                          |
-| `execution`        | `ExecutionBackend \| None`                       | `None`   | Custom root session-based execution backend. Interpreter-shaped compatibility backends belong under `interpreter=`.                                                                                               |
+| `execution`        | `ExecutionBackend \| None`                       | `None`   | Preferred option for session-native execution integrations. CodeInterpreter-shaped compatibility integrations belong under `interpreter=`.                                                                       |
 | `modules`          | `Sequence[RuntimeContribution \| RuntimeModule]` | `()`     | Runtime contributions or zero-argument factories. Factories expand once at construction.                                                                                                                          |
 | `events`           | `Sequence[EventSink]`                            | `()`     | Ordered lifecycle event sinks. Strict sinks are correctness-critical; non-strict sinks are best effort.                                                                                                           |
 | `skills`           | `list[Skill] \| None`                            | `None`   | [Skills](skills.md) providing domain-specific instructions, packages, and tools. Merged automatically.                                                                                                            |
 | `allowed_domains`  | `list[str] \| None`                              | `None`   | Domains/IPs the sandbox can access via network. By default, no network access. Example: `["api.example.com", "192.168.1.100:8080"]`                                                                               |
 | `debug`            | `bool`                                           | `False`  | Print timestamped RLM and sandbox lifecycle diagnostics to stderr. Error-like debug records are colored red when the terminal supports ANSI colors.                                                               |
-| `output_dir`       | `str \| Path \| None`                            | `None`   | Host directory for output files. When set, `File` output fields without an explicit path are written here. If `None`, a temp directory is used.                                                                   |
+| `output_dir`       | `str \| Path \| None`                            | `None`   | Constructor convenience that collects generated `File` and `list[File]` outputs under `<output_dir>/<field>/`. It does not redirect scalar/JSON outputs, logs, or traces. `FileOutputAdapter` is the lower-level configurable equivalent. |
 
 Adapter names must be unique within each role; an input and output adapter may
 share a name. A configured adapter with the same name as a built-in
@@ -145,6 +145,17 @@ declarative requirements in `PreparedInput` instead of calling a backend or sess
 Every input adapter implements `prepare()`. Use it to choose the input value the
 RLM receives, add input-specific instructions, or declare host resources that
 should appear in the sandbox. It returns a `PreparedInput`.
+
+After binding finalizes `prepared.model_value`, adapters may customize the two
+invocation-local outer-model prompts. `append_prompt(prompt, field, prepared,
+ctx) -> str` receives the current full prompt and may append to or rewrite it.
+Hooks chain in input signature-field order for both action generation and forced
+extraction. `_transform_prompt_signature(signature, field, prepared, ctx) ->
+type[dspy.Signature]` similarly transforms only the run-local prompt-facing
+signature before those predictors are built. It never changes the canonical
+`PredictRLM.signature`, adapter selection, or output validation. Both hooks must
+return the declared type, and adapters must keep invocation state in `prepared`
+or `ctx` because adapter instances may be shared concurrently.
 
 For an ordinary value, return `PreparedInput(model_value=value)`. For host
 filesystem resources, return one of these declarations:
@@ -530,7 +541,7 @@ class MySignature(dspy.Signature):
 
 ## `CtxStr`
 
-String input marker for small-to-moderate text whose final adapter-prepared
+String input marker for small-to-moderate text whose final bound model
 value should be injected in full into the outer RLM prompt. Use this for
 criteria, rubrics, task instructions, or other text the outer RLM should see
 immediately instead of only inspecting through REPL variables.
@@ -552,8 +563,8 @@ result = rlm(
 )
 ```
 
-Callers pass a plain `str`. The selected input adapter prepares it, and the
-final prepared string is both the same-named Python variable in the sandbox and
+Callers pass a plain `str`. The selected input adapter prepares and binds it, and
+the final bound model value is both the same-named Python variable in the sandbox and
 an in-full appendix to the action and extract prompts under
 `## In-Context Inputs`. This avoids relying on the ordinary variable preview.
 Per-run predictors live on the run context, so concurrent calls on one

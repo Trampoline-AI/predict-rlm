@@ -79,8 +79,9 @@ src/predict_rlm/
   `sandbox_backend`; currently `jspi` and `sbx`.
 - The root `ExecutionBackend` (`runtime.py`) starts one invocation-scoped
   `ExecutionSession`; this is the protocol accepted by `execution=`.
-- `ExecutionBackend` (`backends/base.py`) is the legacy interpreter-shaped
-  execute/file/shutdown protocol adapted through `interpreter=`.
+- `LegacyExecutionBackend` (`backends/base.py`) is the interpreter-shaped
+  execute/file/shutdown protocol adapted through the compatibility
+  `interpreter=` option. Session-native integrations should prefer `execution=`.
 - `SbxConfig` (`backends/sbx/config.py`) carries Docker Sandboxes
   configuration such as name, resources, template, persistence, and WebSocket
   settings.

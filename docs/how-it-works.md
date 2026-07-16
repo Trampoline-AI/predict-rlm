@@ -59,7 +59,7 @@ see [Runtime observability](observability.md).
 The DSPy signature defines the **inputs**, **outputs**, and **strategy** (via
 the docstring). Use `File` for file-typed fields — input files are copied into
 the sandbox, output files are synced back (see [API](api.md#file) for details).
-Use `CtxStr` for string inputs like criteria or rubrics whose adapter-prepared
+Use `CtxStr` for string inputs like criteria or rubrics whose final bound model
 value should be visible in full in the outer RLM prompt for the invocation. The
 caller still passes a normal `str`, and the value remains available as a Python
 variable inside the execution session.

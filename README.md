@@ -102,7 +102,7 @@ codex-lm usage
   via `File`, keeping interop with your existing data pipelines straightforward.
   (S3 files support soon)
 - **In-context string inputs** — mark criteria, rubrics, or task instructions
-  with `CtxStr` when the outer RLM should see the adapter-prepared text in its
+  with `CtxStr` when the outer RLM should see the final bound model value in its
   prompt.
 - **Structured sub-LM calls** — native Pydantic and DSPy signature support for
   type-safe sub-LM invocations with structured outputs
