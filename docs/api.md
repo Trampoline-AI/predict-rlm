@@ -563,13 +563,14 @@ result = rlm(
 )
 ```
 
-Callers pass a plain `str`. The selected input adapter prepares and binds it, and
+Callers pass a plain `str`. The built-in `CtxStrInputAdapter` prepares and binds it, and
 the final bound model value is both the same-named Python variable in the sandbox and
 an in-full appendix to the action and extract prompts under
 `## In-Context Inputs`. This avoids relying on the ordinary variable preview.
 Per-run predictors live on the run context, so concurrent calls on one
-`PredictRLM` instance remain isolated. PredictRLM recognizes `CtxStr`
-automatically; no extra runtime configuration is required.
+`PredictRLM` instance remain isolated. PredictRLM selects the built-in adapter
+automatically. A configured adapter may replace the built-in `ctx_str` name only
+when it is a `CtxStrInputAdapter` instance or subclass, preserving prompt injection.
 
 `CtxStr` is input-only and currently supports class-based DSPy signatures only.
 Use `field: CtxStr`, not `list[CtxStr]`, `CtxStr | None`, or string signatures

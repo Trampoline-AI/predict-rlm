@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 import typing
-from collections.abc import Mapping
 from typing import Any
 
 import dspy
 from pydantic import GetCoreSchemaHandler, GetJsonSchemaHandler
 from pydantic.json_schema import JsonSchemaValue
 from pydantic_core import core_schema
+
+from .runtime import InputAdapter, PreparedInput
 
 
 class CtxStr(str):
@@ -82,14 +83,7 @@ def _in_context_delimiters(name: str, value: str) -> tuple[str, str]:
         index += 1
 
 
-def _build_in_context_instructions(
-    signature: type[dspy.Signature],
-    prepared_values: Mapping[str, object],
-) -> str:
-    fields = _in_context_field_names(signature)
-    if not fields:
-        return ""
-
+def _format_in_context_inputs(values: list[tuple[str, str]]) -> str:
     lines = [
         "## In-Context Inputs",
         "",
@@ -97,15 +91,7 @@ def _build_in_context_instructions(
         "task context. Each value is also available in the REPL as the same-named "
         "Python string variable.",
     ]
-    for name in fields:
-        if name not in prepared_values:
-            continue
-        value = prepared_values[name]
-        if not isinstance(value, str):
-            raise TypeError(
-                f"CtxStr input field {name!r} expects a string, "
-                f"got {type(value).__name__}."
-            )
+    for name, value in values:
         opening, closing = _in_context_delimiters(name, value)
         lines.extend(
             [
@@ -121,4 +107,45 @@ def _build_in_context_instructions(
     return "\n".join(lines)
 
 
-__all__ = ["CtxStr"]
+class CtxStrInputAdapter(InputAdapter[CtxStr]):
+    """Prepare CtxStr values and add their final bindings to the outer prompt."""
+
+    name = "ctx_str"
+    value_type = CtxStr
+
+    async def prepare(self, field, value, ctx):
+        if not isinstance(value, str):
+            raise TypeError(
+                f"CtxStr input field {field.name!r} expects a string, "
+                f"got {type(value).__name__}."
+            )
+        return PreparedInput(model_value=CtxStr(value))
+
+    def append_prompt(self, prompt, field, prepared, ctx):
+        owned = [
+            binding
+            for binding in ctx.input_bindings.values()
+            if isinstance(binding.adapter, CtxStrInputAdapter)
+            if getattr(
+                binding.adapter.append_prompt,
+                "__func__",
+                binding.adapter.append_prompt,
+            )
+            is CtxStrInputAdapter.append_prompt
+        ]
+        if not owned or owned[0].field.name != field.name:
+            return prompt
+        values = []
+        for binding in owned:
+            value = binding.prepared.model_value
+            if not isinstance(value, str):
+                raise TypeError(
+                    f"CtxStr input field {binding.field.name!r} expects a string, "
+                    f"got {type(value).__name__}."
+                )
+            values.append((binding.field.name, value))
+        appendix = _format_in_context_inputs(values)
+        return "\n\n".join(part for part in (prompt, appendix) if part)
+
+
+__all__ = ["CtxStr", "CtxStrInputAdapter"]

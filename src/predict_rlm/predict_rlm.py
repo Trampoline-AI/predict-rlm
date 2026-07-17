@@ -73,6 +73,7 @@ from .compatibility import (
 from .evidence import EvidenceRecorder, RunEventKind
 from .execution_timeout import validate_execution_timeout
 from .files import File, build_file_plan, scan_file_fields
+from .in_context import CtxStrInputAdapter
 from .rlm_skills import Skill, merge_skills
 from .runtime import (
     Artifact,
@@ -1277,6 +1278,18 @@ class PredictRLM(dspy.RLM):
             *tuple(adapters),
             *(adapter for module in expanded_modules for adapter in module.adapters),
         )
+        unsafe_ctx_str_replacements = [
+            adapter
+            for adapter in configured_adapters
+            if isinstance(adapter, InputAdapter)
+            if adapter.name == CtxStrInputAdapter.name
+            if not isinstance(adapter, CtxStrInputAdapter)
+        ]
+        if unsafe_ctx_str_replacements:
+            raise TypeError(
+                "The built-in 'ctx_str' adapter may only be replaced by a "
+                "CtxStrInputAdapter instance or subclass."
+            )
         configured_input_names = {
             adapter.name
             for adapter in configured_adapters
@@ -1297,7 +1310,11 @@ class PredictRLM(dspy.RLM):
         )
         compatibility_inputs = tuple(
             adapter
-            for adapter in (ValueInputAdapter(), *file_compatibility_contribution.adapters)
+            for adapter in (
+                CtxStrInputAdapter(),
+                ValueInputAdapter(),
+                *file_compatibility_contribution.adapters,
+            )
             if isinstance(adapter, InputAdapter)
             if adapter.name not in configured_input_names
         )
@@ -3321,18 +3338,6 @@ class PredictRLM(dspy.RLM):
             action = self._with_adapter_prompt(action, binding, ctx)
             extract = self._with_adapter_prompt(extract, binding, ctx)
 
-        from .in_context import _build_in_context_instructions
-
-        in_context = _build_in_context_instructions(
-            self.signature,
-            {
-                name: binding.prepared.model_value
-                for name, binding in ctx.input_bindings.items()
-            },
-        )
-        if in_context:
-            action = self._with_prompt_appendix(action, in_context)
-            extract = self._with_prompt_appendix(extract, in_context)
         ctx.state["generate_action"] = action
         ctx.state["extract"] = extract
 
@@ -3360,15 +3365,6 @@ class PredictRLM(dspy.RLM):
         run_predictor.signature = predictor.signature.with_instructions(transformed)
         return run_predictor
 
-    def _with_prompt_appendix(self, predictor: dspy.Predict, appendix: str) -> dspy.Predict:
-        run_predictor = predictor.deepcopy()
-        instructions = "\n\n".join(
-            instruction
-            for instruction in (str(predictor.signature.instructions), appendix)
-            if instruction
-        )
-        run_predictor.signature = predictor.signature.with_instructions(instructions)
-        return run_predictor
 
     async def _setup_runtime_modules(self, ctx: RunContext) -> None:
         session = ctx.session
