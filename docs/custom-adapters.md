@@ -68,6 +68,10 @@ An `InputAdapter` selects fields through `value_type` and returns a
 - `after_execution`: persist changes after each completed generated-code block; and
 - `finalize`: perform the final save and release adapter-owned resources.
 
+The reserved `ctx_str` name may replace the built-in adapter only through a
+`CtxStrInputAdapter` instance or subclass. An independent adapter must use a
+different name; it cannot replace the prompt-injecting behavior implicitly.
+
 Backend and session access follows the lifecycle:
 
 - `prepare()` receives neither; it returns declarative requirements;

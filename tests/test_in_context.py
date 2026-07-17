@@ -9,8 +9,7 @@ import pytest
 
 import predict_rlm
 import predict_rlm.in_context as in_context_module
-from predict_rlm import CtxStr, PredictRLM, Skill
-from predict_rlm.in_context import _build_in_context_instructions
+from predict_rlm import CtxStr, CtxStrInputAdapter, PredictRLM, Skill
 from predict_rlm.runtime import (
     BoundInput,
     FieldDescriptor,
@@ -58,38 +57,190 @@ def test_in_context_is_pydantic_string_schema():
 
 
 def test_in_context_public_surface_is_only_ctx_str():
-    assert in_context_module.__all__ == ["CtxStr"]
+    assert in_context_module.__all__ == ["CtxStr", "CtxStrInputAdapter"]
     assert "CtxStr" in predict_rlm.__all__
+    assert "CtxStrInputAdapter" in predict_rlm.__all__
     assert "PromptContributor" not in predict_rlm.__all__
     assert "discover_runtime_modules" not in predict_rlm.__all__
 
 
-def test_build_in_context_instructions_includes_only_marked_fields():
-    criteria = "Use every cited fact.\nPrefer concise answers."
-
-    instructions = _build_in_context_instructions(
+@pytest.mark.asyncio
+async def test_ctx_str_resolves_to_builtin_adapter_ahead_of_generic_str_adapter():
+    rlm = PredictRLM(
         InContextSignature,
-        {
-            "criteria": criteria,
-            "query": "This ordinary string input should not be injected.",
-        },
+        sub_lm=MagicMock(),
+        adapters=[PrefixStringInputAdapter()],
+        max_iterations=1,
     )
 
-    assert instructions.startswith("## In-Context Inputs")
-    assert instructions.count("## In-Context Inputs") == 1
-    assert "### `criteria`" in instructions
-    assert "Full rubric to apply" not in instructions
-    assert criteria in instructions
-    assert '<BEGIN_IN_CONTEXT_INPUT name="criteria">' in instructions
-    assert '<END_IN_CONTEXT_INPUT name="criteria">' in instructions
-    assert "This ordinary string input should not be injected." not in instructions
+    ctx = await _prepare_run(rlm, {"criteria": "RULE", "query": "QUESTION"})
+
+    assert isinstance(ctx.input_bindings["criteria"].adapter, CtxStrInputAdapter)
+    assert ctx.input_bindings["criteria"].prepared.model_value == "RULE"
+    assert ctx.input_bindings["query"].prepared.model_value == "prepared:QUESTION"
+
+
+@pytest.mark.asyncio
+async def test_ctx_str_subclass_resolves_to_builtin_ahead_of_generic_str_adapter():
+    class SpecializedCtxStr(CtxStr):
+        pass
+
+    class SpecializedSignature(dspy.Signature):
+        criteria: SpecializedCtxStr = dspy.InputField()
+        answer: str = dspy.OutputField()
+
+    rlm = PredictRLM(
+        SpecializedSignature,
+        sub_lm=MagicMock(),
+        adapters=[PrefixStringInputAdapter()],
+        max_iterations=1,
+    )
+
+    ctx = await _prepare_run(rlm, {"criteria": "RULE"})
+
+    assert isinstance(ctx.input_bindings["criteria"].adapter, CtxStrInputAdapter)
+    assert "RULE" in str(ctx.state["generate_action"].signature.instructions)
+
+
+@pytest.mark.asyncio
+async def test_multiple_ctx_str_adapter_instances_append_one_ordered_section():
+    class SpecializedCtxStr(CtxStr):
+        pass
+
+    class MultipleCtxStrSignature(dspy.Signature):
+        first: CtxStr = dspy.InputField()
+        second: SpecializedCtxStr = dspy.InputField()
+        answer: str = dspy.OutputField()
+
+    class SpecializedCtxStrAdapter(CtxStrInputAdapter):
+        name = "specialized_ctx_str"
+        value_type = SpecializedCtxStr
+
+    rlm = PredictRLM(
+        MultipleCtxStrSignature,
+        sub_lm=MagicMock(),
+        adapters=[SpecializedCtxStrAdapter()],
+        max_iterations=1,
+    )
+
+    ctx = await _prepare_run(rlm, {"first": "FIRST", "second": "SECOND"})
+
+    for predictor_name in ("generate_action", "extract"):
+        prompt = str(ctx.state[predictor_name].signature.instructions)
+        assert prompt.count("## In-Context Inputs") == 1
+        assert prompt.index("FIRST") < prompt.index("SECOND")
+
+
+@pytest.mark.asyncio
+async def test_default_ctx_str_prompt_excludes_custom_prompt_hook_fields():
+    class SpecializedCtxStr(CtxStr):
+        pass
+
+    class MultipleCtxStrSignature(dspy.Signature):
+        default: CtxStr = dspy.InputField()
+        custom: SpecializedCtxStr = dspy.InputField()
+        answer: str = dspy.OutputField()
+
+    class CustomPromptAdapter(CtxStrInputAdapter):
+        name = "custom_prompt_ctx_str"
+        value_type = SpecializedCtxStr
+
+        def append_prompt(self, prompt, field, prepared, ctx):
+            return f"{prompt}\n\nCUSTOM:{prepared.model_value}"
+
+    rlm = PredictRLM(
+        MultipleCtxStrSignature,
+        sub_lm=MagicMock(),
+        adapters=[CustomPromptAdapter()],
+        max_iterations=1,
+    )
+
+    ctx = await _prepare_run(rlm, {"default": "DEFAULT", "custom": "CUSTOM-VALUE"})
+
+    for predictor_name in ("generate_action", "extract"):
+        prompt = str(ctx.state[predictor_name].signature.instructions)
+        assert prompt.count("## In-Context Inputs") == 1
+        assert prompt.count("CUSTOM-VALUE") == 1
+        assert "CUSTOM:CUSTOM-VALUE" in prompt
+
+
+def test_independent_same_name_ctx_str_adapter_is_rejected_at_construction():
+    class UnsafeCtxStrAdapter(InputAdapter[CtxStr]):
+        name = "ctx_str"
+        value_type = CtxStr
+
+        async def prepare(self, field, value, ctx):
+            return PreparedInput(model_value=value)
+
+    with pytest.raises(TypeError, match="ctx_str.*CtxStrInputAdapter"):
+        PredictRLM(
+            InContextSignature,
+            sub_lm=MagicMock(),
+            adapters=[UnsafeCtxStrAdapter()],
+            max_iterations=1,
+        )
+
+
+@pytest.mark.asyncio
+async def test_same_name_ctx_str_adapter_replaces_builtin_and_owns_prompt():
+    class ReplacementCtxStrInputAdapter(CtxStrInputAdapter):
+        async def prepare(self, field, value, ctx):
+            return PreparedInput(model_value=f"replacement:{value}")
+
+    rlm = PredictRLM(
+        InContextSignature,
+        sub_lm=MagicMock(),
+        adapters=[ReplacementCtxStrInputAdapter()],
+        max_iterations=1,
+    )
+
+    ctx = await _prepare_run(rlm, {"criteria": "RULE", "query": "QUESTION"})
+    prompt = str(ctx.state["generate_action"].signature.instructions)
+
+    assert type(ctx.input_bindings["criteria"].adapter) is ReplacementCtxStrInputAdapter
+    assert "replacement:RULE" in prompt
+
+
+@pytest.mark.asyncio
+async def test_distinct_exact_ctx_str_adapter_conflicts_with_builtin():
+    class OtherCtxStrAdapter(InputAdapter[CtxStr]):
+        name = "other_ctx_str"
+        value_type = CtxStr
+
+        async def prepare(self, field, value, ctx):
+            return PreparedInput(model_value=value)
+
+    rlm = PredictRLM(
+        InContextSignature,
+        sub_lm=MagicMock(),
+        adapters=[OtherCtxStrAdapter()],
+        max_iterations=1,
+    )
+
+    with pytest.raises(ValueError, match="ctx_str, other_ctx_str"):
+        await _prepare_run(rlm, {"criteria": "RULE", "query": "QUESTION"})
+
+
+@pytest.mark.asyncio
+async def test_kernel_does_not_build_ctx_str_instructions(monkeypatch):
+    monkeypatch.setattr(
+        in_context_module,
+        "_build_in_context_instructions",
+        MagicMock(side_effect=AssertionError("kernel special case called")),
+        raising=False,
+    )
+    rlm = PredictRLM(InContextSignature, sub_lm=MagicMock(), max_iterations=1)
+
+    ctx = await _prepare_run(rlm, {"criteria": "RULE", "query": "QUESTION"})
+
+    assert "RULE" in str(ctx.state["generate_action"].signature.instructions)
+
 
 
 @pytest.mark.asyncio
 async def test_in_context_delimiters_avoid_prepared_value_collisions():
     nominal_closing_marker = '<END_IN_CONTEXT_INPUT name="criteria">'
     raw_value = f"Keep this exact marker:\n{nominal_closing_marker}\nwithout changing it."
-    prepared_value = f"prepared:{raw_value}"
     rlm = PredictRLM(
         InContextSignature,
         sub_lm=MagicMock(),
@@ -103,8 +254,8 @@ async def test_in_context_delimiters_avoid_prepared_value_collisions():
     )
     instructions = str(ctx.state["generate_action"].signature.instructions)
 
-    assert ctx.input_bindings["criteria"].prepared.model_value == prepared_value
-    assert prepared_value in instructions
+    assert ctx.input_bindings["criteria"].prepared.model_value == raw_value
+    assert raw_value in instructions
     assert instructions.count(nominal_closing_marker) == 1
     assert not instructions.rstrip().endswith(nominal_closing_marker)
 
@@ -158,8 +309,8 @@ async def test_runtime_in_context_instructions_follow_files_and_skills():
 
 @pytest.mark.asyncio
 async def test_in_context_preserves_invocation_signature_builder_override():
-    class TransformAdapter(InputAdapter[CtxStr]):
-        name = "transform_ctx"
+    class TransformAdapter(CtxStrInputAdapter):
+        name = "ctx_str"
         value_type = CtxStr
 
         async def prepare(self, field, value, ctx):
@@ -226,7 +377,7 @@ async def test_in_context_rejects_non_string_runtime_value():
 
 
 @pytest.mark.asyncio
-async def test_string_input_adapter_owns_in_context_prompt_value():
+async def test_generic_string_input_adapter_does_not_own_ctx_str_value():
     rlm = PredictRLM(
         InContextSignature,
         sub_lm=MagicMock(),
@@ -240,16 +391,14 @@ async def test_string_input_adapter_owns_in_context_prompt_value():
     )
     action = str(ctx.state["generate_action"].signature.instructions)
 
-    assert ctx.input_bindings["criteria"].prepared.model_value == "prepared:RAW-RULE"
-    assert "prepared:RAW-RULE" in action
-    assert "\nRAW-RULE\n" not in action
+    assert ctx.input_bindings["criteria"].prepared.model_value == "RAW-RULE"
+    assert "\nRAW-RULE\n" in action
+    assert "prepared:RAW-RULE" not in action
 
 
 @pytest.mark.asyncio
 async def test_ctx_str_prompt_uses_final_bound_custom_adapter_value():
-    class BindingAdapter(InputAdapter[CtxStr]):
-        name = "binding_ctx"
-        value_type = CtxStr
+    class BindingAdapter(CtxStrInputAdapter):
 
         async def prepare(self, field, value, ctx):
             return PreparedInput(model_value=f"prepared:{value}")
@@ -297,24 +446,19 @@ async def test_input_adapter_append_prompt_sees_current_prompt_for_action_and_ex
 
     action = str(ctx.state["generate_action"].signature.instructions)
     extract = str(ctx.state["extract"].signature.instructions)
-    assert len(seen) == 4
-    assert all("HOOK:" not in prompt for prompt, field, *_ in seen if field == "criteria")
+    assert len(seen) == 2
     assert [(field, value) for _, field, value, _ in seen] == [
-        ("criteria", "prepared:RULE"),
-        ("criteria", "prepared:RULE"),
         ("query", "prepared:QUESTION"),
         ("query", "prepared:QUESTION"),
     ]
     assert all(run_id == ctx.run_id for *_, run_id in seen)
-    assert "HOOK:criteria:prepared:RULE" in action
-    assert "HOOK:criteria:prepared:RULE" in extract
+    assert "HOOK:query:prepared:QUESTION" in action
+    assert "HOOK:query:prepared:QUESTION" in extract
 
 
 @pytest.mark.asyncio
 async def test_prompt_hooks_chain_in_signature_field_order():
-    class CriteriaAdapter(InputAdapter[CtxStr]):
-        name = "criteria_prompt"
-        value_type = CtxStr
+    class CriteriaAdapter(CtxStrInputAdapter):
 
         async def prepare(self, field, value, ctx):
             return PreparedInput(model_value=value)
@@ -351,8 +495,8 @@ async def test_prompt_hooks_chain_in_signature_field_order():
 async def test_in_place_prompt_signature_transform_is_run_local():
     transformed_signatures = {}
 
-    class TransformAdapter(InputAdapter[CtxStr]):
-        name = "transform_ctx"
+    class TransformAdapter(CtxStrInputAdapter):
+        name = "ctx_str"
         value_type = CtxStr
 
         async def prepare(self, field, value, ctx):
@@ -423,7 +567,6 @@ async def test_instance_bound_prompt_signature_transform_is_applied():
 
     for predictor_name in ("generate_action", "extract"):
         prompt = str(ctx.state[predictor_name].signature.instructions)
-        assert "instance:criteria:prepared:RULE" in prompt
         assert "instance:query:prepared:QUESTION" in prompt
 
 

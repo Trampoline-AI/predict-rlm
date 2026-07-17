@@ -30,7 +30,7 @@ from .evidence import (
     RunEventKind,
 )
 from .files import File, LocalDir, LocalFile, OutputDir, OutputFile, SyncedFile
-from .in_context import CtxStr
+from .in_context import CtxStr, CtxStrInputAdapter
 from .predict_rlm import PredictRLM, SubmitConfirmationContext
 from .rlm_skills import Skill
 from .runtime import (
@@ -107,6 +107,7 @@ __all__ = [
     "ArtifactFileInfo",
     "CallableTool",
     "CtxStr",
+    "CtxStrInputAdapter",
     "DirectoryCreationSession",
     "DirectPythonBackend",
     "IterationStep",

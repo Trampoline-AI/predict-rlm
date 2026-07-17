@@ -1462,6 +1462,19 @@ def resolve_input_adapter(
     concrete = [adapter for adapter in matches if not adapter.fallback]
     if concrete:
         matches = concrete
+    exact = [adapter for adapter in matches if adapter.value_type is field.item_annotation]
+    if exact:
+        matches = exact
+    else:
+        matches = [
+            adapter
+            for adapter in matches
+            if not any(
+                other.value_type is not adapter.value_type
+                and issubclass(other.value_type, adapter.value_type)
+                for other in matches
+            )
+        ]
     return _resolve_adapter(matches, "input", field)
 
 

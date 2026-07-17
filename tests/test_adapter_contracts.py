@@ -19,9 +19,43 @@ from predict_rlm.runtime import (
     PreparedInput,
     PreparedInputBinding,
     compile_prepared_input,
+    resolve_input_adapter,
     validate_output_sandbox_root_reservation,
     validate_sandbox_root_reservations,
 )
+
+
+def test_concrete_input_adapter_wins_before_exact_fallback_specificity():
+    class BaseValue:
+        pass
+
+    class SpecificValue(BaseValue):
+        pass
+
+    class ConcreteBaseAdapter(InputAdapter[BaseValue]):
+        name = "concrete-base"
+        value_type = BaseValue
+
+        async def prepare(self, field, value, ctx):
+            return PreparedInput(model_value=value)
+
+    class ExactFallbackAdapter(InputAdapter[SpecificValue]):
+        name = "exact-fallback"
+        value_type = SpecificValue
+        fallback = True
+
+        async def prepare(self, field, value, ctx):
+            return PreparedInput(model_value=value)
+
+    concrete = ConcreteBaseAdapter()
+
+    selected = resolve_input_adapter(
+        [ExactFallbackAdapter(), concrete],
+        FieldDescriptor("value", SpecificValue),
+        SpecificValue(),
+    )
+
+    assert selected is concrete
 
 
 @pytest.mark.parametrize(
