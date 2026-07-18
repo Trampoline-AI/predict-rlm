@@ -5,7 +5,7 @@ Use this reference to keep generated code aligned with the package API.
 ## Core Imports
 
 ```python
-from predict_rlm import File, PredictRLM, Skill
+from predict_rlm import CtxStr, File, PredictRLM, Skill
 from predict_rlm.skills import docx, pdf, spreadsheet
 ```
 
@@ -18,7 +18,7 @@ PredictRLM(
     sub_lm: dspy.LM | str | None = None,
     max_iterations: int = 30,
     max_llm_calls: int = 50,
-    max_output_chars: int = 100_000,
+    max_output_chars: int = 50_000,
     verbose: bool = True,
     tools: dict[str, Callable[..., str]] | list[Callable] | None = None,
     interpreter: CodeInterpreter | None = None,
@@ -35,6 +35,11 @@ PredictRLM(
     runtime_hooks: list[RuntimeHook] | None = None,
     on_runtime_hook_event: Callable[[RuntimeHookEvent], Any] | None = None,
     model_execution_timeout: bool = False,
+    *,
+    adapters: Sequence[InputAdapter[Any] | OutputAdapter[Any]] = (),
+    execution: ExecutionBackend | None = None,
+    modules: Sequence[RuntimeModule | RuntimeContribution] = (),
+    events: Sequence[EventSink] = (),
 )
 ```
 
@@ -47,6 +52,10 @@ Use `File` for large inputs and generated artifacts.
 
 - Input fields mount host files under `/sandbox/input/{field_name}/`.
 - Output fields sync files from `/sandbox/output/{field_name}/` back to the host.
+
+Use `CtxStr` for string inputs such as criteria or rubrics whose full prepared
+value should be visible in the outer RLM prompt. Callers still pass a normal
+`str`; the built-in input adapter handles prompt injection for that invocation.
 
 ## Skills
 

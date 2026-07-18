@@ -37,3 +37,14 @@ def test_public_rlm_skill_requires_shared_eval_adapter_semantics():
     assert "rlm_gepa.runtime.adapter.RLMGepaAdapter" in skill_text
     assert "eval.json" in skill_text
     assert "rlm-gepa stats <run_dir>" in skill_text
+
+
+def test_public_rlm_skill_matches_current_runtime_api():
+    skill_text = _installable_skill_docs_text()
+
+    assert "max_output_chars: int = 50_000" in skill_text
+    assert "CtxStr" in skill_text
+    assert "adapters: Sequence[InputAdapter" in skill_text
+    assert "execution: ExecutionBackend | None = None" in skill_text
+    assert "modules: Sequence[RuntimeModule | RuntimeContribution] = ()" in skill_text
+    assert "events: Sequence[EventSink] = ()" in skill_text
