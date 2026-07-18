@@ -118,6 +118,15 @@ def test_public_rlm_gepa_project_forwards_runtime_logging_flags():
     assert "debug=context.debug_rlm" in project_layout
 
 
+def test_rlm_gepa_readme_matches_runtime_logging_wiring():
+    gepa_readme = (ROOT / "src" / "rlm_gepa" / "README.md").read_text()
+
+    assert "`--verbose-rlm` controls\nexecutor rollout logs" in gepa_readme
+    assert "proposer RLMs emit their own\nprogress traces" in gepa_readme
+    assert "`--debug-rlm` enables lifecycle diagnostics" in gepa_readme
+    assert "The flags are forwarded into executor rollouts" not in gepa_readme
+
+
 def test_public_rlm_gepa_cli_targets_are_importable():
     project_layout = (
         ROOT / ".agents" / "skills" / "rlm-gepa" / "references" / "project-layout.md"

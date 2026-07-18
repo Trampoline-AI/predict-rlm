@@ -319,9 +319,10 @@ Use `AgentSpec`, seed instructions, evaluator feedback, and `component_focus()`
 to steer _what kinds of behaviors_ GEPA explores. Use CLI/runtime args to steer
 _how much search_ is performed.
 
-`optimize` accepts `--verbose-rlm` and `--debug-rlm` with the same meanings as
-the eval command. The flags are forwarded into executor rollouts, instruction
-proposer RLMs, and patch-merge proposer RLMs.
+`optimize` accepts `--verbose-rlm` and `--debug-rlm`. `--verbose-rlm` controls
+executor rollout logs; instruction and patch-merge proposer RLMs emit their own
+progress traces during optimization. `--debug-rlm` enables lifecycle diagnostics
+for executor and proposer RLMs.
 
 The CLI calls the same Python API, so embedding is still available when you need
 it:
