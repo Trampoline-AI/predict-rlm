@@ -26,9 +26,9 @@ def test_public_rlm_skill_entrypoints_and_references_are_valid():
         assert re.search(rf"(?m)^name: {re.escape(skill_name)}$", frontmatter)
         assert re.search(r"(?m)^description: [>|]?$", frontmatter)
         assert "## Skill Freshness" in body
-        assert (
-            f".agents/skills/{skill_name}/SKILL.md" in body
-        ), f"wrong update URL for {skill_name}"
+        assert f".agents/skills/{skill_name}/SKILL.md" in body, (
+            f"wrong update URL for {skill_name}"
+        )
 
         references = re.findall(r"`(references/[^`]+\.md)`", body)
         assert references, f"{skill_name} does not link any references"
@@ -42,15 +42,11 @@ def test_public_rlm_skill_entrypoints_and_references_are_valid():
 
 
 def test_public_rlm_skill_version_snippets_match_package_version():
-    package_version = tomllib.loads((ROOT / "pyproject.toml").read_text())["project"][
-        "version"
-    ]
+    package_version = tomllib.loads((ROOT / "pyproject.toml").read_text())["project"]["version"]
     skill_text = _installable_skill_docs_text()
 
     generated_versions = re.findall(r'predict_rlm_version = "([^"]+)"', skill_text)
-    dependency_versions = re.findall(
-        r'predict-rlm(?:\[[^\]]+\])?>=([^,\s"]+)', skill_text
-    )
+    dependency_versions = re.findall(r'predict-rlm(?:\[[^\]]+\])?>=([^,\s"]+)', skill_text)
 
     assert generated_versions
     assert dependency_versions
@@ -64,9 +60,7 @@ def test_public_rlm_skill_requires_shared_eval_adapter_semantics():
     assert "rlm_gepa.runtime.adapter.RLMGepaAdapter" in skill_text
     assert "eval.json" in skill_text
     assert "rlm-gepa stats <run_dir>" in skill_text
-    assert re.search(
-        r"reserve\s+official dev/test/challenge splits for reporting", skill_text
-    )
+    assert re.search(r"reserve\s+official dev/test/challenge splits for reporting", skill_text)
     assert "evaluator feedback or hidden scoring APIs" in skill_text
     assert re.search(r"typed\s+JSON boundary", skill_text)
 
@@ -87,12 +81,7 @@ def test_public_rlm_project_layout_is_packaged_and_importable():
         ROOT / ".agents" / "skills" / "rlm" / "references" / "project-layout.md"
     ).read_text()
     gepa_layout = (
-        ROOT
-        / ".agents"
-        / "skills"
-        / "rlm-gepa"
-        / "references"
-        / "project-layout.md"
+        ROOT / ".agents" / "skills" / "rlm-gepa" / "references" / "project-layout.md"
     ).read_text()
     gepa_readme = (ROOT / "src" / "rlm_gepa" / "README.md").read_text()
 
@@ -109,12 +98,7 @@ def test_public_rlm_gepa_agent_spec_examples_satisfy_schema():
         ROOT / ".agents" / "skills" / "rlm-gepa" / "references" / "agent-spec.md"
     ).read_text()
     project_layout = (
-        ROOT
-        / ".agents"
-        / "skills"
-        / "rlm-gepa"
-        / "references"
-        / "project-layout.md"
+        ROOT / ".agents" / "skills" / "rlm-gepa" / "references" / "project-layout.md"
     ).read_text()
 
     assert '"document behaviors"' in agent_spec
@@ -127,12 +111,7 @@ def test_public_rlm_gepa_agent_spec_examples_satisfy_schema():
 
 def test_public_rlm_gepa_project_forwards_runtime_logging_flags():
     project_layout = (
-        ROOT
-        / ".agents"
-        / "skills"
-        / "rlm-gepa"
-        / "references"
-        / "project-layout.md"
+        ROOT / ".agents" / "skills" / "rlm-gepa" / "references" / "project-layout.md"
     ).read_text()
 
     assert "verbose=context.verbose_rlm" in project_layout
@@ -148,12 +127,7 @@ def test_public_rlm_skill_routing_keeps_eval_only_work_with_rlm():
 
 def test_contributor_skill_uses_existing_targeted_test_node():
     repo_map = (
-        ROOT
-        / ".agents"
-        / "skills"
-        / "predict-rlm-contributor"
-        / "references"
-        / "repo-map.md"
+        ROOT / ".agents" / "skills" / "predict-rlm-contributor" / "references" / "repo-map.md"
     ).read_text()
     contributor_guidance = (repo_map, (ROOT / "AGENTS.md").read_text())
 
