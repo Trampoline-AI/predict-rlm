@@ -7,23 +7,25 @@ scope needs them.
 ```text
 my_rlm/
 ├── pyproject.toml
-├── __init__.py
-├── agent/
+├── my_rlm/
 │   ├── __init__.py
-│   ├── schema.py
-│   ├── signature.py
-│   ├── service.py
-│   └── skills.py        # optional custom skills
-├── tools/               # optional host-side tools/helpers
-├── bench/               # optional eval dataset/scoring code
+│   ├── agent/
+│   │   ├── __init__.py
+│   │   ├── schema.py
+│   │   ├── signature.py
+│   │   ├── service.py
+│   │   └── skills.py    # optional custom skills
+│   ├── tools/           # optional host-side tools/helpers
+│   └── bench/           # optional eval dataset/scoring code
 └── tests/
     └── test_smoke.py
 ```
 
-Always create `pyproject.toml`, package `__init__.py`, `agent/schema.py`,
-`agent/signature.py`, `agent/service.py`, `agent/__init__.py`, and
-`tests/test_smoke.py`. Do not add compatibility shims for old flat module names
-in newly generated projects.
+Always create `pyproject.toml`, `my_rlm/__init__.py`,
+`my_rlm/agent/schema.py`, `my_rlm/agent/signature.py`,
+`my_rlm/agent/service.py`, `my_rlm/agent/__init__.py`, and
+`tests/test_smoke.py`. Replace `my_rlm` with the import package name. Do not add
+compatibility shims for old flat module names in newly generated projects.
 
 ## pyproject.toml
 
@@ -44,10 +46,37 @@ predict_rlm_version = "0.8.0-alpha0"
 skill_version = "3.0"
 layout = "agent-tools-bench"
 features = ["agent"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["my_rlm"]
 ```
 
 For examples inside the `predict-rlm` monorepo, an editable path source is fine,
 but keep the metadata table.
+
+## Package Exports
+
+Keep package imports deliberate. Re-export the callable service through both
+package layers so callers can use `from my_rlm import DocumentAnalyzer`.
+
+```python
+# my_rlm/agent/__init__.py
+from .service import DocumentAnalyzer
+from .signature import AnalyzeDocuments
+
+__all__ = ["AnalyzeDocuments", "DocumentAnalyzer"]
+```
+
+```python
+# my_rlm/__init__.py
+from .agent import AnalyzeDocuments, DocumentAnalyzer
+
+__all__ = ["AnalyzeDocuments", "DocumentAnalyzer"]
+```
 
 ## Schema Pattern
 

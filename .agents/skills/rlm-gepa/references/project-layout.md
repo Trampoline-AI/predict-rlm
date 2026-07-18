@@ -1,18 +1,23 @@
 # RLM-GEPA Project Layout
 
 Create project-local optimization wiring only when the user asks for GEPA or
-prompt/skill optimization.
+prompt/skill optimization. Start from the packaged project layout in the `rlm`
+skill and add `bench/` and `gepa/` under the import package.
 
 ```text
 my_rlm/
-├── agent/           # PredictRLM signature, schema, service, skills/tools
-├── bench/           # optional eval loaders/scoring/fixtures
-└── gepa/
-    ├── __init__.py
-    ├── config.py
-    ├── project.py
-    ├── cli.py
-    └── __main__.py
+├── pyproject.toml
+├── my_rlm/
+│   ├── __init__.py
+│   ├── agent/       # PredictRLM signature, schema, service, skills/tools
+│   ├── bench/       # optional eval loaders/scoring/fixtures
+│   └── gepa/
+│       ├── __init__.py
+│       ├── config.py
+│       ├── project.py
+│       ├── cli.py
+│       └── __main__.py
+└── tests/
 ```
 
 The generated `gepa/` package owns train/validation loading, metric feedback,

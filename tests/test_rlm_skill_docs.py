@@ -48,3 +48,25 @@ def test_public_rlm_skill_matches_current_runtime_api():
     assert "execution: ExecutionBackend | None = None" in skill_text
     assert "modules: Sequence[RuntimeModule | RuntimeContribution] = ()" in skill_text
     assert "events: Sequence[EventSink] = ()" in skill_text
+
+
+def test_public_rlm_project_layout_is_packaged_and_importable():
+    project_layout = (
+        ROOT / ".agents" / "skills" / "rlm" / "references" / "project-layout.md"
+    ).read_text()
+    gepa_layout = (
+        ROOT
+        / ".agents"
+        / "skills"
+        / "rlm-gepa"
+        / "references"
+        / "project-layout.md"
+    ).read_text()
+    gepa_readme = (ROOT / "src" / "rlm_gepa" / "README.md").read_text()
+
+    assert "├── my_rlm/" in project_layout
+    assert "[build-system]" in project_layout
+    assert 'packages = ["my_rlm"]' in project_layout
+    assert "from .agent import AnalyzeDocuments, DocumentAnalyzer" in project_layout
+    assert "│   └── gepa/" in gepa_layout
+    assert "├── my_rlm/\n│   ├── agent/" in gepa_readme

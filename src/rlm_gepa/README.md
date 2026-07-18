@@ -77,9 +77,12 @@ When optimization is in scope, the `$rlm-gepa` skill should add the project-loca
 
 ```text
 my_rlm/
-├── agent/           # PredictRLM signature, schema, service, skills/tools
-├── bench/           # train/validation examples, loaders, scoring feedback
-└── gepa/            # RLMGepaProject, AgentSpec, OptimizeConfig, CLI glue
+├── pyproject.toml
+├── my_rlm/
+│   ├── agent/       # PredictRLM signature, schema, service, skills/tools
+│   ├── bench/       # train/validation examples, loaders, scoring feedback
+│   └── gepa/        # RLMGepaProject, AgentSpec, OptimizeConfig, CLI glue
+└── tests/
 ```
 
 The generated GEPA layer should own task loading, metric feedback, seed
