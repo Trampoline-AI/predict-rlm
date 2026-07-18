@@ -110,3 +110,10 @@ def test_public_rlm_gepa_project_forwards_runtime_logging_flags():
 
     assert "verbose=context.verbose_rlm" in project_layout
     assert "debug=context.debug_rlm" in project_layout
+
+
+def test_public_rlm_skill_routing_keeps_eval_only_work_with_rlm():
+    gepa_readme = (ROOT / "src" / "rlm_gepa" / "README.md").read_text()
+
+    assert "for eval-only projects" in gepa_readme
+    assert "when evals or\nRLM-GEPA optimization" not in gepa_readme

@@ -42,8 +42,8 @@ Install the skills in Claude Code, Codex, Cursor, or any compatible coding agent
 npx skills add Trampoline-AI/predict-rlm
 ```
 
-Use `$rlm` to design the PredictRLM itself, and use `$rlm-gepa` when evals or
-RLM-GEPA optimization are in scope:
+Use `$rlm` to design the PredictRLM itself and for eval-only projects. Use
+`$rlm-gepa` when RLM-GEPA optimization or candidate selection is in scope:
 
 ```text
 $rlm-gepa interview me to design a PredictRLM that extracts renewal terms, pricing
