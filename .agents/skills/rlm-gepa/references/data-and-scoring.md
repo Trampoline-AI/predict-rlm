@@ -28,6 +28,25 @@ land in both train and validation without calling it out.
 If the dataset is tiny, prefer explicit hand-authored train/validation files
 over random splitting.
 
+For benchmarks with official splits, preserve the benchmark's public semantics.
+Use the official train split for optimization data, carve GEPA validation from
+that train split when candidate selection needs a separate set, and reserve
+official dev/test/challenge splits for reporting. Do not let optimizer feedback
+from held-out splits influence seed instructions or candidate selection.
+
+## Benchmark Integration Boundaries
+
+Keep benchmark evaluators and oracle-style answer checkers harness-side. The RLM
+may use environment-safe tools, documentation, state APIs, and session controls,
+but it must not see evaluator feedback or hidden scoring APIs while solving an
+example. After the attempt, the harness may pass score and feedback to GEPA as
+the learning signal.
+
+When benchmark packages conflict with PredictRLM, DSPy, Pyodide, or the main
+project environment, run them in an isolated host-side process behind a typed
+JSON boundary. Do not force incompatible benchmark dependencies into the RLM
+sandbox or the generated package environment.
+
 ## Scoring Feedback
 
 Each `evaluate_example()` should return a scalar score plus feedback that helps

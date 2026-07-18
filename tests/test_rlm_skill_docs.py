@@ -37,6 +37,11 @@ def test_public_rlm_skill_requires_shared_eval_adapter_semantics():
     assert "rlm_gepa.runtime.adapter.RLMGepaAdapter" in skill_text
     assert "eval.json" in skill_text
     assert "rlm-gepa stats <run_dir>" in skill_text
+    assert re.search(
+        r"reserve\s+official dev/test/challenge splits for reporting", skill_text
+    )
+    assert "evaluator feedback or hidden scoring APIs" in skill_text
+    assert re.search(r"typed\s+JSON boundary", skill_text)
 
 
 def test_public_rlm_skill_matches_current_runtime_api():
