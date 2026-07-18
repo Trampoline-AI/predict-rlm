@@ -70,3 +70,24 @@ def test_public_rlm_project_layout_is_packaged_and_importable():
     assert "from .agent import AnalyzeDocuments, DocumentAnalyzer" in project_layout
     assert "│   └── gepa/" in gepa_layout
     assert "├── my_rlm/\n│   ├── agent/" in gepa_readme
+
+
+def test_public_rlm_gepa_agent_spec_examples_satisfy_schema():
+    agent_spec = (
+        ROOT / ".agents" / "skills" / "rlm-gepa" / "references" / "agent-spec.md"
+    ).read_text()
+    project_layout = (
+        ROOT
+        / ".agents"
+        / "skills"
+        / "rlm-gepa"
+        / "references"
+        / "project-layout.md"
+    ).read_text()
+
+    assert '"document behaviors"' in agent_spec
+    assert '"document behaviors"' in project_layout
+    assert "agent_spec_from_rlm(build_rlm(SEED_SKILL_INSTRUCTIONS), ...)" not in (
+        project_layout
+    )
+    assert "scoring_description=" in project_layout

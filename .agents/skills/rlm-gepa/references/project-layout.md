@@ -84,7 +84,22 @@ def build_rlm(skill_instructions: str, *, lm=None, sub_lm=None, max_iterations=3
 class MyProject(RLMGepaProject):
     project_name = "my-project"
     components = ("skill_instructions",)
-    agent_spec = agent_spec_from_rlm(build_rlm(SEED_SKILL_INSTRUCTIONS), ...)
+    agent_spec = agent_spec_from_rlm(
+        build_rlm(SEED_SKILL_INSTRUCTIONS),
+        use_cases=[
+            "contract review with clause-level citations",
+            "invoice analysis with total reconciliation",
+        ],
+        runtime_grounding_examples={
+            "skills": ["document-analysis instructions are optimized"],
+            "sandbox facts": ["Pyodide filesystem paths and package limits"],
+            "document behaviors": ["tables may span pages", "OCR text can be missing"],
+        },
+        scoring_description=(
+            "Score combines answer correctness and citation support. Feedback names "
+            "missing findings, unsupported citations, and extraction errors."
+        ),
+    )
 
     def seed_candidate(self) -> dict[str, str]:
         return {"skill_instructions": SEED_SKILL_INSTRUCTIONS}

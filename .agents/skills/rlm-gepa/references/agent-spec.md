@@ -15,6 +15,7 @@ agent_spec = agent_spec_from_rlm(
     runtime_grounding_examples={
         "skills": ["document-analysis skill instructions are optimized"],
         "sandbox facts": ["Pyodide filesystem paths and package limits"],
+        "document behaviors": ["tables may span pages", "OCR text can be missing"],
     },
     scoring_description=(
         "Score combines answer correctness and citation support. Feedback names "
