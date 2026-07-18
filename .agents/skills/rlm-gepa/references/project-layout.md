@@ -25,14 +25,14 @@ Add GEPA dependencies and a project-local CLI when optimization is in scope.
 
 ```toml
 dependencies = [
-    "predict-rlm[gepa,gepa-viz]>=0.7.0-alpha5,<0.8",
+    "predict-rlm[gepa,gepa-viz]>=0.8.0-alpha0,<0.9",
 ]
 
 [project.scripts]
 rlm-gepa = "my_rlm.gepa:main"
 
 [tool.predict-rlm.generated]
-predict_rlm_version = "0.7.0-alpha5"
+predict_rlm_version = "0.8.0-alpha0"
 skill_version = "3.0"
 layout = "agent-tools-bench-gepa"
 features = ["agent", "bench", "rlm-gepa"]

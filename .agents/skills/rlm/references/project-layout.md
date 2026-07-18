@@ -36,11 +36,11 @@ name = "my-rlm"
 version = "0.1.0"
 requires-python = ">=3.11"
 dependencies = [
-    "predict-rlm>=0.7.0-alpha5,<0.8",
+    "predict-rlm>=0.8.0-alpha0,<0.9",
 ]
 
 [tool.predict-rlm.generated]
-predict_rlm_version = "0.7.0-alpha5"
+predict_rlm_version = "0.8.0-alpha0"
 skill_version = "3.0"
 layout = "agent-tools-bench"
 features = ["agent"]

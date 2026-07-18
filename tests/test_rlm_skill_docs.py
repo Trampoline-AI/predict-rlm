@@ -20,13 +20,15 @@ def test_public_rlm_skill_version_snippets_match_package_version():
     ]
     skill_text = _installable_skill_docs_text()
 
-    stale_snippets = [
-        r"predict-rlm>=0\.3\.0",
-        r"predict-rlm\[[^\]]+\]>=0\.4\.0",
-    ]
-    assert f'predict_rlm_version = "{package_version}"' in skill_text
-    for snippet in stale_snippets:
-        assert not re.search(snippet, skill_text), f"stale RLM skill snippet: {snippet}"
+    generated_versions = re.findall(r'predict_rlm_version = "([^"]+)"', skill_text)
+    dependency_versions = re.findall(
+        r'predict-rlm(?:\[[^\]]+\])?>=([^,\s"]+)', skill_text
+    )
+
+    assert generated_versions
+    assert dependency_versions
+    assert set(generated_versions) == {package_version}
+    assert set(dependency_versions) == {package_version}
 
 
 def test_public_rlm_skill_requires_shared_eval_adapter_semantics():
