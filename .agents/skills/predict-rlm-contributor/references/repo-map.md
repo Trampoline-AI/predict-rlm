@@ -40,7 +40,7 @@ uv sync
 uv sync --extra examples
 make test-unit
 make test-integration
-uv run pytest tests/test_predict_rlm.py::TestPredictTool::test_name -v
+uv run pytest tests/test_predict_rlm.py::TestPredictTool::test_predict_returns_dict_response -v
 uv run ruff check src/ tests/
 git diff --check
 ```

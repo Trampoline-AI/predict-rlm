@@ -117,3 +117,19 @@ def test_public_rlm_skill_routing_keeps_eval_only_work_with_rlm():
 
     assert "for eval-only projects" in gepa_readme
     assert "when evals or\nRLM-GEPA optimization" not in gepa_readme
+
+
+def test_contributor_skill_uses_existing_targeted_test_node():
+    repo_map = (
+        ROOT
+        / ".agents"
+        / "skills"
+        / "predict-rlm-contributor"
+        / "references"
+        / "repo-map.md"
+    ).read_text()
+    contributor_guidance = (repo_map, (ROOT / "AGENTS.md").read_text())
+
+    for guidance in contributor_guidance:
+        assert "TestPredictTool::test_predict_returns_dict_response" in guidance
+        assert "::test_name" not in guidance

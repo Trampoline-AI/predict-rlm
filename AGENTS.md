@@ -91,7 +91,7 @@ uv sync --extra examples       # include example deps (pymupdf)
 make test                      # all tests
 make test-unit                 # unit only (no Deno required)
 make test-integration          # integration only (requires Deno v2)
-uv run pytest tests/test_predict_rlm.py::TestPredictTool::test_name -v
+uv run pytest tests/test_predict_rlm.py::TestPredictTool::test_predict_returns_dict_response -v
 
 # Lint
 uv run ruff check src/ tests/
