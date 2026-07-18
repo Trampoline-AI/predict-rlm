@@ -21,6 +21,18 @@ Use this skill when optimization is in scope. If the user only wants a callable
 RLM with no GEPA wiring, use `rlm`. If the user is changing the `predict-rlm`
 repo implementation, use `predict-rlm-contributor`.
 
+## Skill Freshness
+
+When shell, network, and a writable cache are available, check at most once per
+day whether this file differs from
+`https://raw.githubusercontent.com/Trampoline-AI/predict-rlm/main/.agents/skills/rlm-gepa/SKILL.md`.
+Store the last-check marker under
+`${XDG_CACHE_HOME:-$HOME/.cache}/predict-rlm/skill-update-check.json`. If an
+update exists, ask before installing it. Never update automatically. For Hermes,
+use `hermes skills check` and `hermes skills update`; for Skills CLI installs,
+use `npx skills add Trampoline-AI/predict-rlm`. Skip silently when the check
+cannot run.
+
 ## Reference Map
 
 Read only what the task needs:

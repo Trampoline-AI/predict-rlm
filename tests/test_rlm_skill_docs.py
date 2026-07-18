@@ -25,6 +25,10 @@ def test_public_rlm_skill_entrypoints_and_references_are_valid():
         frontmatter, body = skill_text.removeprefix("---\n").split("\n---\n", 1)
         assert re.search(rf"(?m)^name: {re.escape(skill_name)}$", frontmatter)
         assert re.search(r"(?m)^description: [>|]?$", frontmatter)
+        assert "## Skill Freshness" in body
+        assert (
+            f".agents/skills/{skill_name}/SKILL.md" in body
+        ), f"wrong update URL for {skill_name}"
 
         references = re.findall(r"`(references/[^`]+\.md)`", body)
         assert references, f"{skill_name} does not link any references"
