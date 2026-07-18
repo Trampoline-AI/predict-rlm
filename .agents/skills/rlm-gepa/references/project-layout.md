@@ -164,6 +164,24 @@ def main() -> int:
     return run_project_cli(build_project, default_config())
 ```
 
+Export that function from the package target used by `[project.scripts]`:
+
+```python
+# my_rlm/gepa/__init__.py
+from .cli import main
+
+__all__ = ["main"]
+```
+
+Make `python -m my_rlm.gepa` use the same entry point:
+
+```python
+# my_rlm/gepa/__main__.py
+from .cli import main
+
+raise SystemExit(main())
+```
+
 Use `optimize --check` before a real run:
 
 ```bash

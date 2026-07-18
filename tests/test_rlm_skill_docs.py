@@ -118,6 +118,17 @@ def test_public_rlm_gepa_project_forwards_runtime_logging_flags():
     assert "debug=context.debug_rlm" in project_layout
 
 
+def test_public_rlm_gepa_cli_targets_are_importable():
+    project_layout = (
+        ROOT / ".agents" / "skills" / "rlm-gepa" / "references" / "project-layout.md"
+    ).read_text()
+
+    assert 'rlm-gepa = "my_rlm.gepa:main"' in project_layout
+    assert "# my_rlm/gepa/__init__.py\nfrom .cli import main" in project_layout
+    assert "# my_rlm/gepa/__main__.py\nfrom .cli import main" in project_layout
+    assert "raise SystemExit(main())" in project_layout
+
+
 def test_public_rlm_skill_routing_keeps_eval_only_work_with_rlm():
     gepa_readme = (ROOT / "src" / "rlm_gepa" / "README.md").read_text()
 
