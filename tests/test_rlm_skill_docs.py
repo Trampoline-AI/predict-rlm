@@ -7,11 +7,34 @@ import tomllib
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
+PUBLIC_RLM_SKILLS = ("rlm", "rlm-gepa", "predict-rlm-contributor")
 
 
 def _installable_skill_docs_text() -> str:
     skill_docs = sorted((ROOT / ".agents" / "skills").glob("**/*.md"))
     return "\n".join(path.read_text() for path in skill_docs)
+
+
+def test_public_rlm_skill_entrypoints_and_references_are_valid():
+    for skill_name in PUBLIC_RLM_SKILLS:
+        skill_dir = ROOT / ".agents" / "skills" / skill_name
+        skill_file = skill_dir / "SKILL.md"
+        skill_text = skill_file.read_text()
+
+        assert skill_text.startswith("---\n")
+        frontmatter, body = skill_text.removeprefix("---\n").split("\n---\n", 1)
+        assert re.search(rf"(?m)^name: {re.escape(skill_name)}$", frontmatter)
+        assert re.search(r"(?m)^description: [>|]?$", frontmatter)
+
+        references = re.findall(r"`(references/[^`]+\.md)`", body)
+        assert references, f"{skill_name} does not link any references"
+        for reference in references:
+            assert (skill_dir / reference).is_file(), f"missing {skill_name}/{reference}"
+
+        for markdown_file in skill_dir.glob("**/*.md"):
+            assert markdown_file.read_text().count("```") % 2 == 0, (
+                f"unbalanced code fences in {markdown_file.relative_to(ROOT)}"
+            )
 
 
 def test_public_rlm_skill_version_snippets_match_package_version():
