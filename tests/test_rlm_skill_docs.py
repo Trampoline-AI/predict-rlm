@@ -91,3 +91,17 @@ def test_public_rlm_gepa_agent_spec_examples_satisfy_schema():
         project_layout
     )
     assert "scoring_description=" in project_layout
+
+
+def test_public_rlm_gepa_project_forwards_runtime_logging_flags():
+    project_layout = (
+        ROOT
+        / ".agents"
+        / "skills"
+        / "rlm-gepa"
+        / "references"
+        / "project-layout.md"
+    ).read_text()
+
+    assert "verbose=context.verbose_rlm" in project_layout
+    assert "debug=context.debug_rlm" in project_layout

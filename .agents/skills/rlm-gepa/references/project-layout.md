@@ -71,12 +71,22 @@ class EvalExample:
     reference: Any
 
 
-def build_rlm(skill_instructions: str, *, lm=None, sub_lm=None, max_iterations=30):
+def build_rlm(
+    skill_instructions: str,
+    *,
+    lm=None,
+    sub_lm=None,
+    max_iterations=30,
+    verbose=False,
+    debug=False,
+):
     return PredictRLM(
         AnalyzeDocuments,
         lm=lm,
         sub_lm=sub_lm,
         max_iterations=max_iterations,
+        verbose=verbose,
+        debug=debug,
         skills=[Skill(name="document-analysis", instructions=skill_instructions)],
     )
 
@@ -121,6 +131,8 @@ class MyProject(RLMGepaProject):
             lm=context.lm,
             sub_lm=context.sub_lm,
             max_iterations=context.max_iterations,
+            verbose=context.verbose_rlm,
+            debug=context.debug_rlm,
         )
         result = await rlm.acall(**example.rlm_kwargs)
         score, feedback = score_result(result, example.reference)
