@@ -25,15 +25,19 @@ repo implementation, use `predict-rlm-contributor`.
 
 ## Skill Freshness
 
-When shell, network, and a writable cache are available, check at most once per
-day whether this file differs from
-`https://raw.githubusercontent.com/Trampoline-AI/predict-rlm/main/.agents/skills/rlm-gepa/SKILL.md`.
-Store the last-check marker under
-`${XDG_CACHE_HOME:-$HOME/.cache}/predict-rlm/skill-update-check.json`. If an
-update exists, ask before installing it. Never update automatically. For Hermes,
-use `hermes skills check` and `hermes skills update`; for Skills CLI installs,
-use `npx skills add Trampoline-AI/predict-rlm`. Skip silently when the check
-cannot run.
+When shell, network, and a writable cache are available, compare the complete
+installed `rlm-gepa` skill payload with upstream at most once per day:
+`SKILL.md` plus every path in the Reference Map, resolved relative to this
+skill. Compare each installed file with its matching path under
+`https://raw.githubusercontent.com/Trampoline-AI/predict-rlm/main/.agents/skills/rlm-gepa/`.
+Store per-skill check state and timestamps in
+`${XDG_CACHE_HOME:-$HOME/.cache}/predict-rlm/skill-update-check.json` so one
+skill's check does not suppress another's. If any file differs, treat the
+mismatch as an update to the complete payload and ask before installing it.
+Never update automatically. For Hermes, use `hermes skills check` and
+`hermes skills update`; for Skills CLI installs, use
+`npx skills add Trampoline-AI/predict-rlm`. Skip silently when the check cannot
+run.
 
 ## Reference Map
 
