@@ -2,12 +2,14 @@
 name: rlm-gepa
 description: >
   Design, scaffold, and use RLM-GEPA optimization wiring for PredictRLM projects,
-  including AgentSpec scoping, train/validation data, scoring feedback, seed
-  candidates, GEPA project files, and optimize/eval CLI setup. Use when the user
-  asks for GEPA, prompt or skill optimization, candidate selection from RLM
-  traces, AgentSpec, RLMGepaProject, optimization metrics, or train/validation
-  split design. Do not use for modifying the predict-rlm repository internals;
-  use predict-rlm-contributor for that.
+  including AgentSpec scoping, train/validation data for optimization or
+  candidate selection, scoring feedback, seed candidates, GEPA project files,
+  and GEPA optimize/eval CLI setup. Use when the user asks for GEPA, prompt or
+  skill optimization, candidate selection from RLM traces, AgentSpec,
+  RLMGepaProject, optimization metrics, or split design for optimization or
+  candidate selection. Use rlm for ordinary agent-plus-evals or evaluation-only
+  work without GEPA optimization or candidate selection. Do not use for modifying
+  the predict-rlm repository internals; use predict-rlm-contributor for that.
 ---
 
 # RLM-GEPA Optimization
