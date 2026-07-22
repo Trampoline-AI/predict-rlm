@@ -63,6 +63,7 @@ from predict_rlm.runtime import (
     host_sync_worker_policy,
     invoke_host_callable,
 )
+from predict_rlm.serialization import to_plain_data
 from predict_rlm.telemetry import (
     TelemetryContext,
     make_span_id,
@@ -2474,6 +2475,8 @@ class JspiBackend(SyncWorkerTracker, PythonInterpreter):
                         await self._mount_file_during_tool(host_path, sandbox_path)
                 if temp_dir:
                     shutil.rmtree(temp_dir, ignore_errors=True)
+
+            result = to_plain_data(result)
 
             is_json = result is None or isinstance(result, (list, dict, int, float, bool))
             response = {

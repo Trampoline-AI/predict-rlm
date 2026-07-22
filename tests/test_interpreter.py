@@ -1073,6 +1073,53 @@ print(result)
         finally:
             interpreter.shutdown()
 
+    def test_pydantic_model_tool_result_is_mapping(self):
+        from pydantic import BaseModel
+
+        class Source(BaseModel):
+            title: str
+
+        class Retrieval(BaseModel):
+            model_name: str
+            sources: list[Source]
+
+        def retrieve() -> Retrieval:
+            return Retrieval(
+                model_name="test-index",
+                sources=[Source(title="PredictRLM documentation")],
+            )
+
+        interpreter = JspiBackend(tools={"retrieve": retrieve})
+        try:
+            output = interpreter.execute("""
+result = await retrieve()
+print(result["model_name"])
+print(result["sources"][0]["title"])
+""")
+            assert "test-index" in str(output)
+            assert "PredictRLM documentation" in str(output)
+        finally:
+            interpreter.shutdown()
+
+    def test_nested_pydantic_tool_results_are_mappings(self):
+        from pydantic import BaseModel
+
+        class Source(BaseModel):
+            title: str
+
+        def search() -> dict:
+            return {"results": [Source(title="PredictRLM documentation")]}
+
+        interpreter = JspiBackend(tools={"search": search})
+        try:
+            output = interpreter.execute("""
+result = await search()
+print(result["results"][0]["title"])
+""")
+            assert "PredictRLM documentation" in str(output)
+        finally:
+            interpreter.shutdown()
+
     def test_nested_pydantic_models(self):
         """Nested Pydantic models are serialized correctly."""
         received_data = []
