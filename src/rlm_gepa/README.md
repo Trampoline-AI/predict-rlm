@@ -27,50 +27,45 @@ improvement versus a benchmark-specific hack. Budget knobs such as
 `max_metric_calls` and `minibatch_size` control how much search happens;
 `AgentSpec` controls what kind of changes the proposer considers valuable.
 
-## Start with a coding agent
+## Start with coding-agent skills
 
-The repository’s `/rlm` agent skill in `.agents/skills/rlm/SKILL.md` is the
-recommended starting point. It can build a normal PredictRLM package, and when
-you ask for optimization it can also add the RLM-GEPA project wiring.
+This repository ships two complementary coding-agent skills:
 
-Install the skill in Claude Code, Codex, Cursor, or any compatible coding agent:
+- [`/rlm`](../../.agents/skills/rlm/SKILL.md) designs and builds the base
+  PredictRLM.
+- [`/rlm-gepa`](../../.agents/skills/rlm-gepa/SKILL.md) adds evaluation and
+  RLM-GEPA optimization after the base RLM works.
+
+Install the repository skills in Claude Code, Codex, Cursor, or another
+compatible coding agent:
 
 ```bash
 npx skills add Trampoline-AI/predict-rlm
 ```
 
-Then ask the agent to use `/rlm` and be explicit about whether you want just the
-PredictRLM, evals, or RLM-GEPA optimization too:
+First create the RLM and its observable boundary:
 
 ```text
 /rlm interview me to design a PredictRLM that extracts renewal terms, pricing
-changes, and notice windows from vendor contracts. Then build the RLM, evals,
-and RLM-GEPA optimization wiring.
+changes, and notice windows from vendor contracts. Then build the RLM and
+evaluation fixtures.
 ```
 
-When the prompt asks for an interview, the `/rlm` skill is expected to scope the
-RLM and GEPA setup before it writes the plan. The RLM itself should remain the
-source of truth for the DSPy signature and tools; GEPA should derive those via
-`agent_spec_from_rlm(...)`. The interview fills in the extra GEPA brief:
+Then use the optimization skill with the completed RLM, representative examples,
+and a scoring rule:
 
-- input shape and scale, for example “PDF/MSA/SOW contracts, 20-200 pages,”
-  “sales calls as 30-60 minute audio/video,” “support chat transcripts,” or
-  “CRM/event-table records with 20-50 fields”;
-- desired output schema, for example “renewal date, notice window, price change,
-  citation spans, confidence,” “speaker objections with timestamps,” or “ranked
-  research findings with source URLs”;
-- available labels or scoring rule, for example “exact match on dates,” “partial
-  credit for grounded citations,” “timestamp overlap,” or “human preference
-  labels on answer usefulness”;
-- runtime affordances, for example “PDF rendering/text extraction,” “ASR
-  transcripts plus audio timestamps,” “video frame sampling,” “SQL/dataframe
-  inspection,” or “web/deep-research retrieval”;
-- target use cases beyond the benchmark, for example “procurement review,”
-  “sales coaching,” “customer-support QA,” “data-cleaning workflows,” or
-  “competitive research.”
+```text
+/rlm-gepa add train/validation optimization for the contract RLM. Optimize its
+domain instructions, keep official test data held out, and run optimize --check
+before a budgeted run.
+```
 
-When optimization is in scope, the `/rlm` skill should add the project-local
-`gepa/` package:
+The concrete RLM remains the source of truth for the DSPy signature and tools.
+The RLM-GEPA project derives those fields through `agent_spec_from_rlm(...)` and
+adds only the optimization context the RLM cannot infer: transfer use cases,
+runtime grounding, scoring feedback, and anti-overfitting boundaries.
+
+The RLM-GEPA skill creates the project-local `gepa/` package:
 
 ```text
 my_rlm/
@@ -79,9 +74,9 @@ my_rlm/
 └── gepa/            # RLMGepaProject, AgentSpec, OptimizeConfig, CLI glue
 ```
 
-The generated GEPA layer should own task loading, metric feedback, seed
-candidate text, and defaults. The shared `rlm_gepa` package supplies the generic
-optimizer and CLI helpers.
+The generated GEPA layer owns task loading, metric feedback, seed candidate
+text, and defaults. The shared `rlm_gepa` package supplies generic optimization,
+trace capture, and CLI helpers.
 
 ## Minimal project shape
 
@@ -214,8 +209,8 @@ component needs a different proposer brief.
 
 RLM-GEPA projects should feel like a product CLI: from the project root, run
 `uv run rlm-gepa ...` for checks, evals, optimization, stats, and plots. When
-the `/rlm` skill scaffolds an optimization project, it should set this up in
-`pyproject.toml` for you:
+the `/rlm-gepa` skill scaffolds an optimization project, it should set this up
+in `pyproject.toml` for you:
 
 ```toml
 [project.scripts]

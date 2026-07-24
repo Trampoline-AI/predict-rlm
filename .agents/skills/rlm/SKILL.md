@@ -1,18 +1,18 @@
 ---
 name: rlm
-description: >
-  Plan and build an RLM (Recursive Language Model) with predict-rlm, or contribute
-  to predict-rlm/RLM-GEPA itself. Interactively defines inputs, outputs, skills,
-  and architecture from a goal, then implements the code. Use when the user wants
-  to create a new RLM, explore whether one is feasible, or modify RLM/RLM-GEPA
-  guidance and implementation.
-compatibility: Requires Python 3.11+, Deno, and the predict-rlm package (built on DSPy).
+description: >-
+  Plan and build a new callable Recursive Language Model with predict-rlm. Use
+  when a user wants to design an RLM, assess whether an RLM fits a workflow, or
+  implement an RLM package with structured boundaries, skills, host-side tools,
+  custom adapters, or runtime-kernel extensions. For optimization of an existing
+  RLM, use rlm-gepa instead.
+compatibility: Requires Python 3.11+, Deno 2, DSPy, and predict-rlm 0.8.0-alpha0 or newer.
 metadata:
   author: Emile Riberdy
-  version: "2.1"
+  version: "3.0"
 ---
 
-# Build an RLM
+# Create a PredictRLM
 
 An RLM is a callable, pre-configured agent. It autonomously explores context,
 writes and executes code in a sandboxed REPL, calls tools, inspects results, and
@@ -20,986 +20,880 @@ iterates until the task is done. Unlike a chat agent, an RLM is a function — y
 define its inputs, outputs, and tools, then call it from your code. It returns
 structured data, not chat messages.
 
-This skill has two phases:
+## Mental model
 
-1. **Plan** — interactively define the RLM with the user, research feasibility,
-   produce a plan
-2. **Build** — implement the plan as code files
+The caller supplies a DSPy signature. Its input and output fields are the
+function contract, and its docstring is the operating procedure. On each call:
 
-**First action**: Check skill freshness if due, then enter plan mode using the
-EnterPlanMode tool, unless the user is contributing to predict-rlm/RLM-GEPA
-itself. For contribution work, use Contributor mode first.
+1. PredictRLM prepares the typed inputs and acquires a sandboxed execution
+   session. The default backend is a stateful Python REPL running through
+   Deno and Pyodide/WASM.
+2. The **outer LM** reads the signature and strategy, then writes Python code
+   to inspect inputs, preserve intermediate state, branch, retry, and verify.
+   Python variables persist across iterations of that call.
+3. Sandbox code can use `await predict(...)` for focused **sub-LM** perception
+   or extraction. Each `predict()` call has its own context window and can use a
+   typed DSPy signature, Pydantic schemas, and `dspy.Image`.
+4. Sandbox code can also use packages and modules supplied by `Skill` objects,
+   call host-side tools for capabilities outside WASM, and access explicitly
+   allowed network domains.
+5. When the work is complete, the outer LM calls `SUBMIT(...)`. PredictRLM
+   validates the declared outputs, synchronizes file outputs to the host, and
+   returns a `dspy.Prediction` with the output fields and a structured `trace`.
 
----
+The separation is deliberate: the outer LM owns planning and code execution;
+the sub-LM owns narrow understanding tasks; deterministic libraries and tools
+do the work they are better suited for. Large context stays in files, sandbox
+variables, and focused subcalls instead of accumulating in one prompt.
 
-# Skill freshness check
+```text
+application call
+    -> DSPy signature: inputs + strategy + outputs
+    -> outer LM <-> stateful sandbox REPL
+                     |-> predict() -> sub-LM
+                     |-> skill packages and modules
+                     `-> host-side tools
+    -> validated dspy.Prediction + trace
+```
 
-When this skill is loaded in an environment with shell, filesystem, and network
-access, run a lightweight update check at most once per day. Keep the last-check
-marker under
-`${HERMES_HOME:-$HOME/.hermes}/skills/.rlm-skill-update-check.json`. Compare the
-installed `SKILL.md` against
-`https://raw.githubusercontent.com/Trampoline-AI/predict-rlm/main/.agents/skills/rlm/SKILL.md`
-using a content hash, ETag, or commit SHA.
+## Core API
 
-If a newer skill is available, tell the user the `/rlm` skill has updates and
-ask whether they want to update or reinstall it. Do not update automatically.
-Suggested commands are `hermes skills update` for Hermes-managed installs, or
-`npx skills add Trampoline-AI/predict-rlm` for direct Skills CLI installs.
+A minimal typed RLM has a signature, a configured `PredictRLM`, and a normal
+sync or async call:
 
-Skip the check silently when tools, network, or a writable marker path are not
-available.
+The signature class docstring **is the model instruction prompt passed to the
+outer LM**. It is not merely developer documentation: put the RLM's workflow,
+decision rules, verification steps, and completion criteria there. Changing the
+docstring changes the model's runtime behavior.
 
----
+```python
+import dspy
+from pydantic import BaseModel, Field
 
-# Contributor mode for predict-rlm / RLM-GEPA
+from predict_rlm import CtxStr, File, PredictRLM
+from predict_rlm.skills import pdf
 
-Use this mode when the user is modifying this repository's code, docs, examples,
-or installable skill guidance rather than asking you to build a new RLM package.
-Do not force the new-RLM scoping interview. First inspect the repo context, the
-requested change, and the relevant implementation/docs paths.
 
-Contributor rules:
+class Analysis(BaseModel):
+    summary: str = Field(description="Grounded summary of the documents")
+    risks: list[str] = Field(description="Material risks supported by the documents")
 
-- PredictRLM is for callable, repeatable, deep-context workflows, not open-ended
-  interactive chat flows.
-- Keep large inputs as `File` references or metadata. Use focused `predict()`
-  calls, and keep LLM-facing Pydantic schemas lean with
-  `Field(description=...)`.
-- Validate at system boundaries. Prefer host-side tools for native libraries,
-  auth, network APIs, filesystem-heavy work, and anything that cannot run
-  cleanly in Pyodide.
-- For RLM-GEPA, treat `AgentSpec`, evaluator feedback, and seed instructions as
-  the optimization direction. Keep runtime and budget knobs separate.
-- Derive `AgentSpec` signature/tool context from the constructed RLM with
-  `agent_spec_from_rlm(...)` where possible. Avoid duplicating broad prose or
-  exposing internal IDs unnecessarily.
-- Keep generic proposer behavior domain-neutral. Domain or benchmark specifics
-  belong in `AgentSpec`, seed/domain skills, runtime grounding examples, or
-  evaluator feedback.
-- Patch-merge/crossover should be evidence-backed behavioral grafting from train
-  disagreement traces, not broad synthesis, prompt concatenation, or source text
-  import.
-- Persist experimental optimizer behavior in config, CLI options, or artifacts
-  rather than hidden env-only switches.
-- Creating GitHub PRs/issues or pushing public branches is external publishing;
-  do it only when explicitly requested.
-- When an investigation identifies a bug or problem likely attributable to the
-  `predict-rlm` package, ask the user whether they want it reported as a GitHub
-  issue as soon as that attribution is clear. Do not open the issue without that
-  explicit approval.
-- For verification, docs-only changes need markdown sanity or
-  `git diff
-  --check`. Code changes need targeted tests, plus broader tests
-  when touching shared interfaces, sandbox execution, optimizer behavior, or
-  examples.
 
----
+class AnalyzeDocuments(dspy.Signature):
+    """Inspect the documents, apply the criteria, and return a grounded analysis.
+
+    Survey the files first. Extract only relevant evidence with focused
+    predict() calls, verify important claims, then submit the typed result.
+    """
+
+    documents: list[File] = dspy.InputField(desc="Documents to inspect")
+    criteria: CtxStr = dspy.InputField(desc="Criteria the outer LM must see in full")
+    analysis: Analysis = dspy.OutputField(desc="Evidence-grounded analysis")
+
+
+rlm = PredictRLM(
+    AnalyzeDocuments,
+    lm="openai/gpt-5.4",
+    sub_lm="openai/gpt-5.1",
+    skills=[pdf],
+    max_iterations=30,
+)
+
+result = await rlm.acall(
+    documents=[File(path="report.pdf")],
+    criteria="Cover obligations, deadlines, and material risks.",
+)
+print(result.analysis.summary)
+```
+
+Use `rlm(...)` for a synchronous call and `await rlm.acall(...)` for an
+asynchronous call. Both return a `dspy.Prediction`; each declared output is
+available as an attribute such as `result.analysis`.
+
+The main constructor surface is:
+
+- `signature` — a DSPy signature class or compact string signature;
+- `lm` — the outer LM that writes code;
+- `sub_lm` — the LM behind the built-in `predict()` tool;
+- `skills` — reusable instructions, PyPI packages, sandbox modules, and tools;
+- `tools` — sync or async host callables exposed inside the sandbox;
+- `allowed_domains` — the sandbox network allowlist, empty by default;
+- `max_iterations`, `max_llm_calls`, and `max_output_chars` — execution budgets;
+- `output_dir` — host collection root for declared `File` outputs;
+- `verbose` and `debug` — human-readable run output and lifecycle diagnostics.
+
+Use `File` or `list[File]` for large file inputs and generated artifacts. Use
+`CtxStr` for a direct string input, such as a rubric, whose full runtime value
+must be added to the outer LM prompt as well as exposed as a Python variable.
+Use a `Skill` when the sandbox needs reusable instructions, packages, modules,
+or bundled tools. Use `tools=` directly for specific host-side actions such as
+authenticated APIs, databases, native libraries, or host filesystem access.
+
+## Runtime kernel and extension model
+
+Most RLMs should use only signatures, `File`, `CtxStr`, `Workspace`, skills, and
+host tools. Extend the kernel only when the workflow needs a new typed boundary,
+resource lifecycle, execution substrate, or correctness-critical event stream.
+Do not reach for a custom adapter merely because a signature uses a Pydantic
+model.
+
+At construction, PredictRLM resolves direct options and `RuntimeContribution`
+module factories into one immutable `RuntimeSpec`: instructions, adapters,
+tools, packages, exactly one execution backend, event sinks, validators, and
+tool operations. Module factories run once at construction. Every invocation
+then creates a fresh `RunContext` for mutable state, prepared inputs, bindings,
+output reservations, cleanup callbacks, and evidence status.
+
+### Kernel lifecycle and ownership
+
+```text
+construction
+  direct options + RuntimeContribution modules
+      -> immutable RuntimeSpec
+
+invocation
+  prepare typed inputs and output requirements
+      -> compile path and artifact claims
+      -> open adapter-owned resources
+      -> validate requirements and acquire one ExecutionSession
+      -> bind inputs and reserve outputs
+      -> apply invocation-local prompt contributions
+      -> run generated-code attempts
+           -> after_execution durability hooks
+      -> materialize submitted outputs while the session is active
+      -> finalize input adapters in reverse order
+      -> finalize and release the kernel-owned session
+      -> run remaining LIFO RunContext cleanup
+```
+
+The ownership boundaries are strict:
+
+- Adapters declare requirements and destinations before session acquisition.
+- The `ExecutionBackend` creates the invocation-scoped `ExecutionSession`.
+- Adapters may use supported backend or session capabilities, but never acquire,
+  finalize, or release the session.
+- Mutable provider clients, leases, baselines, and retry state belong in the
+  invocation's `PreparedInput` or `RunContext`, never on a shared adapter.
+- Sandbox destination overlaps fail before generated code runs.
+- Adapter resources finalize on success, failure, setup failure, and
+  cancellation. Framework-owned session finalization still runs after adapter
+  errors.
+
+### Choose the smallest extension point
+
+Use the first boundary that can express the requirement:
+
+1. **Signature docstring or `CtxStr`** — task strategy or invocation-specific
+   criteria the outer LM must read.
+2. **`Skill`** — reusable outer-LM instructions plus sandbox packages,
+   importable Python modules, or bundled host tools.
+3. **`tools=`** — a narrow sync or async host callable. Use this for native
+   libraries, credentials, APIs, databases, and host filesystem access. Return
+   plain JSON-like data or Pydantic values that can be normalized at the
+   transport boundary.
+4. **`File`, `Workspace`, or an existing adapter** — ordinary copied files,
+   generated files, or a mutable directory. Prefer these built-ins over a new
+   type.
+5. **`InputAdapter` with `PreparedInput.path()`, `.paths()`, or `.glob()`** — a
+   custom typed input can first be materialized as host paths. The kernel owns
+   destination normalization, overlap checks, copying or explicit mounting,
+   backend requirements, and the model-visible sandbox paths.
+6. **Full `InputAdapter` lifecycle** — an external resource needs a provider
+   lease, live handle, per-attempt synchronization, or a custom session
+   capability that cannot be represented as host paths.
+7. **`OutputAdapter`** — a custom output needs a reserved destination and
+   provider-specific materialization while the session is still active.
+8. **`RuntimeContribution` through `modules=`** — several host-side extensions
+   belong together and should compose as one reusable construction-time unit.
+9. **`EventSink` through `events=`** — a consumer needs ordered lifecycle events
+   during the run. Use `prediction.trace` when only the completed trace is
+   needed.
+10. **`ExecutionBackend` through `execution=`** — only for a genuinely new
+    sandbox or execution substrate. Use `sandbox_backend="jspi"` or `"sbx"` for
+    maintained backends.
+
+`interpreter=` is a compatibility bridge for older CodeInterpreter-shaped
+integrations, not the root extension contract. New session-native integrations
+must implement `ExecutionBackend` and use `execution=`.
+
+### Input adapters
+
+An `InputAdapter[T]` selects signature fields through `value_type` and turns the
+caller's value into model-visible data and runtime requirements. Adapter
+instances are construction-time objects and may serve concurrent calls, so
+keep them immutable or concurrency-safe.
+
+Use the current lifecycle names and responsibilities:
+
+- `prepare(field, value, ctx) -> PreparedInput` runs before backend acquisition.
+  It receives no backend or session. Return declarative paths, artifacts,
+  sandbox-root reservations, metadata, requirements, and input instructions.
+- `open(field, prepared, ctx, backend)` may acquire an adapter-owned client or
+  lease after all inputs are prepared but before a session exists. Store the
+  handle in `ctx.state` under an adapter-owned key.
+- `bind(field, prepared, ctx, session) -> BoundInput` runs after acquisition.
+  Use it only when the default artifact mounting is insufficient; return the
+  final value and bindings visible to generated code.
+- `append_prompt(prompt, field, prepared, ctx) -> str` may add invocation-local
+  context to the outer action and forced-extraction prompts after binding. It
+  must not mutate the canonical `PredictRLM.signature`.
+- `after_execution(field, prepared, ctx, session, result, error)` runs after
+  each completed generated-code attempt. Use it for durability or sync work,
+  including changes made before that attempt raised an error.
+- `finalize(field, prepared, ctx, session, error)` performs the final save and
+  releases adapter-owned resources. Opened adapters finalize once in reverse
+  order; `session` is `None` if acquisition failed.
+
+For the common path case, implement only `prepare()`:
+
+```python
+class S3FileAdapter(InputAdapter[S3File]):
+    name = "s3-file"
+    value_type = S3File
+
+    async def prepare(self, field, value, ctx) -> PreparedInput:
+        local_path = await materialize_s3(value.uri, ctx=ctx)
+        return PreparedInput.path(
+            local_path,
+            instructions=(f"{field.name} is available at its sandbox path.",),
+        )
+```
+
+Register one-off adapters directly with
+`PredictRLM(MySignature, adapters=[S3FileAdapter()])`, or contribute them from a
+runtime module when they belong with tools, packages, events, or an execution
+backend.
+
+Copy is the portable default. Set `mode="mount"` only for a required live
+directory view; unsupported backends fail rather than silently copying.
+`.paths()` exposes an explicit list, and `.glob()` performs deterministic,
+host-side selection with traversal and symlink-escape checks.
+
+For a resource described completely by an ID, URI, or host path, return an
+`Artifact` in `PreparedInput.artifacts` and let the default `bind()` call
+`session.mount(artifact)`. For a provider-managed live handle, acquire it in
+`open()`, keep it in `ctx.state`, and use a capability protocol implemented by
+the selected session from `bind()`.
+
+Do not use removed lifecycle names: input `prepare_session()` became `open()`,
+input `mount()` became `bind()`, and `MountedInput` became `BoundInput`.
+`prepare_session()` remains an output-adapter method. The reserved `ctx_str`
+adapter name may only be replaced by a `CtxStrInputAdapter` subclass.
+
+### Output adapters
+
+An `OutputAdapter[T]` owns a custom typed output boundary:
+
+- `prepare_session()` contributes pre-acquisition policy and requirements;
+- `reserve()` claims a destination after session acquisition but before code;
+- `materialize()` turns the submitted value into the caller-facing value while
+  the session is active.
+
+Output adapters have no input-style `finalize()` hook. Clean partial failures
+locally, and register provider cleanup that can outlive the session with
+`ctx.add_cleanup()`. If an output owns a sandbox path, place it in the
+reservation artifact's `metadata["sandbox_path"]`; the kernel rejects overlaps
+with inputs and other outputs before execution.
+
+### Runtime modules
+
+Use a zero-argument module factory to package related host-side contributions:
+
+```python
+from predict_rlm import CallableTool, RuntimeContribution
+
+
+def document_runtime() -> RuntimeContribution:
+    return RuntimeContribution(
+        instructions=("Treat document IDs as opaque provider references.",),
+        adapters=(DocumentReferenceAdapter(),),
+        tools=(
+            CallableTool(
+                name="fetch_metadata",
+                function=fetch_metadata,
+                description="Fetch provider metadata for one document ID.",
+                schema={
+                    "type": "object",
+                    "properties": {"document_id": {"type": "string"}},
+                    "required": ["document_id"],
+                },
+            ),
+        ),
+        packages=("pure-python-package",),
+        events=(DocumentAuditSink(),),
+    )
+
+
+rlm = PredictRLM(MySignature, modules=[document_runtime])
+```
+
+`PredictRLM(modules=...)` composes host-side runtime behavior.
+`Skill.modules` is different: it copies Python files into the sandbox so
+generated code can import them. Contribution packages are deduplicated;
+duplicate adapter, tool, or tool-operation names are errors; and the resolved
+configuration must select exactly one execution backend.
+
+### Execution, events, hooks, and gates
+
+- An `ExecutionBackend.start(spec, ctx)` returns an async context manager that
+  yields one invocation-scoped `ExecutionSession`. The session implements code
+  execution, package installation, artifact mounting and collection,
+  cancellation, and finalization. Optional capability protocols add operations
+  such as host-directory mounts or mutable-directory collection.
+- `EventSink` implements async `emit`, `flush`, and `close` plus a `strict`
+  flag. Use `strict=False` for monitoring whose failure must not fail the run.
+  Use `strict=True` only when durable, complete evidence is part of correctness;
+  a strict sink failure can prevent successful publication.
+- DSPy callbacks report high-level RLM iteration progress. `EventSink` reports
+  ordered kernel lifecycle evidence. They solve different problems.
+- `RuntimeHook(target=..., phases={"before", "after", "error"})` instruments a
+  dotted function inside the sandbox and emits sanitized `RuntimeHookEvent`
+  values to `on_runtime_hook_event`. Runtime hooks require the SBX backend in
+  PredictRLM v1; do not design a portable extension around them.
+- `submit_confirmation` is a gate after a valid `SUBMIT`: return feedback to
+  continue the RLM loop, or `None`/`""` to accept the submission.
+
+Before implementing a kernel extension, read `docs/custom-path-inputs.md` for
+path-backed inputs, `docs/custom-adapters.md` for lifecycle patterns,
+`docs/api.md` for exact method signatures, and `docs/observability.md` for event
+sink guarantees. Import public contracts from `predict_rlm`; do not use removed
+shim modules such as `predict_rlm.adapters`, `predict_rlm.artifacts`,
+`predict_rlm.events`, `predict_rlm.execution`, or `predict_rlm.kernel`.
+
+Test extensions across success, generated-code failure, setup failure,
+cancellation, and concurrent calls. If they own mutable external state, verify
+LIFO cleanup and that no state leaks between invocations.
+
+## What this skill builds
+
+This skill creates or extends the reusable package around PredictRLM: schemas,
+the DSPy signature and strategy, capability definitions, a service wrapper, and
+smoke tests. Do not add RLM-GEPA optimization wiring here; use the separate
+`rlm-gepa` skill once the base RLM works and an optimization objective exists.
+
+Work in two phases:
+
+1. **Plan** — define the RLM with the user, research feasibility, and produce a
+   concrete implementation plan.
+2. **Build** — implement the approved plan, then smoke-test the generated
+   package.
 
 # Phase 1: Plan
 
-Work through these steps interactively. Do not skip steps or rush to the plan.
-Each step should involve asking the user questions and confirming alignment
-before moving on.
+Keep the following sequence. It prevents a plausible-looking RLM from having
+an unusable boundary, missing runtime capability, or an unfalsifiable output.
 
-## Step 1: Goal Definition
+## Step 1: Goal definition
 
 Understand what the user wants to build.
 
 Ask:
 
-- What is the desired outcome? What does success look like?
-- What is the input material? (documents, code, data, APIs, etc.)
-- What does the output look like? (structured report, modified files,
-  spreadsheet, etc.)
+- What is the desired outcome and what does success look like?
+- What is the input material: documents, code, data, APIs, or stateful systems?
+- What should the output be: structured data, modified files, a spreadsheet, or
+  another artifact?
 
-Then **validate RLM fit**. An RLM is the right tool when:
+Then validate RLM fit. An RLM is a good fit when it needs one or more of:
 
-- The input is large and needs selective exploration (documents, datasets,
-  codebases)
-- The task is multi-step with tool use (extract -> transform -> validate)
-- Actions modify state (redaction, form filling, generation)
-- Parallel sub-LM calls are needed across many items
-- File-to-file transformations (PDFs -> spreadsheets, documents -> reports)
+- selective exploration of large inputs such as documents, datasets, or codebases;
+- multi-step work with tools, for example extract → transform → validate;
+- actions that modify a file or another controlled state boundary;
+- parallel sub-LM calls across many items;
+- file-to-file transformation such as PDFs to spreadsheets or documents to reports.
 
-If the task is better served by a single LLM call or a simple script, tell the
-user and suggest an alternative. Otherwise, proceed.
+If a single LM call or a deterministic script is a better fit, say so and
+propose it instead.
 
-## Step 2: Input Design
+## Step 2: Input design
 
-Work with the user to define every input to the RLM.
+Define every input before defining implementation files.
 
-For each input, determine:
+For each input, decide its name, type, source, description, and whether the
+outer LM needs the complete value immediately.
 
-- **Name** and **type**: `File`, `list[File]`, `str`, or a Pydantic model
-- **Description**: what it contains and how the RLM uses it
-- **Source**: user-provided file, API response, config, generated data
+- Use `File` or `list[File]` for large files. Inputs are copied into the sandbox
+  under `/sandbox/input/<field>/`; the RLM accesses them on demand.
+- Use ordinary `str`, primitives, or lean Pydantic models for metadata and
+  configuration.
+- Use `CtxStr` only for a small-to-moderate string that the outer LM must see in
+  full, such as a rubric or task instruction. `CtxStr` is input-only and only
+  valid as a direct field annotation in a class-based DSPy signature.
+- Do not put raw document contents or large tables directly in a prompt when a
+  `File` reference and focused extraction can keep the context small.
 
-Key principles:
+Confirm the input boundary before moving on.
 
-- Large content (PDFs, images, datasets) must be `File` references — the RLM
-  accesses content on-demand through skills, keeping its context small
-- Metadata (file paths, page counts, config flags) can be strings or Pydantic
-  models
-- Use `list[File]` for variable-count file inputs
+## Step 3: Output design
 
-Confirm the input design with the user before proceeding.
+Define the structured output before selecting packages or writing prompts.
 
-## Step 3: Output Design
+For each output field, decide its name, type, description, and whether it is a
+primitive, a Pydantic model, `File`, or `list[File]`.
 
-Work with the user to define the structured output.
+Push for specific, observable fields. Use Pydantic `Field(description=...)` for
+non-obvious model fields. Model only data the caller needs; do not expose
+internal IDs or intermediate reasoning.
 
-For each output field, determine:
+Ask what users check first, which computed values matter, and whether they need
+output files. Confirm the schema before moving on.
 
-- **Name**, **type**, and **description**
-- Whether it's a Pydantic model (structured data), `File` (generated file), or
-  primitive
+## Step 4: Research feasibility
 
-Push for specificity — vague outputs lead to poor RLM performance. Sketch the
-Pydantic models with `Field(description=...)` annotations. Include nested models
-where appropriate.
+Research autonomously, then report a clear feasibility assessment.
 
-Ask the user:
+1. Find domain libraries and existing project patterns.
+2. Check sandbox compatibility. The default execution environment is Pyodide in
+   WASM: pure-Python wheels and Pyodide-built packages work; native binaries and
+   ordinary C extensions do not.
+3. Identify network needs and list exact domains for `allowed_domains`.
+4. Identify host-side needs. Put native libraries, authenticated APIs, database
+   access, heavy host filesystem work, and unsupported packages behind typed
+   host-side tools.
+5. Check whether `pdf`, `spreadsheet`, or `docx` built-in skills already cover
+   the task.
+6. Check whether the boundary already fits `File`, `Workspace`, `CtxStr`, an
+   existing adapter, or a `PreparedInput` path declaration before designing a
+   full runtime extension.
 
-- What fields matter most? What would they check first?
-- Are there any computed/derived fields (scores, summaries, counts)?
-- Do they need output files (Excel, PDF, images)?
+Treat a package that cannot run in Pyodide as a design decision, not a surprise
+at implementation time: use a host-side tool or change the approach.
 
-Confirm the output design with the user before proceeding.
+## Step 5: Capability design
 
-## Step 4: Research
-
-This step is **autonomous**. Tell the user you are researching, then do it.
-
-Use web search and the Explore subagent to:
-
-1. **Find Python packages** for the domain (e.g., `networkx` for graphs,
-   `tree-sitter` for code parsing, `beautifulsoup4` for HTML).
-
-2. **Check Pyodide compatibility**. The sandbox runs Pyodide (Python in WASM).
-   Only **pure-Python wheels** or packages with **Emscripten builds** work.
-   Search pypi.org for each package and check:
-   - Does it have a `py3-none-any` wheel? (pure Python — works)
-   - Does it have C extensions without Emscripten builds? (won't work in
-     sandbox)
-   - Is it in the Pyodide built-in package list? (check
-     <https://pyodide.org/en/stable/usage/packages-in-pyodide.html>)
-
-3. **Identify network needs**. Does the task require calling external APIs? If
-   so, note the domains for `allowed_domains`.
-
-4. **Identify host-side tool needs**. If any functionality cannot run in WASM
-   (native binaries, C extensions, heavy computation), it must be a **host-side
-   tool** — a Python function running on the host that the RLM calls like any
-   other tool.
-
-5. **Check for existing skills**. The built-in skills are:
-   - `pdf` — pymupdf for PDF rendering, text extraction, manipulation
-   - `spreadsheet` — openpyxl, pandas, formulas for Excel work
-   - `docx` — python-docx for reading, writing, and modifying Word documents
-
-Report findings to the user with a clear feasibility assessment. Flag any
-blockers.
-
-## Step 5: Skill Design
-
-Based on research, design the skill configuration.
+Choose the smallest capability surface that makes the workflow work.
 
 ### Built-in skills
 
-List which built-in skills to use and why.
+State which built-in skills are needed and why:
 
-### Custom skills (if needed)
+- `pdf` for PDF rendering, text extraction, modification, and redaction;
+- `spreadsheet` for Excel workbooks, formulas, and formatting;
+- `docx` for reading and writing Word documents.
 
-For each custom skill, define:
+### Custom skills
 
-- **name**: short identifier
-- **instructions**: prose guidance injected into the RLM's system prompt —
-  teaches the RLM patterns and best practices. Be detailed; this is the primary
-  way to control RLM behavior.
-- **packages**: PyPI packages installed in the sandbox via micropip (must be
-  Pyodide-compatible)
-- **modules**: Python files mounted into the sandbox as importable modules
-- **tools**: host-side callable functions exposed to the RLM
+Create a `Skill` only for a capability that can be reused across different
+RLMs. A skill teaches the model how to use one thing well—for example, how to
+inspect and modify PDFs, work with spreadsheets, or query a docket system. Its
+instructions should remain useful when attached unchanged to another RLM that
+needs the same capability.
 
-### Host-side tool design
+Put workflow-specific instructions in the DSPy signature docstring instead.
+The signature docstring is the outer LM's instruction prompt, so it owns the
+current RLM's objective, input-specific procedure, business rules, output
+requirements, verification steps, and completion criteria.
 
-For each host-side tool:
+Use this test:
 
-- Function name and signature with type hints
-- Docstring (the RLM sees this to understand how to call it)
-- What it does and why it must be host-side
+- If the guidance explains **how to use a reusable capability**, put it in a
+  `Skill`.
+- If the guidance explains **what this RLM must do**, put it in the signature
+  docstring.
+- If the text names this RLM's fields, output schema, one-off policy, or
+  workflow stages, it is almost certainly signature-specific.
 
-Confirm the skill design with the user before proceeding.
+Do not create a skill merely to move instructions out of a long signature, and
+do not duplicate the same guidance in both places. A one-off host callable
+belongs directly in `tools=`; bundle it into a skill only when the callable and
+its operating guidance form a capability other RLMs can reuse.
 
-## Step 6: Strategy and Architecture
+For each genuinely reusable skill, specify:
 
-### Signature strategy
+- `name` — concise capability identifier;
+- `instructions` — general operating guidance independent of the current RLM;
+- `packages` — Pyodide-compatible sandbox packages required by the capability;
+- `modules` — host paths mapped to reusable importable sandbox modules;
+- `tools` — host callables that belong with the reusable capability.
 
-Write the step-by-step strategy that goes in the signature's docstring. This is
-the RLM's playbook:
+`instructions` should be an operating manual, not a short package description
+or list of functions. A useful skill normally includes:
 
-1. What to do first (survey/understand the input)
-2. How to gather information (render pages, use predict() for extraction, call
-   tools)
-3. How to process and synthesize
-4. What to produce and where to save output files
+1. when to use the capability and how to choose among its approaches;
+2. an ordered workflow for inspecting, modifying, or producing artifacts;
+3. runnable code patterns for the operations models commonly get wrong;
+4. correctness invariants and checks to perform before `SUBMIT`;
+5. known failure modes, sandbox limitations, and recovery guidance.
 
-### Single vs chained RLMs
+Built-in skills are intentionally substantive: the PDF skill explains visual
+rendering versus text extraction and parallel `predict()` calls; the DOCX skill
+covers document structure, editing patterns, formatting traps, and limitations;
+the spreadsheet skill covers formula policy, recalculation, rendering, style
+preservation, and output verification.
 
-Evaluate whether this needs one RLM or multiple chained RLMs.
+This reusable HTML capability shows the expected shape at a smaller scale:
 
-**Use a single RLM when**:
+```python
+from predict_rlm import Skill
 
-- The task is one coherent workflow
-- All steps need the same context/state
-- The iteration count stays reasonable (under 40)
 
-**Use chained RLMs when**:
+html_skill = Skill(
+    name="html",
+    instructions="""Use BeautifulSoup to inspect and extract static HTML documents.
 
-- There are distinct phases with different skill needs
-- One phase produces artifacts consumed by another
-- The combined task would exceed reasonable iteration counts
-- Different phases benefit from different sub-LM models
+## Workflow
 
-If chaining, define each stage:
+1. Read the source without modifying it and record its path and byte size.
+2. Parse with `html.parser`. Remove scripts, styles, and `noscript` blocks, but
+   preserve headings, lists, links, tables, labels, and form controls.
+3. Inventory the semantic structure before extracting: title, headings, main
+   content container, tables, links, and repeated navigation/footer regions.
+4. Use deterministic selectors and extraction first. Use `predict()` only for
+   interpretation of one bounded, cleaned section with a typed result; never
+   send an entire large page when a section or table is sufficient.
 
-- Stage name, signature (inputs/outputs), skills, strategy
-- The DAG: which stage feeds into which, with typed connections
+## Parse and inventory
 
-### Configuration
+    from bs4 import BeautifulSoup
 
-- `max_iterations` estimate per RLM
-- `allowed_domains` if network access is needed
-- `sub_lm` recommendations (capability level needed)
+    with open(path, "r", encoding="utf-8", errors="replace") as handle:
+        soup = BeautifulSoup(handle.read(), "html.parser")
 
-### Delivery scope
+    for node in soup(["script", "style", "noscript"]):
+        node.decompose()
 
-Confirm which artifacts the user wants. Do not assume evals or optimization are
-required for every RLM.
+    root = soup.find("main") or soup.find("article") or soup.body or soup
+    title = soup.title.get_text(" ", strip=True) if soup.title else None
+    headings = [
+        {
+            "level": node.name,
+            "text": node.get_text(" ", strip=True),
+            "id": node.get("id"),
+        }
+        for node in root.find_all(["h1", "h2", "h3", "h4", "h5", "h6"])
+    ]
 
-- **Agent only**: the callable RLM package, domain skills/tools, and fast smoke
-  tests. This is the default unless the user asks for benchmarking or GEPA.
-- **Agent + evals**: add a `bench/` package with dataset loading, scoring, and
-  evaluation CLI/helpers. Use this when the user has labeled examples, fixtures,
-  or a deterministic metric.
-- **Agent + optimization**: add project-local RLM-GEPA wiring only when the user
-  wants prompt/skill optimization. GEPA needs train/validation examples and a
-  metric, but it does not require a separate held-out eval CLI unless requested.
-- **Full project**: agent, tools, benchmark/eval harness, and optimization
-  wiring, like the SpreadBench example.
+## Extract links and tables
 
-### RLM-GEPA scoping interview
+    links = [
+        {"text": a.get_text(" ", strip=True), "href": a.get("href")}
+        for a in root.find_all("a", href=True)
+    ]
 
-When the user asks for optimization wiring but has not supplied enough context
-to write a concrete `AgentSpec`, run a short interview before writing the plan.
-Do not invent the AgentSpec from a vague task description. Gather enough to
-define:
+    tables = []
+    for table in root.find_all("table"):
+        rows = [
+            [cell.get_text(" ", strip=True) for cell in row.find_all(["th", "td"])]
+            for row in table.find_all("tr")
+        ]
+        tables.append(rows)
 
-- the product or optimization goal GEPA should improve for;
-- the input distribution, scale, and examples that represent real work;
-- the output schema and the failure modes users care about most;
-- the train/validation data source and whether labels or reference outputs
-  exist;
-- the scoring rule, partial-credit feedback, and anti-overfitting boundaries;
-- the tools, sandbox constraints, file conventions, and runtime facts the
-  proposer must preserve.
+## Correctness and verification
 
-The interview should scope the RLM that owns the real DSPy signature and tools;
-do not ask the user to restate `target_signature`, `tool_signatures`, or a broad
-agent description as separate prose artifacts. Generate the signature/tool
-fields from the constructed RLM with `agent_spec_from_rlm(...)`; omit
-`agent_type` unless the user volunteers a product or optimization anchor that
-adds useful context.
+- Preserve document order, exact link targets, table row order, element IDs,
+  and the nearest heading as source context. Do not invent text hidden behind
+  missing JavaScript data.
+- Check that the selected root is nonempty, expected headings and tables were
+  found, and extracted row/link counts match the parsed elements.
+- Keep raw source text for quoted evidence. Re-open and verify important quotes
+  or values against the original element before submitting.
 
-If the user cannot answer everything, proceed with explicit assumptions and mark
-the generated `AgentSpec` fields that should be revisited before spending model
-calls.
+## Failure modes
 
-### Dataset and split hygiene
+- Static HTML may omit content rendered by JavaScript. Report that limitation
+  and use a host-side browser tool when rendered DOM access is required.
+- `errors="replace"` can hide encoding damage; flag replacement characters in
+  relevant text and retry with an identified encoding when necessary.
+- `rowspan` and `colspan` require explicit normalization when table geometry
+  matters. Do not pretend a flattened row list preserves merged-cell layout.
+""",
+    packages=["beautifulsoup4"],
+)
+```
 
-When the user asks for evals or optimization, investigate the dataset before
-writing split or scoring code. Inspect enough examples to identify task types,
-input sizes, label/reference-output shape, duplicate or near-duplicate examples,
-leakage risks, missing labels, and failure buckets the scorer should expose.
-Capture those findings in the plan instead of treating the dataset as an opaque
-list of rows.
+The example is reusable because it teaches HTML handling without mentioning any
+one RLM's fields, output schema, business rules, or completion policy.
 
-Use split semantics consistently:
+### Host-side tools
 
-- **Train**: examples the optimizer/proposer may use to generate and gate edits.
-- **Validation**: examples used for candidate selection and regression checks
-  during optimization.
-- **Test / held-out eval**: optional final reporting set. Do not create or spend
-  on it unless the user asks for a benchmark/eval harness or has enough labeled
-  data to justify it.
+For each tool, define the typed signature, a useful docstring, return shape,
+and why it must run on the host. Return plain JSON-like data or Pydantic models;
+PredictRLM normalizes Pydantic values, including nested values, to mappings and
+lists before they cross the sandbox boundary.
 
-Prefer deterministic splits. Put the random seed, split ratio/counts, grouping
-key (if examples share source documents/users/tasks), and any sampling limits in
-`bench/config.py` or `gepa/config.py`. Split by group when leakage is plausible;
-never let near-identical cases from the same source land in both train and
-validation without calling it out. If the dataset is tiny, prefer explicit
-hand-authored train/validation files over random splitting.
+Prefer narrow, typed tools. A tool is a system boundary, not an escape hatch for
+arbitrary host access.
 
-For GEPA, the project-local `gepa/` code owns train/validation loading and the
-seed candidate text. The seed candidate means the initial mutable component,
-such as baseline skill instructions; it is separate from the random seed used
-for splits, sampling, or optimizer reproducibility.
+### Kernel extensions
 
-For benchmarks with official splits, preserve the benchmark's public semantics.
-Use the official train split for optimization data, carve GEPA validation from
-that train split when a candidate-selection set is needed, and reserve official
-dev/test/challenge splits for reporting only when the user asks for held-out
-benchmark evaluation. Do not let optimizer feedback leak from held-out splits
-into seed instructions or candidate selection.
+If the workflow needs a custom runtime boundary, specify it in the plan rather
+than discovering it during implementation:
 
-### Benchmark integration boundaries
+- the caller-facing signature type and model-visible value;
+- why built-in files, workspaces, skills, or host tools are insufficient;
+- the smallest extension point from the kernel decision order above;
+- all sandbox paths, copy versus mount behavior, and backend requirements;
+- adapter-owned resources, invocation-local state, persistence points, and
+  cleanup on success, failure, cancellation, and partial setup;
+- whether the extension is portable across JSPI and SBX;
+- the `RuntimeContribution` composition boundary when several pieces belong
+  together; and
+- focused lifecycle and concurrency tests.
 
-Keep benchmark evaluators and oracle-style answer checkers harness-side. The RLM
-may see environment-safe tools, docs, state APIs, or session controls, but it
-should not see evaluator feedback or hidden scoring APIs while solving an
-example. After the attempt, the harness can call the evaluator and pass score
-and feedback to GEPA as the learning signal.
+## Step 6: Strategy and architecture
 
-When benchmark packages conflict with predict-rlm, DSPy, Pyodide, or the main
-project environment, prefer an isolated host-side runner/tool behind a typed
-JSON boundary. Do not force incompatible benchmark dependencies into the RLM
-sandbox or main package environment.
+Write the strategy that belongs in the DSPy signature docstring. It is the
+RLM's playbook:
 
-For eval and optimization CLIs, route task execution through the shared
-`rlm_gepa.runtime.adapter.RLMGepaAdapter` semantics rather than bespoke
-`asyncio.gather` loops. Project-local `bench/` code may own dataset selection,
-candidate loading, and `eval.json` summary shaping, but should reuse the adapter
-for concurrency, per-task timeouts, progress bars, verbose RLM log handling,
-`task_traces/*.jsonl`, and `cost_log.jsonl`. If the eval command is async, call
-`await adapter.aevaluate(...)`; if it is synchronous, call
-`adapter.evaluate(...)`. Write `eval.json` in the run directory so
-`rlm-gepa stats <run_dir>` works for held-out evals as well as optimize runs.
+1. survey and understand the available inputs;
+2. gather evidence with file skills, `predict()`, and host tools;
+3. process, cross-check, and synthesize the evidence;
+4. emit the declared data and write any output files in their output locations.
 
-## Feasibility Checklist
+Choose one RLM when the work is a coherent workflow with shared state and a
+reasonable iteration budget. Chain RLMs only when stages have genuinely
+different capabilities, output artifacts consumed by later stages, or separate
+model/iteration requirements. For every chain, define typed stage boundaries
+and a DAG before implementation.
 
-Before producing the final plan, verify:
+Choose initial `max_iterations`, `max_llm_calls`, and `max_output_chars` from
+the workload. Record required `allowed_domains`, whether a capable `sub_lm` is
+needed for extraction, and whether the caller needs `output_dir` for generated
+files.
 
-- [ ] All proposed packages are Pyodide-compatible (or have host-side fallbacks)
-- [ ] Network access needs are identified with specific domains
-- [ ] Host-side tools are defined for anything that can't run in WASM
-- [ ] Iteration count is reasonable (under 50 per RLM)
-- [ ] Input sizes are manageable (or chunking strategy is defined)
-- [ ] Output schemas are specific enough for reliable extraction
-- [ ] The task is achievable — no unsupported capabilities assumed
+## Feasibility checklist
 
-## Plan Output
+Before finalizing the plan, verify:
 
-Write the plan to the Claude Code plan file with these sections:
+- [ ] Every sandbox package is Pyodide-compatible or replaced by a host tool.
+- [ ] Network domains are explicit and minimal.
+- [ ] Host-side tools cover every unsupported host capability.
+- [ ] The iteration and LM-call budgets are plausible for the workflow.
+- [ ] Large inputs stay as `File` references or on-demand metadata.
+- [ ] Output schemas are specific enough to validate.
+- [ ] Any chained stages have typed, necessary boundaries.
 
-1. **Overview** — one paragraph: what, why, and expected workflow
-2. **Delivery scope** — agent-only, evals, optimization, or full project
-3. **File manifest** — every file to create with a one-line description
-4. **Input schemas** — complete Pydantic model code for `agent/schema.py`
-5. **Output schemas** — complete Pydantic model code for `agent/schema.py`
-6. **Signature** — complete `agent/signature.py` code with strategy docstring
-7. **Skills configuration** — built-in imports + custom `Skill(...)`
-   definitions + tool signatures
-8. **Service architecture** — single RLM wiring or chained DAG:
+## Plan output
 
-   ```
-   Stage1(documents) --[ExtractedData]--> Stage2(extracted) --[Report]--> Stage3(report)
-   ```
+Deliver a plan containing:
 
-9. **Optional eval/optimization design** — only if requested. Include dataset
-   audit findings, split policy, scoring feedback shape, and reproducibility
-   seed. For optimization, also include the `AgentSpec` interview summary,
-   train/validation source, seed candidate source, and the exact `gepa/` files
-   to create.
-10. **Feasibility notes** — constraints, risks, alternatives
-11. **Estimated complexity** — iteration count, sub-LM calls, cost range,
-    runtime
-12. **Smoke tests** — test files to create and commands to run. Every generated
-    RLM must include at least one fast no-network smoke test that imports the
-    generated package and constructs the service without making LLM calls.
-
-After writing the plan, use ExitPlanMode to get user approval. Once approved,
-proceed to Phase 2.
-
----
+1. Overview and RLM-fit decision.
+2. Delivery scope and file manifest.
+3. Complete input and output schemas.
+4. Complete signature strategy.
+5. Skill and host-tool contracts.
+6. Service architecture, including a typed DAG when chained.
+7. Feasibility constraints, alternatives, and initial budgets.
+8. Smoke-test cases and exact verification commands.
 
 # Phase 2: Build
 
-Implement the approved plan. Create all files following the patterns below.
+Implement the approved design with the smallest maintainable package layout.
+Do not scaffold benchmarks or RLM-GEPA optimization speculatively. Add an eval
+layer only when the user has examples and a scoring need; use `rlm-gepa` for
+optimization wiring.
 
-## File structure
+## Default package layout
 
-Default to a grouped package. Keep the root package thin and put the callable
-RLM under `agent/`. Add `tools/`, `bench/`, and `gepa/` only when the selected
-delivery scope needs them.
-
-```
+```text
 my_rlm/
-├── pyproject.toml        # Dependencies + generated-with metadata
-├── __init__.py           # Public exports from agent/
-├── agent/
-│   ├── __init__.py       # Public agent exports
-│   ├── schema.py         # Pydantic models for inputs AND outputs
-│   ├── signature.py      # DSPy Signature + strategy docstring
-│   ├── service.py        # DSPy Module wiring signature + PredictRLM + skills
-│   └── skills.py         # Optional custom skill definitions
-├── tools/                # Optional host-side tools and helpers
-│   └── __init__.py
-├── bench/                # Optional dataset/eval/scoring code
-│   ├── __init__.py
-│   ├── config.py         # Optional eval defaults
-│   └── cli.py            # Optional eval CLI helpers
-├── gepa/                 # Optional project-local RLM-GEPA wiring
-│   ├── __init__.py       # Exports main for `my_rlm.gepa:main`
-│   ├── config.py         # OptimizeConfig defaults + AgentSpec
-│   ├── project.py        # RLMGepaProject implementation
-│   ├── cli.py            # Thin run_project_cli wiring
-│   └── __main__.py       # Optional `python -m my_rlm.gepa`
-└── tests/
-    └── test_smoke.py     # Fast import/construction smoke tests
+├── pyproject.toml
+├── src/
+│   └── my_rlm/
+│       ├── __init__.py
+│       ├── schema.py       # Pydantic inputs and outputs
+│       ├── signature.py    # DSPy signature and strategy
+│       ├── service.py      # PredictRLM wiring
+│       ├── skills.py       # Only when custom skills are needed
+│       └── tools.py        # Only when host-side tools are needed
 ```
 
-**Always create**: `pyproject.toml`, package `__init__.py`, `agent/schema.py`,
-`agent/signature.py`, `agent/service.py`, `agent/__init__.py`, and
-`tests/test_smoke.py`.
+Create `schema.py`, `signature.py`, `service.py`, package exports. Add files only when the chosen boundary needs them.
 
-**Create when needed**:
+## Dependencies
 
-- `agent/skills.py` when the RLM needs domain-specific instructions beyond
-  built-in skills.
-- `tools/` when host-side functions or helper modules are needed.
-- `bench/` when the user wants evals, datasets, scoring, or eval config.
-- `gepa/` and a console script when the user wants RLM-GEPA optimization.
+Install predict-rlm in the target repository without hardcoding a version:
 
-Do not add compatibility shims for old flat module names in newly generated
-projects. The grouped imports are the source of truth.
-
-## pyproject.toml — Dependencies and generated-with metadata
-
-Every generated RLM project should record which predict-rlm version and skill
-layout it targets. Use the current package version unless the user explicitly
-pins another one. For this repository version, that is `0.4.1`.
-
-Agent-only project:
-
-```toml
-[project]
-name = "my-rlm"
-version = "0.1.0"
-requires-python = ">=3.11"
-dependencies = [
-    "predict-rlm>=0.4.1,<0.5",
-]
-
-[tool.predict-rlm.generated]
-predict_rlm_version = "0.4.1"
-skill_version = "2.0"
-layout = "agent-tools-bench-gepa"
-features = ["agent"]
+```bash
+uv add predict-rlm
 ```
 
-If the project uses built-in example skills, add only the required extras or
-packages. If it uses GEPA, add the GEPA extras and project-local `rlm-gepa`
-script as the main UX. Do not include optimization dependencies for an
-agent-only or eval-only project.
+Add the `examples` extra only when using built-in document or spreadsheet
+skills, and add any domain dependency only where it runs. Do not include GEPA
+or visualization extras in an agent-only project.
 
-```toml
-dependencies = [
-    "predict-rlm[examples,gepa,gepa-viz]>=0.4.1,<0.5",
-]
-
-[project.scripts]
-rlm-gepa = "my_rlm.gepa:main"
-
-[tool.predict-rlm.generated]
-predict_rlm_version = "0.4.1"
-skill_version = "2.0"
-layout = "agent-tools-bench-gepa"
-features = ["agent", "tools", "bench", "rlm-gepa"]
-```
-
-For examples inside the predict-rlm monorepo, an editable path source is fine,
-but keep the generated metadata table so readers know which API/layout version
-the project was generated against.
-
-## agent/schema.py — Pydantic models
-
-Define models for structured inputs and outputs. Use `Field(description=...)` so
-the RLM knows what each field means.
+## Schema
 
 ```python
 from pydantic import BaseModel, Field
 
 
 class KeyDate(BaseModel):
-    """A key date extracted from a document."""
-
-    name: str = Field(description="e.g. 'Submission Deadline', 'Effective Date'")
-    date: str = Field(description="ISO format date (YYYY-MM-DD)")
-    time: str | None = Field(
-        None, description="24-hour format (HH:MM), e.g. '14:00', '09:30'"
-    )
-    timezone: str | None = Field(
-        None, description="Timezone code, e.g. 'EST', 'EDT', 'PST', 'UTC'"
-    )
+    name: str = Field(description="What deadline or effective date this is")
+    date: str = Field(description="ISO-8601 calendar date")
 
 
 class DocumentAnalysis(BaseModel):
-    """Structured analysis of a document set."""
-
-    report: str = Field(
-        description="Full analysis as a well-formatted markdown report"
-    )
+    summary: str = Field(description="Grounded Markdown summary")
     key_dates: list[KeyDate] = Field(
-        default_factory=list, description="Important dates found in the documents"
+        default_factory=list,
+        description="Dates supported by the input documents",
     )
 ```
 
-## agent/signature.py — Inputs, outputs, and strategy
+## Signature and strategy
 
-The docstring becomes the RLM's system instructions — tell the RLM how to
-approach the task step by step:
+Treat the signature docstring as the RLM's executable strategy, not a one-line
+summary. Strong instructions define source authority, discovery, bounded tool
+use, intermediate state, evidence rules, validation, recovery from missing or
+conflicting information, the output contract, and a stopping condition.
 
 ```python
 import dspy
 
-from predict_rlm import File
+from predict_rlm import CtxStr, File
 
 from .schema import DocumentAnalysis
 
 
 class AnalyzeDocuments(dspy.Signature):
-    """Analyze documents and produce a structured report.
+    """Analyze a related document set into a grounded, structured report.
 
-    1. **Read the report criteria** (appended below) to understand what
-       information to extract and in what format.
+    Read `criteria` first and treat the supplied documents as the sole authority
+    for document facts.
 
-    2. **Survey the documents** to understand what you're working with:
-       file names, page counts, document types.
+    ## Method
 
-    3. **Gather information** systematically by rendering pages as images
-       and using predict() to extract content.
+    1. Inventory every file before deep reading. Record its exact name, format,
+       page or sheet count, likely role, and which criteria it may answer.
+    2. Inspect each file with deterministic, format-appropriate tools. Search
+       and extract structure to narrow the work; render pages or use focused
+       `predict()` calls only on bounded sections that need interpretation.
+       Never send the whole document corpus through one giant sub-LM call.
+    3. Keep a compact evidence map in Python state with the source file, page,
+       sheet, section, or other locator for each relevant fact. Retain evidence,
+       not repeated full-document text.
+    4. Reconcile overlapping sources. Prefer explicit and more current evidence,
+       deduplicate repeated facts, and preserve meaningful disagreements.
 
-    4. **Produce the report** following the format specified in the criteria.
-       Use tables for structured data, prose for analysis and context.
+    ## Evidence rules
+
+    - Every conclusion and key date must trace to a source locator.
+    - Never turn missing, ambiguous, or contradictory evidence into a confident
+      claim. Mark it unresolved and explain what is missing.
+    - Use `criteria` to control emphasis and format, but never let it justify an
+      unsupported fact or silently exclude a supplied file.
+
+    ## Verification and stopping
+
+    Before submitting, confirm that every file was inspected, every criterion is
+    answered or explicitly unresolved, important facts were cross-checked, and
+    the result satisfies the declared schema. Stop only after those checks pass.
+
+    ## Output contract
+
+    Return one `DocumentAnalysis`. Its summary must be a standalone grounded
+    report that follows `criteria`; `key_dates` must contain only supported dates
+    with their meaning and normalized value. Use an empty list when no key date
+    is supported.
     """
 
-    documents: list[File] = dspy.InputField(
-        desc="PDF documents to analyze"
-    )
-    analysis: DocumentAnalysis = dspy.OutputField(
-        desc="Structured analysis with markdown report, key dates, and key entities"
-    )
+    documents: list[File] = dspy.InputField(desc="Documents to inspect")
+    criteria: CtxStr = dspy.InputField(desc="Rubric to apply in full")
+    analysis: DocumentAnalysis = dspy.OutputField(desc="Grounded result")
 ```
 
-## agent/service.py — Wiring it together
+Callers pass a plain string for `criteria`; `CtxStr` makes it both a sandbox
+variable and a full prompt appendix. Use an ordinary `str` when the RLM can
+inspect the value from the sandbox instead.
 
-Wrap signature + skills + PredictRLM into a reusable DSPy Module:
+## Service
 
 ```python
 import dspy
 
 from predict_rlm import File, PredictRLM
-from predict_rlm.skills import pdf as pdf_skill
+from predict_rlm.skills import pdf
 
-from .schema import DocumentAnalysis
 from .signature import AnalyzeDocuments
 
 
 class DocumentAnalyzer(dspy.Module):
     def __init__(
         self,
+        *,
+        lm: dspy.LM | str | None = None,
         sub_lm: dspy.LM | str | None = None,
         max_iterations: int = 30,
         verbose: bool = False,
         debug: bool = False,
-    ):
-        self.sub_lm = sub_lm
-        self.max_iterations = max_iterations
-        self.verbose = verbose
-        self.debug = debug
-
-    async def aforward(
-        self, documents: list[File], criteria: str
-    ) -> DocumentAnalysis:
-        signature = AnalyzeDocuments.with_instructions(
-            AnalyzeDocuments.instructions + "\n\n# Task\n\n" + criteria.strip()
+    ) -> None:
+        self.predictor = PredictRLM(
+            AnalyzeDocuments,
+            lm=lm,
+            sub_lm=sub_lm,
+            max_iterations=max_iterations,
+            verbose=verbose,
+            debug=debug,
+            skills=[pdf],
         )
-        predictor = PredictRLM(
-            signature,
-            sub_lm=self.sub_lm,
-            skills=[pdf_skill],
-            max_iterations=self.max_iterations,
-            verbose=self.verbose,
-            debug=self.debug,
-        )
-        result = await predictor.acall(documents=documents)
-        return result.analysis
+
+    async def aforward(self, documents: list[File], criteria: str):
+        return await self.predictor.acall(documents=documents, criteria=criteria)
 ```
 
-When using multiple skills or host-side tools:
+Use `tools=[callable]` when the callable name is suitable, or
+`tools={"name": callable}` to expose a deliberate tool name. Use `skills=[...]`
+for reusable sandbox capabilities. Pass `output_dir` to `PredictRLM` when
+`File` or `list[File]` outputs must be collected below a caller-selected root.
 
-```python
-from predict_rlm.skills import pdf as pdf_skill
-from predict_rlm.skills import spreadsheet as spreadsheet_skill
+# Runtime reference
 
-async def aforward(self, documents: list[File]) -> MyOutput:
-    predictor = PredictRLM(
-        MySignature,
-        sub_lm=self.sub_lm,
-        skills=[pdf_skill, spreadsheet_skill],
-        tools={"fetch_exchange_rate": fetch_exchange_rate},
-        ...
-    )
-```
-
-### Chaining pattern (multiple RLMs)
-
-```python
-async def aforward(self, documents: list[File]):
-    # Stage 1: Extract
-    extractor = PredictRLM(ExtractSignature, sub_lm=self.sub_lm, skills=[pdf_skill])
-    extracted = await extractor.acall(documents=documents)
-
-    # Stage 2: Analyze (uses output from stage 1)
-    analyzer = PredictRLM(AnalyzeSignature, sub_lm=self.sub_lm, skills=[analysis_skill])
-    result = await analyzer.acall(data=extracted.data)
-
-    return result
-```
-
-## agent/skills.py — Custom skills
-
-Create only when the RLM needs domain-specific instructions beyond built-in
-skills.
-
-```python
-from predict_rlm import Skill
-from predict_rlm.skills import pdf as pdf_skill
-
-redaction_skill = Skill(
-    name="redaction",
-    instructions="""How to redact content from PDFs using pymupdf.
-
-## Text redaction
-Search for text, create redaction annotations, then apply:
-    page = doc[page_num]
-    hits = page.search_for("sensitive text")
-    for rect in hits:
-        page.add_redact_annot(rect, fill=(0, 0, 0))
-    page.apply_redactions()
-...""",
-)
-
-__all__ = ["pdf_skill", "redaction_skill"]
-```
-
-## tests/test_smoke.py — Generated smoke tests
-
-Create smoke tests for every generated RLM. The default smoke test must be fast
-and must not require network access, API keys, Deno, Pyodide, or an actual LLM
-call. It should prove the generated package imports, the signature exposes the
-expected fields, and the service can be constructed.
-
-Tailor imports and class names to the generated RLM:
-
-```python
-def test_service_constructs():
-    from my_rlm import DocumentAnalyzer
-
-    service = DocumentAnalyzer(max_iterations=1, verbose=False, debug=False)
-    assert service.max_iterations == 1
-
-
-def test_signature_has_fields():
-    from my_rlm.agent.signature import AnalyzeDocuments
-
-    assert AnalyzeDocuments.input_fields
-    assert AnalyzeDocuments.output_fields
-```
-
-If the generated project includes tiny local fixtures and the user wants an
-end-to-end check, add a separate `@pytest.mark.integration` test that performs a
-minimal `acall`. Gate that test behind explicit credentials or an environment
-flag so the default smoke suite remains deterministic and cheap.
-
-## Optional bench/ package — Evals
-
-Create `bench/` only when the user wants evaluation. Keep it project-local:
-dataset loaders, scoring rules, fixtures, and reports belong here, not in
-`agent/`. Evals can exist without optimization. The eval layer should make the
-dataset audit and split policy explicit: where examples come from, how labels or
-reference outputs are represented, which examples are train/validation/test, and
-which seed/grouping rules make the split reproducible.
-
-Suggested files when needed:
-
-```text
-bench/
-├── __init__.py
-├── config.py      # Eval defaults and EvalConfig
-├── dataset.py      # Load examples/fixtures into typed task objects
-├── evaluation.py   # Project-specific task execution/scoring contract
-├── scoring.py      # Deterministic task-specific scoring
-└── cli.py          # Optional held-out eval subcommand/helpers
-```
-
-For benchmark eval and optimize entrypoints, use the shared RLM-GEPA runtime
-adapter semantics in `src/rlm_gepa/runtime/adapter.py` unless the user
-explicitly asks for a one-off local harness. Put dataset loading, scoring,
-setup, and task cleanup behind the project contract; let the shared adapter own
-concurrency, timeouts, progress/tqdm display, trace capture, and report
-semantics.
-
-## Optional gepa/ package — Optimization
-
-Create optimization wiring only when the user asks for it. The shared `rlm_gepa`
-package provides generic orchestration; the generated project owns its task
-loading, metric, seed candidate, and defaults. Import `agent_spec_from_rlm`,
-`OptimizeConfig`, `RLMGepaExampleResult`, `RLMGepaProject`, and
-`EvaluationContext` from `rlm_gepa` rather than copying optimizer internals into
-the project.
-
-The generated `AgentSpec` should be interview-backed, but it should not
-duplicate facts already present on the RLM. Define a single `build_rlm(...)`
-helper that constructs the PredictRLM with the real DSPy signature, skills, and
-tools. Use `agent_spec_from_rlm(build_rlm(seed_instructions), ...)` so GEPA
-derives `target_signature` and `tool_signatures` from that object. Omit
-`agent_type` by default; set it only for a short product or optimization anchor
-that adds non-duplicative framing beyond the signature, tools, or output schema.
-The interview should supply only the extra GEPA brief: transfer use cases,
-runtime-grounding examples, scoring signal, and anti-overfitting boundary. If
-any of those are weakly specified, add a `TODO` in `config.py` and keep
-`optimize --check` available so the user can catch missing setup before spending
-model calls.
-
-Suggested files when needed:
-
-```text
-gepa/
-├── __init__.py    # Exports `main` for the console script
-├── config.py      # Project-local OptimizeConfig defaults + AgentSpec
-├── project.py     # RLMGepaProject implementation and metric wiring
-├── cli.py         # Thin run_project_cli glue
-└── __main__.py    # Optional `python -m my_rlm.gepa`
-```
-
-Optimization can reuse helpers from `bench/` when evals exist. If a `bench/`
-package is present, expose its seed/validation/held-out evaluation flow as an
-`eval` subcommand on the same GEPA CLI surface. Do not create a held-out eval
-command just because GEPA is present: GEPA needs training and validation
-examples plus feedback; a separate benchmark/eval suite is optional.
-
----
-
-# Architecture Reference
-
-Use this reference to ensure plans and implementations are accurate. Do not
-hallucinate parameters or patterns.
-
-## How an RLM works
-
-The architecture is two-level:
-
-1. **The outer LLM** (the RLM itself) writes and executes Python code in a
-   sandboxed Pyodide/WASM REPL. It plans, orchestrates, and iterates.
-2. **The sub-LM** (via `predict()`) handles perception and extraction —
-   analyzing images, understanding text, and returning typed results. Each
-   `predict()` call gets its own context window.
-
-The outer LLM's context stays small (code + tool results), while context-heavy
-work is offloaded to `predict()` calls.
-
-## File I/O
-
-Use `File` for file-typed fields:
-
-- **Input field**: mounts the file from host into the sandbox at
-  `/sandbox/input/{field_name}/`
-- **Output field**: syncs from `/sandbox/output/{field_name}/` back to the host
-
-```python
-from predict_rlm import File
-
-# Input: File(path="/absolute/path/to/file.pdf")
-# Output: declared as File output field, RLM writes to /sandbox/output/<field>/
-```
-
-## PredictRLM constructor
+## Core constructor
 
 ```python
 PredictRLM(
-    signature: type[Signature] | str,     # DSPy signature class
-    lm: dspy.LM | str | None = None,      # Main LM (code generation)
-    sub_lm: dspy.LM | str | None = None,  # Sub-LM for predict() calls
-    max_iterations: int = 30,
-    max_llm_calls: int = 50,
-    verbose: bool = False,
-    tools: dict[str, Callable] | list[Callable] | None = None,
-    allowed_domains: list[str] | None = None,
-    skills: list[Skill] | None = None,
-    debug: bool = False,
-    output_dir: str | Path | None = None,
+    signature,
+    lm=None,
+    sub_lm=None,
+    max_iterations=30,
+    max_llm_calls=50,
+    max_output_chars=50_000,
+    verbose=True,
+    tools=None,
+    skills=None,
+    adapters=(),
+    execution=None,
+    modules=(),
+    events=(),
+    allowed_domains=None,
+    output_dir=None,
+    interpreter=None,
+    runtime_hooks=None,
+    submit_confirmation=None,
+    debug=False,
 )
 ```
 
-Both `lm` and `sub_lm` accept a model string (e.g. `"openai/gpt-5.4"`) or a
-`dspy.LM` instance. If `lm` is omitted, the current context LM from
-`dspy.context(lm=...)` is used.
+`lm` drives outer code generation; `sub_lm` serves sandbox `predict()` calls.
+Both accept a DSPy LM or model string. `predict()` is always available.
 
-## CodexLM / ChatGPT subscription backend
+The kernel extension contracts are described above. Use `execution=` for a new
+session-native backend and reserve `interpreter=` for CodeInterpreter-shaped
+compatibility integrations. Consult `docs/api.md` for exact signatures rather
+than guessing lifecycle parameters.
 
-Starting in `predict-rlm` v0.7.0, `predict-rlm[codex-lm]` includes
-`dspy_codex_lm.CodexLM`, a DSPy LM backed by the Codex/ChatGPT subscription
-backend. Use it when the user wants PredictRLM to run on Codex model slugs
-through ChatGPT/Codex auth instead of normal OpenAI API keys.
+## Files, skills, and tools
 
-Install and authenticate:
+- `File(path="report.pdf")` represents an input file; `File.from_dir(path)`
+  creates a sorted recursive list of file references.
+- Input files are copied to `/sandbox/input/<field>/`. File outputs are written
+  under `/sandbox/output/<field>/` and synchronized back after execution.
+- `Skill(name, instructions, packages, modules, tools)` bundles reusable
+  capability. Skill tool-name collisions are errors.
+- `pdf`, `spreadsheet`, and `docx` are the built-in skills:
 
-```bash
-uv add "predict-rlm[codex-lm]"
-uv run codex-lm auth login default
-uv run codex-lm auth status
-uv run codex-lm smoke-test --model gpt-5.5
-```
+  ```python
+  from predict_rlm.skills import docx, pdf, spreadsheet
+  ```
 
-For prerelease builds, allow prereleases explicitly:
+- Host tools run outside WASM. Make their docstrings, arguments, and return
+  data clear enough for generated code to call safely.
 
-```bash
-uv add --prerelease=allow "predict-rlm[codex-lm]==0.7.0-alpha0"
-```
+## Sandbox constraints
 
-Use `CodexLM` directly when wiring `lm` or `sub_lm`:
-
-```python
-from dspy_codex_lm import CodexLM
-from predict_rlm import PredictRLM
-
-rlm = PredictRLM(
-    MySignature,
-    lm=CodexLM(model="gpt-5.5"),
-    sub_lm=CodexLM(model="gpt-5.5"),
-)
-```
-
-To run an existing DSPy script without editing its LM construction, use the CLI
-wrapper. It monkeypatches OpenAI-family `dspy.LM(...)` calls and routes supported
-Codex model slugs to `CodexLM`:
-
-```bash
-uv run codex-lm my_dspy_script.py
-```
-
-Useful CLI commands:
-
-```bash
-uv run codex-lm --help
-uv run codex-lm auth list
-uv run codex-lm usage
-uv run codex-lm rotation on
-```
-
-Important caveats:
-
-- CodexLM uses Codex/ChatGPT subscription auth, not ordinary OpenAI API keys.
-- Routing is strict: OpenAI-family model strings are intercepted only when the
-  slug is a supported Codex model; unsupported OpenAI-family slugs raise an
-  error instead of silently falling back.
-- Common supported slugs include `gpt-5.1-codex`, `gpt-5.1-codex-max`,
-  `gpt-5.1-codex-mini`, `gpt-5.2`, `gpt-5.2-codex`, `gpt-5.3-codex`,
-  `gpt-5.3-codex-spark`, `gpt-5.4`, `gpt-5.4-mini`, and `gpt-5.5`.
-
-## Skill dataclass
-
-```python
-from predict_rlm import Skill
-
-Skill(
-    name="my-skill",                          # Short identifier
-    instructions="How to approach...",         # Prose injected into the RLM prompt
-    packages=["pandas", "openpyxl"],           # PyPI packages installed in the sandbox
-    modules={"helper": "/path/to/helper.py"},  # Python files mounted as importable modules
-    tools={"fetch": fetch_fn},                 # Host-side callable functions exposed to the RLM
-)
-```
-
-Skills can bundle **host-side tools** via their `tools=` field. When skills are
-composed, their tools are merged alongside instructions and packages (tool name
-conflicts raise errors).
-
-## Built-in skills
-
-```python
-from predict_rlm.skills import pdf as pdf_skill          # pymupdf
-from predict_rlm.skills import spreadsheet as spreadsheet_skill  # openpyxl, pandas, formulas
-from predict_rlm.skills import docx as docx_skill        # python-docx
-```
-
-| Skill           | Packages                         | Modules        | What it teaches the RLM                                                    |
-| --------------- | -------------------------------- | -------------- | -------------------------------------------------------------------------- |
-| **pdf**         | `pymupdf`                        | —              | Read, render, modify, and redact PDFs                                      |
-| **spreadsheet** | `openpyxl`, `pandas`, `formulas` | `formula_eval` | Build and modify Excel workbooks with formulas and formatting              |
-| **docx**        | `python-docx`                    | `md2docx`      | Read, write, and modify Word documents with tables, formatting, and styles |
-
-## Tools
-
-Tools are **host-side functions** the RLM can call from the sandbox. Use them
-for operations that cannot run inside the sandbox — host access, authenticated
-APIs, database queries, system resources.
-
-```python
-async def fetch_exchange_rate(currency: str, date: str) -> str:
-    """Fetch the exchange rate for a currency on a given date.
-
-    Args:
-        currency: ISO currency code (e.g. "EUR", "GBP")
-        date: Date in YYYY-MM-DD format
-
-    Returns:
-        JSON string with the exchange rate data
-    """
-    async with httpx.AsyncClient() as client:
-        resp = await client.get(f"https://api.example.com/rates/{currency}/{date}")
-        return resp.text
-```
-
-Tools can be passed directly to PredictRLM via `tools={"name": fn}` or bundled
-inside a Skill via `tools=`.
-
-### When to use a Skill vs tools
-
-| Use a Skill when...                                  | Use `tools=` when...                                                      |
-| ---------------------------------------------------- | ------------------------------------------------------------------------- |
-| The RLM needs a **package** installed in the sandbox | The function must run on the **host** (API calls, DB queries, filesystem) |
-| You need to teach the RLM **how to use** something   | The tool's docstring is self-explanatory                                  |
-| The knowledge is **reusable** across RLMs            | It's a single specific function for one RLM                               |
-
-## predict() tool (inside sandbox)
-
-The RLM can call `predict()` for sub-LM perception/extraction:
-
-```python
-result = await predict(
-    "image: dspy.Image -> items: list[Item]",
-    instructions="Extract all line items from this invoice page",
-    image=page_image,
-)
-```
-
-Each predict() call gets its own context window. Supports `dspy.Image` for
-multimodal.
-
-## Key imports
-
-```python
-from predict_rlm import PredictRLM, Skill, File
-from predict_rlm.skills import pdf, spreadsheet, docx
-```
-
-## WASM sandbox constraints
-
-- Only pure-Python wheels or Pyodide built-in packages work
-- No subprocess, no native binaries, no C extensions (unless Emscripten-built)
-- Network access requires `allowed_domains` whitelist
-- File I/O is within the sandbox filesystem
-- Host-side tools bridge the gap for anything WASM can't do
+- Use pure-Python or Pyodide-compatible packages in sandbox skills.
+- Do not expect subprocesses, native binaries, or ordinary C extensions.
+- Default network access is denied; set a minimal `allowed_domains` list when
+  the sandbox must reach a network service.
+- Use host-side tools for native code, credentials, databases, and host files.
