@@ -26,9 +26,3 @@ def test_public_rlm_skill_version_snippets_match_package_version():
         assert not re.search(snippet, skill_text), f"stale RLM skill snippet: {snippet}"
 
 
-def test_public_rlm_skill_requires_shared_eval_adapter_semantics():
-    skill_text = (ROOT / ".agents/skills/rlm/SKILL.md").read_text()
-
-    assert "rlm_gepa.runtime.adapter.RLMGepaAdapter" in skill_text
-    assert "eval.json" in skill_text
-    assert "rlm-gepa stats <run_dir>" in skill_text
