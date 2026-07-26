@@ -14,6 +14,18 @@ metadata:
 
 # Create a PredictRLM
 
+## Check for skill updates
+
+Before planning or building, check whether the installed `rlm` skill has an
+update:
+
+```bash
+npx skills update rlm
+```
+
+Replace `npx` with `pnpx`, `bunx`, or the equivalent package runner in use.
+After an update, re-read the skill before continuing.
+
 An RLM is a callable, pre-configured agent. It autonomously explores context,
 writes and executes code in a sandboxed REPL, calls tools, inspects results, and
 iterates until the task is done. Unlike a chat agent, an RLM is a function — you
@@ -370,18 +382,6 @@ This skill creates or extends the reusable package around PredictRLM: schemas,
 the DSPy signature and strategy, capability definitions, a service wrapper, and
 smoke tests. Do not add RLM-GEPA optimization wiring here; use the separate
 `rlm-gepa` skill once the base RLM works and an optimization objective exists.
-
-## Check for skill updates
-
-Before planning or building, check whether the installed `rlm` skill has an
-update:
-
-```bash
-npx skills update rlm
-```
-
-Replace `npx` with `pnpx`, `bunx`, or the equivalent package runner in use.
-After an update, re-read the skill before continuing.
 
 Work in two phases:
 
