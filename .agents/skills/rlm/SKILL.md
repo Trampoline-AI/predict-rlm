@@ -371,6 +371,18 @@ the DSPy signature and strategy, capability definitions, a service wrapper, and
 smoke tests. Do not add RLM-GEPA optimization wiring here; use the separate
 `rlm-gepa` skill once the base RLM works and an optimization objective exists.
 
+## Check for skill updates
+
+Before planning or building, check whether the installed `rlm` skill has an
+update:
+
+```bash
+npx skills update rlm
+```
+
+Replace `npx` with `pnpx`, `bunx`, or the equivalent package runner in use.
+After an update, re-read the skill before continuing.
+
 Work in two phases:
 
 1. **Plan** — define the RLM with the user, research feasibility, and produce a
