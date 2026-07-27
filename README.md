@@ -73,6 +73,8 @@ With the Codex LM extra installed, import `CodexLM` or use the script. The
 vendored backend supports the GPT-5.6 family: `gpt-5.6-sol`, `gpt-5.6-terra`,
 and `gpt-5.6-luna`.
 
+Authenticate with `codex-lm` before running a Codex-backed workflow.
+
 ```python
 from dspy_codex_lm import CodexLM
 ```
