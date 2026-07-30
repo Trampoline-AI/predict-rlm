@@ -1313,6 +1313,36 @@ print(result)
 class TestNoneValueSerialization:
     """Tests that None/True/False in Pydantic models survive sandbox injection."""
 
+    def test_pydantic_model_with_date_and_decimal_injected_as_plain_data(self):
+        """Pydantic dates and decimals are JSON-safe before sandbox injection."""
+        from datetime import date
+        from decimal import Decimal
+
+        from pydantic import BaseModel
+
+        class Money(BaseModel):
+            amount: Decimal
+
+        class InvoiceLabel(BaseModel):
+            invoice_date: date
+            spend: Money
+
+        invoice = InvoiceLabel(
+            invoice_date=date(2026, 2, 9),
+            spend=Money(amount=Decimal("160.00")),
+        )
+
+        interpreter = JspiBackend(preinstall_packages=False)
+        try:
+            result = interpreter.execute(
+                "print(invoice['invoice_date'], invoice['spend']['amount'])",
+                variables={"invoice": invoice},
+            )
+        finally:
+            interpreter.shutdown()
+
+        assert str(result) == "2026-02-09 160.00\n"
+
     def test_pydantic_model_with_none_fields_injected_as_variable(self):
         """Pydantic models with None fields are accessible in the sandbox."""
         from pydantic import BaseModel, Field

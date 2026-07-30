@@ -30,7 +30,6 @@ from typing import TYPE_CHECKING, Any
 
 from dspy.primitives.code_interpreter import CodeInterpreterError, FinalOutput
 from dspy.primitives.python_interpreter import PythonInterpreter
-from pydantic import BaseModel
 
 from predict_rlm._logging import (
     configure_predict_rlm_logging,
@@ -1315,13 +1314,7 @@ class JspiBackend(SyncWorkerTracker, PythonInterpreter):
 
     def _to_python(self, value: Any) -> Any:
         """Recursively convert Pydantic models to plain Python dicts."""
-        if isinstance(value, BaseModel):
-            return value.model_dump()
-        if isinstance(value, list):
-            return [self._to_python(v) for v in value]
-        if isinstance(value, dict):
-            return {k: self._to_python(v) for k, v in value.items()}
-        return value
+        return to_plain_data(value)
 
     def _serialize_value(self, value: Any) -> str:
         """Serialize a Python value to a string representation for injection.
