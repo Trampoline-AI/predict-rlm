@@ -6,6 +6,8 @@ import shutil
 import threading
 from collections.abc import Sequence
 from contextlib import asynccontextmanager, contextmanager
+from datetime import date
+from decimal import Decimal
 from pathlib import Path
 from typing import Annotated
 from unittest.mock import AsyncMock, MagicMock
@@ -13,6 +15,7 @@ from unittest.mock import AsyncMock, MagicMock
 import dspy
 import pytest
 from dspy.primitives.code_interpreter import FinalOutput
+from pydantic import BaseModel
 
 from predict_rlm.backends.adapters import (
     InterpreterBackendAdapter,
@@ -432,6 +435,35 @@ async def test_strict_evidence_rejects_lossy_event_serialization():
         await recorder.emit(RunEventKind.RUN_STARTED, unsupported=object())
 
     assert sink.events == []
+
+
+def test_strict_evidence_serializes_pydantic_dates_and_decimals():
+    class InvoiceLabel(BaseModel):
+        invoice_date: date
+        spend: Decimal
+
+    sink = RecordingSink()
+    ctx = RunContext(make_spec(events=(sink,)), {})
+    recorder = EvidenceRecorder(ctx, (sink,))
+    asyncio.run(recorder.emit(RunEventKind.RUN_STARTED))
+
+    asyncio.run(
+        recorder.finish_success(
+            outputs={
+                "label": InvoiceLabel(
+                    invoice_date=date(2026, 2, 9),
+                    spend=Decimal("160.00"),
+                )
+            }
+        )
+    )
+
+    terminal = sink.events[-1]
+    assert terminal.kind is RunEventKind.RUN_SUCCEEDED
+    assert terminal.data["outputs"]["label"] == {
+        "invoice_date": "2026-02-09",
+        "spend": "160.00",
+    }
 
 
 @pytest.mark.asyncio
