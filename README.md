@@ -147,6 +147,9 @@ Then ask your agent to build an RLM:
 ❯ /rlm build an RLM that extracts line items from PDF invoices into a spreadsheet
 ```
 
+For train/validation optimization of an existing RLM, use the separate
+[`/rlm-gepa` skill](.agents/skills/rlm-gepa/SKILL.md).
+
 ### Quick Example
 
 ```python
