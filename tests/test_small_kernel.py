@@ -13,6 +13,7 @@ from unittest.mock import AsyncMock, MagicMock
 import dspy
 import pytest
 from dspy.primitives.code_interpreter import FinalOutput
+from pydantic import BaseModel, HttpUrl
 
 from predict_rlm.backends.adapters import (
     InterpreterBackendAdapter,
@@ -432,6 +433,25 @@ async def test_strict_evidence_rejects_lossy_event_serialization():
         await recorder.emit(RunEventKind.RUN_STARTED, unsupported=object())
 
     assert sink.events == []
+
+
+@pytest.mark.asyncio
+async def test_strict_evidence_serializes_pydantic_json_types():
+    class Request(BaseModel):
+        seed_url: HttpUrl
+
+    sink = RecordingSink()
+    ctx = RunContext(make_spec(events=(sink,)), {})
+    recorder = EvidenceRecorder(ctx, (sink,))
+
+    event = await recorder.emit(
+        RunEventKind.RUN_STARTED,
+        inputs={"request": Request(seed_url="https://example.com/venues")},
+    )
+
+    assert event.data["inputs"]["request"] == {
+        "seed_url": "https://example.com/venues"
+    }
 
 
 @pytest.mark.asyncio

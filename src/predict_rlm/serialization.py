@@ -52,6 +52,6 @@ def _is_pydantic_v1_model(value: Any) -> bool:
 
 def _model_dump(value: Any) -> Any:
     try:
-        return value.model_dump(mode="python")
+        return value.model_dump(mode="json")
     except TypeError:
         return value.model_dump()
