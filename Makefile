@@ -22,8 +22,8 @@ test-integration:
 
 # --- Per-suite targets (one per CI job; each installs only what it needs) ---
 
-# Core: no extras. Pure host-side logic; proves the package works standalone
-# (passes with neither Deno nor websockets present).
+# Core: no extras. Host logic and local CPython subprocess contracts;
+# no Deno execution, websockets, or external sandbox service.
 test-core:
 	uv run pytest -m "not integration and not sbx and not gepa and not codex_lm" $(ARGS)
 

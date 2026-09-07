@@ -17,6 +17,7 @@ SLUGIFY_SKILL = Skill(
     packages=["python-slugify"],
 )
 
+
 SLUGIFY_CODE = (
     "from slugify import slugify\n"
     "answer = slugify('Skill Packages Work')\n"
@@ -75,50 +76,11 @@ def _run_skill_package_rlm(**kwargs) -> None:
 
 
 @pytest.mark.integration
-@pytest.mark.skipif(shutil.which("deno") is None, reason="JSPI skill-package test requires Deno")
+@pytest.mark.skipif(
+    shutil.which("deno") is None, reason="JSPI skill-package test requires Deno"
+)
 def test_predict_rlm_installs_skill_packages_in_jspi_sandbox() -> None:
     _run_skill_package_rlm()
-
-
-@pytest.mark.sbx
-@pytest.mark.integration
-@pytest.mark.skipif(
-    not _real_sbx_available(),
-    reason="real SBX tests require PREDICT_RLM_RUN_SBX_TESTS=1, sbx CLI, and sbx login",
-)
-def test_predict_rlm_installs_skill_packages_in_sbx_sandbox() -> None:
-    from predict_rlm import SbxConfig
-
-    _run_skill_package_rlm(
-        sandbox_backend="sbx",
-        sbx_config=SbxConfig(name=f"predict-rlm-skill-package-{os.getpid()}"),
-    )
-
-
-@pytest.mark.sbx
-@pytest.mark.integration
-@pytest.mark.skipif(
-    not _real_sbx_available(),
-    reason="real SBX tests require PREDICT_RLM_RUN_SBX_TESTS=1, sbx CLI, and sbx login",
-)
-def test_predict_rlm_installs_skill_packages_in_injected_sbx_sandbox(tmp_path) -> None:
-    from predict_rlm import SbxConfig
-    from predict_rlm.backends import SbxBackend
-    from predict_rlm.workspace import DirectWorkspaceMount
-
-    interpreter = SbxBackend(
-        config=SbxConfig(name=f"predict-rlm-skill-package-injected-{os.getpid()}"),
-        direct_workspace_mounts=[
-            DirectWorkspaceMount(
-                host_path=str(tmp_path.resolve()),
-                sandbox_path=str(tmp_path.resolve()),
-            )
-        ],
-    )
-    try:
-        _run_skill_package_rlm(interpreter=interpreter)
-    finally:
-        interpreter.shutdown()
 
 
 @pytest.mark.sbx

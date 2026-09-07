@@ -1,4 +1,3 @@
-import json
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -32,33 +31,17 @@ def reset_dspy_cache():
 
 @pytest.fixture(autouse=True)
 def _disable_codex_retries_in_tests(monkeypatch):
-    """By default, tests see CodexLM behave like the pre-tenacity version:
-    one attempt, no retry, no backoff. Stream-error tests rely on a single
-    ``iter(events)`` side-effect that would be exhausted on retry. Tests
-    that want to exercise retry behaviour (``tests/test_auto_retry.py``)
-    re-raise this fixture's values to enable retries with zero backoff.
-    """
+    """Retries are opt-in; tests never sleep through production backoff."""
     monkeypatch.setattr("dspy_codex_lm.lm.CODEX_STREAM_MAX_ATTEMPTS", 1)
     monkeypatch.setattr("dspy_codex_lm.lm.CODEX_STREAM_WAIT_MULTIPLIER", 0.0)
     monkeypatch.setattr("dspy_codex_lm.lm.CODEX_STREAM_WAIT_MAX", 0.0)
 
 
-@pytest.fixture
-def fake_auth_file(tmp_path: Path) -> Path:
-    path = tmp_path / "auth.json"
-    path.write_text(
-        json.dumps(
-            {
-                "tokens": {
-                    "access_token": "fake-access-token",
-                    "account_id": "fake-account-id",
-                    "refresh_token": "fake-refresh",
-                    "id_token": "fake-id",
-                }
-            }
-        )
-    )
-    return path
+@pytest.fixture(autouse=True)
+def isolate_auth_home(tmp_path, monkeypatch):
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
+    monkeypatch.delenv("CODEX_LM_AUTH_PROFILE", raising=False)
+    monkeypatch.delenv("CODEX_LM_ENABLE_LEGACY_AUTH_FALLBACK", raising=False)
 
 
 @pytest.fixture

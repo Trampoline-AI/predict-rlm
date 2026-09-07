@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Reduced the package regression suite to behavioral contracts; consolidated
+  shared backend execution tests and removed duplicate inherited cases,
+  static/presentation checks, and one-off benchmark/example checks.
+- Direct CPython contracts now run in the core tier without the SBX extra.
+
 ### Breaking Changes
 
 - `SbxBackend.shutdown()` can no longer be called from the event loop that owns

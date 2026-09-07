@@ -76,13 +76,9 @@ def runner(tmp_path):
         proc.close()
 
 
-def test_runtime_hooks_are_opt_in(runner: LocalRunner, tmp_path: Path):
-    path = tmp_path / "no-hook.txt"
-    result = runner.request("execute", {"code": f"open({str(path)!r}, 'w').close()"})
-    assert result["result"]["output"] == ""
-
-
-def test_runtime_hooks_emit_function_events(runner: LocalRunner, tmp_path: Path):
+def test_runtime_hook_registration_emits_user_events_and_can_be_cleared(
+    runner: LocalRunner, tmp_path: Path
+):
     path = tmp_path / "hooked.txt"
     registered = runner.request(
         "register_runtime_hooks",
@@ -121,6 +117,15 @@ def test_runtime_hooks_emit_function_events(runner: LocalRunner, tmp_path: Path)
     ]
     assert events[0]["phase"] == "before"
     assert events[1]["phase"] == "after"
+    assert path.read_text(encoding="utf-8") == "hello"
+
+    runner.request("register_runtime_hooks", {"hooks": []})
+    execute = runner.request(
+        "execute",
+        {"code": f"Path({str(path)!r}).write_text('after reset')"},
+    )
+    assert "method" not in execute
+    assert path.read_text(encoding="utf-8") == "after reset"
 
 
 def test_runtime_hooks_do_not_emit_internal_capture_file_events(runner: LocalRunner):
@@ -143,19 +148,6 @@ def test_runtime_hooks_emit_error_events(runner: LocalRunner):
     assert event["method"] == "runtime_hook_event"
     assert event["params"]["target"] == "builtins.open"
     assert event["params"]["phase"] == "error"
-
-
-def test_runtime_hooks_reset_on_reregister(runner: LocalRunner, tmp_path: Path):
-    runner.request(
-        "register_runtime_hooks",
-        {"hooks": [{"target": "pathlib.Path.write_text", "phases": ["before"]}]},
-    )
-    # Re-register with empty set should clear hooks.
-    runner.request("register_runtime_hooks", {"hooks": []})
-    path = tmp_path / "after-reset.txt"
-    execute = runner.request(
-        "execute",
-        {"code": f"from pathlib import Path\nPath({str(path)!r}).write_text('x')"},
-    )
-    assert "method" not in execute
-    assert execute["result"]["output"] == ""
+    response = json.loads(runner.proc.stdout.readline())
+    assert response["error"]["data"]["type"] == "FileNotFoundError"
+    assert response["error"]["message"] == event["params"]["error"]

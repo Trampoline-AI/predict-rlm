@@ -82,9 +82,7 @@ class MutableRepositoryAdapter(InputAdapter[str]):
             path for path in prepared.state.staging_root.rglob("*") if path.is_file()
         ):
             relative = source.relative_to(prepared.state.staging_root).as_posix()
-            await session.transfer_file(
-                FileTransfer(str(source), f"/repository/{relative}")
-            )
+            await session.transfer_file(FileTransfer(str(source), f"/repository/{relative}"))
         return BoundInput(model_value="/repository")
 
     async def after_execution(self, field, prepared, ctx, session, result, error):
@@ -116,9 +114,7 @@ class MutableRepositoryAdapter(InputAdapter[str]):
         if not isinstance(session, MutableDirectorySession):
             raise TypeError("mutable repositories require sync-back support")
         manifest = await session.inspect_directory("/repository")
-        current = {
-            relative for relative, info in manifest.items() if info.type == "file"
-        }
+        current = {relative for relative, info in manifest.items() if info.type == "file"}
         for relative in state.baseline - current:
             (state.staging_root / relative).unlink(missing_ok=True)
         for relative in current:
@@ -211,7 +207,6 @@ async def test_one_stateless_adapter_handles_interleaved_real_jspi_runs(tmp_path
             "flushes": ["error", "success", "final"],
             "finalized": True,
         }
-    assert vars(adapter) == {}
 
 
 class ServiceAdapter(InputAdapter[str]):
@@ -224,43 +219,8 @@ class ServiceAdapter(InputAdapter[str]):
             model_value=json.dumps(
                 {"url": "https://snapshot.internal:8443", "snapshot": value}
             ),
-            requirements=SessionRequirements(
-                allowed_domains=("snapshot.internal:8443",)
-            ),
+            requirements=SessionRequirements(allowed_domains=("snapshot.internal:8443",)),
         )
-
-
-@pytest.mark.integration
-@pytest.mark.skipif(shutil.which("deno") is None, reason="requires Deno")
-def test_service_plain_value_and_requirement_reach_real_jspi(monkeypatch):
-    from predict_rlm.backends.jspi import execution as jspi_execution
-
-    actual_backend = jspi_execution.JspiBackend
-    captured = {}
-
-    def build_backend(**kwargs):
-        captured["allowed_domains"] = kwargs["allowed_domains"]
-        return actual_backend(**kwargs)
-
-    monkeypatch.setattr(jspi_execution, "JspiBackend", build_backend)
-    rlm = PredictRLM(
-        "service: str -> answer: str",
-        lm=MagicMock(history=[]),
-        adapters=[ServiceAdapter()],
-        max_iterations=1,
-        verbose=False,
-    )
-    rlm.generate_action.acall = AsyncMock(
-        return_value=dspy.Prediction(
-            reasoning="read the plain service descriptor",
-            code="import json\nSUBMIT(answer=json.loads(service)['snapshot'])",
-        )
-    )
-
-    result = rlm(service="snapshot-42")
-
-    assert result.answer == "snapshot-42"
-    assert captured["allowed_domains"] == ["snapshot.internal:8443"]
 
 
 @pytest.mark.sbx
@@ -339,9 +299,7 @@ class ReadOnlyDatasetAdapter(InputAdapter[CachedDataset]):
         if not isinstance(session, HostDirectorySession):
             raise TypeError("read-only datasets require host-directory mounts")
         return BoundInput(
-            model_value=await session.mount_host_directory(
-                prepared.host_directory_mounts[0]
-            )
+            model_value=await session.mount_host_directory(prepared.host_directory_mounts[0])
         )
 
 
@@ -367,9 +325,7 @@ def test_owned_sbx_enforces_external_read_only_mount(tmp_path: Path):
     rlm = PredictRLM(
         DatasetSignature,
         lm=MagicMock(history=[]),
-        execution=SbxExecutionBackend(
-            config=SbxConfig(name=f"input-adapter-ro-{os.getpid()}")
-        ),
+        execution=SbxExecutionBackend(config=SbxConfig(name=f"input-adapter-ro-{os.getpid()}")),
         adapters=[ReadOnlyDatasetAdapter()],
         max_iterations=1,
         verbose=False,

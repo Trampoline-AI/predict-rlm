@@ -24,117 +24,6 @@ def _events():
 
 
 @pytest.mark.asyncio
-async def test_codex_wslm_default_transport_streams_responses_websocket(unused_tcp_port):
-    captured = {}
-
-    async def ws_handler(request):
-        captured["headers"] = dict(request.headers)
-        ws = web.WebSocketResponse()
-        ws.headers["x-codex-turn-state"] = "sticky-1"
-        await ws.prepare(request)
-        message = await ws.receive_json()
-        captured["body"] = message
-        for event in _events():
-            await ws.send_str(json.dumps(event))
-        await ws.close()
-        return ws
-
-    app = web.Application()
-    app.router.add_get("/backend-api/codex/responses", ws_handler)
-    runner = web.AppRunner(app)
-    await runner.setup()
-    port = unused_tcp_port
-    site = web.TCPSite(runner, "127.0.0.1", port)
-    await site.start()
-
-    try:
-        lm = CodexWSLM(
-            model="gpt-5.3-codex",
-            access_token="fake-token",
-            account_id="fake-account",
-            ws_base="http://127.0.0.1:%d/backend-api/codex" % port,
-            cache=False,
-            ws_fallback=False,
-        )
-
-        result = await lm.aforward(prompt="hello", cache=False)
-    finally:
-        await runner.cleanup()
-
-    assert result.output[0].content[0].text == "hello"
-    assert captured["body"]["type"] == "response.create"
-    assert captured["body"]["model"] == "gpt-5.3-codex"
-    assert captured["body"]["stream"] is True
-    assert captured["headers"]["OpenAI-Beta"] == "responses_websockets=2026-02-06"
-    assert captured["headers"]["Authorization"] == "Bearer fake-token"
-    assert captured["headers"]["ChatGPT-Account-Id"] == "fake-account"
-
-
-@pytest.mark.asyncio
-async def test_codex_wslm_moves_responses_lite_header_into_response_create_metadata(
-    unused_tcp_port,
-):
-    captured = {"frames": []}
-
-    async def ws_handler(request):
-        captured["headers"] = dict(request.headers)
-        ws = web.WebSocketResponse()
-        await ws.prepare(request)
-        captured["frames"].append(await ws.receive_json())
-        await ws.send_json(
-            {
-                "type": "response.completed",
-                "response": {"id": "resp-prewarm"},
-            }
-        )
-        captured["frames"].append(await ws.receive_json())
-        for event in _events():
-            await ws.send_str(json.dumps(event))
-        await ws.close()
-        return ws
-
-    app = web.Application()
-    app.router.add_get("/backend-api/codex/responses", ws_handler)
-    runner = web.AppRunner(app)
-    await runner.setup()
-    port = unused_tcp_port
-    site = web.TCPSite(runner, "127.0.0.1", port)
-    await site.start()
-
-    try:
-        lm = CodexWSLM(
-            model="gpt-5.6-sol",
-            access_token="fake-token",
-            account_id="fake-account",
-            ws_base="http://127.0.0.1:%d/backend-api/codex" % port,
-            cache=False,
-            ws_fallback=False,
-        )
-
-        await lm.aforward(
-            prompt="hello",
-            cache=False,
-            headers={"X-Test-Header": "keep"},
-            client_metadata={"existing": "keep"},
-        )
-    finally:
-        await runner.cleanup()
-
-    handshake_headers = {key.lower(): value for key, value in captured["headers"].items()}
-    assert "x-openai-internal-codex-responses-lite" not in handshake_headers
-    assert handshake_headers["x-test-header"] == "keep"
-    for frame in captured["frames"]:
-        assert frame["type"] == "response.create"
-        assert frame["client_metadata"]["existing"] == "keep"
-        assert (
-            frame["client_metadata"][
-                "ws_request_header_x_openai_internal_codex_responses_lite"
-            ]
-            == "true"
-        )
-
-
-@pytest.mark.asyncio
 async def test_codex_wslm_response_lite_prewarms_before_generating(unused_tcp_port):
     frames = []
 
@@ -143,6 +32,11 @@ async def test_codex_wslm_response_lite_prewarms_before_generating(unused_tcp_po
         await ws.prepare(request)
 
         first = await ws.receive_json()
+        assert first["client_metadata"]["existing"] == "keep"
+        assert (
+            first["client_metadata"]["ws_request_header_x_openai_internal_codex_responses_lite"]
+            == "true"
+        )
         frames.append(first)
         if first.get("generate") is not False:
             for event in _events():
@@ -181,7 +75,9 @@ async def test_codex_wslm_response_lite_prewarms_before_generating(unused_tcp_po
             ws_fallback=False,
         )
 
-        result = await lm.aforward(prompt="hello", cache=False)
+        result = await lm.aforward(
+            prompt="hello", cache=False, client_metadata={"existing": "keep"}
+        )
     finally:
         await runner.cleanup()
 
@@ -244,14 +140,14 @@ async def test_codex_wslm_response_lite_prewarm_preserves_server_error_details(
     assert (
         exc_info.value.failure_kind,
         exc_info.value.failure_code,
-        str(exc_info.value),
         exc_info.value.retry_after_seconds,
     ) == (
         "error",
         "rate_limit_exceeded",
-        "Codex stream error (rate_limit_exceeded): prewarm capacity exhausted",
         2.5,
     )
+    assert "prewarm capacity exhausted" in str(exc_info.value)
+
 
 @pytest.mark.asyncio
 async def test_codex_wslm_uses_fresh_turn_state_per_forward(unused_tcp_port):
@@ -361,6 +257,7 @@ async def test_codex_wslm_websocket_401_is_codex_lm_auth_expired(
     unused_tcp_port,
 ):
     monkeypatch.setattr("dspy_codex_lm.lm.CODEX_STREAM_MAX_ATTEMPTS", 1)
+
     async def auth_failed(_request):
         return web.Response(status=401, text="expired")
 

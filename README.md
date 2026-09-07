@@ -354,6 +354,39 @@ result = await rlm.acall(query="...")
 Register globally instead with `dspy.configure(callbacks=[...])` and the
 same handlers fire for every `PredictRLM` instance.
 
+## Tests
+
+The default package regression suite is `tests/`; example-local suites are
+separate. Tests protect observable behavior, not exports, defaults, prompt wording,
+docstrings, source text, or mocked argument forwarding.
+
+- `tests/runtime_contracts/`: shared execution, state, submission, files, tools,
+  and recovery contracts across Direct, JSPI, and SBX. Backend-specific gaps are
+  explicit in `backends.py`; native Direct callbacks are serial, and deferred
+  submission is a Direct-only interpreter API.
+- RLM, adapter, file, and workspace tests: generated-code execution, typed
+  predictions, input/output handling, cancellation ownership, and data-loss boundaries.
+- Trace and telemetry tests: evidence projection, accounting, redaction, and
+  failure classification.
+- GEPA tests: candidate acceptance, merge guardrails, evaluation artifacts,
+  resume, and spend.
+- `tests/codex_lm/`: auth, transport completion/recovery, caching, and usage.
+
+```bash
+make test-unit              # all extras; no Deno or external SBX execution
+make test-integration-jspi  # real Deno/Pyodide contracts; no LM credentials
+make test-core             # no extras; includes local CPython processes
+make test-sbx              # local WebSocket supervisor and pool contracts
+make test-gepa
+make test-codex-lm
+```
+
+Real SBX tests require the CLI, login, and `make test-integration-sbx`.
+Bootstrap image tests additionally require Docker and
+`PREDICT_RLM_RUN_BOOTSTRAP_DOCKER_TESTS=1`. Timing-sensitive `local` tests run
+locally but are excluded from CI. Add a case only for a distinct failure or
+invariant; extend the shared contract instead of copying it into backend suites.
+
 ## Next steps
 
 - [Custom path inputs](docs/custom-path-inputs.md) — add file-, workspace-, or
