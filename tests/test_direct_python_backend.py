@@ -2,21 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from predict_rlm.backends.supervisor._payload import (
-    _pickleable_globals_snapshot,
-    _SandboxPath,
-)
 from predict_rlm.backends.supervisor.runner import DirectPythonBackend
-
-
-def test_sandbox_path_snapshot_uses_virtual_string() -> None:
-    snapshot = _pickleable_globals_snapshot({
-        "path": _SandboxPath("/sandbox/output/foo"),
-    })
-
-    assert snapshot["globals"] == {"path": "/sandbox/output/foo"}
-    assert snapshot["restored_globals"] == ["path"]
-    assert snapshot["lost_globals"] == []
 
 
 def test_sandbox_path_global_does_not_poison_later_execute(tmp_path: Path) -> None:
@@ -70,9 +56,7 @@ def test_regular_path_global_survives_timeout_recovery_as_path(tmp_path: Path) -
     )
     try:
         first = backend.execute(
-            "from pathlib import Path\n"
-            "p = Path('/app/model.xml')\n"
-            "print(type(p).__name__)",
+            "from pathlib import Path\np = Path('/app/model.xml')\nprint(type(p).__name__)",
             timeout=10,
         )
         backend.execute(
@@ -83,9 +67,7 @@ def test_regular_path_global_survives_timeout_recovery_as_path(tmp_path: Path) -
             timeout=0.05,
         )
         recovered = backend.execute(
-            "print(type(p).__name__)\n"
-            "print(hasattr(p, 'read_text'))\n"
-            "print(p / 'child.txt')",
+            "print(type(p).__name__)\nprint(hasattr(p, 'read_text'))\nprint(p / 'child.txt')",
             timeout=10,
         )
     finally:

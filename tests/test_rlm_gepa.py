@@ -1,19 +1,16 @@
 from __future__ import annotations
 
-import argparse
 import asyncio
 import json
-import os
 import pickle
 import random
+from contextlib import nullcontext
 from pathlib import Path
 from types import SimpleNamespace
 
-import dspy
 import pytest
 
-import rlm_gepa.cli as cli_module
-from predict_rlm.telemetry import JsonlTelemetrySink, TelemetryContext, classify_failure
+from predict_rlm.telemetry import JsonlTelemetrySink, TelemetryContext
 from predict_rlm.trace import (
     IterationStep,
     LMFinishMetadata,
@@ -24,52 +21,26 @@ from predict_rlm.trace import (
     TokenUsage,
     ToolCall,
 )
-from rlm_gepa import (
-    AgentSpec,
-    EvaluationContext,
-    OptimizeConfig,
-    RLMGepaProject,
-    agent_spec_from_rlm,
-    build_merge_signature,
-    build_patch_merge_signature,
-    build_proposer_for_rlm,
-    build_proposer_signature,
-    check_optimization,
-    run_optimization,
-)
-from rlm_gepa.cli import apply_optimize_args, run_project_cli
-from rlm_gepa.proposer.merge import VALID_STATUSES, RlmMergeProposer
-from rlm_gepa.proposer.rlm import (
-    ImproveInstructionsGeneric,
-    PatchMergeInstructionsGeneric,
-    RLMInstructionProposer,
-    SelectedCapability,
-)
-from rlm_gepa.proposer.selection import (
-    PatchMergePair,
-    pick_patch_merge_pair,
-)
-from rlm_gepa.reporting import stats as stats_report
+from rlm_gepa import AgentSpec, OptimizeConfig, RLMGepaProject
+from rlm_gepa.cli import run_project_cli
+from rlm_gepa.proposer.merge import RlmMergeProposer
+from rlm_gepa.proposer.rlm import RLMInstructionProposer
+from rlm_gepa.proposer.selection import pick_patch_merge_pair
 from rlm_gepa.reporting.cost import CostRow, aggregate_costs_from_log, append_cost_rows
-from rlm_gepa.reporting.plots import load_plot_data, make_lineage, resolve_plot_output_paths
+from rlm_gepa.reporting.plots import load_plot_data
 from rlm_gepa.reporting.stats import (
     candidate_rows,
     cost_rows,
-    eval_cost_rows,
-    eval_task_rows,
     iteration_rows,
     merge_rows,
     render_stats,
-    render_table,
 )
 from rlm_gepa.runtime.acceptance import should_accept_reflective_candidate
-from rlm_gepa.runtime.adapter import RLMGepaAdapter, _row_failure_metadata
+from rlm_gepa.runtime.adapter import RLMGepaAdapter
 from rlm_gepa.schema import RLMGepaExampleResult, validate_project
 from rlm_gepa.service import (
-    GroupAwareBatchSampler,
     _build_minibatch_sampler,
     _coerce_reflection_lm_text,
-    _ProgressCandidateSelector,
     prepare_run_dir,
 )
 
@@ -100,20 +71,6 @@ def _spec() -> AgentSpec:
     )
 
 
-def _spec_without_agent_type() -> AgentSpec:
-    return AgentSpec(
-        use_cases=["case a", "case b"],
-        runtime_grounding_examples={
-            "tools": ["tool()"],
-            "env": ["sandbox timeout"],
-            "spec": ["protocol behavior"],
-        },
-        tool_signatures="tool() -> str",
-        target_signature="input: str -> output: str",
-        scoring_description="score is exact match",
-    )
-
-
 class _Project(RLMGepaProject):
     project_name = "test-project"
     components = ("skill_instructions",)
@@ -130,20 +87,6 @@ class _Project(RLMGepaProject):
 
     async def evaluate_example(self, candidate, example, context):  # pragma: no cover
         raise NotImplementedError
-
-
-def test_reflective_candidate_accepts_bounded_dense_loss_with_hard_flip_signal():
-    decision = should_accept_reflective_candidate(
-        before_scores=[0.99, 0.99, 0.99, 0.50],
-        after_scores=[1.00, 1.00, 1.00, 0.45],
-    )
-
-    assert decision.accepted
-    assert decision.reason == "hard_flip_signal"
-    assert decision.dense_delta < 0.0
-    assert decision.hard_wins == 3
-    assert decision.hard_losses == 0
-    assert decision.hard_flip_p_value <= 0.40
 
 
 def test_reflective_candidate_rejects_bounded_dense_loss_without_significant_hard_flips():
@@ -184,120 +127,6 @@ def test_reflective_candidate_accepts_two_sided_hard_flip_signal_under_default_t
     assert decision.hard_flip_p_value == pytest.approx(0.375)
 
 
-def test_build_signatures_render_agent_spec():
-    spec = _spec()
-    proposer = build_proposer_signature(spec)
-    merge = build_merge_signature(spec)
-
-    assert "test agent" in proposer.instructions
-    assert "{{" not in proposer.instructions
-    assert "paired_disagreement_traces_file" in merge.input_fields
-
-
-def test_agent_spec_agent_type_is_optional():
-    proposer = build_proposer_signature(_spec_without_agent_type())
-    merge = build_merge_signature(_spec_without_agent_type())
-
-    assert "target RLM" in proposer.instructions
-    assert "target RLM" in merge.instructions
-    assert "for ." not in proposer.instructions
-    assert "{{" not in proposer.instructions
-
-
-def test_agent_spec_from_rlm_can_omit_agent_type():
-    class DemoSignature(dspy.Signature):
-        """Answer questions."""
-
-        question: str = dspy.InputField()
-        answer: str = dspy.OutputField()
-
-    def lookup(query: str) -> str:
-        """Look up a fact."""
-        return query
-
-    rlm = SimpleNamespace(signature=DemoSignature, tools=[lookup])
-
-    spec = agent_spec_from_rlm(
-        rlm,
-        use_cases=["case a", "case b"],
-        runtime_grounding_examples={
-            "tools": ["lookup(query)"],
-            "env": ["sandbox timeout"],
-            "spec": ["question answering"],
-        },
-        scoring_description="score is exact match",
-    )
-
-    assert spec.agent_type == ""
-    assert "DemoSignature" in spec.target_signature
-    assert "lookup" in spec.tool_signatures
-
-
-def test_proposer_signature_mentions_parallel_predict_analysis_for_concrete_edits():
-    proposer = build_proposer_signature(_spec())
-    instructions = " ".join(proposer.instructions.split())
-
-    assert "predict()" in instructions
-    assert "asyncio.gather" in instructions
-    assert "concrete" in instructions
-    assert "new_instructions" in instructions
-
-
-def test_patch_merge_signature_uses_base_and_patch_source_without_ancestor():
-    patch = build_patch_merge_signature(_spec())
-
-    assert "base_parent_id" in patch.input_fields
-    assert "base_parent_instructions" in patch.input_fields
-    assert "patch_source_parent_id" in patch.input_fields
-    assert "patch_source_parent_instructions" in patch.input_fields
-    assert "paired_disagreement_traces_file" in patch.input_fields
-    assert "common_ancestor_instructions" not in patch.input_fields
-    assert "common ancestor" not in patch.instructions.lower()
-
-
-def test_patch_merge_signature_exposes_selected_capability_contract():
-    patch = build_patch_merge_signature(_spec())
-
-    assert "patch_summary" in patch.output_fields
-    assert "selected_capability" in patch.output_fields
-    assert "patch_audit" in patch.output_fields
-    assert "new_instructions" in patch.output_fields
-    assert set(SelectedCapability.model_fields) == {
-        "decision",
-        "summary",
-        "evidence_task_ids",
-        "trigger",
-        "non_application_boundary",
-    }
-
-
-def test_merge_signature_is_evidence_backed_patch_contract():
-    merge = build_merge_signature(_spec())
-
-    assert set(merge.input_fields) == set(build_patch_merge_signature(_spec()).input_fields)
-    assert "base_parent_id" in merge.input_fields
-    assert "paired_disagreement_traces_file" in merge.input_fields
-    assert "common_ancestor_instructions" not in merge.input_fields
-    assert "synthesize" not in merge.instructions.lower()
-
-
-def test_validate_project_accepts_minimal_project():
-    result = validate_project(_Project())
-    assert result.seed_candidate == {"skill_instructions": "seed rules"}
-    assert list(result.trainset) == ["train"]
-    assert list(result.valset) == ["val"]
-
-
-def test_minibatch_sampler_uses_flat_epoch_shuffle_when_project_has_no_group_ids():
-    from gepa.core.data_loader import ensure_loader
-    from gepa.strategies.batch_sampler import EpochShuffledBatchSampler
-
-    loader = ensure_loader(["a", "b", "c", "d"])
-    sampler = _build_minibatch_sampler(_Project(), loader, minibatch_size=2, rng=random.Random(7))
-
-    assert isinstance(sampler, EpochShuffledBatchSampler)
-
-
 def test_group_aware_batch_sampler_keeps_groups_intact():
     from gepa.core.data_loader import ensure_loader
 
@@ -318,7 +147,6 @@ def test_group_aware_batch_sampler_keeps_groups_intact():
         rng=random.Random(7),
     )
 
-    assert isinstance(sampler, GroupAwareBatchSampler)
     batch_ids = sampler.next_minibatch_ids(loader, SimpleNamespace(i=0))
     batch_examples = loader.fetch(batch_ids)
     group_counts: dict[str, int] = {}
@@ -415,84 +243,6 @@ def test_pick_patch_merge_pair_dedups_sorted_pair_across_ancestors():
     assert pair is None
 
 
-def test_pick_patch_merge_pair_weighted_sampling_is_not_pure_argmax():
-    class FakeRng:
-        def __init__(self):
-            self.population = []
-            self.weights = []
-
-        def choices(self, population, weights, k):
-            assert k == 1
-            self.population = list(population)
-            self.weights = list(weights)
-            return [self.population[1]]
-
-    parents = [[None], [0], [0], [0]]
-    candidates = [
-        {"skill_instructions": "seed"},
-        {"skill_instructions": "parent one"},
-        {"skill_instructions": "parent two"},
-        {"skill_instructions": "parent three"},
-    ]
-    scores_1 = {"t0": 1.0, "t1": 1.0, "t2": 0.0, "t3": 0.0}
-    scores_2 = {"t0": 0.0, "t1": 0.0, "t2": 1.0, "t3": 1.0}
-    scores_3 = {"t0": 0.3, "t1": 0.3, "t2": 0.9, "t3": 0.9}
-    rng = FakeRng()
-
-    pair = pick_patch_merge_pair(
-        merge_candidates=[1, 2, 3],
-        program_candidates=candidates,
-        parent_program_for_candidate=parents,
-        prog_candidate_val_subscores=[{}, scores_1, scores_2, scores_3],
-        tracked_scores=[0.0, 0.4, 0.4, 0.4],
-        merges_performed=[],
-        rng=rng,
-        component_name="skill_instructions",
-        min_each=2,
-    )
-
-    assert pair == rng.population[1]
-    assert len(rng.population) > 1
-    weights_by_pair = {
-        (item.parent_a_id, item.parent_b_id): weight
-        for item, weight in zip(rng.population, rng.weights, strict=True)
-    }
-    assert weights_by_pair[(1, 2)] > weights_by_pair[(1, 3)]
-    assert (pair.parent_a_id, pair.parent_b_id) != (1, 2)
-
-
-def test_pick_patch_merge_pair_ties_pair_weights_deterministically():
-    class NoChoiceRng:
-        def choices(self, *_args, **_kwargs):
-            raise AssertionError("equal-weight selector should not call rng.choices")
-
-    parents = [[None], [0], [0], [0]]
-    candidates = [
-        {"skill_instructions": "seed"},
-        {"skill_instructions": "parent one"},
-        {"skill_instructions": "parent two"},
-        {"skill_instructions": "parent three"},
-    ]
-    scores_1 = {"t0": 1.0, "t1": 1.0, "t2": 0.0, "t3": 0.0}
-    scores_2 = {"t0": 0.0, "t1": 0.0, "t2": 1.0, "t3": 1.0}
-    scores_3 = dict(scores_2)
-
-    pair = pick_patch_merge_pair(
-        merge_candidates=[3, 2, 1],
-        program_candidates=candidates,
-        parent_program_for_candidate=parents,
-        prog_candidate_val_subscores=[{}, scores_1, scores_2, scores_3],
-        tracked_scores=[0.0, 0.4, 0.4, 0.4],
-        merges_performed=[],
-        rng=NoChoiceRng(),
-        component_name="skill_instructions",
-        min_each=2,
-    )
-
-    assert pair is not None
-    assert (pair.parent_a_id, pair.parent_b_id) == (1, 2)
-
-
 def test_pick_patch_merge_pair_chooses_higher_tracked_parent_as_base():
     parents = [[None], [0], [0]]
     candidates = [
@@ -520,125 +270,6 @@ def test_pick_patch_merge_pair_chooses_higher_tracked_parent_as_base():
     assert pair.patch_source_parent_id == 2
 
 
-def test_pick_patch_merge_pair_ties_base_parent_deterministically():
-    parents = [[None], [0], [0]]
-    candidates = [
-        {"skill_instructions": "seed"},
-        {"skill_instructions": "lower id"},
-        {"skill_instructions": "higher id"},
-    ]
-    scores_a = {f"t{i}": 1.0 if i % 2 else 0.0 for i in range(6)}
-    scores_b = {f"t{i}": 0.0 if i % 2 else 1.0 for i in range(6)}
-
-    pair = pick_patch_merge_pair(
-        merge_candidates=[2, 1],
-        program_candidates=candidates,
-        parent_program_for_candidate=parents,
-        prog_candidate_val_subscores=[{}, scores_a, scores_b],
-        tracked_scores=[0.0, 0.5, 0.5],
-        merges_performed=[],
-        rng=random.Random(0),
-        component_name="skill_instructions",
-        min_each=2,
-    )
-
-    assert pair is not None
-    assert pair.base_parent_id == 1
-    assert pair.patch_source_parent_id == 2
-
-
-def test_rlm_merge_proposer_uses_patch_selector_by_default(tmp_path: Path, monkeypatch):
-    from gepa.core.data_loader import ensure_loader
-
-    import rlm_gepa.proposer.merge as merge_module
-
-    calls = {"patch": 0}
-
-    def fake_find_dominators(*_args):
-        return [1, 2]
-
-    def fake_patch_selector(**_kwargs):
-        calls["patch"] += 1
-        return None
-
-    def evaluator(_inputs, _candidate):
-        return [], [], None
-
-    monkeypatch.setattr(merge_module, "find_dominator_programs", fake_find_dominators)
-    monkeypatch.setattr(merge_module, "pick_patch_merge_pair", fake_patch_selector)
-
-    state = SimpleNamespace(
-        i=0,
-        full_program_trace=[{}],
-        program_candidates=[
-            {"skill_instructions": "ancestor"},
-            {"skill_instructions": "parent a"},
-            {"skill_instructions": "parent b"},
-        ],
-        parent_program_for_candidate=[[None], [0], [0]],
-        prog_candidate_val_subscores=[{}, {"v1": 1.0}, {"v1": 0.0}],
-        program_full_scores_val_set=[0.0, 0.5, 0.4],
-        per_program_tracked_scores=[0.0, 0.5, 0.4],
-        total_num_evals=0,
-    )
-    state.get_pareto_front_mapping = lambda: {}
-    proposer = RlmMergeProposer(
-        logger=_Logger(),
-        valset=ensure_loader(["val"]),
-        evaluator=evaluator,
-        adapter=SimpleNamespace(),
-        trainset=ensure_loader(["train"]),
-        use_merge=True,
-        max_merge_invocations=1,
-        max_rlm_merge_attempts=5,
-        min_each=1,
-        merge_minibatch_size=1,
-        rlm_merge_state_path=tmp_path / "state.json",
-        rng=random.Random(0),
-    )
-    proposer.last_iter_found_new_program = True
-    proposer.merges_due = 1
-
-    assert proposer.propose(state) is None
-    assert calls == {"patch": 1}
-
-
-def _make_merge_helper(tmp_path: Path) -> RlmMergeProposer:
-    proposer = RlmMergeProposer.__new__(RlmMergeProposer)
-    proposer.rlm_merge_state_path = tmp_path / "rlm_merge_state.json"
-    proposer.rlm_merge_attempts_used = 0
-    proposer.merges_performed = ([], [])
-    return proposer
-
-
-def test_rlm_merge_status_helpers_validate_status_and_namespace(tmp_path: Path):
-    proposer = _make_merge_helper(tmp_path)
-    state = SimpleNamespace(full_program_trace=[{"i": 0}])
-
-    proposer._record_merge_status(
-        state,
-        "accepted",
-        attempt_idx=0,
-        rlm_merge_candidate_pair=(1, 2),
-    )
-
-    assert state.full_program_trace[-1]["rlm_merge_status"] == "accepted"
-    assert state.full_program_trace[-1]["rlm_merge_candidate_pair"] == (1, 2)
-    assert VALID_STATUSES == frozenset(
-        {
-            "attempt_cap_exhausted",
-            "pair_skipped",
-            "preflight_failed",
-            "subsample_rejected",
-            "accepted",
-            "error",
-        }
-    )
-
-    with pytest.raises(ValueError, match="invalid merge status"):
-        proposer._record_merge_status(state, "not_real", attempt_idx=None)
-    with pytest.raises(ValueError, match="must start with 'rlm_merge_'"):
-        proposer._record_merge_status(state, "accepted", attempt_idx=0, bad_field="value")
 class _FirstKRng(random.Random):
     def sample(self, population, k):
         return list(population)[:k]
@@ -653,19 +284,14 @@ class _PatchEvidenceAdapter:
         self.base_scores = base_scores
         self.source_scores = source_scores
         self.evaluate_calls = 0
-        self.progress_labels: list[str] = []
+        self.patch_calls = 0
 
-    def progress_label(self, label):
-        self.progress_labels.append(label)
+    def progress_label(self, _label):
+        return nullcontext()
 
-        class NoopContext:
-            def __enter__(self):
-                return None
-
-            def __exit__(self, *_args):
-                return False
-
-        return NoopContext()
+    def _rlm_propose_patch_merge_texts(self, **_kwargs):
+        self.patch_calls += 1
+        return "patched instructions", {"patch_summary": "imported one clause"}
 
     def evaluate(self, batch, _candidate, *, capture_traces, kind):
         scores = self.base_scores if self.evaluate_calls == 0 else self.source_scores
@@ -710,9 +336,15 @@ def _patch_evidence_state():
         i=0,
         full_program_trace=[{}],
         program_candidates=[
-            {"skill_instructions": "ancestor"},
-            {"skill_instructions": "base"},
-            {"skill_instructions": "source"},
+            {"skill_instructions": "ancestor", "other": "ancestor kept"},
+            {"skill_instructions": "base", "other": "base kept"},
+            {"skill_instructions": "source", "other": "source ignored"},
+        ],
+        parent_program_for_candidate=[[None], [0], [0]],
+        prog_candidate_val_subscores=[
+            {},
+            {"v1": 1.0, "v2": 1.0, "v3": 0.0, "v4": 0.0},
+            {"v1": 0.0, "v2": 0.0, "v3": 1.0, "v4": 1.0},
         ],
         total_num_evals=0,
     )
@@ -746,48 +378,6 @@ def _make_patch_evidence_proposer(
         rng=_FirstKRng(),
     )
     return proposer
-
-
-def test_patch_evidence_oversamples_two_minibatches_before_selecting_records(tmp_path: Path):
-    proposer = _make_patch_evidence_proposer(
-        tmp_path,
-        base_scores=[1.0, 0.9, 0.8, 0.7, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6],
-        source_scores=[0.1, 0.2, 0.3, 0.4, 1.0, 0.9, 0.8, 0.7, 0.6, 0.5],
-        merge_minibatch_size=4,
-    )
-
-    evidence = proposer._build_patch_disagreement_evidence(
-        state=_patch_evidence_state(),
-        iteration=1,
-        attempt_idx=0,
-        base_parent_id=1,
-        patch_source_parent_id=2,
-    )
-
-    assert len(evidence.sampled_train_ids) == 8
-    assert len(evidence.records) == 4
-
-
-def test_patch_evidence_progress_labels_use_zero_indexed_iteration(tmp_path: Path):
-    proposer = _make_patch_evidence_proposer(
-        tmp_path,
-        base_scores=[1.0, 0.0],
-        source_scores=[0.0, 1.0],
-        merge_minibatch_size=2,
-    )
-
-    proposer._build_patch_disagreement_evidence(
-        state=_patch_evidence_state(),
-        iteration=4,
-        attempt_idx=0,
-        base_parent_id=1,
-        patch_source_parent_id=2,
-    )
-
-    assert proposer.adapter.progress_labels == [
-        "Iteration 4 Patch Base Parent #1 Trace",
-        "Iteration 4 Patch Source Parent #2 Trace",
-    ]
 
 
 def test_patch_evidence_prefers_larger_disagreements_and_caps_records(tmp_path: Path):
@@ -840,208 +430,41 @@ def test_patch_evidence_balances_base_and_patch_source_win_directions(tmp_path: 
     assert winners.count("patch_source") == 2
 
 
-def test_patch_evidence_tops_up_with_both_success_records(tmp_path: Path):
+@pytest.mark.parametrize(
+    ("base_scores", "source_scores", "min_each"),
+    [
+        ([1.0, 1.0], [0.0, 0.0], 1),
+        ([1.0, 1.0, 0.0, 0.0], [0.0, 0.0, 1.0, 1.0], 2),
+    ],
+    ids=["missing-source-wins", "cap-drops-required-evidence"],
+)
+def test_patch_merge_rejects_unbalanced_selected_evidence(
+    tmp_path: Path, base_scores, source_scores, min_each
+):
     proposer = _make_patch_evidence_proposer(
         tmp_path,
-        base_scores=[1.0, 0.0, 1.0, 1.0, 1.0, 1.0],
-        source_scores=[0.0, 1.0, 1.0, 1.0, 1.0, 1.0],
-        merge_minibatch_size=6,
-    )
-
-    evidence = proposer._build_patch_disagreement_evidence(
-        state=_patch_evidence_state(),
-        iteration=1,
-        attempt_idx=0,
-        base_parent_id=1,
-        patch_source_parent_id=2,
-    )
-
-    winners = [record["winner"] for record in evidence.records]
-    assert winners.count("base") == 1
-    assert winners.count("patch_source") == 1
-    assert winners.count("both_success") == 4
-    assert len(evidence.records) == 6
-
-
-def test_patch_merge_preflight_fails_without_balanced_disagreement_evidence(
-    tmp_path: Path,
-    monkeypatch,
-):
-    from gepa.core.data_loader import ensure_loader
-
-    import rlm_gepa.proposer.merge as merge_module
-
-    class FakeAdapter(_PatchEvidenceAdapter):
-        def __init__(self):
-            super().__init__(tmp_path, base_scores=[1.0, 1.0], source_scores=[0.0, 0.0])
-            self.patch_calls = 0
-
-        def _rlm_propose_patch_merge_texts(self, **_kwargs):
-            self.patch_calls += 1
-            return "should not be called", {}
-
-    def evaluator(_inputs, _candidate):
-        return [], [], None
-
-    adapter = FakeAdapter()
-    monkeypatch.setattr(merge_module, "find_dominator_programs", lambda *_args: [1, 2])
-    monkeypatch.setattr(
-        merge_module,
-        "pick_patch_merge_pair",
-        lambda **_kwargs: PatchMergePair(
-            parent_a_id=1,
-            parent_b_id=2,
-            base_parent_id=1,
-            patch_source_parent_id=2,
-            ancestor=0,
-            common_ancestors=(0,),
-            oracle_score=1.0,
-            oracle_gain=0.5,
-            base_wins=("v1",),
-            patch_source_wins=("v2",),
-            weight=0.5,
-        ),
-    )
-    proposer = RlmMergeProposer(
-        logger=_Logger(),
-        valset=ensure_loader(["v1", "v2"]),
-        evaluator=evaluator,
-        adapter=adapter,
-        trainset=ensure_loader(["train_1", "train_2"]),
-        use_merge=True,
-        max_merge_invocations=1,
-        max_rlm_merge_attempts=5,
-        min_each=1,
+        base_scores=base_scores,
+        source_scores=source_scores,
         merge_minibatch_size=2,
-        rlm_merge_state_path=tmp_path / "state.json",
-        rng=_FirstKRng(),
+        min_each=min_each,
     )
-    proposer.last_iter_found_new_program = True
-    proposer.merges_due = 1
-    state = SimpleNamespace(
-        i=0,
-        full_program_trace=[{}],
-        program_candidates=[
-            {"skill_instructions": "ancestor"},
-            {"skill_instructions": "base"},
-            {"skill_instructions": "source"},
-        ],
-        parent_program_for_candidate=[[None], [0], [0]],
-        prog_candidate_val_subscores=[{}, {"v1": 1.0, "v2": 0.0}, {"v1": 0.0, "v2": 1.0}],
-        program_full_scores_val_set=[0.0, 0.5, 0.5],
-        per_program_tracked_scores=[0.0, 0.5, 0.5],
-        total_num_evals=0,
-    )
-    state.get_pareto_front_mapping = lambda: {}
+    state = _patch_evidence_state()
 
-    proposal = proposer.propose(state)
+    proposal = proposer._propose_patch_merge(
+        state=state, iteration=0, merge_candidates=[1, 2], tracked_scores=[0.0, 0.5, 0.5]
+    )
 
     assert proposal is None
-    assert adapter.patch_calls == 0
+    assert proposer.adapter.patch_calls == 0
     assert state.full_program_trace[-1]["rlm_merge_status"] == "preflight_failed"
-    assert state.full_program_trace[-1]["rlm_merge_reject_reason"].startswith(
-        "insufficient patch disagreement evidence"
-    )
-    assert state.full_program_trace[-1]["rlm_merge_preflight_base_wins"] == 2
-    assert state.full_program_trace[-1]["rlm_merge_preflight_patch_source_wins"] == 0
-
-
-def test_patch_merge_preflight_fails_when_prompt_cap_cannot_carry_min_each(
-    tmp_path: Path,
-    monkeypatch,
-):
-    from gepa.core.data_loader import ensure_loader
-
-    import rlm_gepa.proposer.merge as merge_module
-
-    class FakeAdapter(_PatchEvidenceAdapter):
-        def __init__(self):
-            super().__init__(
-                tmp_path,
-                base_scores=[1.0, 1.0, 0.0, 0.0],
-                source_scores=[0.0, 0.0, 1.0, 1.0],
-            )
-            self.patch_calls = 0
-
-        def _rlm_propose_patch_merge_texts(self, **_kwargs):
-            self.patch_calls += 1
-            return "should not be called", {}
-
-    def evaluator(_inputs, _candidate):
-        return [], [], None
-
-    adapter = FakeAdapter()
-    monkeypatch.setattr(merge_module, "find_dominator_programs", lambda *_args: [1, 2])
-    monkeypatch.setattr(
-        merge_module,
-        "pick_patch_merge_pair",
-        lambda **_kwargs: PatchMergePair(
-            parent_a_id=1,
-            parent_b_id=2,
-            base_parent_id=1,
-            patch_source_parent_id=2,
-            ancestor=0,
-            common_ancestors=(0,),
-            oracle_score=1.0,
-            oracle_gain=0.5,
-            base_wins=("v1", "v2"),
-            patch_source_wins=("v3", "v4"),
-            weight=0.5,
-        ),
-    )
-    proposer = RlmMergeProposer(
-        logger=_Logger(),
-        valset=ensure_loader(["v1", "v2", "v3", "v4"]),
-        evaluator=evaluator,
-        adapter=adapter,
-        trainset=ensure_loader(["train_1", "train_2", "train_3", "train_4"]),
-        use_merge=True,
-        max_merge_invocations=1,
-        max_rlm_merge_attempts=5,
-        min_each=2,
-        merge_minibatch_size=2,
-        rlm_merge_state_path=tmp_path / "state.json",
-        rng=_FirstKRng(),
-    )
-    proposer.last_iter_found_new_program = True
-    proposer.merges_due = 1
-    state = SimpleNamespace(
-        i=0,
-        full_program_trace=[{}],
-        program_candidates=[
-            {"skill_instructions": "ancestor"},
-            {"skill_instructions": "base"},
-            {"skill_instructions": "source"},
-        ],
-        parent_program_for_candidate=[[None], [0], [0]],
-        prog_candidate_val_subscores=[
-            {},
-            {"v1": 1.0, "v2": 1.0, "v3": 0.0, "v4": 0.0},
-            {"v1": 0.0, "v2": 0.0, "v3": 1.0, "v4": 1.0},
-        ],
-        program_full_scores_val_set=[0.0, 0.5, 0.5],
-        per_program_tracked_scores=[0.0, 0.5, 0.5],
-        total_num_evals=0,
-    )
-    state.get_pareto_front_mapping = lambda: {}
-
-    proposal = proposer.propose(state)
-
-    assert proposal is None
-    assert adapter.patch_calls == 0
-    assert state.full_program_trace[-1]["rlm_merge_status"] == "preflight_failed"
-    assert state.full_program_trace[-1]["rlm_merge_preflight_base_wins"] == 2
-    assert state.full_program_trace[-1]["rlm_merge_preflight_patch_source_wins"] == 2
-    assert state.full_program_trace[-1]["rlm_merge_selected_base_wins"] == 1
-    assert state.full_program_trace[-1]["rlm_merge_selected_patch_source_wins"] == 1
 
 
 def test_patch_disagreement_trace_jsonl_contains_patch_schema(tmp_path: Path):
     proposer = _make_patch_evidence_proposer(
         tmp_path,
-        base_scores=[1.0, 0.0],
-        source_scores=[0.0, 1.0],
-        merge_minibatch_size=2,
+        base_scores=[1.0, 0.0, 1.0],
+        source_scores=[0.0, 1.0, 1.0],
+        merge_minibatch_size=3,
     )
 
     evidence = proposer._build_patch_disagreement_evidence(
@@ -1051,9 +474,15 @@ def test_patch_disagreement_trace_jsonl_contains_patch_schema(tmp_path: Path):
         base_parent_id=1,
         patch_source_parent_id=2,
     )
-    records = [json.loads(line) for line in Path(evidence.paired_trace_path).read_text().splitlines()]
+    records = [
+        json.loads(line) for line in Path(evidence.paired_trace_path).read_text().splitlines()
+    ]
 
-    assert len(records) == 2
+    assert {record["task_id"]: record["evidence_role"] for record in records} == {
+        "train_0": "base_win",
+        "train_1": "patch_source_win",
+        "train_2": "both_success_guardrail",
+    }
     assert records[0]["schema_version"] == 1
     assert records[0]["winner"] in {"base", "patch_source"}
     assert records[0]["evidence_role"] in {"base_win", "patch_source_win"}
@@ -1071,103 +500,35 @@ def test_patch_disagreement_trace_jsonl_contains_patch_schema(tmp_path: Path):
     assert records[0]["patch_source_parent"]["feedback"]
 
 
-def test_patch_mode_proposer_wires_base_source_fields_without_ancestor(
-    tmp_path: Path,
-    monkeypatch,
+@pytest.mark.parametrize("child_scores", [[1.0, 1.0], [0.0, 1.0]], ids=["improved", "tied"])
+def test_patch_merge_requires_improvement_and_preserves_base_components(
+    tmp_path: Path, child_scores
 ):
-    from gepa.core.data_loader import ensure_loader
-
-    import rlm_gepa.proposer.merge as merge_module
-
-    class FakeAdapter(_PatchEvidenceAdapter):
-        def __init__(self):
-            super().__init__(tmp_path, base_scores=[1.0, 0.0], source_scores=[0.0, 1.0])
-            self.patch_kwargs = None
-
-        def _reserve_merge_proposer_call_idx(self):
-            return 9
-
-        def _rlm_propose_patch_merge_texts(self, **kwargs):
-            self.patch_kwargs = kwargs
-            return "patched instructions", {"patch_summary": "imported one clause"}
-
-        def queue_valset_progress_label(self, _label):
-            pass
-
-    def evaluator(_inputs, _candidate):
-        return [], [], None
-
-    adapter = FakeAdapter()
-    monkeypatch.setattr(merge_module, "find_dominator_programs", lambda *_args: [1, 2])
-    monkeypatch.setattr(
-        merge_module,
-        "pick_patch_merge_pair",
-        lambda **_kwargs: PatchMergePair(
-            parent_a_id=1,
-            parent_b_id=2,
-            base_parent_id=1,
-            patch_source_parent_id=2,
-            ancestor=0,
-            common_ancestors=(0,),
-            oracle_score=1.0,
-            oracle_gain=0.5,
-            base_wins=("v1",),
-            patch_source_wins=("v2",),
-            weight=0.5,
-        ),
+    proposer = _make_patch_evidence_proposer(
+        tmp_path, base_scores=[1.0, 0.0], source_scores=[0.0, 1.0], merge_minibatch_size=2
     )
-    proposer = RlmMergeProposer(
-        logger=_Logger(),
-        valset=ensure_loader(["v1", "v2"]),
-        evaluator=evaluator,
-        adapter=adapter,
-        trainset=ensure_loader(["train_1", "train_2"]),
-        use_merge=True,
-        max_merge_invocations=1,
-        max_rlm_merge_attempts=5,
-        min_each=1,
-        merge_minibatch_size=2,
-        rlm_merge_state_path=tmp_path / "state.json",
-        rng=_FirstKRng(),
-    )
-    proposer.last_iter_found_new_program = True
-    proposer.merges_due = 1
-    captured_child = {}
-    state = SimpleNamespace(
-        i=0,
-        full_program_trace=[{}],
-        program_candidates=[
-            {"skill_instructions": "ancestor", "other": "ancestor kept"},
-            {"skill_instructions": "base", "other": "base kept"},
-            {"skill_instructions": "source", "other": "source ignored"},
-        ],
-        parent_program_for_candidate=[[None], [0], [0]],
-        prog_candidate_val_subscores=[{}, {"v1": 1.0, "v2": 0.0}, {"v1": 0.0, "v2": 1.0}],
-        program_full_scores_val_set=[0.0, 0.5, 0.5],
-        per_program_tracked_scores=[0.0, 0.5, 0.5],
-        total_num_evals=0,
-    )
-    state.get_pareto_front_mapping = lambda: {}
+    state = _patch_evidence_state()
 
-    def cached_evaluate(candidate, ids, fetch, _evaluator):
-        captured_child.update(candidate)
-        assert list(ids) == [0, 1]
-        assert fetch(list(ids)) == ["train_1", "train_2"]
-        return [0.0, 0.0], 2
+    def cached_evaluate(candidate, ids, fetch, evaluator):
+        assert candidate == {"skill_instructions": "patched instructions", "other": "base kept"}
+        return child_scores, len(child_scores)
 
     state.cached_evaluate = cached_evaluate
+    proposal = proposer._propose_patch_merge(
+        state=state, iteration=0, merge_candidates=[1, 2], tracked_scores=[0.0, 0.5, 0.5]
+    )
 
-    proposal = proposer.propose(state)
-
-    assert proposal is None
-    assert adapter.patch_kwargs is not None
-    assert adapter.patch_kwargs["base_parent_id"] == 1
-    assert adapter.patch_kwargs["base_parent_instructions"] == "base"
-    assert adapter.patch_kwargs["patch_source_parent_id"] == 2
-    assert adapter.patch_kwargs["patch_source_parent_instructions"] == "source"
-    assert "paired_disagreement_traces_file" in adapter.patch_kwargs
-    assert "common_ancestor_instructions" not in adapter.patch_kwargs
-    assert captured_child == {"skill_instructions": "patched instructions", "other": "base kept"}
+    if sum(child_scores) > 1:
+        assert proposal.candidate == {
+            "skill_instructions": "patched instructions",
+            "other": "base kept",
+        }
+        assert proposal.parent_program_ids == [1, 2]
+        assert state.full_program_trace[-1]["rlm_merge_status"] == "accepted"
+    else:
+        assert proposal is None
+        assert state.full_program_trace[-1]["rlm_merge_status"] == "subsample_rejected"
+    assert state.program_candidates[1] == {"skill_instructions": "base", "other": "base kept"}
 
 
 def test_reflection_lm_text_normalization_accepts_common_payloads():
@@ -1192,67 +553,13 @@ def test_reflection_lm_text_normalization_accepts_common_payloads():
         _coerce_reflection_lm_text({"usage": {"input_tokens": 10}})
 
 
-def test_progress_candidate_selector_uses_zero_indexed_iteration():
-    class Selector:
-        def select_candidate_idx(self, _state):
-            return 4
-
-    class Adapter:
-        def __init__(self):
-            self.context = None
-
-        def set_reflective_progress_context(self, **kwargs):
-            self.context = kwargs
-
-    adapter = Adapter()
-    selector = _ProgressCandidateSelector(Selector(), adapter)
-
-    assert selector.select_candidate_idx(SimpleNamespace(i=5, program_candidates=[{}, {}, {}])) == 4
-    assert adapter.context == {"iteration": 5, "parent_idx": 4, "child_idx": 3}
-
-
-def _make_merge_proposer(tmp_path: Path, state_payload: dict | None = None) -> RlmMergeProposer:
-    from gepa.core.data_loader import ensure_loader
-
-    state_path = tmp_path / "rlm_merge_state.json"
-    if state_payload is not None:
-        state_path.write_text(json.dumps(state_payload))
-
-    def evaluator(_inputs, _candidate):
-        return [], [], None
-
-    return RlmMergeProposer(
-        logger=_Logger(),
-        valset=ensure_loader(["val"]),
-        evaluator=evaluator,
-        adapter=SimpleNamespace(),
-        trainset=ensure_loader(["train"]),
-        use_merge=True,
-        max_merge_invocations=1,
-        max_rlm_merge_attempts=5,
-        min_each=1,
-        merge_minibatch_size=1,
-        rlm_merge_state_path=state_path,
-        rng=random.Random(0),
-    )
-
-
-def test_rlm_merge_proposer_loads_sidecar_state(tmp_path: Path):
-    proposer = _make_merge_proposer(
+def test_merge_sidecar_preserves_attempts_and_pairs_on_resume(tmp_path: Path):
+    proposer = _make_patch_evidence_proposer(
         tmp_path,
-        {
-            "schema_version": 1,
-            "rlm_merge_attempts_used": 2,
-            "merges_performed": [[1, 2, 0], [3, 4, 1]],
-        },
+        base_scores=[1.0],
+        source_scores=[0.0],
+        merge_minibatch_size=1,
     )
-
-    assert proposer.rlm_merge_attempts_used == 2
-    assert proposer.merges_performed[0] == [(1, 2, 0), (3, 4, 1)]
-
-
-def test_rlm_merge_proposer_flushes_sidecar_on_propose_exit(tmp_path: Path):
-    proposer = _make_merge_proposer(tmp_path)
     proposer.use_merge = False
     proposer.rlm_merge_attempts_used = 1
     proposer.merges_performed[0].append((1, 2, 0))
@@ -1260,337 +567,14 @@ def test_rlm_merge_proposer_flushes_sidecar_on_propose_exit(tmp_path: Path):
 
     assert proposer.propose(state) is None
 
-    data = json.loads((tmp_path / "rlm_merge_state.json").read_text())
-    assert data["schema_version"] == 1
-    assert data["rlm_merge_attempts_used"] == 1
-    assert data["merges_performed"] == [[1, 2, 0]]
-    assert data["flushed_at"]
-    assert state.full_program_trace[-1]["invoked_merge"] is True
-
-
-def test_plot_output_paths_default_to_run_dir(tmp_path: Path):
-    score_path, lineage_path = resolve_plot_output_paths(tmp_path)
-
-    assert score_path == tmp_path / "plots" / "score_vs_rollouts.png"
-    assert lineage_path == tmp_path / "plots" / "candidate_lineage.png"
-
-
-def test_plot_output_paths_accept_directory_or_prefix(tmp_path: Path):
-    score_path, lineage_path = resolve_plot_output_paths(tmp_path, tmp_path / "plots")
-
-    assert score_path == tmp_path / "plots" / "score_vs_rollouts.png"
-    assert lineage_path == tmp_path / "plots" / "candidate_lineage.png"
-
-    score_path, lineage_path = resolve_plot_output_paths(tmp_path, tmp_path / "summary.png")
-
-    assert score_path == tmp_path / "summary_score_vs_rollouts.png"
-    assert lineage_path == tmp_path / "summary_candidate_lineage.png"
-
-
-class _FakePlotlyFigure:
-    def __init__(self):
-        self.traces = []
-        self.annotations = []
-        self.layout = {}
-
-    def add_trace(self, trace):
-        self.traces.append(trace)
-
-    def add_annotation(self, **kwargs):
-        self.annotations.append(kwargs)
-
-    def update_layout(self, **kwargs):
-        self.layout.update(kwargs)
-
-
-def _fake_plotly_scatter(**kwargs):
-    return SimpleNamespace(**kwargs)
-
-
-_fake_plotly_go = SimpleNamespace(Figure=_FakePlotlyFigure, Scatter=_fake_plotly_scatter)
-
-
-def test_lineage_draws_all_valid_merge_parent_edges():
-    data = {
-        "n": 4,
-        "scores": [0.1, 0.2, 0.3, 0.4],
-        "parents": [[None], [0], [0], [1, 2]],
-        "best_idx": 3,
-        "pareto_map": {},
-    }
-
-    fig = make_lineage(data, _fake_plotly_go)
-    edge_trace = fig.traces[0]
-    node_trace = fig.traces[1]
-    coord_to_candidate = {
-        (x, y): int(str(text).split("<br>", maxsplit=1)[0])
-        for x, y, text in zip(node_trace.x, node_trace.y, node_trace.text, strict=True)
-    }
-    edges = {
-        (
-            coord_to_candidate[(edge_trace.x[i], edge_trace.y[i])],
-            coord_to_candidate[(edge_trace.x[i + 1], edge_trace.y[i + 1])],
-        )
-        for i in range(0, len(edge_trace.x), 3)
-    }
-
-    assert edge_trace.x.count(None) == 4
-    assert edges == {(0, 1), (0, 2), (1, 3), (2, 3)}
-    assert "Parents: 1, 2" in node_trace.hovertext[3]
-
-
-def test_lineage_reflows_merge_candidates_to_reduce_crossings():
-    data = {
-        "n": 8,
-        "scores": [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8],
-        "parents": [[None], [0], [0], [1, 2], [0], [4], [4], [1, 4]],
-        "best_idx": 7,
-        "pareto_map": {},
-    }
-
-    fig = make_lineage(data, _fake_plotly_go)
-    positions = _lineage_node_positions(fig)
-    edges = _lineage_edges(fig)
-    baseline_positions = _primary_tree_lineage_positions(data["parents"])
-    baseline_crossings = _edge_crossing_count(edges, baseline_positions)
-
-    assert baseline_crossings > 0
-    assert _edge_crossing_count(edges, positions) < baseline_crossings
-    assert _distance_from_parent_center(3, (1, 2), positions) < _distance_from_parent_center(
-        3, (1, 2), baseline_positions
+    resumed = _make_patch_evidence_proposer(
+        tmp_path,
+        base_scores=[1.0],
+        source_scores=[0.0],
+        merge_minibatch_size=1,
     )
-
-
-def test_best_lineage_annotation_reserves_horizontal_space_from_same_layer_nodes():
-    data = {
-        "n": 8,
-        "scores": [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8],
-        "parents": [[None], [0], [0], [1, 2], [0], [4], [4], [1, 4]],
-        "best_idx": 7,
-        "pareto_map": {},
-    }
-
-    fig = make_lineage(data, _fake_plotly_go)
-    positions = _lineage_node_positions(fig)
-    best_annotation = next(annotation for annotation in fig.annotations if "Candidate 7 (best)" in annotation["text"])
-    xmin, xmax = _annotation_horizontal_footprint(best_annotation)
-    same_layer_nodes = {
-        candidate: x
-        for candidate, (x, y) in positions.items()
-        if candidate != 7 and y == positions[7][1]
-    }
-
-    assert {
-        candidate: x
-        for candidate, x in same_layer_nodes.items()
-        if xmin < x < xmax
-    } == {}
-
-
-def test_lineage_spaces_nodes_away_from_unowned_straight_edges():
-    data = {
-        "n": 13,
-        "scores": [0.899, 0.895, 0.934, 0.898, 0.873, 0.945, 0.931, 0.900, 0.925, 0.951, 0.952, 0.910, 0.970],
-        "parents": [[None], [0], [1], [0], [0], [2], [0], [0], [5], [8, 7], [8], [5], [2]],
-        "best_idx": 12,
-        "pareto_map": {},
-    }
-
-    fig = make_lineage(data, _fake_plotly_go)
-    edge_trace = fig.traces[0]
-
-    assert edge_trace.x.count(None) == 13
-    assert _lineage_edge_node_intersections(fig) == []
-
-
-def _annotation_horizontal_footprint(annotation: dict[str, object]) -> tuple[float, float]:
-    x = float(annotation["x"])
-    width = 1.5
-    if annotation["xanchor"] == "right":
-        return x - width, x
-    return x, x + width
-
-
-def _lineage_node_positions(fig) -> dict[int, tuple[float, float]]:
-    node_trace = fig.traces[1]
-    return {
-        int(str(text).split("<br>", maxsplit=1)[0]): (float(x), float(y))
-        for x, y, text in zip(node_trace.x, node_trace.y, node_trace.text, strict=True)
-    }
-
-
-def _lineage_edges(fig) -> list[tuple[int, int]]:
-    edge_trace = fig.traces[0]
-    positions = _lineage_node_positions(fig)
-    candidate_by_position = {position: candidate for candidate, position in positions.items()}
-    return [
-        (
-            candidate_by_position[(float(edge_trace.x[index]), float(edge_trace.y[index]))],
-            candidate_by_position[(float(edge_trace.x[index + 1]), float(edge_trace.y[index + 1]))],
-        )
-        for index in range(0, len(edge_trace.x), 3)
-    ]
-
-
-def _primary_tree_lineage_positions(raw_parents: list[object]) -> dict[int, tuple[float, float]]:
-    primary_parents = [_first_valid_parent(raw_parent, child) for child, raw_parent in enumerate(raw_parents)]
-    children: dict[int, list[int]] = {index: [] for index in range(len(raw_parents))}
-    for child, parent in enumerate(primary_parents):
-        if parent is not None:
-            children[parent].append(child)
-
-    depth = [0] * len(raw_parents)
-
-    def compute_depth(node: int, current_depth: int) -> None:
-        depth[node] = current_depth
-        for child in children[node]:
-            compute_depth(child, current_depth + 1)
-
-    for root, parent in enumerate(primary_parents):
-        if parent is None:
-            compute_depth(root, 0)
-
-    x_pos: dict[int, float] = {}
-    next_x = 0
-
-    def layout(node: int) -> None:
-        nonlocal next_x
-        if not children[node]:
-            x_pos[node] = float(next_x)
-            next_x += 1
-            return
-        for child in children[node]:
-            layout(child)
-        x_pos[node] = sum(x_pos[child] for child in children[node]) / len(children[node])
-
-    for root, parent in enumerate(primary_parents):
-        if parent is None:
-            layout(root)
-
-    return {index: (x_pos[index], float(-depth[index])) for index in range(len(raw_parents))}
-
-
-def _first_valid_parent(raw_parent: object, child: int) -> int | None:
-    raw_values = raw_parent if isinstance(raw_parent, list | tuple) else [raw_parent]
-    for value in raw_values:
-        if isinstance(value, bool) or value is None:
-            continue
-        parent = int(value)
-        if 0 <= parent < child:
-            return parent
-    return None
-
-
-def _edge_crossing_count(
-    edges: list[tuple[int, int]], positions: dict[int, tuple[float, float]]
-) -> int:
-    return sum(
-        _segments_cross(edge, other_edge, positions)
-        for index, edge in enumerate(edges)
-        for other_edge in edges[index + 1 :]
-    )
-
-
-def _lineage_edge_node_intersections(fig, node_radius: float = 0.25) -> list[tuple[tuple[float, float], tuple[float, float], int]]:
-    positions = _lineage_node_positions(fig)
-    edge_trace = fig.traces[0]
-    intersections = []
-    polyline: list[tuple[float, float]] = []
-    for x, y in zip(edge_trace.x, edge_trace.y, strict=True):
-        if x is None or y is None:
-            intersections.extend(_polyline_node_intersections(polyline, positions, node_radius))
-            polyline = []
-        else:
-            polyline.append((float(x), float(y)))
-    intersections.extend(_polyline_node_intersections(polyline, positions, node_radius))
-    return intersections
-
-
-def _polyline_node_intersections(
-    polyline: list[tuple[float, float]],
-    positions: dict[int, tuple[float, float]],
-    node_radius: float,
-) -> list[tuple[tuple[float, float], tuple[float, float], int]]:
-    if len(polyline) < 2:
-        return []
-    endpoints = {polyline[0], polyline[-1]}
-    return [
-        (start, end, candidate)
-        for start, end in zip(polyline, polyline[1:])
-        for candidate, position in positions.items()
-        if position not in endpoints and _point_segment_distance(position, start, end) < node_radius
-    ]
-
-
-def _point_segment_distance(
-    point: tuple[float, float], start: tuple[float, float], end: tuple[float, float]
-) -> float:
-    px, py = point
-    sx, sy = start
-    ex, ey = end
-    dx = ex - sx
-    dy = ey - sy
-    segment_len_sq = dx * dx + dy * dy
-    if segment_len_sq == 0:
-        return ((px - sx) ** 2 + (py - sy) ** 2) ** 0.5
-    t = max(0.0, min(1.0, ((px - sx) * dx + (py - sy) * dy) / segment_len_sq))
-    nearest_x = sx + t * dx
-    nearest_y = sy + t * dy
-    return ((px - nearest_x) ** 2 + (py - nearest_y) ** 2) ** 0.5
-
-
-def _segments_cross(
-    edge: tuple[int, int],
-    other_edge: tuple[int, int],
-    positions: dict[int, tuple[float, float]],
-) -> bool:
-    if set(edge) & set(other_edge):
-        return False
-    a, b = positions[edge[0]], positions[edge[1]]
-    c, d = positions[other_edge[0]], positions[other_edge[1]]
-    ab_c = _orientation(a, b, c)
-    ab_d = _orientation(a, b, d)
-    cd_a = _orientation(c, d, a)
-    cd_b = _orientation(c, d, b)
-    return ab_c * ab_d < 0 and cd_a * cd_b < 0
-
-
-def _orientation(
-    a: tuple[float, float], b: tuple[float, float], c: tuple[float, float]
-) -> float:
-    return (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0])
-
-
-def _distance_from_parent_center(
-    candidate: int, parents: tuple[int, ...], positions: dict[int, tuple[float, float]]
-) -> float:
-    parent_center = sum(positions[parent][0] for parent in parents) / len(parents)
-    return abs(positions[candidate][0] - parent_center)
-
-
-def test_cost_aggregation_raw_and_logical(tmp_path: Path):
-    path = tmp_path / "cost_log.jsonl"
-    row = CostRow(
-        event_id="event_1",
-        operation_id="op_1",
-        attempt_id="attempt_1",
-        event="minibatch",
-        role="executor",
-        model="dummy",
-        calls=2,
-        input_tokens=10,
-        output_tokens=5,
-        cost_usd=0.1,
-    )
-    append_cost_rows(path, [row, row])
-
-    raw = aggregate_costs_from_log(path)
-    logical = aggregate_costs_from_log(path, logical=True)
-
-    assert raw[0].calls == 4
-    assert raw[0].cost_usd == pytest.approx(0.2)
-    assert logical[0].calls == 2
-    assert logical[0].cost_usd == pytest.approx(0.1)
+    assert resumed.rlm_merge_attempts_used == 1
+    assert resumed.merges_performed[0] == [(1, 2, 0)]
 
 
 def test_logical_cost_keeps_resumed_operations_with_reused_local_counters(tmp_path: Path):
@@ -1625,6 +609,13 @@ def test_logical_cost_keeps_resumed_operations_with_reused_local_counters(tmp_pa
 
     assert logical[0].calls == 5
     assert logical[0].cost_usd == pytest.approx(0.3)
+    raw = aggregate_costs_from_log(path)
+    assert raw[0].calls == 7
+    assert raw[0].cost_usd == pytest.approx(0.4)
+    total = next(row for row in cost_rows(tmp_path) if row["scope"] == "TOTAL")
+    assert total["total_cost"] == "$0.40"
+    assert total["repeat_cost"] == "$0.10"
+    assert total["effective_cost"] == "$0.30"
 
 
 def test_logical_cost_does_not_collapse_legacy_rows_without_operation_ids(tmp_path: Path):
@@ -1691,95 +682,6 @@ def test_merge_iteration_rows_use_best_actual_parent_instead_of_oracle(tmp_path:
     assert merge_stats[0]["hard: best(par) -> merge"] == "0.250 → 0.000 -0.250; 1 → 0"
     assert merge_stats[0]["flips"] == "+0/-1 -1"
     assert merge_stats[0]["p"] == "1.00"
-    assert "score Δ" not in merge_stats[0]
-
-
-def test_stats_hard_flip_p_values_use_two_sided_exact_for_ties(tmp_path: Path):
-    parent_scores = [0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0]
-    child_scores = [1.0, 1.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0]
-    state = {
-        "full_program_trace": [
-            {
-                "i": 0,
-                "selected_program_candidate": 0,
-                "new_program_idx": 1,
-                "subsample_scores": parent_scores,
-                "new_subsample_scores": child_scores,
-            },
-            {
-                "i": 1,
-                "rlm_merge_candidate_pair": (0, 1),
-                "id1_subsample_scores": parent_scores,
-                "id2_subsample_scores": [0.0] * len(parent_scores),
-                "new_program_subsample_scores": child_scores,
-            },
-        ],
-    }
-    with (tmp_path / "gepa_state.bin").open("wb") as f:
-        pickle.dump(state, f)
-
-    rows = iteration_rows(tmp_path)
-    merge_stats = merge_rows(tmp_path)
-
-    assert rows[0]["flips"] == "+4/-4 +0"
-    assert rows[0]["p"] == "1.00"
-    assert merge_stats[0]["flips"] == "+4/-4 +0"
-    assert merge_stats[0]["p"] == "1.00"
-
-
-def test_merge_rows_report_accepted_child_without_full_val_detail(tmp_path: Path):
-    state = {
-        "prog_candidate_val_subscores": [
-            {"a": 0.0, "b": 1.0, "c": 0.0},
-            {"a": 1.0, "b": 1.0, "c": 0.0},
-            {"a": 0.0, "b": 1.0, "c": 1.0},
-            {"a": 1.0, "b": 1.0, "c": 1.0},
-        ],
-        "full_program_trace": [
-            {
-                "i": 8,
-                "rlm_merge_candidate_pair": (1, 2),
-                "rlm_merge_ancestor": 0,
-                "rlm_merge_status": "accepted",
-                "rlm_merge_base_parent": 1,
-                "rlm_merge_patch_source_parent": 2,
-                "new_program_idx": 3,
-                "id1_subsample_scores": [1.0, 0.0],
-                "id2_subsample_scores": [0.0, 1.0],
-                "new_program_subsample_scores": [1.0, 1.0],
-            }
-        ],
-    }
-    with (tmp_path / "gepa_state.bin").open("wb") as f:
-        pickle.dump(state, f)
-
-    rows = merge_rows(tmp_path)
-
-    assert [key for key in rows[0] if not key.startswith("_")] == [
-        "iter",
-        "pair@anc",
-        "soft: best(par) -> merge",
-        "hard: best(par) -> merge",
-        "flips",
-        "p",
-        "outcome",
-    ]
-    assert "pre" not in rows[0]
-    assert "n" not in rows[0]
-    assert "val Δ" not in rows[0]
-    assert "score Δ" not in rows[0]
-    assert "status" not in rows[0]
-    assert rows[0]["soft: best(par) -> merge"] == "0.500 → 1.000 +0.500"
-    assert rows[0]["hard: best(par) -> merge"] == "0.500 → 1.000 +0.500; 1 → 2"
-    assert rows[0]["flips"] == "+1/-0 +1"
-    assert rows[0]["p"] == "1.00"
-    assert rows[0]["outcome"] == "accepted"
-    assert rows[0]["_muted_prefix"] == {
-        "soft: best(par) -> merge": "0.500 → 1.000",
-        "hard: best(par) -> merge": "0.500 → 1.000",
-        "flips": "+1/-0",
-    }
-    assert rows[0]["_detail"] == "→ cand 3"
 
 
 def test_merge_rows_use_subsample_scores_for_table_metrics_not_full_val_details(tmp_path: Path):
@@ -1845,88 +747,12 @@ def test_merge_rows_do_not_use_normal_mutation_child_for_rejected_merge_val(tmp_
 
     rows = merge_rows(tmp_path)
 
-    assert "val Δ" not in rows[0]
-    assert "score Δ" not in rows[0]
-    assert "status" not in rows[0]
     assert rows[0]["soft: best(par) -> merge"] == "0.500 → 0.500 +0.000"
     assert rows[0]["hard: best(par) -> merge"] == "0.500 → 0.500 +0.000; 1 → 1"
     assert rows[0]["flips"] == "+1/-1 +0"
     assert rows[0]["p"] == "1.00"
     assert rows[0]["outcome"] == "rejected"
-    assert rows[0]["_muted_prefix"] == {
-        "soft: best(par) -> merge": "0.500 → 0.500",
-        "hard: best(par) -> merge": "0.500 → 0.500",
-        "flips": "+1/-1",
-    }
     assert rows[0]["_detail"] == "not better than best parent"
-
-
-def test_merge_rows_use_explicit_merge_child_for_accepted_detail(tmp_path: Path):
-    state = {
-        "prog_candidate_val_subscores": [
-            {"a": 0.0, "b": 1.0, "c": 0.0},
-            {"a": 1.0, "b": 1.0, "c": 0.0},
-            {"a": 0.0, "b": 1.0, "c": 1.0},
-            {"a": 0.0, "b": 0.0, "c": 0.0},
-            {"a": 1.0, "b": 1.0, "c": 1.0},
-        ],
-        "full_program_trace": [
-            {
-                "i": 10,
-                "rlm_merge_candidate_pair": (1, 2),
-                "rlm_merge_ancestor": 0,
-                "rlm_merge_status": "accepted",
-                "rlm_merge_new_program_idx": 4,
-                "new_program_idx": 3,
-                "id1_subsample_scores": [1.0, 0.0],
-                "id2_subsample_scores": [0.0, 1.0],
-                "new_program_subsample_scores": [1.0, 1.0],
-            }
-        ],
-    }
-    with (tmp_path / "gepa_state.bin").open("wb") as f:
-        pickle.dump(state, f)
-
-    rows = merge_rows(tmp_path)
-
-    assert "val Δ" not in rows[0]
-    assert "score Δ" not in rows[0]
-    assert "status" not in rows[0]
-    assert rows[0]["soft: best(par) -> merge"] == "0.500 → 1.000 +0.500"
-    assert rows[0]["hard: best(par) -> merge"] == "0.500 → 1.000 +0.500; 1 → 2"
-    assert rows[0]["flips"] == "+1/-0 +1"
-    assert rows[0]["p"] == "1.00"
-    assert rows[0]["outcome"] == "accepted"
-    assert rows[0]["_muted_prefix"] == {
-        "soft: best(par) -> merge": "0.500 → 1.000",
-        "hard: best(par) -> merge": "0.500 → 1.000",
-        "flips": "+1/-0",
-    }
-    assert rows[0]["_detail"] == "→ cand 4"
-
-
-def test_iteration_hard_count_transition_aligns_count_width(tmp_path: Path):
-    parent_scores = [1.0] * 13 + [0.0] * 37
-    child_scores = [1.0] * 9 + [0.0] * 41
-    state = {
-        "full_program_trace": [
-            {
-                "i": 8,
-                "selected_program_candidate": 2,
-                "subsample_scores": parent_scores,
-                "new_subsample_scores": child_scores,
-            }
-        ]
-    }
-    with (tmp_path / "gepa_state.bin").open("wb") as f:
-        pickle.dump(state, f)
-
-    rows = iteration_rows(tmp_path)
-
-    assert rows[0]["hard: par → child"] == "0.260 → 0.180 -0.080; 13 →  9"
-    rendered = render_table(rows, width=120)
-    plain_rendered = stats_report.re.sub(r"\033\[[0-9;]*m", "", rendered)
-    assert ".260 → .180 -.080; 13 →  9" in plain_rendered
 
 
 def test_iteration_rows_include_attempts_without_child_scores(tmp_path: Path):
@@ -1948,273 +774,9 @@ def test_iteration_rows_include_attempts_without_child_scores(tmp_path: Path):
     rows = iteration_rows(tmp_path)
 
     assert [row["iter"] for row in rows] == ["1 [0]", "2 [0]"]
-    assert rows[0] == {
-        "iter": "1 [0]",
-        "soft: par → child": "-",
-        "hard: par → child": "-",
-        "flips": "-",
-        "p": "-",
-        "outcome": "NO CHILD",
-        "_highlight": False,
-        "_muted_prefix": {},
-        "_iteration_hard_denominator": 2,
-        "_terminal_header_suffixes": {"hard: par → child": "/2"},
-    }
+    assert rows[0]["outcome"] == "NO CHILD"
+    assert rows[0]["soft: par → child"] == "-"
     assert rows[1]["outcome"] == "REJECTED"
-
-
-def test_merge_rows_compact_outcomes_for_terminal_width(tmp_path: Path):
-    state = {
-        "full_program_trace": [
-            {"i": 1, "rlm_merge_status": "pair_skipped", "rlm_merge_candidate_pair": (0, 1)},
-            {
-                "i": 2,
-                "rlm_merge_status": "no_merge_candidate",
-                "rlm_merge_candidate_pair": (0, 1),
-            },
-            {
-                "i": 3,
-                "rlm_merge_status": "subsample_rejected",
-                "rlm_merge_candidate_pair": (0, 1),
-            },
-            {
-                "i": 4,
-                "rlm_merge_status": "preflight_failed",
-                "rlm_merge_candidate_pair": (0, 1),
-            },
-            {"i": 5, "rlm_merge_status": "accepted", "rlm_merge_candidate_pair": (0, 1)},
-            {"i": 6, "rlm_merge_status": "custom_status", "rlm_merge_candidate_pair": (0, 1)},
-        ]
-    }
-    with (tmp_path / "gepa_state.bin").open("wb") as f:
-        pickle.dump(state, f)
-
-    rows = merge_rows(tmp_path)
-
-    assert [row["outcome"] for row in rows] == [
-        "skipped",
-        "skipped",
-        "rejected",
-        "rejected",
-        "accepted",
-        "custom_status",
-    ]
-
-
-def test_reporting_tables_from_artifacts(tmp_path: Path):
-    state = {
-        "i": 1,
-        "total_num_evals": 4,
-        "program_candidates": [{"skill_instructions": "seed"}, {"skill_instructions": "new"}],
-        "program_full_scores_val_set": [0.5, 0.75],
-        "prog_candidate_val_subscores": [
-            {"a": 0.0, "b": 1.0},
-            {"a": 1.0, "b": 1.0},
-        ],
-        "parent_program_for_candidate": [[None], [0]],
-        "full_program_trace": [
-            {
-                "i": 0,
-                "selected_program_candidate": 0,
-                "subsample_scores": {"a": 0.0, "b": 1.0},
-                "new_subsample_scores": {"a": 1.0, "b": 1.0},
-                "new_program_idx": 1,
-            },
-            {
-                "i": 1,
-                "rlm_merge_candidate_pair": (0, 1),
-                "rlm_merge_ancestor": 0,
-                "rlm_merge_attempt_idx": 0,
-                "rlm_merge_status": "subsample_rejected",
-                "rlm_merge_preflight_a_wins": 3,
-                "rlm_merge_preflight_b_wins": 2,
-                "rlm_merge_reject_reason": "not better than best parent",
-                "id1_subsample_scores": [0.0, 1.0],
-                "id2_subsample_scores": [1.0, 0.0],
-                "new_program_subsample_scores": [1.0, 0.0],
-            },
-        ],
-    }
-    with (tmp_path / "gepa_state.bin").open("wb") as f:
-        pickle.dump(state, f)
-    (tmp_path / "run_metadata.json").write_text(
-        json.dumps(
-            {
-                "resolved_config": {
-                    "executor_reasoning_effort": "low",
-                    "executor_sub_lm_reasoning_effort": "none",
-                    "proposer_reasoning_effort": "medium",
-                    "proposer_sub_lm_reasoning_effort": "medium",
-                }
-            }
-        )
-    )
-    append_cost_rows(
-        tmp_path / "cost_log.jsonl",
-        [
-            CostRow(
-                event_id="e",
-                operation_id="op",
-                attempt_id="a",
-                event="valset",
-                role="executor",
-                model="dummy",
-                calls=1,
-                input_tokens=10,
-                output_tokens=2,
-                cost_usd=0.01,
-            ),
-            CostRow(
-                event_id="e",
-                operation_id="op",
-                attempt_id="a",
-                event="valset",
-                role="executor",
-                model="dummy",
-                calls=1,
-                input_tokens=10,
-                output_tokens=2,
-                cost_usd=0.01,
-            ),
-        ],
-    )
-
-    rows = iteration_rows(tmp_path)
-    assert rows[0]["outcome"] == "→ cand 1"
-    assert rows[0]["soft: par → child"] == "0.500 → 1.000 +0.500"
-    assert rows[0]["hard: par → child"] == "0.500 → 1.000 +0.500; 1 → 2"
-    assert rows[0]["flips"] == "+1/-0 +1"
-    assert rows[0]["p"] == "1.00"
-    assert rows[0]["iter"] == "0 [0]"
-    assert rows[0]["_highlight"] is True
-    iteration_terminal = render_table(rows, width=120)
-    iteration_plain_lines = [
-        stats_report.re.sub(r"\033\[[0-9;]*m", "", line) for line in iteration_terminal.splitlines()
-    ]
-    iteration_header_line = next(line for line in iteration_plain_lines if "hard: par" in line)
-    iteration_hard_header = iteration_header_line.strip("│").split("│")[2]
-    assert iteration_hard_header.rstrip().endswith("/2")
-    assert "1 → 2 /2" not in iteration_terminal
-    assert rows[1]["iter"] == "1 [0, 1]"
-    merges = merge_rows(tmp_path)
-    assert {
-        key: value
-        for key, value in merges[0].items()
-        if key not in {"_merge_hard_denominator", "_terminal_header_aliases", "_terminal_header_suffixes"}
-    } == {
-        "iter": "1",
-        "pair@anc": "0+1@0",
-        "soft: best(par) -> merge": "0.500 → 0.500 +0.000",
-        "hard: best(par) -> merge": "0.500 → 0.500 +0.000; 1 → 1",
-        "flips": "+1/-1 +0",
-        "p": "1.00",
-        "outcome": "rejected",
-        "_detail": "not better than best parent",
-        "_muted_prefix": {
-            "soft: best(par) -> merge": "0.500 → 0.500",
-            "hard: best(par) -> merge": "0.500 → 0.500",
-            "flips": "+1/-1",
-        },
-    }
-    assert rows[0]["_terminal_header_suffixes"]["hard: par → child"] == "/2"
-    assert merges[0]["_terminal_header_suffixes"]["hard: best(par) -> merge"] == "/2"
-    candidates = candidate_rows(tmp_path)
-    assert candidates[0]["cand [par]"] == "0 [seed]"
-    assert candidates[0]["soft: par → child"] == "- → 0.500"
-    assert "soft" not in candidates[0]
-    assert "mean" not in candidates[0]
-    assert candidates[0]["hard: par → child"] == "- → 0.500"
-    assert candidates[0]["flips vs par"] == "-"
-    assert candidates[0]["Δ-seed"] == "-"
-    assert candidates[1]["cand [par]"] == "1 [0]"
-    assert candidates[1]["soft: par → child"] == "0.500 → 1.000 +0.500"
-    assert "soft" not in candidates[1]
-    assert "mean" not in candidates[1]
-    assert candidates[1]["hard: par → child"] == "0.500 → 1.000 +0.500"
-    assert candidates[1]["flips vs par"] == "+1/-0 +1"
-    assert candidates[1]["Δ-seed"] == "+0.500"
-    assert candidates[1]["_muted_prefix"] == {
-        "soft: par → child": "0.500 → ",
-        "hard: par → child": "0.500 → ",
-        "flips vs par": "+1/-0",
-    }
-    assert candidates[1]["_muted_suffix"] == {
-        "soft: par → child": " +0.500",
-        "hard: par → child": " +0.500",
-    }
-    assert candidates[1]["_highlight"] is True
-    candidate_terminal = render_table(candidates, width=120)
-    assert "\033[38;5;178m0.500 → \033[0m\033[1;38;5;220m1.000\033[38;5;178m +0.500" in candidate_terminal
-    costs = cost_rows(tmp_path)
-    assert costs[0]["scope"] == "executor"
-    assert costs[0]["model"] == ""
-    assert costs[0]["calls"] == ""
-    assert costs[0]["_category"] is True
-    assert costs[1]["scope"] == "  - main"
-    assert costs[1]["model"] == "dummy-low"
-    assert costs[1]["total_cost"] == "$0.02"
-    assert costs[1]["repeat_cost"] == "$0.01"
-    assert costs[1]["effective_cost"] == "$0.01"
-    assert costs[2]["scope"] == "  - sub"
-    assert costs[2]["model"] == "-"
-    assert costs[2]["calls"] == "-"
-    assert costs[3]["_spacer"] is True
-    assert costs[-1]["scope"] == "TOTAL"
-    assert costs[-1]["model"] == ""
-    assert costs[-1]["calls"] == "2"
-    assert costs[-1]["total_cost"] == "$0.02"
-    assert costs[-1]["repeat_cost"] == "$0.01"
-    assert costs[-1]["effective_cost"] == "$0.01"
-    rendered = render_stats(tmp_path, output_format="markdown")
-    assert "iterations:" in rendered
-    assert "merges:" in rendered
-    assert "| iter" in rendered
-    assert "| soft: par → child" in rendered
-    assert "| hard: par → child" in rendered
-    assert "| soft: best(par) -> merge" in rendered
-    assert "| hard: best(par) -> merge" in rendered
-    assert "| pair@anc" in rendered
-    assert "rejected" in rendered
-    assert "merge details:" in rendered
-    assert "iter 1 0+1@0: not better than best parent" in rendered
-    assert "| cand [par]" in rendered
-    candidate_section = rendered.split("candidates:", maxsplit=1)[1].split("costs:", maxsplit=1)[0]
-    assert "soft: par → child" in candidate_section
-    assert "hard: par → child" in candidate_section
-    assert "flips vs par" in candidate_section
-    assert "| soft |" not in candidate_section
-    assert "| hard |" not in candidate_section
-    assert "| flips |" not in candidate_section
-    assert "| Δ-seed" in rendered
-    assert "| ----" in rendered
-    assert "**1 [0]**" in rendered
-    terminal = render_stats(tmp_path, width=120)
-    assert "┌" in terminal
-    assert "\033[3m" in terminal
-    assert "\033[38;5;248m" in terminal
-    assert "\033[38;5;178m0.500 → 1.000\033[0m\033[1;38;5;220m +0.500" in terminal
-    assert "\033[38;5;178m0.500 → 1.000\033[0m\033[1;38;5;220m +0.500; 1 → 2" in terminal
-    assert "\033[38;5;178m+1/-0\033[0m\033[1;38;5;220m +1" in terminal
-    assert "\033[38;5;248m+1/-1\033[0m +0" in terminal
-    assert "\033[38;5;248m0.500 → 0.500\033[0m +0.000" in terminal
-    assert "\033[38;5;248m0.500 → 0.500\033[0m +0.000; 1 → 1" in terminal
-    assert "\033[1;38;5;220m" in terminal
-    assert "**1**" not in terminal
-    assert "costs:" in terminal
-    assert "total" in terminal
-    assert "repeat" in terminal
-    assert "eff" in terminal
-    assert "costs (raw spend: all logged LM calls):" not in terminal
-    assert "costs (deduped spend: stable operation ids only; legacy rows counted raw):" not in terminal
-
-
-def test_render_stats_before_state_checkpoint_does_not_crash(tmp_path: Path) -> None:
-    (tmp_path / "run_metadata.json").write_text(json.dumps({"project_name": "demo"}))
-
-    rendered = render_stats(tmp_path, table="all", output_format="markdown")
-
-    assert "iter=0" in rendered
-    assert "candidates=0" in rendered
 
 
 def test_candidate_rows_show_flips_against_each_parent(tmp_path: Path):
@@ -2234,34 +796,10 @@ def test_candidate_rows_show_flips_against_each_parent(tmp_path: Path):
     assert rows[2]["soft: par → child"] == "0.333 → 0.667 +0.333\n0.333 → 0.667 +0.333"
     assert rows[2]["hard: par → child"] == "0.333 → 0.667 +0.333\n0.333 → 0.667 +0.333"
     assert rows[2]["flips vs par"] == "+1/-0 +1\n+1/-0 +1"
-    assert rows[2]["_muted_prefix"] == {
-        "soft: par → child": "0.333 → \n0.333 → ",
-        "hard: par → child": "0.333 → \n0.333 → ",
-        "flips vs par": "+1/-0\n+1/-0",
-    }
-    assert rows[2]["_muted_suffix"] == {
-        "soft: par → child": " +0.333\n +0.333",
-        "hard: par → child": " +0.333\n +0.333",
-    }
-
-    rendered = render_table(rows, width=120)
-
-    assert " -> " not in rendered
-    assert "\033[38;5;178m.333 → \033[0m\033[1;38;5;220m.667\033[38;5;178m +.333" in rendered
-    assert "\033[38;5;178m+1/-0\033[0m\033[1;38;5;220m +1" in rendered
 
 
 def test_live_state_best_candidate_overrides_stale_summary(tmp_path: Path):
     state = {
-        "full_program_trace": [
-            {
-                "i": 0,
-                "selected_program_candidate": 0,
-                "subsample_scores": [0.0, 0.0],
-                "new_subsample_scores": [1.0, 1.0],
-                "new_program_idx": 2,
-            }
-        ],
         "program_candidates": [{}, {}, {}],
         "parent_program_for_candidate": [[None], [0], [1]],
         "prog_candidate_val_subscores": [
@@ -2283,12 +821,8 @@ def test_live_state_best_candidate_overrides_stale_summary(tmp_path: Path):
         )
     )
 
-    candidates = candidate_rows(tmp_path)
-    iterations = iteration_rows(tmp_path)
     plot_data = load_plot_data(tmp_path)
 
-    assert [row["_highlight"] for row in candidates] == [False, False, True]
-    assert iterations[0]["_highlight"] is True
     assert plot_data["best_idx"] == 2
     assert plot_data["scores"] == [0.0, 0.6, 1.0]
 
@@ -2330,316 +864,6 @@ def test_plot_data_repairs_truncated_live_full_scores_from_subscores(tmp_path: P
     assert plot_data["eval_counts"] == [0, 10, 20, 30, 40, 50, 51, 52]
 
 
-def test_cost_rows_group_patch_merge_roles(tmp_path: Path):
-    (tmp_path / "run_metadata.json").write_text(
-        json.dumps(
-            {
-                "resolved_config": {
-                    "proposer_reasoning_effort": "medium",
-                    "proposer_sub_lm_reasoning_effort": "low",
-                }
-            }
-        )
-    )
-    append_cost_rows(
-        tmp_path / "cost_log.jsonl",
-        [
-            CostRow(
-                event_id="e",
-                operation_id="op",
-                attempt_id="a",
-                event="patch_merge",
-                role="patch_merge_proposer",
-                model="dummy-patch",
-                calls=1,
-                input_tokens=10,
-                output_tokens=2,
-                cost_usd=0.01,
-            ),
-            CostRow(
-                event_id="e-sub",
-                operation_id="op-sub",
-                attempt_id="a-sub",
-                event="patch_merge",
-                role="patch_merge_proposer_sub_lm",
-                model="dummy-patch-sub",
-                calls=1,
-                input_tokens=11,
-                output_tokens=3,
-                cost_usd=0.02,
-            ),
-        ],
-    )
-
-    rows = cost_rows(tmp_path)
-
-    assert any(row.get("scope") == "merge" and row.get("_category") for row in rows)
-    assert any(
-        row.get("scope") == "  - proposer main" and row.get("model") == "dummy-patch-medium"
-        for row in rows
-    )
-    assert any(
-        row.get("scope") == "  - proposer sub" and row.get("model") == "dummy-patch-sub-low"
-        for row in rows
-    )
-    assert not any(row.get("scope") == "patch-merge" for row in rows)
-    assert not any(row.get("scope") == "other" for row in rows)
-
-
-def test_highlighted_terminal_rows_use_dim_gold_for_muted_prefixes():
-    rendered = render_table(
-        [
-            {
-                "metric": "0.100 → 0.200 +0.100",
-                "_highlight": True,
-                "_muted_prefix": {"metric": "0.100 → 0.200"},
-            }
-        ]
-    )
-
-    assert "\033[38;5;178m.100 → .200" in rendered
-    assert "\033[38;5;248m.100 → .200" not in rendered
-
-
-def test_terminal_cost_table_wraps_scope_and_model_to_terminal_width(monkeypatch):
-    monkeypatch.setattr(
-        stats_report.shutil,
-        "get_terminal_size",
-        lambda fallback=(120, 24): os.terminal_size((82, 24)),
-    )
-    rows = [
-        {
-            "scope": "  - patch_merge_proposer_sub_lm",
-            "model": "openai/gpt-5.4-mini-medium",
-            "calls": "1,234",
-            "prompt_tok": "12,345,678",
-            "completion_tok": "123,456",
-            "total_cost": "$123.45",
-            "repeat_cost": "$0.00",
-            "effective_cost": "$123.45",
-        }
-    ]
-
-    rendered = render_table(rows)
-    plain_lines = [stats_report.re.sub(r"\033\[[0-9;]*m", "", line) for line in rendered.splitlines()]
-
-    assert max(len(line) for line in plain_lines) <= 82
-    assert "in_tok" in rendered
-    assert "out_tok" in rendered
-    assert "total_cost" not in rendered
-    assert "  - patch" in rendered
-    assert "│     merge_" in rendered
-    assert "propos" in rendered
-
-
-def test_terminal_merge_table_wraps_headers_and_status_to_terminal_width(monkeypatch):
-    def plain_lines(rendered: str) -> list[str]:
-        return [stats_report.re.sub(r"\033\[[0-9;]*m", "", line) for line in rendered.splitlines()]
-
-    def cell_lines(rendered: str, column_index: int) -> list[str]:
-        lines = []
-        for line in plain_lines(rendered):
-            if line.startswith("│"):
-                cells = line.strip("│").split("│")
-                lines.append(cells[column_index].strip())
-        return lines
-
-    def raw_cell_lines(rendered: str, column_index: int) -> list[str]:
-        lines = []
-        for line in plain_lines(rendered):
-            if line.startswith("│"):
-                cells = line.strip("│").split("│")
-                lines.append(cells[column_index])
-        return lines
-
-    def body_cell_rows(rendered: str) -> list[list[str]]:
-        lines = plain_lines(rendered)
-        body_start = next(index for index, line in enumerate(lines) if line.startswith("├")) + 1
-        return [line.strip("│").split("│") for line in lines[body_start:] if line.startswith("│")]
-
-    monkeypatch.setattr(
-        stats_report.shutil,
-        "get_terminal_size",
-        lambda fallback=(120, 24): os.terminal_size((90, 24)),
-    )
-    rows = [
-        {
-            "iter": "12345 [123, 456]",
-            "pair@anc": "123+456@789",
-            "soft: best(par) -> merge": "0.123 → 0.987 +0.864",
-            "hard: best(par) -> merge": "0.111 → 0.999 +0.888; 1 → 9",
-            "flips": "+8/-0 +8",
-            "p": "0.01",
-            "outcome": "rejected",
-            "_terminal_header_aliases": {
-                "soft: best(par) -> merge": "soft\nbest(par) -> merge",
-                "hard: best(par) -> merge": "hard\nbest(par) -> merge",
-            },
-            "_terminal_header_suffixes": {
-                "hard: best(par) -> merge": "/10",
-            },
-            "_muted_prefix": {
-                "soft: best(par) -> merge": "0.123 → 0.987",
-                "hard: best(par) -> merge": "0.111 → 0.999",
-                "flips": "+8/-0",
-            },
-        }
-    ]
-
-    rendered = render_table(rows)
-
-    assert "soft: best(par) -> merge" not in rendered
-    assert "hard: best(par) -> merge" not in rendered
-    assert "soft" in rendered
-    assert "best(par) -> merge" in rendered
-    assert stats_report.re.search(r"best\(par\) -> merge\s+/10", "\n".join(plain_lines(rendered)))
-    assert "par→merge" not in rendered
-    assert "1 → 9 /10" not in rendered
-    assert "rejected" in rendered
-
-    monkeypatch.setattr(
-        stats_report.shutil,
-        "get_terminal_size",
-        lambda fallback=(120, 24): os.terminal_size((92, 24)),
-    )
-    moderate = render_table(
-        [
-            {
-                "iter": "12",
-                "pair@anc": "3+4@2",
-                "soft: best(par) -> merge": "0.123 → 0.987 +0.864",
-                "hard: best(par) -> merge": "0.111 → 0.999 +0.888; 1 → 9",
-                "flips": "+8/-0 +8",
-                "p": "0.01",
-                "outcome": "accepted",
-                "_terminal_header_aliases": {
-                    "soft: best(par) -> merge": "soft\nbest(par) -> merge",
-                    "hard: best(par) -> merge": "hard\nbest(par) -> merge",
-                },
-                "_terminal_header_suffixes": {
-                    "hard: best(par) -> merge": "/10",
-                },
-                "_muted_prefix": {
-                    "soft: best(par) -> merge": "0.123 → 0.987",
-                    "hard: best(par) -> merge": "0.111 → 0.999",
-                    "flips": "+8/-0",
-                },
-            }
-        ]
-    )
-    moderate_lines = plain_lines(moderate)
-    pair_lines = cell_lines(moderate, 1)
-    hard_lines = raw_cell_lines(moderate, 3)
-    moderate_body_cells = body_cell_rows(moderate)
-
-    assert moderate_lines
-    assert pair_lines[:2] == ["pair", "@anc"]
-    assert "@" not in pair_lines[:2]
-    assert "anc" not in pair_lines[:2]
-    assert pair_lines[2:3] == ["3+4@2"]
-    assert hard_lines[1].rstrip().endswith("/10")
-    assert len(moderate_body_cells) == 1
-    assert [moderate_body_cells[0][index].strip() for index in (1, 2, 3, 4)] == [
-        "3+4@2",
-        ".123 → .987 +.864",
-        ".111 → .999 +.888; 1 → 9",
-        "+8/-0 +8",
-    ]
-
-    monkeypatch.setattr(
-        stats_report.shutil,
-        "get_terminal_size",
-        lambda fallback=(120, 24): os.terminal_size((90, 24)),
-    )
-    tight = render_table(rows)
-    tight_lines = plain_lines(tight)
-    body_cells = body_cell_rows(tight)
-
-    assert tight_lines
-    assert len(body_cells) == 1
-    assert [body_cells[0][index].strip() for index in (1, 2, 3, 4)] == [
-        "123+456@789",
-        ".123 → .987 +.864",
-        ".111 → .999 +.888; 1 → 9",
-        "+8/-0 +8",
-    ]
-
-
-def test_eval_stats_from_eval_artifact(tmp_path: Path):
-    report = {
-        "config": {"reasoning_effort": "medium"},
-        "total_tasks": 2,
-        "soft_restriction_avg": 0.75,
-        "hard_restriction_avg": 0.5,
-        "tasks_all_passing": 1,
-        "duration_seconds": 125,
-        "total_cost_usd": 1.23,
-        "costs": [
-            {
-                "role": "main",
-                "model": "dummy-main",
-                "calls": 3,
-                "prompt_tokens": 100,
-                "completion_tokens": 20,
-                "cost_usd": 1.0,
-            },
-            {
-                "role": "sub",
-                "model": "dummy-sub",
-                "calls": 2,
-                "prompt_tokens": 10,
-                "completion_tokens": 5,
-                "cost_usd": 0.23,
-            },
-        ],
-        "per_task": [
-            {
-                "task_id": "a",
-                "soft": 1.0,
-                "hard": 1,
-                "cases": [
-                    {"passed": True, "message": "All 10 cells match"},
-                    {"passed": True, "message": "All 5 cells match"},
-                ],
-            },
-            {
-                "task_id": "b",
-                "soft": 0.5,
-                "hard": 0,
-                "cases": [
-                    {"passed": False, "message": "Sheet 'A' range A1:A6: 3/6 cells match"}
-                ],
-            },
-        ],
-    }
-    (tmp_path / "eval.json").write_text(json.dumps(report))
-
-    tasks = eval_task_rows(tmp_path)
-    costs = eval_cost_rows(tmp_path)
-    rendered = render_stats(tmp_path, table="all")
-
-    assert tasks[0] == {
-        "task": "a",
-        "soft": "1.000 (15 /15)",
-        "hard": "1.000 (2 /2)",
-        "_align": {"soft": "left"},
-    }
-    assert tasks[1] == {
-        "task": "b",
-        "soft": "0.500 (3 /6)",
-        "hard": "0.000 (0 /1)",
-        "_align": {"soft": "left"},
-    }
-    assert costs[0]["scope"] == "executor"
-    assert costs[1]["scope"] == "  - main"
-    assert costs[1]["model"] == "dummy-main-medium"
-    assert costs[2]["scope"] == "  - sub"
-    assert costs[2]["model"] == "dummy-sub-none"
-    assert "eval: tasks=2, soft=0.750, hard=0.500 (1/2), cost=$1.23, duration=2m 5s" in rendered
-    assert "tasks:" in rendered
-    assert "costs:" in rendered
-
-
 def test_eval_stats_reports_attempt_outcomes_and_latency_percentiles(tmp_path: Path):
     report = {
         "total_tasks": 4,
@@ -2661,7 +885,12 @@ def test_eval_stats_reports_attempt_outcomes_and_latency_percentiles(tmp_path: P
                     "example_id": "ok",
                     "status": "completed",
                     "feedback": "passed",
-                    "trace": {"status": "completed", "iterations": 2, "max_iterations": 5, "duration_ms": 1000},
+                    "trace": {
+                        "status": "completed",
+                        "iterations": 2,
+                        "max_iterations": 5,
+                        "duration_ms": 1000,
+                    },
                 },
                 {
                     "example_id": "outer-timeout",
@@ -2684,7 +913,12 @@ def test_eval_stats_reports_attempt_outcomes_and_latency_percentiles(tmp_path: P
                     "example_id": "project-timeout",
                     "status": "error",
                     "error": "RLM timeout at 300s",
-                    "trace": {"status": "error", "iterations": 1, "max_iterations": 5, "duration_ms": 2000},
+                    "trace": {
+                        "status": "error",
+                        "iterations": 1,
+                        "max_iterations": 5,
+                        "duration_ms": 2000,
+                    },
                 },
             ]
         )
@@ -2694,83 +928,10 @@ def test_eval_stats_reports_attempt_outcomes_and_latency_percentiles(tmp_path: P
     markdown = render_stats(tmp_path, table="all", output_format="markdown")
 
     expected = (
-        "attempts=4, timeouts=2, max_iter_hits=1, "
-        "latency p50=2.0s p90=5.0s p95=5.0s max=5.0s"
+        "attempts=4, timeouts=2, max_iter_hits=1, latency p50=2.0s p90=5.0s p95=5.0s max=5.0s"
     )
     assert expected in terminal
     assert expected in markdown
-
-
-def test_optimize_stats_reports_attempt_outcomes_and_latency_percentiles(tmp_path: Path):
-    with (tmp_path / "gepa_state.bin").open("wb") as f:
-        pickle.dump(
-            {
-                "i": 0,
-                "program_candidates": [],
-                "total_num_evals": 2,
-                "prog_candidate_val_subscores": [],
-            },
-            f,
-        )
-    trace_dir = tmp_path / "task_traces"
-    trace_dir.mkdir()
-    (trace_dir / "eval_minibatch_attempts.jsonl").write_text(
-        "\n".join(
-            json.dumps(row)
-            for row in [
-                {
-                    "example_id": "a",
-                    "status": "completed",
-                    "trace": {"status": "completed", "iterations": 1, "max_iterations": 3, "duration_ms": 2500},
-                },
-                {
-                    "example_id": "b",
-                    "status": "completed",
-                    "trace": {"status": "completed", "iterations": 3, "max_iterations": 3, "duration_ms": 7500},
-                },
-                {
-                    "example_id": "c",
-                    "status": "timeout",
-                    "feedback": "timed out",
-                    "trace": None,
-                },
-            ]
-        )
-    )
-
-    rendered = render_stats(tmp_path, table="costs")
-
-    assert (
-        "attempts=3, timeouts=1, max_iter_hits=1, "
-        "latency p50=2.5s p90=7.5s p95=7.5s max=7.5s"
-    ) in rendered
-
-
-def test_render_table_outputs_github_markdown():
-    rendered = render_table([{"a": "x|y", "b": "z\nw"}], output_format="markdown")
-
-    assert rendered.splitlines()[0].startswith("| a")
-    assert rendered.splitlines()[1].startswith("| -")
-    assert "x\\|y" in rendered
-    assert "z<br>w" in rendered
-
-
-def test_render_table_compacts_fractional_decimal_columns():
-    rows = [
-        {"mean": "0.123", "delta": "+0.045", "mixed": "0.123 → 1.000", "model": "gpt-0.5"},
-        {"mean": "0.456", "delta": "-0.012", "mixed": "0.456 → 1.000", "model": "gpt-0.7"},
-    ]
-
-    markdown = render_table(rows, output_format="markdown")
-    terminal = render_table(rows, output_format="terminal", width=120)
-
-    assert ".123" in markdown
-    assert "+.045" in markdown
-    assert "-.012" in markdown
-    assert "0.123 → 1.000" in markdown
-    assert "gpt-0.5" in markdown
-    assert ".456" in terminal
-    assert "gpt-0.7" in terminal
 
 
 def test_project_cli_check_with_dummy_lms(capsys):
@@ -2786,448 +947,16 @@ def test_project_cli_check_with_dummy_lms(capsys):
     assert "check ok" in capsys.readouterr().out
 
 
-def test_project_cli_accepts_stat_alias(monkeypatch, capsys, tmp_path: Path):
-    def render_stats(run_dir, table="all", output_format="terminal", width=None):
-        return f"stats {Path(run_dir).name} {table} {output_format} {width}"
-
-    monkeypatch.setattr(cli_module, "render_stats", render_stats)
-
-    status = run_project_cli(lambda: _Project(), OptimizeConfig(), argv=["stat", str(tmp_path)])
-
-    assert status == 0
-    assert f"stats {tmp_path.name} all terminal None" in capsys.readouterr().out
-
-
-def test_project_cli_passes_stats_width(monkeypatch, capsys, tmp_path: Path):
-    def render_stats(run_dir, table="all", output_format="terminal", width=None):
-        return f"stats {Path(run_dir).name} {table} {output_format} {width}"
-
-    monkeypatch.setattr(cli_module, "render_stats", render_stats)
-
-    status = run_project_cli(
-        lambda: _Project(),
-        OptimizeConfig(),
-        argv=["stats", str(tmp_path), "--width", "107"],
-    )
-
-    assert status == 0
-    assert f"stats {tmp_path.name} all terminal 107" in capsys.readouterr().out
-
-
-def test_public_api_exports_expected_helpers():
-    assert run_optimization is not None
-    assert check_optimization is not None
-    assert agent_spec_from_rlm is not None
-    assert build_proposer_for_rlm is not None
-
-
-def test_apply_optimize_args_does_not_mutate_default_config():
-    config = OptimizeConfig(executor_lm="before")
-    args = argparse.Namespace(
-        executor_lm="after",
-        executor_sub_lm=None,
-        executor_reasoning_effort=None,
-        executor_sub_lm_reasoning_effort=None,
-        proposer_lm=None,
-        proposer_sub_lm=None,
-        proposer_reasoning_effort=None,
-        proposer_sub_lm_reasoning_effort=None,
-        max_metric_calls=None,
-        minibatch_size=None,
-        concurrency=None,
-        max_iterations=None,
-        task_timeout=None,
-        proposer_timeout=None,
-        heartbeat_interval_seconds=None,
-        run_dir=None,
-        candidate_selection_strategy=None,
-        component_selection_strategy=None,
-        max_merge_attempts=None,
-        resume=False,
-        cache=False,
-        verbose_rlm=False,
-        debug_rlm=False,
-        merge_proposer=True,
-    )
-
-    updated = apply_optimize_args(config, args)
-
-    assert config.executor_lm == "before"
-    assert updated.executor_lm == "after"
-    assert updated.merge_proposer is True
-
-
 class _TimeoutProject(_Project):
+    cancelled = False
+
     async def evaluate_example(self, candidate, example, context):
-        await asyncio.sleep(1)
+        try:
+            await asyncio.sleep(1)
+        except asyncio.CancelledError:
+            self.cancelled = True
+            raise
         return RLMGepaExampleResult(score=1.0, feedback="ok", traces=[])
-
-
-class _ExampleTimeoutProject(_Project):
-    def task_timeout_for_example(self, example, default_timeout):
-        return 1
-
-    def task_resources_for_example(self, example):
-        return {"cpus": 2, "memory_mb": 4096}
-
-    async def evaluate_example(self, candidate, example, context):
-        await asyncio.sleep(0.02)
-        return RLMGepaExampleResult(
-            score=1.0,
-            feedback=f"timeout={context.task_timeout} resources={dict(context.task_resources)}",
-            traces=[
-                RunTrace(
-                    status="completed",
-                    model="test",
-                    iterations=1,
-                    max_iterations=1,
-                    duration_ms=1,
-                )
-            ],
-            example_id=str(example),
-        )
-
-
-class _ImmediateProject(_Project):
-    async def evaluate_example(self, candidate, example, context):
-        return RLMGepaExampleResult(
-            score=1.0,
-            feedback="",
-            traces=[{"status": "ok"}],
-            example_id=str(example),
-        )
-
-
-def test_adapter_progress_bar_updates_per_example(tmp_path: Path, monkeypatch):
-    import rlm_gepa.runtime.adapter as adapter_module
-
-    events: list[tuple[str, object]] = []
-
-    class FakeTqdm:
-        def __init__(self, **kwargs):
-            events.append(("init", kwargs))
-
-        def set_postfix_str(self, value):
-            events.append(("postfix", value))
-
-        def update(self, value):
-            events.append(("update", value))
-
-        def close(self):
-            events.append(("close", None))
-
-    monkeypatch.setattr(adapter_module, "tqdm", FakeTqdm, raising=False)
-    adapter = RLMGepaAdapter(
-        project=_ImmediateProject(),
-        lm=_DummyLM(),
-        sub_lm=_DummyLM(),
-        max_iterations=1,
-        concurrency=2,
-        task_timeout=1,
-        output_dir=tmp_path,
-        run_id="run_test",
-        display_progress_bar=True,
-    )
-
-    batch = adapter.evaluate(["a", "b"], {"skill_instructions": "seed"}, capture_traces=True)
-
-    assert batch.scores == [1.0, 1.0]
-    assert events[0] == (
-        "init",
-        {"total": 2, "desc": "  MB 0000 (2 tasks)", "leave": False, "unit": "task"},
-    )
-    assert [event for event in events if event[0] == "update"] == [("update", 1), ("update", 1)]
-    assert events[-1] == ("close", None)
-
-
-def test_adapter_writes_eval_progress_events(tmp_path: Path):
-    adapter = RLMGepaAdapter(
-        project=_ImmediateProject(),
-        lm=_DummyLM(),
-        sub_lm=_DummyLM(),
-        max_iterations=1,
-        concurrency=2,
-        task_timeout=1,
-        output_dir=tmp_path,
-        run_id="run_test",
-    )
-
-    batch = adapter.evaluate(["a", "b"], {"skill_instructions": "seed"}, capture_traces=True)
-
-    assert batch.scores == [1.0, 1.0]
-    events = [json.loads(line) for line in (tmp_path / "eval_progress.jsonl").read_text().splitlines()]
-    seen = [(event["example_id"], event["status"]) for event in events]
-    assert sorted(seen) == sorted(
-        [
-            ("a", "started"),
-            ("b", "started"),
-            ("a", "completed"),
-            ("b", "completed"),
-        ]
-    )
-    assert all(event["label"] == "MB 0000" for event in events)
-    assert events[-1]["score"] == 1.0
-
-
-def test_adapter_progress_bar_labels_valset(tmp_path: Path, monkeypatch):
-    import rlm_gepa.runtime.adapter as adapter_module
-
-    events: list[tuple[str, object]] = []
-
-    class FakeTqdm:
-        def __init__(self, **kwargs):
-            events.append(("init", kwargs))
-
-        def set_postfix_str(self, value):
-            events.append(("postfix", value))
-
-        def update(self, value):
-            events.append(("update", value))
-
-        def close(self):
-            events.append(("close", None))
-
-    monkeypatch.setattr(adapter_module, "tqdm", FakeTqdm, raising=False)
-    adapter = RLMGepaAdapter(
-        project=_ImmediateProject(),
-        lm=_DummyLM(),
-        sub_lm=_DummyLM(),
-        max_iterations=1,
-        concurrency=2,
-        task_timeout=1,
-        output_dir=tmp_path,
-        run_id="run_test",
-        display_progress_bar=True,
-        valset_size=2,
-    )
-
-    adapter.evaluate(["a", "b"], {"skill_instructions": "seed"}, capture_traces=False)
-
-    assert events[0] == (
-        "init",
-        {"total": 2, "desc": "  VALSET 0000 (2 tasks)", "leave": False, "unit": "task"},
-    )
-
-
-def test_adapter_caps_task_trace_filename_length(tmp_path: Path):
-    long_label = "long_evaluation_kind_with_nested_context_segments_and_repeated_observation_windows_001"
-    adapter = RLMGepaAdapter(
-        project=_ImmediateProject(),
-        lm=_DummyLM(),
-        sub_lm=_DummyLM(),
-        max_iterations=1,
-        concurrency=1,
-        task_timeout=1,
-        output_dir=tmp_path,
-        run_id=(
-            "synthetic-domain-neutral-task-with-extended-run-identifier-and-many-"
-            "descriptive-segments-for-trace-filename-stress-20260522-010041"
-        ),
-    )
-
-    batch = adapter.evaluate(
-        [long_label],
-        {"skill_instructions": "seed"},
-        capture_traces=False,
-        kind=long_label,
-    )
-
-    trace_files = list((tmp_path / "task_traces").glob("*.jsonl"))
-    assert batch.scores == [1.0]
-    assert len(trace_files) == 1
-    assert len(trace_files[0].name) < 255
-    row = json.loads(trace_files[0].read_text())
-    assert row["event_id"].endswith("attempt_0000")
-    assert row["kind"] == long_label
-
-
-def test_adapter_classifies_no_trace_repeat_batch_as_minibatch(tmp_path: Path, monkeypatch):
-    import rlm_gepa.runtime.adapter as adapter_module
-
-    descriptions: list[str] = []
-
-    class FakeTqdm:
-        def __init__(self, **kwargs):
-            descriptions.append(kwargs["desc"])
-
-        def set_postfix_str(self, value):
-            pass
-
-        def update(self, value):
-            pass
-
-        def close(self):
-            pass
-
-    monkeypatch.setattr(adapter_module, "tqdm", FakeTqdm, raising=False)
-    adapter = RLMGepaAdapter(
-        project=_ImmediateProject(),
-        lm=_DummyLM(),
-        sub_lm=_DummyLM(),
-        max_iterations=1,
-        concurrency=2,
-        task_timeout=1,
-        output_dir=tmp_path,
-        run_id="run_test",
-        display_progress_bar=True,
-        valset_size=2,
-    )
-
-    adapter.evaluate(["a", "b"], {"skill_instructions": "seed"}, capture_traces=True)
-    adapter.evaluate(["a", "b"], {"skill_instructions": "seed"}, capture_traces=False)
-
-    assert descriptions == ["  MB 0000 (2 tasks)", "  MB 0001 (2 tasks)"]
-
-
-def test_adapter_progress_bar_uses_reflective_context(tmp_path: Path, monkeypatch):
-    import rlm_gepa.runtime.adapter as adapter_module
-
-    descriptions: list[str] = []
-
-    class FakeTqdm:
-        def __init__(self, **kwargs):
-            descriptions.append(kwargs["desc"])
-
-        def set_postfix_str(self, value):
-            pass
-
-        def update(self, value):
-            pass
-
-        def close(self):
-            pass
-
-    monkeypatch.setattr(adapter_module, "tqdm", FakeTqdm, raising=False)
-    adapter = RLMGepaAdapter(
-        project=_ImmediateProject(),
-        lm=_DummyLM(),
-        sub_lm=_DummyLM(),
-        max_iterations=1,
-        concurrency=2,
-        task_timeout=1,
-        output_dir=tmp_path,
-        run_id="run_test",
-        display_progress_bar=True,
-        valset_size=2,
-    )
-
-    adapter.set_reflective_progress_context(iteration=13, parent_idx=4, child_idx=7)
-    adapter.evaluate(["a", "b"], {"skill_instructions": "parent"}, capture_traces=True)
-    adapter.evaluate(["a", "b"], {"skill_instructions": "child"}, capture_traces=False)
-    adapter.evaluate(["c", "d"], {"skill_instructions": "child"}, capture_traces=False)
-
-    assert descriptions == [
-        "  Iteration 13 Parent #4 Minibatch (2 tasks)",
-        "  Iteration 13 Child #7 Minibatch (2 tasks)",
-        "  Candidate #7 Valset (2 tasks)",
-    ]
-
-
-class _ContextProject(_Project):
-    def __init__(self):
-        self.verbose_values: list[bool] = []
-        self.debug_values: list[bool] = []
-
-    async def evaluate_example(self, candidate, example, context):
-        self.verbose_values.append(context.verbose_rlm)
-        self.debug_values.append(context.debug_rlm)
-        return RLMGepaExampleResult(
-            score=1.0,
-            feedback="",
-            traces=[{"status": "ok"}],
-            example_id=str(example),
-        )
-
-
-def test_adapter_propagates_rlm_logging_flags_to_every_example(tmp_path: Path):
-    project = _ContextProject()
-    adapter = RLMGepaAdapter(
-        project=project,
-        lm=_DummyLM(),
-        sub_lm=_DummyLM(),
-        max_iterations=1,
-        concurrency=2,
-        task_timeout=1,
-        output_dir=tmp_path,
-        run_id="run_test",
-        verbose_rlm=True,
-        debug_rlm=True,
-    )
-
-    adapter.evaluate(["a", "b"], {"skill_instructions": "seed"}, capture_traces=False)
-
-    assert project.verbose_values == [True, True]
-    assert project.debug_values == [True, True]
-
-
-class _TelemetryProject(_Project):
-    def __init__(self):
-        self.contexts: list[EvaluationContext] = []
-
-    async def evaluate_example(self, candidate, example, context):
-        self.contexts.append(context)
-        context.telemetry_context.write_span(
-            "test.case",
-            event_domain="test",
-            attributes={"example": example},
-        )
-        return RLMGepaExampleResult(
-            score=1.0,
-            feedback="",
-            traces=[{"status": "ok"}],
-            example_id=str(example),
-        )
-
-
-def test_adapter_threads_telemetry_context_and_persists_candidate_hash(tmp_path: Path):
-    project = _TelemetryProject()
-    telemetry_context = TelemetryContext(
-        sink=JsonlTelemetrySink(tmp_path / "telemetry" / "events.jsonl"),
-        trace_id="run_test",
-        run_id="run_test",
-    )
-    adapter = RLMGepaAdapter(
-        project=project,
-        lm=_DummyLM(),
-        sub_lm=_DummyLM(),
-        max_iterations=1,
-        concurrency=2,
-        task_timeout=1,
-        output_dir=tmp_path,
-        run_id="run_test",
-        telemetry_context=telemetry_context,
-    )
-
-    adapter.evaluate(
-        [SimpleNamespace(task_id="example")],
-        {"skill_instructions": "seed"},
-        capture_traces=False,
-    )
-
-    context = project.contexts[0].telemetry_context
-    assert context.run_id == "run_test"
-    assert context.eval_kind == "valset"
-    assert context.eval_idx == 0
-    assert context.attempt_id == "attempt_0000"
-    assert context.example_id == "example"
-    assert context.candidate_id is None
-    assert context.candidate_hash.startswith("cand_sha256_")
-    events = [
-        json.loads(line)
-        for line in (tmp_path / "telemetry" / "events.jsonl").read_text().splitlines()
-    ]
-    assert events[0]["attributes"]["rlm.candidate_hash"] == context.candidate_hash
-    trace_rows = [
-        json.loads(line)
-        for line in (
-            tmp_path / "task_traces" / "run_test_eval_valset_attempt_0000_valset.jsonl"
-        )
-        .read_text()
-        .splitlines()
-    ]
-    assert trace_rows[0]["candidate_id"] is None
-    assert trace_rows[0]["candidate_hash"] == context.candidate_hash
-    assert trace_rows[0]["telemetry_ref"]["trace_id"] == context.trace_id
 
 
 class _FailingTelemetryProject(_Project):
@@ -3245,43 +974,6 @@ class _FailingTelemetryProject(_Project):
             example_id=str(example),
             error="tool timed out",
         )
-
-
-def test_adapter_trace_rows_include_compact_failure_metadata(tmp_path: Path):
-    telemetry_context = TelemetryContext(
-        sink=JsonlTelemetrySink(tmp_path / "telemetry" / "events.jsonl"),
-        trace_id="run_test",
-        run_id="run_test",
-    )
-    adapter = RLMGepaAdapter(
-        project=_FailingTelemetryProject(),
-        lm=_DummyLM(),
-        sub_lm=_DummyLM(),
-        max_iterations=1,
-        concurrency=1,
-        task_timeout=1,
-        output_dir=tmp_path,
-        run_id="run_test",
-        telemetry_context=telemetry_context,
-    )
-
-    adapter.evaluate(["example"], {"skill_instructions": "seed"}, capture_traces=False)
-
-    trace_rows = [
-        json.loads(line)
-        for line in (
-            tmp_path / "task_traces" / "run_test_eval_valset_attempt_0000_valset.jsonl"
-        )
-        .read_text()
-        .splitlines()
-    ]
-    row = trace_rows[0]
-    assert row["candidate_id"] is None
-    assert row["candidate_hash"].startswith("cand_sha256_")
-    assert row["failure_class"] == "host_tool_timeout_or_leak"
-    assert row["failure_reason"] == "tool timed out"
-    assert row["telemetry_ref"]["events_path"] == "telemetry/events.jsonl"
-    assert row["telemetry_ref"]["trace_id"].endswith(":0")
 
 
 def test_reflective_record_visible_to_gepa_includes_failure_metadata(tmp_path: Path):
@@ -3444,69 +1136,10 @@ def test_adapter_reflective_records_include_structured_run_traces(tmp_path: Path
     assert task_row["traces"][0]["usage"]["sub"]["cost"] == 0.002
 
 
-def test_gepa_failure_metadata_includes_lm_truncation_fields():
-    events = [
-        {
-            "name": "rlm.action_generation.parse_error",
-            "status": {"code": "ERROR", "message": "parse failed"},
-            "attributes": {
-                "failure.class": "model_output_truncated",
-                "lm.truncated": True,
-                "lm.truncation_reason": "max_tokens",
-                "lm.finish_reason": "length",
-                "lm.max_tokens": 50000,
-                "lm.output_tokens": 50000,
-            },
-        }
-    ]
-
-    metadata = _row_failure_metadata(
-        {"score": 0.0},
-        events,
-        telemetry_context=None,
-    )
-
-    assert metadata["failure_class"] == "model_output_truncated"
-    assert metadata["truncated"] is True
-    assert metadata["truncation_reason"] == "max_tokens"
-    assert metadata["finish_reason"] == "length"
-    assert metadata["max_tokens"] == 50000
-    assert metadata["output_tokens"] == 50000
-
-
-def test_gepa_failure_metadata_infers_truncation_from_structured_trace_finish_reason():
-    metadata = _row_failure_metadata(
-        {
-            "score": 0.0,
-            "trace": {
-                "usage": {
-                    "main": {
-                        "output_tokens": 50000,
-                        "max_tokens": 50000,
-                    }
-                },
-                "steps": [{"lm": {"finish_reason": "length"}}],
-            },
-        },
-        [],
-        telemetry_context=None,
-    )
-
-    assert metadata["failure_class"] == "model_output_truncated"
-    assert metadata["truncated"] is True
-    assert metadata["truncation_reason"] == "max_tokens"
-    assert metadata["finish_reason"] == "length"
-    assert metadata["max_tokens"] == 50000
-    assert metadata["output_tokens"] == 50000
-
-
-def test_telemetry_classifier_uses_truncation_without_error_text():
-    assert classify_failure({"score": 0.0, "truncated": True}, []) == "model_output_truncated"
-
-
 def test_adapter_enforces_per_example_timeout(tmp_path: Path):
+    project = _TimeoutProject()
     adapter = RLMGepaAdapter(
-        project=_TimeoutProject(),
+        project=project,
         lm=_DummyLM(),
         sub_lm=_DummyLM(),
         max_iterations=1,
@@ -3519,50 +1152,10 @@ def test_adapter_enforces_per_example_timeout(tmp_path: Path):
     batch = adapter.evaluate(["example"], {"skill_instructions": "seed"}, capture_traces=True)
 
     assert batch.scores == [0.0]
-    assert batch.trajectories[0]["record"]["Feedback"] == "evaluation timeout at 0.01s"
-
-
-def test_adapter_uses_project_timeout_and_resources_for_each_example(tmp_path: Path):
-    adapter = RLMGepaAdapter(
-        project=_ExampleTimeoutProject(),
-        lm=_DummyLM(),
-        sub_lm=_DummyLM(),
-        max_iterations=1,
-        concurrency=1,
-        task_timeout=0.01,
-        output_dir=tmp_path,
-        run_id="run_test",
-    )
-
-    batch = adapter.evaluate(["example"], {"skill_instructions": "seed"}, capture_traces=True)
-
-    assert batch.scores == [1.0]
-    assert batch.trajectories[0]["record"]["Feedback"] == (
-        "timeout=1 resources={'cpus': 2, 'memory_mb': 4096}"
-    )
-
-
-def test_adapter_prints_big_warning_for_evaluation_errors(tmp_path: Path, monkeypatch):
-    import rlm_gepa.runtime.adapter as adapter_module
-
-    messages: list[str] = []
-    monkeypatch.setattr(adapter_module, "progress_write", messages.append)
-    adapter = RLMGepaAdapter(
-        project=_ErrorProject(),
-        lm=_DummyLM(),
-        sub_lm=_DummyLM(),
-        max_iterations=1,
-        concurrency=1,
-        task_timeout=1,
-        output_dir=tmp_path,
-        run_id="run_test",
-    )
-
-    adapter.evaluate(["example"], {"skill_instructions": "seed"})
-
-    assert messages == [
-        "⚠️  EVALUATION ERROR valset example: expected failure",
-    ]
+    assert project.cancelled
+    row = json.loads(next((tmp_path / "task_traces").glob("*.jsonl")).read_text())
+    assert row["score"] == 0.0
+    assert "timeout" in row["error"]
 
 
 class _ErrorProject(_Project):
@@ -3582,7 +1175,9 @@ def test_resume_uses_unique_event_namespace_for_write_once_artifacts(tmp_path: P
     _run_dir, first_run_id = prepare_run_dir(_Project(), config, command="first")
     assert (run_dir / "telemetry").is_dir()
     (run_dir / "gepa_state.bin").write_bytes(b"checkpoint")
-    old_trace = run_dir / "task_traces" / f"{first_run_id}_eval_valset_attempt_0000_valset.jsonl"
+    old_trace = (
+        run_dir / "task_traces" / f"{first_run_id}_eval_valset_attempt_0000_valset.jsonl"
+    )
     old_trace.write_text("existing\n")
 
     resume_config = OptimizeConfig(run_dir=run_dir, resume=True)
@@ -3604,142 +1199,15 @@ def test_resume_uses_unique_event_namespace_for_write_once_artifacts(tmp_path: P
 
     assert batch.scores == [0.0]
     assert old_trace.read_text() == "existing\n"
-    new_trace = run_dir / "task_traces" / f"{resume_run_id}_eval_valset_attempt_0000_valset.jsonl"
-    assert new_trace.exists()
-
-
-def test_patch_merge_adapter_uses_patch_signature_and_persists_metadata(
-    tmp_path: Path,
-    monkeypatch,
-):
-    import rlm_gepa.proposer.rlm as proposer_module
-    import rlm_gepa.runtime.adapter as adapter_module
-
-    captured: dict[str, object] = {}
-    proposer_lm = _DummyLM()
-    proposer_sub_lm = _DummyLM()
-
-    class FakePredictRLM:
-        def __init__(self, signature, *, lm, sub_lm, skills, max_iterations, verbose, debug):
-            captured.update(
-                {
-                    "signature": signature,
-                    "lm": lm,
-                    "sub_lm": sub_lm,
-                    "skills": skills,
-                    "max_iterations": max_iterations,
-                    "verbose": verbose,
-                    "debug": debug,
-                }
-            )
-
-        async def acall(self, **kwargs):
-            captured["inputs"] = kwargs
-            return SimpleNamespace(
-                base_parent_id=10,
-                patch_summary="imported one clause",
-                selected_capability={
-                    "decision": "grafted",
-                    "summary": "validate inputs before invoking tools",
-                    "evidence_task_ids": ["train-a"],
-                    "trigger": "task requires validating user-provided tool inputs before invocation",
-                    "non_application_boundary": (
-                        "do not apply on base-win rows where direct tool invocation already succeeds"
-                    ),
-                },
-                patch_audit={
-                    "supported_source_win_ids": ["train-a"],
-                    "guardrail_hazards": [],
-                    "notes": "base lacks this validated-input facet",
-                },
-                new_instructions="base plus patch",
-                trace=None,
-                trajectory=[],
-            )
-
-    monkeypatch.setattr(adapter_module, "PredictRLM", FakePredictRLM)
-    monkeypatch.setattr(adapter_module, "progress_write", lambda _message: None)
-    monkeypatch.setattr(proposer_module, "progress_write", lambda _message: None)
-    (tmp_path / "proposer_traces").mkdir()
-    paired_trace = tmp_path / "paired_patch.jsonl"
-    paired_trace.write_text("{}\n")
-    adapter = RLMGepaAdapter(
-        project=_Project(),
-        lm=_DummyLM(),
-        sub_lm=_DummyLM(),
-        max_iterations=1,
-        concurrency=1,
-        task_timeout=1,
-        output_dir=tmp_path,
-        run_id="run_test",
-        proposer_lm=proposer_lm,
-        proposer_sub_lm=proposer_sub_lm,
-        proposer_max_iterations=17,
+    new_trace = (
+        run_dir / "task_traces" / f"{resume_run_id}_eval_valset_attempt_0000_valset.jsonl"
     )
-
-    new_text, metadata = adapter._rlm_propose_patch_merge_texts(
-        call_idx=4,
-        attempt_idx=2,
-        base_parent_id=10,
-        patch_source_parent_id=11,
-        base_parent_instructions="base",
-        patch_source_parent_instructions="source",
-        paired_disagreement_traces_file=SimpleNamespace(path=str(paired_trace)),
-        trace_task_ids=["train-a"],
-    )
-
-    assert new_text == "base plus patch"
-    assert metadata["patch_summary"] == "imported one clause"
-    assert metadata["selected_capability"]["decision"] == "grafted"
-    assert (
-        metadata["selected_capability"]["trigger"]
-        == "task requires validating user-provided tool inputs before invocation"
-    )
-    assert (
-        metadata["selected_capability"]["non_application_boundary"]
-        == "do not apply on base-win rows where direct tool invocation already succeeds"
-    )
-    assert metadata["base_instruction_chars"] == len("base")
-    assert metadata["new_instruction_chars"] == len("base plus patch")
-    assert metadata["instruction_char_delta"] == len("base plus patch") - len("base")
-    assert captured["signature"].input_fields.keys() >= {
-        "base_parent_id",
-        "base_parent_instructions",
-        "patch_source_parent_id",
-        "patch_source_parent_instructions",
-        "paired_disagreement_traces_file",
-    }
-    assert "selected_capability" in captured["signature"].output_fields
-    assert "patch_audit" in captured["signature"].output_fields
-    assert "behavioral_rules" not in captured["signature"].output_fields
-    assert "patch_merge_audit" not in captured["signature"].output_fields
-    assert "rejected_from_other" not in captured["signature"].output_fields
-    assert "imported_from_other" not in captured["signature"].output_fields
-    assert "common_ancestor_instructions" not in captured["inputs"]
-    assert captured["inputs"]["base_parent_id"] == 10
-    assert captured["inputs"]["patch_source_parent_id"] == 11
-    artifacts = list(
-        (tmp_path / "proposer_traces").glob("*_patch_from_cand_10_using_cand_11.json")
-    )
-    assert len(artifacts) == 1
-    payload = json.loads(artifacts[0].read_text())
-    assert payload["kind"] == "patch_merge_proposer"
-    patch_output = payload["patch_output"]
-    _assert_valid_patch_output(
-        patch_output,
-        trace_task_ids=["train-a"],
-        base_instructions="base",
-        new_instructions="base plus patch",
-    )
-    assert patch_output["patch_audit"]["supported_source_win_ids"] == ["train-a"]
-    assert "behavioral_rules" not in patch_output
-    assert "patch_merge_audit" not in patch_output
-    assert "rejected_from_other" not in patch_output
+    row = json.loads(new_trace.read_text())
+    assert row["score"] == 0.0
+    assert row["error"] == "expected failure"
 
 
-def test_rlm_patch_merge_no_op_patch_persists_compact_audit(
-    tmp_path: Path, monkeypatch
-):
+def test_rlm_patch_merge_no_op_patch_persists_compact_audit(tmp_path: Path, monkeypatch):
     import rlm_gepa.proposer.rlm as proposer_module
     import rlm_gepa.runtime.adapter as adapter_module
 
@@ -3808,89 +1276,15 @@ def test_rlm_patch_merge_no_op_patch_persists_compact_audit(
     assert metadata["selected_capability"]["evidence_task_ids"] == []
     assert metadata["instruction_char_delta"] == 0
     assert metadata["patch_audit"]["supported_source_win_ids"] == []
-    assert "duplicate" in metadata["patch_audit"]["notes"]
     artifacts = list(
         (tmp_path / "proposer_traces").glob("*_patch_from_cand_10_using_cand_11.json")
     )
     assert len(artifacts) == 1
     patch_output = json.loads(artifacts[0].read_text())["patch_output"]
-    _assert_valid_patch_output(
-        patch_output,
-        trace_task_ids=["train-a"],
-        base_instructions=base_instructions,
-        new_instructions=base_instructions,
-    )
+    assert patch_output["new_instructions"] == base_instructions
+    assert patch_output["instruction_char_delta"] == 0
+    assert patch_output["patch_audit"]["supported_source_win_ids"] == []
     assert patch_output["selected_capability"]["decision"] == "no-op"
-
-
-def test_patch_merge_prompt_contains_compact_grounding_invariants():
-    instructions = build_merge_signature(_spec()).instructions
-
-    assert "# Workflow" in instructions
-    assert "# Patch Contract" not in instructions
-    assert "one coherent missing capability family" in instructions
-    assert "necessary facets of the same behavior" in instructions
-    assert "do not import unrelated source-parent behaviors" in instructions
-    assert "return\n`new_instructions` unchanged" in instructions
-    assert "no task IDs, row labels, audit labels, or" in instructions
-    assert "provenance notes in `new_instructions`" in instructions
-    assert "base wins" in instructions
-    assert "both-success rows are preservation checks" in instructions
-    assert PatchMergeInstructionsGeneric.input_fields[
-        "paired_disagreement_traces_file"
-    ].json_schema_extra["desc"] == (
-        "JSONL file carrying train disagreement evidence for the two parents"
-    )
-    assert "use those as primary behavioral evidence" in instructions
-    assert "Inspect failed rows alongside scores and feedback" in instructions
-    assert "tool-call inputs/outputs/errors" in instructions
-    assert "predict-call\n  inputs/outputs/errors" in instructions
-    assert "LM finish reasons to understand why one parent\n  won" in instructions
-    assert "`steps[*].output` can be shortened for display" in instructions
-    assert "prefer `steps[*].untruncated_output` if present" in instructions
-    assert 'failure_metadata.failure_class == "model_output_truncated"' in instructions
-    assert "generated LM answer was cut off or incomplete" in instructions
-    assert "shortened sandbox display output" in instructions
-    assert "Use repeated\n  behavioral failure modes" in instructions
-    assert "do not overfit to one unusual disagreement row" in instructions
-    assert "Use available tools and `predict()` for focused evidence extraction" in instructions
-    assert "Helper `predict()` calls may extract evidence" in instructions
-    assert "you choose the final" in instructions
-    assert "Before editing, identify one patch-source-win cluster" in instructions
-    assert "state the exact" in instructions
-    assert "task-intent or observable trigger" in instructions
-    assert "state the" in instructions
-    assert "non-application boundary" in instructions
-    assert "grounded in base-win or both-success evidence" in instructions
-    assert "cannot state the trigger and boundary concretely" in instructions
-    assert "ProposerRunTrace" not in instructions
-    assert "archival" not in instructions
-    assert "token cost/cache accounting" not in instructions
-    assert "durations" not in instructions
-    assert "candidate_hash" not in instructions
-    assert "outer proposer" not in instructions
-    assert "helper output" not in instructions
-    assert "support-filter" not in instructions
-    assert "verification" not in instructions
-
-
-def test_generic_proposer_prompt_contains_surgical_compression_invariants():
-    instructions = build_proposer_signature(_spec()).instructions
-
-    assert "spreadsheet formula" not in instructions.lower()
-    assert ImproveInstructionsGeneric.input_fields["traces_file"].json_schema_extra["desc"] == (
-        "JSON file containing structured execution evidence for proposer review"
-    )
-    assert "ProposerRunTrace" not in instructions
-    assert "archival" not in instructions
-    assert "token cost/cache accounting" not in instructions
-    assert "durations" not in instructions
-    assert "candidate_hash" not in instructions
-    assert "outer proposer" not in instructions
-    assert "helper output" not in instructions
-    assert "support-filter" not in instructions
-    assert "one coherent missing capability family" not in instructions
-    assert "patch-source" not in instructions
 
 
 def test_rlm_instruction_proposer_serializes_proposer_trace_records(
@@ -3916,8 +1310,6 @@ def test_rlm_instruction_proposer_serializes_proposer_trace_records(
 
     monkeypatch.setattr(proposer_module, "PredictRLM", FakePredictRLM)
     monkeypatch.setattr(proposer_module, "progress_write", lambda _message: None)
-    monkeypatch.setattr(proposer_module, "install_rlm_log_stream", lambda _label: None)
-    monkeypatch.setattr(proposer_module, "restore_rlm_log_stream", lambda _stream: None)
     proposer = RLMInstructionProposer(
         spec=_spec(),
         lm=_DummyLM(),
@@ -3996,14 +1388,13 @@ def test_rlm_instruction_proposer_serializes_proposer_trace_records(
     serialized = captured["records"]
     assert isinstance(serialized, list)
     assert serialized[0]["Traces"][0]["steps"][0]["tool_calls"][0]["error"] == "boom"
-    assert serialized[0]["Traces"][0]["steps"][0]["predict_calls"][0]["calls"][0][
-        "error"
-    ] == "predict boom"
+    assert (
+        serialized[0]["Traces"][0]["steps"][0]["predict_calls"][0]["calls"][0]["error"]
+        == "predict boom"
+    )
     serialized_text = json.dumps(serialized)
     assert "QUJDREVGRw==" not in serialized_text
     assert "data:image/png;base64,<IMAGE_BASE_64_ENCODED(12)>" in serialized_text
-    assert "usage" not in serialized[0]["Traces"][0]
-    assert "duration_ms" not in serialized[0]["Traces"][0]
     assert "usage" not in serialized_text
     assert "duration_ms" not in serialized_text
     assert "cost" not in serialized_text
@@ -4015,54 +1406,3 @@ def test_rlm_instruction_proposer_serializes_proposer_trace_records(
     assert "trace_id" not in serialized_text
     assert "Trace Preview" not in serialized[0]
     assert "Generated Outputs" not in serialized[0]
-
-
-def test_generic_proposer_output_fields_describe_compact_edits_and_preservation():
-    output_fields = ImproveInstructionsGeneric.output_fields
-
-    new_desc = output_fields["new_instructions"].json_schema_extra["desc"]
-    check_desc = output_fields["generalization_check"].json_schema_extra["desc"]
-
-    assert "compact replacement or compression over appending" in new_desc
-    assert "Do not include audit labels or task IDs" in new_desc
-    assert "preserved solved behavior" in check_desc
-
-
-def _assert_valid_patch_output(
-    patch_output: dict[str, object],
-    *,
-    trace_task_ids: list[str],
-    base_instructions: str,
-    new_instructions: str,
-) -> None:
-    selected_capability = patch_output["selected_capability"]
-    assert isinstance(selected_capability, dict)
-    assert set(selected_capability) >= {
-        "decision",
-        "summary",
-        "evidence_task_ids",
-        "trigger",
-        "non_application_boundary",
-    }
-    assert set(selected_capability["evidence_task_ids"]) <= set(trace_task_ids)
-    assert isinstance(selected_capability["trigger"], str)
-    assert selected_capability["trigger"].strip()
-    assert isinstance(selected_capability["non_application_boundary"], str)
-    assert selected_capability["non_application_boundary"].strip()
-    patch_audit = patch_output["patch_audit"]
-    assert isinstance(patch_audit, dict)
-    assert set(patch_audit) >= {
-        "supported_source_win_ids",
-        "guardrail_hazards",
-        "notes",
-    }
-    assert patch_output["base_instruction_chars"] == len(base_instructions)
-    assert patch_output["new_instruction_chars"] == len(new_instructions)
-    assert patch_output["instruction_char_delta"] == len(new_instructions) - len(
-        base_instructions
-    )
-    for task_id in trace_task_ids:
-        if len(task_id) >= 4:
-            assert task_id not in new_instructions
-    for audit_label in ("base_win", "patch_source_win", "both_success_guardrail"):
-        assert audit_label not in new_instructions

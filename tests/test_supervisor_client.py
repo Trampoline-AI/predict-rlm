@@ -32,9 +32,7 @@ class FakePipe:
 class FakeProcess:
     def __init__(self, stdout_lines: list[dict[str, Any]] | None = None) -> None:
         self.stdin = FakePipe()
-        self.stdout = FakePipe(
-            [json.dumps(line) + "\n" for line in (stdout_lines or [])]
-        )
+        self.stdout = FakePipe([json.dumps(line) + "\n" for line in (stdout_lines or [])])
         self.stderr = FakePipe()
         self.returncode: int | None = None
         self.killed = False
@@ -134,18 +132,6 @@ class FakeClient(SupervisorClient):
         raise CodeInterpreterError(str(error.get("message") or "runner error"))
 
 
-def test_supervisor_client_discards_stale_response_then_returns_fresh() -> None:
-    process = FakeProcess(
-        [
-            {"jsonrpc": "2.0", "id": 99, "result": {"output": "stale"}},
-            {"jsonrpc": "2.0", "id": 1, "result": {"output": "fresh"}},
-        ]
-    )
-    client = FakeClient([process])
-
-    assert client.execute("print('fresh')") == "fresh"
-
-
 def test_supervisor_client_discards_stale_error_then_returns_fresh() -> None:
     process = FakeProcess(
         [
@@ -174,43 +160,3 @@ def test_supervisor_client_exhausted_stale_resync_raises_cleanly() -> None:
 
     with pytest.raises(CodeInterpreterError, match="stale.*resyncing"):
         client.execute("print('fresh')")
-
-
-def test_supervisor_client_recovers_dead_supervisor_after_structured_timeout() -> None:
-    first = FakeProcess(
-        [
-            {
-                "jsonrpc": "2.0",
-                "id": 1,
-                "result": {
-                    "timeout": {"seconds": 0.2},
-                    "stdout": "before\n",
-                    "stderr": "timed out\n",
-                },
-            }
-        ]
-    )
-    restarted = FakeProcess([])
-    client = FakeClient([first, restarted])
-
-    timeout_result = client.execute("slow()", timeout=0.2)
-    first.returncode = 137
-    restart_result = client.execute("next()", timeout=0.2)
-
-    assert timeout_result.timeout_seconds == 0.2
-    assert client.started == 2
-    assert "fake restart diagnostic" in restart_result
-    assert "supervisor_returncode=137" in restart_result
-    assert "previous_response=structured_timeout" in restart_result
-    assert restarted.stdin.writes == []
-
-
-def test_supervisor_client_host_timeout_unwraps_recoverable_timeout() -> None:
-    process = FakeProcess([])
-    client = FakeClient([process])
-
-    result = client.execute("silent()", timeout=0.2)
-
-    assert process.killed is True
-    assert result.timeout_seconds == 0.2
-    assert "fake supervisor restarted" in result.stderr

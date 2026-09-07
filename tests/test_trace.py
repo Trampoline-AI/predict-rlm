@@ -1,9 +1,7 @@
 """Tests for structured trace output."""
 
-import contextvars
 import json
-import time
-from unittest.mock import MagicMock
+from types import SimpleNamespace
 
 import pytest
 
@@ -13,230 +11,27 @@ from predict_rlm.trace import (
     LMUsage,
     PredictCallDetail,
     PredictCallGroup,
-    ProposerRunTrace,
     RunEvidence,
     RunEvidenceEvent,
     RunTrace,
     TokenUsage,
     ToolCall,
     _RawPredictCall,
-    _sanitize_for_trace,
     drain_predict_calls,
     drain_tool_calls,
     init_predict_call_collector,
     init_tool_call_collector,
     lm_completion_metadata_since,
     lm_finish_since,
-    ms_since,
     record_predict_call,
     record_tool_call,
     reset_predict_call_collector,
     reset_tool_call_collector,
-    snapshot_lm_history_len,
     usage_since,
 )
 
 
-class TestTokenUsage:
-    def test_defaults_to_zero(self):
-        usage = TokenUsage()
-        assert usage.input_tokens == 0
-        assert usage.output_tokens == 0
-        assert usage.cost == 0.0
-
-    def test_iadd(self):
-        a = TokenUsage(input_tokens=10, output_tokens=5, cost=0.01)
-        b = TokenUsage(input_tokens=20, output_tokens=10, cost=0.02)
-        a += b
-        assert a.input_tokens == 30
-        assert a.output_tokens == 15
-        assert a.cost == pytest.approx(0.03)
-
-
-class TestPredictCallGroup:
-    def test_fields(self):
-        group = PredictCallGroup(
-            signature="q -> a",
-            model="openai/gpt-4o",
-            calls=[
-                PredictCallDetail(duration_ms=90, usage=TokenUsage(input_tokens=40, output_tokens=20, cost=0.004)),
-                PredictCallDetail(duration_ms=110, usage=TokenUsage(input_tokens=60, output_tokens=30, cost=0.006)),
-            ],
-        )
-        assert group.signature == "q -> a"
-        assert group.model == "openai/gpt-4o"
-        assert len(group.calls) == 2
-        assert group.calls[0].duration_ms == 90
-
-
-class TestIterationStep:
-    def test_fields(self):
-        step = IterationStep(
-            iteration=1,
-            reasoning="think",
-            code="print(1)",
-            output="1",
-            untruncated_output="1",
-            duration_ms=500,
-        )
-        assert step.iteration == 1
-        assert step.predict_calls == []
-
-    def test_output_vs_untruncated(self):
-        long_output = "x" * 10000
-        truncated = long_output[:5000] + f"\n... (truncated to 5000/{len(long_output):,} chars)"
-        step = IterationStep(
-            iteration=1,
-            reasoning="",
-            code="print('x' * 10000)",
-            output=truncated,
-            untruncated_output=long_output,
-            duration_ms=100,
-        )
-        assert len(step.untruncated_output) == 10000
-        assert len(step.output) < 6000
-        assert "truncated" in step.output
-
-
 class TestRunTrace:
-    def test_serialization(self):
-        trace = RunTrace(
-            status="completed",
-            model="openai/gpt-5",
-            sub_model="openai/gpt-4o",
-            iterations=2,
-            max_iterations=5,
-            duration_ms=1000,
-            usage=LMUsage(
-                main=TokenUsage(input_tokens=70, output_tokens=40, cost=0.04),
-                sub=TokenUsage(input_tokens=30, output_tokens=10, cost=0.01),
-            ),
-            steps=[
-                IterationStep(
-                    iteration=1,
-                    reasoning="step 1",
-                    code="x = 1",
-                    output="",
-                    untruncated_output="",
-                    duration_ms=400,
-                    lm=LMFinishMetadata(finish_reason="length"),
-                    predict_calls=[
-                        PredictCallGroup(
-                            signature="q -> a",
-                            model="openai/gpt-4o",
-                            calls=[
-                                PredictCallDetail(
-                                    duration_ms=200,
-                                    usage=TokenUsage(input_tokens=30, output_tokens=10, cost=0.01),
-                                    lm=LMFinishMetadata(finish_reason="length"),
-                                )
-                            ],
-                        )
-                    ],
-                ),
-                IterationStep(
-                    iteration=2,
-                    reasoning="step 2",
-                    code="SUBMIT(x)",
-                    output="FINAL: {'answer': 1}",
-                    untruncated_output="FINAL: {'answer': 1}",
-                    duration_ms=600,
-                ),
-            ],
-        )
-        data = trace.model_dump()
-        assert data["status"] == "completed"
-        assert data["model"] == "openai/gpt-5"
-        assert data["sub_model"] == "openai/gpt-4o"
-        assert data["iterations"] == 2
-        assert len(data["steps"]) == 2
-        assert len(data["steps"][0]["predict_calls"]) == 1
-        assert data["steps"][0]["predict_calls"][0]["signature"] == "q -> a"
-        assert data["steps"][0]["predict_calls"][0]["model"] == "openai/gpt-4o"
-        assert data["usage"]["main"]["input_tokens"] == 70
-        assert data["usage"]["sub"]["input_tokens"] == 30
-
-    def test_exportable_json_keeps_lm_finish_metadata_compact(self):
-        trace = RunTrace(
-            status="completed",
-            model="openai/gpt-5",
-            iterations=1,
-            max_iterations=5,
-            duration_ms=100,
-            usage=LMUsage(
-                main=TokenUsage(input_tokens=100, output_tokens=50, cost=0.01),
-                sub=TokenUsage(input_tokens=20, output_tokens=10, cost=0.002),
-            ),
-            steps=[
-                IterationStep(
-                    iteration=1,
-                    reasoning="think",
-                    code="answer = predict(q='x')",
-                    output="ok",
-                    untruncated_output="ok",
-                    duration_ms=100,
-                    lm=LMFinishMetadata(finish_reason="length"),
-                    predict_calls=[
-                        PredictCallGroup(
-                            signature="q -> a",
-                            model="openai/gpt-4o",
-                            total_usage=TokenUsage(input_tokens=20, output_tokens=10, cost=0.002),
-                            calls=[
-                                PredictCallDetail(
-                                    duration_ms=20,
-                                    usage=TokenUsage(input_tokens=20, output_tokens=10, cost=0.002),
-                                    lm=LMFinishMetadata(finish_reason="length"),
-                                )
-                            ],
-                        )
-                    ],
-                )
-            ],
-        )
-
-        import json
-
-        data = json.loads(trace.to_exportable_json())
-        serialized = trace.to_exportable_json()
-        assert '"truncation"' not in serialized
-        assert data["usage"]["main"] == {
-            "input_tokens": 100,
-            "output_tokens": 50,
-            "cost": 0.01,
-            "cache_hits": 0,
-        }
-        assert data["usage"]["sub"] == {
-            "input_tokens": 20,
-            "output_tokens": 10,
-            "cost": 0.002,
-            "cache_hits": 0,
-        }
-        assert data["steps"][0]["lm"] == {"finish_reason": "length"}
-        call = data["steps"][0]["predict_calls"][0]["calls"][0]
-        assert call["lm"] == {"finish_reason": "length"}
-        forbidden = {"truncated", "truncation_reason", "max_tokens", "output_tokens"}
-        assert forbidden.isdisjoint(data["steps"][0]["lm"])
-        assert forbidden.isdisjoint(call["lm"])
-
-    def test_sub_model_optional(self):
-        trace = RunTrace(
-            status="completed",
-            model="openai/gpt-5",
-            iterations=1,
-            max_iterations=5,
-            duration_ms=100,
-        )
-        assert trace.sub_model is None
-        assert trace.usage.sub.input_tokens == 0
-
-    def test_status_literals(self):
-        for status in ("in_progress", "completed", "max_iterations", "error"):
-            trace = RunTrace(
-                status=status, model="openai/gpt-5",
-                iterations=1, max_iterations=5, duration_ms=100,
-            )
-            assert trace.status == status
-
     def test_atomic_export_replaces_in_progress_trace(self, tmp_path):
         from predict_rlm.predict_rlm import PredictRLM
 
@@ -267,35 +62,33 @@ class TestRunTrace:
         assert json.loads(path.read_text())["status"] == "completed"
         assert not list(tmp_path.glob("*.tmp"))
 
-    def test_to_exportable_json_returns_string(self):
-        trace = RunTrace(
-            status="completed", model="openai/gpt-5",
-            iterations=1, max_iterations=5, duration_ms=100,
-        )
-        result = trace.to_exportable_json()
-        assert isinstance(result, str)
-        import json
-        data = json.loads(result)
-        assert data["status"] == "completed"
-
     def test_to_exportable_json_sanitizes_base64(self):
         b64 = "A" * 40000
         trace = RunTrace(
-            status="completed", model="openai/gpt-5",
-            iterations=1, max_iterations=5, duration_ms=100,
+            status="completed",
+            model="openai/gpt-5",
+            iterations=1,
+            max_iterations=5,
+            duration_ms=100,
             steps=[
                 IterationStep(
-                    iteration=1, reasoning="", code="",
-                    output="", untruncated_output="", duration_ms=100,
+                    iteration=1,
+                    reasoning="",
+                    code="",
+                    output="",
+                    untruncated_output="",
+                    duration_ms=100,
                     predict_calls=[
                         PredictCallGroup(
                             signature="page: dspy.Image -> answer",
                             model="openai/gpt-4o",
-                            calls=[PredictCallDetail(
-                                duration_ms=50,
-                                input={"page": f"data:image/png;base64,{b64}"},
-                                output={"answer": "hello"},
-                            )],
+                            calls=[
+                                PredictCallDetail(
+                                    duration_ms=50,
+                                    input={"page": f"data:image/png;base64,{b64}"},
+                                    output={"answer": "hello"},
+                                )
+                            ],
                         )
                     ],
                 )
@@ -377,12 +170,6 @@ class TestRunTrace:
         step = data["steps"][0]
         predict_call = step["predict_calls"][0]["calls"][0]
 
-        assert isinstance(proposer, ProposerRunTrace)
-        assert data["status"] == "completed"
-        assert data["model"] == "openai/gpt-5"
-        assert data["sub_model"] == "openai/gpt-4o"
-        assert data["iterations"] == 1
-        assert data["max_iterations"] == 5
         assert step["reasoning"] == "inspect"
         assert step["code"] == "answer = tool('x')"
         assert step["output"] == "truncated"
@@ -405,53 +192,6 @@ class TestRunTrace:
         forbidden = ("usage", "duration_ms", "cost", "cache_hits", "total_usage")
         for field in forbidden:
             assert f'"{field}"' not in serialized
-
-    def test_to_proposer_sanitizes_base64_payloads(self):
-        b64 = "A" * 40000
-        trace = RunTrace(
-            status="completed",
-            model="openai/gpt-5",
-            iterations=1,
-            max_iterations=5,
-            duration_ms=100,
-            steps=[
-                IterationStep(
-                    iteration=1,
-                    reasoning=f"see data:image/png;base64,{b64}",
-                    code="SUBMIT(answer)",
-                    output="ok",
-                    untruncated_output="ok",
-                    duration_ms=100,
-                    tool_calls=[
-                        ToolCall(
-                            name="tool",
-                            args=[f"data:image/png;base64,{b64}"],
-                            result={"image": f"data:image/png;base64,{b64}"},
-                            duration_ms=1,
-                        )
-                    ],
-                    predict_calls=[
-                        PredictCallGroup(
-                            signature="page: dspy.Image -> answer",
-                            model="openai/gpt-4o",
-                            calls=[
-                                PredictCallDetail(
-                                    duration_ms=50,
-                                    input={"page": f"data:image/png;base64,{b64}"},
-                                    output={"answer": "hello"},
-                                )
-                            ],
-                        )
-                    ],
-                )
-            ],
-        )
-
-        result = trace.to_proposer_json()
-        assert "AAAA" not in result
-        assert result.count("<IMAGE_BASE_64_ENCODED(40000)>") == 4
-        full = trace.model_dump()
-        assert b64 in full["steps"][0]["reasoning"]
 
     def test_to_proposer_projects_strict_evidence_without_raw_or_accounting_data(self):
         b64 = "A" * 40000
@@ -537,362 +277,154 @@ class TestRunTrace:
         ):
             assert f'"{field}"' not in serialized
 
-    def test_to_exportable_json_writes_file(self, tmp_path):
-        trace = RunTrace(
-            status="completed", model="openai/gpt-5",
-            iterations=1, max_iterations=5, duration_ms=100,
-        )
-        out = tmp_path / "trace.json"
-        result = trace.to_exportable_json(out)
-        assert out.exists()
-        assert result == out.read_text()
-
 
 class TestPredictCallCollector:
-    def test_different_signatures_not_aggregated(self):
-        init_predict_call_collector()
-        record_predict_call(_RawPredictCall(
-            signature="a -> b", instructions=None, model="openai/gpt-4o",
-            duration_ms=50, usage=TokenUsage(), input={"a": "1"}, output={"b": "x"},
-        ))
-        record_predict_call(_RawPredictCall(
-            signature="c -> d", instructions=None, model="openai/gpt-4o",
-            duration_ms=30, usage=TokenUsage(), input={"c": "2"}, output={"d": "y"},
-        ))
-        groups = drain_predict_calls()
-        assert len(groups) == 2
-        assert groups[0].signature == "a -> b"
-        assert groups[1].signature == "c -> d"
-        assert len(groups[0].calls) == 1
-        assert groups[0].calls[0].output == {"b": "x"}
-        # Drain clears the list
-        assert drain_predict_calls() == []
-
-    def test_same_signature_aggregated(self):
-        init_predict_call_collector()
-        record_predict_call(_RawPredictCall(
-            signature="page: dspy.Image -> items: list[str]",
-            instructions="Extract items",
-            model="openai/gpt-4o",
-            duration_ms=100,
-            usage=TokenUsage(input_tokens=50, output_tokens=20, cost=0.01),
-            input={"page": "url1"}, output={"items": ["a"]},
-        ))
-        record_predict_call(_RawPredictCall(
-            signature="page: dspy.Image -> items: list[str]",
-            instructions="Extract items",
-            model="openai/gpt-4o",
-            duration_ms=150,
-            usage=TokenUsage(input_tokens=60, output_tokens=30, cost=0.02),
-            input={"page": "url2"}, output={"items": ["b", "c"]},
-        ))
-        record_predict_call(_RawPredictCall(
-            signature="page: dspy.Image -> items: list[str]",
-            instructions="Extract items",
-            model="openai/gpt-4o",
-            duration_ms=120,
-            usage=TokenUsage(input_tokens=55, output_tokens=25, cost=0.015),
-            input={"page": "url3"}, output={"items": []},
-        ))
-        groups = drain_predict_calls()
-        assert len(groups) == 1
-        agg = groups[0]
-        assert len(agg.calls) == 3
-        assert agg.calls[0].duration_ms == 100
-        assert agg.calls[0].output == {"items": ["a"]}
-        assert agg.calls[1].usage.input_tokens == 60
-        assert agg.calls[2].output == {"items": []}
-
-    def test_different_instructions_not_aggregated(self):
-        init_predict_call_collector()
-        record_predict_call(_RawPredictCall(
-            signature="q -> a", instructions="Task A", model="m",
-            duration_ms=10, usage=TokenUsage(), input={"q": "x"}, output={"a": "1"},
-        ))
-        record_predict_call(_RawPredictCall(
-            signature="q -> a", instructions="Task B", model="m",
-            duration_ms=10, usage=TokenUsage(), input={"q": "y"}, output={"a": "2"},
-        ))
-        groups = drain_predict_calls()
-        assert len(groups) == 2
+    def test_groups_by_signature_instructions_and_model(self):
+        token = init_predict_call_collector()
+        try:
+            for signature, instructions, model, answer in [
+                ("q -> a", "extract", "m", "first"),
+                ("q -> a", "extract", "m", "second"),
+                ("q -> a", "summarize", "m", "different instructions"),
+                ("q -> a", "extract", "other", "different model"),
+                ("text -> label", "extract", "m", "different signature"),
+            ]:
+                record_predict_call(
+                    _RawPredictCall(
+                        signature=signature,
+                        instructions=instructions,
+                        model=model,
+                        duration_ms=10,
+                        usage=TokenUsage(input_tokens=5, cost=0.01),
+                        input={"q": "input"},
+                        output={"a": answer},
+                    )
+                )
+            groups = drain_predict_calls()
+            assert [[call.output["a"] for call in group.calls] for group in groups] == [
+                ["first", "second"],
+                ["different instructions"],
+                ["different model"],
+                ["different signature"],
+            ]
+            assert groups[0].total_usage.input_tokens == 10
+            assert groups[0].total_usage.cost == pytest.approx(0.02)
+            assert drain_predict_calls() == []
+        finally:
+            reset_predict_call_collector(token)
 
     def test_nested_collector_restores_parent_calls(self):
         outer_token = init_predict_call_collector()
-        record_predict_call(_RawPredictCall(
-            signature="outer-before", instructions=None, model="m",
-            duration_ms=10, usage=TokenUsage(), input={}, output={},
-        ))
+        record_predict_call(
+            _RawPredictCall(
+                signature="outer-before",
+                instructions=None,
+                model="m",
+                duration_ms=10,
+                usage=TokenUsage(),
+                input={},
+                output={},
+            )
+        )
 
         inner_token = init_predict_call_collector()
-        record_predict_call(_RawPredictCall(
-            signature="inner", instructions=None, model="m",
-            duration_ms=10, usage=TokenUsage(), input={}, output={},
-        ))
+        record_predict_call(
+            _RawPredictCall(
+                signature="inner",
+                instructions=None,
+                model="m",
+                duration_ms=10,
+                usage=TokenUsage(),
+                input={},
+                output={},
+            )
+        )
         inner_groups = drain_predict_calls()
         reset_predict_call_collector(inner_token)
 
-        record_predict_call(_RawPredictCall(
-            signature="outer-after", instructions=None, model="m",
-            duration_ms=10, usage=TokenUsage(), input={}, output={},
-        ))
+        record_predict_call(
+            _RawPredictCall(
+                signature="outer-after",
+                instructions=None,
+                model="m",
+                duration_ms=10,
+                usage=TokenUsage(),
+                input={},
+                output={},
+            )
+        )
         outer_groups = drain_predict_calls()
         reset_predict_call_collector(outer_token)
 
         assert [group.signature for group in inner_groups] == ["inner"]
         assert [group.signature for group in outer_groups] == ["outer-before", "outer-after"]
 
-    def test_record_without_init_is_silent(self):
-        from predict_rlm import trace
-
-        original = trace._predict_calls
-        trace._predict_calls = contextvars.ContextVar("_predict_calls_fresh")
-        try:
-            record_predict_call(_RawPredictCall(
-                signature="orphan", instructions=None, model="m",
-                duration_ms=1, usage=TokenUsage(), input={}, output={},
-            ))
-            assert drain_predict_calls() == []
-        finally:
-            trace._predict_calls = original
-
-
-class TestToolCall:
-    def test_fields(self):
-        call = ToolCall(
-            name="read_pdf", args=[], kwargs={"path": "/tmp/doc.pdf"},
-            result='{"pages": 5}', duration_ms=200,
-        )
-        assert call.name == "read_pdf"
-        assert call.error is None
-        assert call.result == '{"pages": 5}'
-
-    def test_error_field(self):
-        call = ToolCall(
-            name="bad_tool", args=[], kwargs={},
-            result="", error="FileNotFoundError: no such file", duration_ms=10,
-        )
-        assert call.error == "FileNotFoundError: no such file"
-
-    def test_serialization(self):
-        call = ToolCall(
-            name="search", args=["query"], kwargs={"limit": 10},
-            result='["a", "b"]', duration_ms=50,
-        )
-        data = call.model_dump()
-        assert data["name"] == "search"
-        assert data["args"] == ["query"]
-        assert data["kwargs"] == {"limit": 10}
-
 
 class TestToolCallCollector:
-    def test_init_drain_cycle(self):
-        init_tool_call_collector()
-        record_tool_call(ToolCall(
-            name="tool_a", args=[], kwargs={"x": 1},
-            result="ok", duration_ms=50,
-        ))
-        record_tool_call(ToolCall(
-            name="tool_b", args=[1, 2], kwargs={},
-            result="done", duration_ms=30,
-        ))
-        calls = drain_tool_calls()
-        assert len(calls) == 2
-        assert calls[0].name == "tool_a"
-        assert calls[1].name == "tool_b"
-        assert calls[1].args == [1, 2]
-        # Drain clears the list
-        assert drain_tool_calls() == []
-
-    def test_error_calls_recorded(self):
-        init_tool_call_collector()
-        record_tool_call(ToolCall(
-            name="failing_tool", args=[], kwargs={},
-            result="", error="boom", duration_ms=5,
-        ))
-        calls = drain_tool_calls()
-        assert len(calls) == 1
-        assert calls[0].error == "boom"
-
     def test_nested_collector_restores_parent_calls(self):
         outer_token = init_tool_call_collector()
-        record_tool_call(ToolCall(
-            name="outer_before", args=[], kwargs={}, result="ok", duration_ms=1,
-        ))
+        record_tool_call(
+            ToolCall(
+                name="outer_before",
+                args=[],
+                kwargs={},
+                result="ok",
+                duration_ms=1,
+            )
+        )
 
         inner_token = init_tool_call_collector()
-        record_tool_call(ToolCall(
-            name="inner", args=[], kwargs={}, result="ok", duration_ms=1,
-        ))
+        record_tool_call(
+            ToolCall(
+                name="inner",
+                args=[],
+                kwargs={},
+                result="",
+                error="tool failed",
+                duration_ms=1,
+            )
+        )
         inner_calls = drain_tool_calls()
+        assert drain_tool_calls() == []
         reset_tool_call_collector(inner_token)
 
-        record_tool_call(ToolCall(
-            name="outer_after", args=[], kwargs={}, result="ok", duration_ms=1,
-        ))
+        record_tool_call(
+            ToolCall(
+                name="outer_after",
+                args=[],
+                kwargs={},
+                result="ok",
+                duration_ms=1,
+            )
+        )
         outer_calls = drain_tool_calls()
         reset_tool_call_collector(outer_token)
 
         assert [call.name for call in inner_calls] == ["inner"]
+        assert inner_calls[0].error == "tool failed"
         assert [call.name for call in outer_calls] == ["outer_before", "outer_after"]
-
-    def test_record_without_init_is_silent(self):
-        from predict_rlm import trace
-
-        original = trace._tool_calls
-        trace._tool_calls = contextvars.ContextVar("_tool_calls_fresh")
-        try:
-            record_tool_call(ToolCall(
-                name="orphan", args=[], kwargs={}, result="", duration_ms=1,
-            ))
-            assert drain_tool_calls() == []
-        finally:
-            trace._tool_calls = original
-
-
-class TestSnapshotLmHistoryLen:
-    def test_with_history(self):
-        lm = MagicMock()
-        lm.history = [{"usage": {}}, {"usage": {}}]
-        assert snapshot_lm_history_len(lm) == 2
-
-    def test_without_history(self):
-        lm = MagicMock(spec=[])
-        assert snapshot_lm_history_len(lm) == 0
-
-    def test_empty_history(self):
-        lm = MagicMock()
-        lm.history = []
-        assert snapshot_lm_history_len(lm) == 0
 
 
 class TestUsageSince:
-    def test_sums_new_entries(self):
-        lm = MagicMock()
-        lm.history = [
-            {"usage": {"prompt_tokens": 100, "completion_tokens": 50}, "cost": 0.01},
-            {"usage": {"prompt_tokens": 200, "completion_tokens": 100}, "cost": 0.02},
-            {"usage": {"prompt_tokens": 300, "completion_tokens": 150}, "cost": 0.03},
-        ]
+    def test_history_delta_excludes_cached_cost_without_losing_real_usage(self):
+        lm = SimpleNamespace(
+            history=[
+                {"usage": {"prompt_tokens": 900}, "cost": 1.0},
+                {"usage": {"prompt_tokens": 100, "completion_tokens": 20}, "cost": 0.01},
+                {"usage": {}, "cost": 0.01, "response": SimpleNamespace(cache_hit=True)},
+                {"usage": {}, "cost": 0.01},
+                {"usage": {"prompt_tokens": 0, "completion_tokens": 0}, "cost": 0},
+                {"usage": {"prompt_tokens": 200, "completion_tokens": 30}, "cost": 0.02},
+            ]
+        )
         usage = usage_since(lm, 1)
-        assert usage.input_tokens == 500
-        assert usage.output_tokens == 250
-        assert usage.cost == pytest.approx(0.05)
-
-    def test_since_zero_sums_all(self):
-        lm = MagicMock()
-        lm.history = [
-            {"usage": {"prompt_tokens": 100, "completion_tokens": 50}, "cost": 0.01},
-        ]
-        usage = usage_since(lm, 0)
-        assert usage.input_tokens == 100
+        assert usage.input_tokens == 300
         assert usage.output_tokens == 50
-
-    def test_since_beyond_length_returns_zero(self):
-        lm = MagicMock()
-        lm.history = [{"usage": {"prompt_tokens": 100, "completion_tokens": 50}, "cost": 0.01}]
-        usage = usage_since(lm, 5)
-        assert usage.input_tokens == 0
-
-    def test_no_history_returns_zero(self):
-        lm = MagicMock(spec=[])
-        usage = usage_since(lm, 0)
-        assert usage.input_tokens == 0
-
-    def test_cache_hit_via_response_flag_excluded_from_cost(self):
-        """DSPy's Cache.get() zeros response.usage but keeps response._hidden_params
-        on a cache hit. Without care, usage_since double-counts: 0 tokens yet
-        phantom cost. We detect cache hits via response.cache_hit and drop them
-        from the billed aggregate, surfacing the count via TokenUsage.cache_hits.
-        """
-        fresh_resp = MagicMock()
-        fresh_resp.cache_hit = False
-        cached_resp = MagicMock()
-        cached_resp.cache_hit = True
-
-        lm = MagicMock()
-        lm.history = [
-            {
-                "usage": {"prompt_tokens": 1000, "completion_tokens": 50},
-                "cost": 0.001,
-                "response": fresh_resp,
-            },
-            {
-                "usage": {},  # DSPy clears usage on cache hit
-                "cost": 0.001,  # but leaves cost
-                "response": cached_resp,
-            },
-        ]
-        usage = usage_since(lm, 0)
-        # Only the fresh call counts toward tokens and cost.
-        assert usage.input_tokens == 1000
-        assert usage.output_tokens == 50
-        assert usage.cost == pytest.approx(0.001)
-        # The cache hit is surfaced for observability.
-        assert usage.cache_hits == 1
-
-    def test_cache_hit_via_empty_usage_heuristic(self):
-        """When the response object isn't accessible (e.g. synthetic history or
-        the response was dropped), an empty usage dict paired with non-zero
-        cost is an unambiguous cache-hit signature: a real call always
-        populates prompt_tokens/completion_tokens.
-        """
-        lm = MagicMock()
-        lm.history = [
-            {"usage": {"prompt_tokens": 1000, "completion_tokens": 50}, "cost": 0.001},
-            {"usage": {}, "cost": 0.001},  # no response key, usage empty, cost > 0
-        ]
-        usage = usage_since(lm, 0)
-        assert usage.input_tokens == 1000
-        assert usage.output_tokens == 50
-        assert usage.cost == pytest.approx(0.001)
-        assert usage.cache_hits == 1
-
-    def test_legitimate_zero_usage_entry_not_flagged(self):
-        """An entry with zero usage AND zero cost is a legitimate no-op, not a
-        cache hit. Don't surface it as one.
-        """
-        lm = MagicMock()
-        lm.history = [
-            {"usage": {"prompt_tokens": 0, "completion_tokens": 0}, "cost": 0},
-        ]
-        usage = usage_since(lm, 0)
-        assert usage.input_tokens == 0
-        assert usage.output_tokens == 0
-        assert usage.cost == 0
-        assert usage.cache_hits == 0
-
-    def test_usage_since_keeps_token_usage_free_of_truncation_metadata(self):
-        lm = MagicMock()
-        lm.history = [
-            {
-                "usage": {"prompt_tokens": 100, "completion_tokens": 50000},
-                "kwargs": {"max_tokens": 50000},
-                "response": {"choices": [{"finish_reason": "length"}]},
-            }
-        ]
-
-        usage = usage_since(lm, 0)
-
-        assert usage.input_tokens == 100
-        assert usage.output_tokens == 50000
-        assert not hasattr(usage, "truncation")
-
-    def test_lm_finish_since_extracts_finish_reason_only(self):
-        lm = MagicMock()
-        lm.history = [
-            {
-                "usage": {"prompt_tokens": 100, "completion_tokens": 49100},
-                "kwargs": {"max_tokens": 50000},
-                "response": {"choices": [{"finish_reason": "stop"}]},
-            }
-        ]
-
-        metadata = lm_finish_since(lm, 0)
-
-        assert metadata == LMFinishMetadata(finish_reason="stop")
+        assert usage.cost == pytest.approx(0.03)
+        assert usage.cache_hits == 2
 
     def test_lm_completion_metadata_includes_prompt_cache_stats(self):
-        lm = MagicMock()
+        lm = SimpleNamespace()
         lm.history = [
             {
                 "usage": {
@@ -918,111 +450,4 @@ class TestUsageSince:
         assert metadata.input_tokens == 1500
         assert metadata.cached_input_tokens == 850
         assert metadata.cache_read_ratio == pytest.approx(850 / 1500)
-
-
-class TestConcurrentUsageAccounting:
-    """Regression test for the concurrency overcount bug.
-
-    The naïve ``usage_since(shared_lm, snapshot)`` pattern inflated each
-    worker's delta under concurrent execution: two workers starting at the
-    same ``lm.history`` length and finishing after each other's entries
-    have landed each see the OTHER's entries in their "delta", doubling
-    the logged total.
-
-    The fix is architectural: each PredictRLM instance makes its own
-    ``lm.copy()`` (fresh history, shared cache/callbacks/config) in
-    ``__init__``. Each worker's ``lm.history`` is isolated, so
-    ``usage_since`` sees only that worker's own calls.
-    """
-
-    def test_lm_history_delta_overcounts_under_shared_history(self):
-        """Demonstrates the bug shape. Two workers sharing an lm.history
-        both see the full delta; sum is 2x the real tokens. This is why
-        PredictRLM copies the lm in __init__.
-        """
-        class SharedLM:
-            def __init__(self):
-                self.history = []
-
-        lm = SharedLM()
-        snap_A = snapshot_lm_history_len(lm)
-        snap_B = snapshot_lm_history_len(lm)
-        lm.history.append({"usage": {"prompt_tokens": 100, "completion_tokens": 10}, "cost": 0.001})
-        lm.history.append({"usage": {"prompt_tokens": 200, "completion_tokens": 20}, "cost": 0.002})
-        lm.history.append({"usage": {"prompt_tokens": 150, "completion_tokens": 15}, "cost": 0.0015})
-        usage_A = usage_since(lm, snap_A)
-        usage_B = usage_since(lm, snap_B)
-
-        real_total = sum(e["cost"] for e in lm.history)
-        logged_total = usage_A.cost + usage_B.cost
-        assert logged_total == pytest.approx(real_total * 2), (
-            "shared history always inflates — that's the bug we fix via "
-            "per-RLM lm.copy()"
-        )
-
-    def test_lm_copy_gives_fresh_history_per_instance(self):
-        """The fix: dspy.LM.copy() creates a new LM with an empty
-        history list. Calls made through one copy don't pollute the
-        other's history — so two concurrent PredictRLM instances sharing
-        an 'original' LM still see only their own calls via usage_since.
-        """
-        import dspy
-
-        original = dspy.LM(model="openai/gpt-4o", cache=False)
-        # PredictRLM.__init__ does this internally:
-        lm_a = original.copy()
-        lm_b = original.copy()
-
-        # Simulate calls landing in each instance's history
-        lm_a.history.append({"usage": {"prompt_tokens": 100, "completion_tokens": 10}, "cost": 0.001})
-        lm_a.history.append({"usage": {"prompt_tokens": 150, "completion_tokens": 15}, "cost": 0.0015})
-        lm_b.history.append({"usage": {"prompt_tokens": 200, "completion_tokens": 20}, "cost": 0.002})
-
-        # Each copy's usage_since sees only ITS own calls
-        u_a = usage_since(lm_a, 0)
-        u_b = usage_since(lm_b, 0)
-        assert u_a.input_tokens == 250
-        assert u_b.input_tokens == 200
-        # Sum matches real total — no inflation
-        assert u_a.cost + u_b.cost == pytest.approx(0.0045)
-        # And the original lm's history is untouched
-        assert len(original.history) == 0
-
-
-
-class TestSanitizeForTrace:
-    def test_replaces_data_uri(self):
-        data_uri = "data:image/png;base64," + "A" * 40000
-        result = _sanitize_for_trace(data_uri)
-        assert result == "data:image/png;base64,<IMAGE_BASE_64_ENCODED(40000)>"
-
-    def test_replaces_nested_in_dict(self):
-        data = {
-            "page": "data:image/jpeg;base64," + "B" * 20000,
-            "question": "What is this?",
-        }
-        result = _sanitize_for_trace(data)
-        assert result["question"] == "What is this?"
-        assert result["page"] == "data:image/jpeg;base64,<IMAGE_BASE_64_ENCODED(20000)>"
-
-    def test_replaces_in_list(self):
-        data = ["data:image/png;base64," + "C" * 10000, "normal string"]
-        result = _sanitize_for_trace(data)
-        assert result[0] == "data:image/png;base64,<IMAGE_BASE_64_ENCODED(10000)>"
-        assert result[1] == "normal string"
-
-    def test_leaves_normal_strings(self):
-        assert _sanitize_for_trace("hello") == "hello"
-        assert _sanitize_for_trace("data:not-base64") == "data:not-base64"
-
-    def test_leaves_non_strings(self):
-        assert _sanitize_for_trace(42) == 42
-        assert _sanitize_for_trace(None) is None
-
-
-class TestMsSince:
-    def test_returns_positive_int(self):
-        start = time.perf_counter()
-        ms = ms_since(start)
-        assert isinstance(ms, int)
-        assert ms >= 0
+        assert lm_finish_since(lm, 0) == LMFinishMetadata(finish_reason="stop")

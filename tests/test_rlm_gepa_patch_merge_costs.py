@@ -31,7 +31,11 @@ class _Project(RLMGepaProject):
     agent_spec = AgentSpec(
         agent_type="test agent",
         use_cases=["case a", "case b"],
-        runtime_grounding_examples={"tools": ["tool()"], "env": ["sandbox"], "spec": ["protocol"]},
+        runtime_grounding_examples={
+            "tools": ["tool()"],
+            "env": ["sandbox"],
+            "spec": ["protocol"],
+        },
         tool_signatures="tool() -> str",
         target_signature="input: str -> output: str",
         scoring_description="exact match",
@@ -87,8 +91,12 @@ def _trace_with_proposer_usage() -> RunTrace:
     )
 
 
-def test_patch_merge_proposer_logs_merge_proposer_cost_roles(tmp_path: Path, monkeypatch):
+def test_patch_merge_preserves_output_artifact_and_charges_main_and_sub_usage(
+    tmp_path: Path, monkeypatch
+):
     import rlm_gepa.runtime.adapter as adapter_module
+
+    instructions = "  Preserve base rules.\n\nApply the supported patch: café.\n"
 
     class FakePredictRLM:
         def __init__(self, *_args, **_kwargs):
@@ -112,7 +120,7 @@ def test_patch_merge_proposer_logs_merge_proposer_cost_roles(tmp_path: Path, mon
                     "guardrail_hazards": [],
                     "notes": "base lacks the selected facet",
                 },
-                new_instructions="patched instructions",
+                new_instructions=instructions,
                 trace=_trace_with_proposer_usage(),
                 trajectory=[],
             )
@@ -135,7 +143,7 @@ def test_patch_merge_proposer_logs_merge_proposer_cost_roles(tmp_path: Path, mon
         proposer_max_iterations=1,
     )
 
-    adapter._rlm_propose_patch_merge_texts(
+    new_text, _metadata = adapter._rlm_propose_patch_merge_texts(
         call_idx=1,
         attempt_idx=0,
         base_parent_id=1,
@@ -145,25 +153,29 @@ def test_patch_merge_proposer_logs_merge_proposer_cost_roles(tmp_path: Path, mon
         paired_disagreement_traces_file=SimpleNamespace(path=str(paired_trace)),
         trace_task_ids=["train-a"],
     )
+    artifact = next(
+        (tmp_path / "proposer_traces").glob("*_patch_from_cand_1_using_cand_2.json")
+    )
+    payload = json.loads(artifact.read_text())
+    assert new_text == instructions
+    assert payload["new_instructions"] == instructions
+    assert payload["patch_output"]["new_instructions"] == instructions
+    assert payload["patch_output"]["instruction_char_delta"] == len(instructions) - len("base")
 
-    cost_log = [json.loads(line) for line in (tmp_path / "cost_log.jsonl").read_text().splitlines()]
+    cost_log = [
+        json.loads(line) for line in (tmp_path / "cost_log.jsonl").read_text().splitlines()
+    ]
     assert [row["role"] for row in cost_log] == ["merge_proposer", "merge_proposer_sub_lm"]
     assert [row["cost_usd"] for row in cost_log] == [0.03, 0.02]
 
     rows = cost_rows(tmp_path)
-    assert any(row.get("scope") == "merge" and row.get("_category") for row in rows)
-    assert any(
-        row.get("scope") == "  - proposer main" and row.get("total_cost") == "$0.03"
-        for row in rows
-    )
-    assert any(
-        row.get("scope") == "  - proposer sub" and row.get("total_cost") == "$0.02"
-        for row in rows
-    )
-    assert not any(row.get("scope") == "patch-merge" for row in rows)
+    total = next(row for row in rows if row["scope"] == "TOTAL")
+    assert total["total_cost"] == "$0.05"
+    assert total["effective_cost"] == "$0.05"
+    assert total["repeat_cost"] == "$0.00"
 
 
-def test_cost_rows_group_legacy_patch_merge_roles_under_merge_proposer(tmp_path: Path):
+def test_legacy_patch_roles_preserve_both_costs_with_shared_operation_ids(tmp_path: Path):
     append_cost_rows(
         tmp_path / "cost_log.jsonl",
         [
@@ -196,13 +208,7 @@ def test_cost_rows_group_legacy_patch_merge_roles_under_merge_proposer(tmp_path:
 
     rows = cost_rows(tmp_path)
 
-    assert any(row.get("scope") == "merge" and row.get("_category") for row in rows)
-    assert any(
-        row.get("scope") == "  - proposer main" and row.get("model") == "dummy-main"
-        for row in rows
-    )
-    assert any(
-        row.get("scope") == "  - proposer sub" and row.get("model") == "dummy-sub"
-        for row in rows
-    )
-    assert not any(row.get("scope") == "patch-merge" for row in rows)
+    total = next(row for row in rows if row["scope"] == "TOTAL")
+    assert total["total_cost"] == "$0.03"
+    assert total["effective_cost"] == "$0.03"
+    assert total["repeat_cost"] == "$0.00"

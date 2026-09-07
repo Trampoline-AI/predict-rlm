@@ -1,222 +1,86 @@
 from __future__ import annotations
 
-import importlib
 import os
 import shutil
+import socket
 import sys
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Literal, Protocol
+from typing import Any, Callable
 
 import pytest
 
-# The runtime-contract matrix exercises the supervisor/SBX backend (local-supervisor
-# seam and real SBX), so the whole package requires the [sbx] extra (websockets).
-pytest.importorskip("websockets")
+from predict_rlm.backends import DirectPythonBackend, JspiBackend
 
-from predict_rlm.backends import (  # noqa: E402
-    DirectPythonBackend,
-    JspiBackend,
-    SbxBackend,
-    SbxConfig,
-)
-
-ROOT = Path(__file__).resolve().parents[2]
-TERMINAL_BENCH_DIR = ROOT / "examples" / "terminal_bench"
-if str(TERMINAL_BENCH_DIR) not in sys.path:
-    sys.path.insert(0, str(TERMINAL_BENCH_DIR))
-
-runner_module = importlib.import_module("terminal_bench_rlm.tools.runner")
-runner_script_path = runner_module.runner_script_path
-
-
-CAPABILITIES = frozenset(
-    {
-        "execute",
-        "state",
-        "reset",
-        "code_fences",
-        "submit",
-        "deferred_submit",
-        "recoverable_errors",
-        "host_tools",
-        "recoverable_iteration_timeout",
-        "files",
-    }
+PAYLOAD_PATH = (
+    Path(__file__).resolve().parents[2] / "src/predict_rlm/backends/supervisor/_payload.py"
 )
 
 
-class RuntimeHandle(Protocol):
-    spec: RuntimeSpec
+def _predict_tool(signature: str, **kwargs: Any) -> dict[str, Any]:
+    return {"answer": "4"}
 
-    def require(self, capability: str) -> None: ...
 
-    def configure(
-        self,
-        *,
-        tools: dict[str, Callable[..., Any]] | None = None,
-        output_fields: list[dict[str, Any]] | None = None,
-    ) -> None: ...
+def _shape_tool(kind: str) -> Any:
+    return {"list": [1, 2], "dict": {"ok": True}, "none": None, "text": "hello"}[kind]
 
-    def execute(self, code: str, *, timeout: float | None = None) -> Any: ...
 
-    def output(self, result: Any) -> str: ...
+def _failing_tool() -> None:
+    raise ValueError("host tool failed")
 
-    def timeout_observation(self, result: Any) -> dict[str, Any]: ...
 
-    def defer_next_submit_finalization(self) -> None: ...
-
-    def reset(self) -> None: ...
-
-    def shutdown(self) -> None: ...
-
-    def mount_file_at(self, host_path: str, sandbox_path: str) -> None: ...
-
-    def mkdir_p(self, sandbox_path: str) -> None: ...
-
-    def list_dir(self, sandbox_path: str) -> list[str]: ...
-
-    def sync_file_to(self, sandbox_path: str, host_path: str) -> None: ...
+def _default_tools() -> dict[str, Callable[..., Any]]:
+    return {"predict": _predict_tool, "shape_tool": _shape_tool, "failing_tool": _failing_tool}
 
 
 @dataclass(frozen=True)
 class RuntimeSpec:
     name: str
-    adapter: Literal[
-        "jspi-process",
-        "sbx-cli",
-        "direct-process",
-        "test-only-local-supervisor",
-    ]
-    environment: Literal[
-        "deno-subprocess",
-        "sbx-sandbox",
-        "direct-process",
-        "local-supervisor-seam",
-    ]
-    engine: Literal["pyodide-jspi", "python-runner"]
-    make: Callable[[Path, "RuntimeSpec"], RuntimeHandle]
-    capabilities: frozenset[str]
-    opt_in: bool = False
-    skip_reason: str | None = None
-    xfail_contracts: dict[str, str] = field(default_factory=dict)
+    make: Callable[[Path, "RuntimeSpec"], "RuntimeHandle"]
+    unsupported: frozenset[str] = frozenset()
 
 
-def _predict_tool(signature: str, **kwargs: Any) -> dict[str, Any]:
-    del signature, kwargs
-    return {"answer": "4"}
+class RuntimeHandle:
+    """Normalize the two legacy result/reset interfaces, not backend behavior."""
 
-
-def _shape_tool(kind: str) -> Any:
-    if kind == "list":
-        return [1, 2]
-    if kind == "dict":
-        return {"ok": True}
-    if kind == "none":
-        return None
-    if kind == "text":
-        return "hello"
-    raise ValueError(f"unknown shape: {kind}")
-
-
-def _failing_tool() -> str:
-    raise ValueError("host tool failed")
-
-
-def _default_tools() -> dict[str, Callable[..., Any]]:
-    return {
-        "predict": _predict_tool,
-        "shape_tool": _shape_tool,
-        "failing_tool": _failing_tool,
-    }
-
-
-class InterpreterRuntimeHandle:
     def __init__(self, spec: RuntimeSpec, interpreter: Any) -> None:
         self.spec = spec
         self.interpreter = interpreter
 
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self.interpreter, name)
+
     def require(self, capability: str) -> None:
-        if capability not in CAPABILITIES:
-            raise AssertionError(f"unknown runtime capability: {capability}")
-        if capability in self.spec.xfail_contracts:
-            pytest.xfail(self.spec.xfail_contracts[capability])
-        if capability not in self.spec.capabilities:
-            pytest.skip(
-                self.spec.skip_reason
-                or f"{self.spec.name} does not advertise {capability}"
-            )
+        if capability in self.spec.unsupported:
+            pytest.skip(f"{self.spec.name} does not support {capability}")
 
-    def configure(
-        self,
-        *,
-        tools: dict[str, Callable[..., Any]] | None = None,
-        output_fields: list[dict[str, Any]] | None = None,
-    ) -> None:
-        configure_runtime = getattr(self.interpreter, "configure_runtime", None)
-        if configure_runtime is None:
-            pytest.skip(f"{self.spec.name} does not support runtime reconfiguration")
-        configure_runtime(tools=tools, output_fields=output_fields)
-
-    def execute(self, code: str, *, timeout: float | None = None) -> Any:
-        return self.interpreter.execute(code, timeout=timeout)
-
-    def output(self, result: Any) -> str:
-        if isinstance(result, str):
-            return result
-        if isinstance(result, dict) and "output" in result:
-            return str(result["output"])
-        return str(result)
-
-    def timeout_observation(self, result: Any) -> dict[str, Any]:
-        if isinstance(result, dict) and "timeout" in result:
-            return {
-                "seconds": result["timeout"]["seconds"],
-                "stdout": result.get("stdout", ""),
-                "stderr": result.get("stderr", ""),
-                "state": result.get("state"),
-            }
-        return {
-            "seconds": getattr(result, "timeout_seconds"),
-            "stdout": getattr(result, "stdout", ""),
-            "stderr": getattr(result, "stderr", ""),
-            "state": getattr(result, "state", None),
-        }
-
-    def defer_next_submit_finalization(self) -> None:
-        defer = getattr(self.interpreter, "defer_next_submit_finalization", None)
-        if defer is None:
-            pytest.skip(f"{self.spec.name} does not support deferred submit")
-        defer()
+    def configure(self, **kwargs: Any) -> None:
+        self.interpreter.configure_runtime(**kwargs)
 
     def reset(self) -> None:
-        reset = getattr(self.interpreter, "reset", None)
-        if reset is None:
+        if isinstance(self.interpreter, JspiBackend):
             self.interpreter.shutdown()
-            return
-        reset()
+        else:
+            self.interpreter.reset()
 
-    def shutdown(self) -> None:
-        self.interpreter.shutdown()
+    @staticmethod
+    def output(result: Any) -> str:
+        return result["output"] if isinstance(result, dict) else str(result)
 
-    def mount_file_at(self, host_path: str, sandbox_path: str) -> None:
-        self.interpreter.mount_file_at(host_path, sandbox_path)
-
-    def mkdir_p(self, sandbox_path: str) -> None:
-        self.interpreter.mkdir_p(sandbox_path)
-
-    def list_dir(self, sandbox_path: str) -> list[str]:
-        return self.interpreter.list_dir(sandbox_path)
-
-    def sync_file_to(self, sandbox_path: str, host_path: str) -> None:
-        self.interpreter.sync_file_to(sandbox_path, host_path)
+    @staticmethod
+    def timeout_observation(result: Any) -> dict[str, Any]:
+        return {
+            "seconds": result.timeout_seconds,
+            "stdout": result.stdout,
+            "stderr": result.stderr,
+            "state": result.state,
+        }
 
 
 def _make_jspi(tmp_path: Path, spec: RuntimeSpec) -> RuntimeHandle:
-    del tmp_path
     if shutil.which("deno") is None:
         pytest.skip("JSPI contracts require Deno")
-    return InterpreterRuntimeHandle(
+    return RuntimeHandle(
         spec,
         JspiBackend(
             tools=_default_tools(),
@@ -226,8 +90,8 @@ def _make_jspi(tmp_path: Path, spec: RuntimeSpec) -> RuntimeHandle:
     )
 
 
-def _make_direct_process(tmp_path: Path, spec: RuntimeSpec) -> RuntimeHandle:
-    return InterpreterRuntimeHandle(
+def _make_direct(tmp_path: Path, spec: RuntimeSpec) -> RuntimeHandle:
+    return RuntimeHandle(
         spec,
         DirectPythonBackend(
             tools=_default_tools(),
@@ -240,86 +104,55 @@ def _make_direct_process(tmp_path: Path, spec: RuntimeSpec) -> RuntimeHandle:
 
 
 def _make_sbx(tmp_path: Path, spec: RuntimeSpec) -> RuntimeHandle:
-    if os.environ.get("PREDICT_RLM_RUN_SBX_TESTS") != "1":
+    if spec.name == "sbx" and (
+        os.environ.get("PREDICT_RLM_RUN_SBX_TESTS") != "1" or shutil.which("sbx") is None
+    ):
         pytest.skip(
-            "real SBX runtime contracts require PREDICT_RLM_RUN_SBX_TESTS=1, "
-            "the sbx CLI, and sbx login"
+            "real SBX contracts require PREDICT_RLM_RUN_SBX_TESTS=1, sbx CLI, and login"
         )
-    if shutil.which("sbx") is None:
-        pytest.skip("real SBX runtime contracts require the sbx CLI")
-    return InterpreterRuntimeHandle(
+    pytest.importorskip("websockets")
+    from predict_rlm.backends import SbxBackend, SbxConfig
+
+    kwargs: dict[str, Any] = {}
+    if spec.name == "sbx/local-websocket":
+        with socket.socket() as sock:
+            sock.bind(("127.0.0.1", 0))
+            port = sock.getsockname()[1]
+        path = f"/runtime-contract-{os.getpid()}-{port}"
+        kwargs = {
+            "_websocket_supervisor_command": [
+                sys.executable,
+                "-u",
+                str(PAYLOAD_PATH),
+                "--websocket-host",
+                "127.0.0.1",
+                "--websocket-port",
+                str(port),
+                "--websocket-path",
+                path,
+            ],
+            "_websocket_url": f"ws://127.0.0.1:{port}{path}",
+        }
+    return RuntimeHandle(
         spec,
         SbxBackend(
             config=SbxConfig(name="runtime-contract-sbx", exec_timeout=10),
             tools=_default_tools(),
             preinstall_packages=False,
             _staging_root=tmp_path / "sbx-staging",
-        ),
-    )
-
-
-def _make_internal_jsonrpc(tmp_path: Path, spec: RuntimeSpec) -> RuntimeHandle:
-    return InterpreterRuntimeHandle(
-        spec,
-        SbxBackend(
-            config=SbxConfig(name="runtime-contract-local-supervisor", exec_timeout=10),
-            tools=_default_tools(),
-            preinstall_packages=False,
-            _supervisor_command=[sys.executable, "-u", str(runner_script_path())],
-            _staging_root=tmp_path / "internal-jsonrpc-staging",
+            **kwargs,
         ),
     )
 
 
 def runtime_specs() -> list[RuntimeSpec]:
     return [
+        RuntimeSpec("jspi", _make_jspi, frozenset({"deferred_submit"})),
         RuntimeSpec(
-            name="jspi",
-            adapter="jspi-process",
-            environment="deno-subprocess",
-            engine="pyodide-jspi",
-            make=_make_jspi,
-            capabilities=frozenset(
-                {
-                    "execute",
-                    "state",
-                    "reset",
-                    "code_fences",
-                    "recoverable_errors",
-                    "host_tools",
-                    "recoverable_iteration_timeout",
-                }
-            ),
+            "python-runner/direct-process",
+            _make_direct,
+            frozenset({"partial_error_output", "concurrent_tools"}),
         ),
-        RuntimeSpec(
-            name="python-runner/direct-process",
-            adapter="direct-process",
-            environment="direct-process",
-            engine="python-runner",
-            make=_make_direct_process,
-            capabilities=frozenset(CAPABILITIES),
-        ),
-        RuntimeSpec(
-            name="sbx",
-            adapter="sbx-cli",
-            environment="sbx-sandbox",
-            engine="python-runner",
-            make=_make_sbx,
-            capabilities=frozenset(CAPABILITIES),
-            opt_in=True,
-            xfail_contracts={
-                "tool_timeout": (
-                    "real SBX per-host-tool timeout is not implemented in the "
-                    "shared contract matrix yet"
-                )
-            },
-        ),
-        RuntimeSpec(
-            name="internal/python-runner-jsonrpc",
-            adapter="test-only-local-supervisor",
-            environment="local-supervisor-seam",
-            engine="python-runner",
-            make=_make_internal_jsonrpc,
-            capabilities=frozenset(CAPABILITIES),
-        ),
+        RuntimeSpec("sbx/local-websocket", _make_sbx, frozenset({"deferred_submit"})),
+        RuntimeSpec("sbx", _make_sbx, frozenset({"deferred_submit"})),
     ]

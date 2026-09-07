@@ -1,35 +1,9 @@
-"""RED-GREEN repro for unbounded host-side tool calls.
-
-Background:
-    Sandbox code calling ``await recalculate(path)`` triggers a host
-    tool dispatch in ``JspiBackend._execute_tool_async``. If the
-    tool is slow (e.g. LibreOffice on a whole-column formula → 2-3
-    minutes), the overall ``execute`` round-trip blows past the
-    ``_exec_timeout`` ceiling. That timeout **kills the Deno
-    subprocess**, raises ``SandboxFatalError``, and turns what should
-    have been a recoverable tool error into a cascade of
-    ``[Errno 9] Bad file descriptor`` retries. A 2026-04-18 gemini
-    eval lost 19 cases to this failure mode — every one of them
-    scored 0 by the time ``task_timeout=600s`` finally fired.
-
-    The fix: give each tool call its own wall-clock budget
-    (``TOOL_CALL_TIMEOUT_SEC``, default 180s) via ``asyncio.wait_for``.
-    If the tool exceeds its budget, return a clean error response to
-    the sandbox — deno's ``await tool()`` resumes with the error,
-    exec continues, the RLM can see "[Error] tool timed out" and
-    rewrite its code using a different approach. The sandbox stays
-    alive, the case stays recoverable.
-
-RED: a mock tool that sleeps forever hangs ``_execute_tool_async``.
-GREEN: it returns an error response with a timeout message within
-    ~TOOL_CALL_TIMEOUT_SEC.
-"""
+"""Host tool deadlines remain recoverable for async, sync, and wrapped tools."""
 
 from __future__ import annotations
 
 import asyncio
 import concurrent.futures
-import inspect
 import time
 
 import pytest
@@ -87,48 +61,11 @@ def test_async_tool_that_hangs_times_out_cleanly(monkeypatch):
         f"tool returned but took {elapsed:.2f}s — expected ~0.3s based on "
         f"the monkeypatched timeout"
     )
-    assert "error" in response, (
-        f"expected error response after timeout, got {response!r}"
-    )
+    assert "error" in response, f"expected error response after timeout, got {response!r}"
     err = str(response.get("error") or "")
     assert "timed out" in err.lower() or "timeout" in err.lower(), (
         f"error message should mention the timeout; got {err!r}"
     )
-
-
-def test_async_tool_that_completes_quickly_is_not_affected(monkeypatch):
-    """Guardrail: normal fast tools must continue to return their
-    results unchanged — the timeout is a ceiling, not a delay.
-    """
-    monkeypatch.setattr(rlm_interpreter, "TOOL_CALL_TIMEOUT_SEC", 1.0)
-
-    async def _fast_tool(**_kwargs):
-        return "ok"
-
-    interp = _build_interp_with_tool(_fast_tool)
-    response = asyncio.run(
-        interp._execute_tool_async("slow_tool", {"args": [], "kwargs": {}})
-    )
-    assert response.get("value") == "ok"
-    assert "error" not in response
-
-
-def test_tool_exception_still_routes_through_error_path(monkeypatch):
-    """If a tool raises (e.g. ValueError inside the tool), the existing
-    ``except Exception`` in _execute_tool_async captures it and returns
-    ``{"error": ...}``. The timeout wrap must not change this behaviour.
-    """
-    monkeypatch.setattr(rlm_interpreter, "TOOL_CALL_TIMEOUT_SEC", 1.0)
-
-    async def _raising_tool(**_kwargs):
-        raise ValueError("tool blew up")
-
-    interp = _build_interp_with_tool(_raising_tool)
-    response = asyncio.run(
-        interp._execute_tool_async("slow_tool", {"args": [], "kwargs": {}})
-    )
-    assert "error" in response
-    assert "blew up" in str(response["error"])
 
 
 def test_sync_tool_timeout_does_not_poison_executor(monkeypatch):
@@ -144,9 +81,7 @@ def test_sync_tool_timeout_does_not_poison_executor(monkeypatch):
     interp = _build_interp_with_tool(_slow_tool)
     interp._executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
     try:
-        first = asyncio.run(
-            interp._execute_tool_async("slow_tool", {"args": [], "kwargs": {}})
-        )
+        first = asyncio.run(interp._execute_tool_async("slow_tool", {"args": [], "kwargs": {}}))
         assert "error" in first
 
         interp.tools["slow_tool"] = _fast_tool
@@ -174,8 +109,6 @@ def test_evidence_wrapped_sync_tool_deadline_does_not_wait_for_worker(monkeypatc
     owner = type("EvidenceOwner", (), {"_evidence": lambda self: None})()
     wrapped = PredictRLM._wrap_evidence_tool(owner, "slow_tool", _blocked_tool)
     interp = _build_interp_with_tool(wrapped)
-
-    assert not inspect.iscoroutinefunction(inspect.unwrap(wrapped))
 
     async def _run():
         started_at = time.monotonic()

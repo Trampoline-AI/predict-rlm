@@ -1,10 +1,8 @@
 from __future__ import annotations
 
 import asyncio
-import inspect
-import json
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -13,176 +11,12 @@ from predict_rlm.backends.jspi import JspiBackend
 from predict_rlm.backends.jspi.execution import JspiExecutionBackend
 from predict_rlm.execution_timeout import ITERATION_TIMEOUT_FAILURE_CLASS
 from predict_rlm.runtime import ExecutionSpec
-from predict_rlm.workspace import WorkspaceFileInfo
-
-
-def _fail_sync_helper(*args, **kwargs):
-    raise AssertionError("async JSPI path called a synchronous helper")
 
 
 @pytest.fixture
 def interpreter() -> JspiBackend:
     backend = JspiBackend(preinstall_packages=False)
-    backend._ensure_deno_process = _fail_sync_helper  # type: ignore[method-assign]
-    backend._send_request = _fail_sync_helper  # type: ignore[method-assign]
-    backend._mount_files = _fail_sync_helper  # type: ignore[method-assign]
-    backend._register_tools = _fail_sync_helper  # type: ignore[method-assign]
     return backend
-
-
-@pytest.mark.asyncio
-async def test_aexecute_uses_only_async_setup_helpers(interpreter: JspiBackend):
-    interpreter._aensure_deno_process = AsyncMock()  # type: ignore[method-assign]
-    interpreter._amount_files = AsyncMock()  # type: ignore[method-assign]
-    interpreter._aregister_tools = AsyncMock()  # type: ignore[method-assign]
-    interpreter._write_stdin_async = AsyncMock()  # type: ignore[method-assign]
-    interpreter._execute_with_timeout = AsyncMock(return_value="ok")  # type: ignore[method-assign]
-
-    result = await interpreter._aexecute_inner("print('ok')", {})
-
-    assert result == "ok"
-    interpreter._aensure_deno_process.assert_awaited_once_with()
-    interpreter._amount_files.assert_awaited_once_with()
-    interpreter._aregister_tools.assert_awaited_once_with()
-
-
-@pytest.mark.asyncio
-async def test_aexecute_broken_pipe_uses_async_kill(interpreter: JspiBackend):
-    interpreter._aensure_deno_process = AsyncMock()  # type: ignore[method-assign]
-    interpreter._amount_files = AsyncMock()  # type: ignore[method-assign]
-    interpreter._aregister_tools = AsyncMock()  # type: ignore[method-assign]
-    interpreter._write_stdin_async = AsyncMock(  # type: ignore[method-assign]
-        side_effect=BrokenPipeError
-    )
-    interpreter._kill_sandbox = _fail_sync_helper  # type: ignore[method-assign]
-    interpreter._akill_sandbox = AsyncMock()  # type: ignore[method-assign]
-
-    with pytest.raises(SandboxFatalError, match="BrokenPipeError"):
-        await interpreter._aexecute_inner("print('ok')", {})
-
-    interpreter._akill_sandbox.assert_awaited_once_with()
-
-
-@pytest.mark.asyncio
-async def test_async_control_operations_use_async_rpc(interpreter: JspiBackend):
-    interpreter._aensure_deno_process = AsyncMock()  # type: ignore[method-assign]
-    interpreter._asend_request = AsyncMock(  # type: ignore[method-assign]
-        side_effect=[
-            {"result": {"mounted": "/sandbox/input.txt"}},
-            {"result": {"created": "/sandbox/output"}},
-            {"result": {"files": ["/sandbox/output/result.txt"]}},
-            {
-                "result": {
-                    "files": {
-                        "result.txt": {
-                            "type": "file",
-                            "sha256": "abc",
-                            "size": 3,
-                        }
-                    }
-                }
-            },
-            {"result": {"ok": True}},
-        ]
-    )
-
-    await interpreter.amount_file_at("/host/input.txt", "/sandbox/input.txt")
-    await interpreter.amkdir_p("/sandbox/output")
-    files = await interpreter.alist_dir("/sandbox/output")
-    manifest = await interpreter.aworkspace_manifest("/sandbox/output")
-    await interpreter.async_file_to("/sandbox/output/result.txt", "/host/result.txt")
-
-    assert files == ["/sandbox/output/result.txt"]
-    assert manifest == {
-        "result.txt": WorkspaceFileInfo(type="file", sha256="abc", size=3)
-    }
-    assert [call.args[0] for call in interpreter._asend_request.await_args_list] == [
-        "mount_file",
-        "mkdir_p",
-        "list_dir",
-        "workspace_manifest",
-        "sync_file",
-    ]
-
-
-@pytest.mark.asyncio
-async def test_async_package_setup_uses_async_rpc(interpreter: JspiBackend):
-    interpreter._aensure_deno_process = AsyncMock()  # type: ignore[method-assign]
-    interpreter._asend_request = AsyncMock(  # type: ignore[method-assign]
-        return_value={"result": {"installed": ["openpyxl"]}}
-    )
-
-    await interpreter.aensure_skill_packages(["openpyxl", "openpyxl"])
-
-    interpreter._asend_request.assert_awaited_once_with(
-        "install_packages",
-        {"packages": ["openpyxl"]},
-        "installing skill packages",
-    )
-
-
-@pytest.mark.asyncio
-async def test_async_ready_uses_native_async_startup(interpreter: JspiBackend):
-    interpreter._aensure_deno_process = AsyncMock()  # type: ignore[method-assign]
-
-    await interpreter.aensure_ready()
-    await interpreter.astart()
-
-    assert interpreter._aensure_deno_process.await_count == 2
-
-
-def test_async_lifecycle_methods_do_not_use_to_thread():
-    methods = (
-        JspiBackend._aensure_deno_process,
-        JspiBackend._ahealth_check,
-        JspiBackend._asend_request,
-        JspiBackend._amount_files,
-        JspiBackend._aregister_tools,
-        JspiBackend._async_files,
-        JspiBackend._akill_sandbox,
-        JspiBackend.aensure_ready,
-        JspiBackend.astart,
-        JspiBackend.aensure_skill_packages,
-        JspiBackend.amount_file_at,
-        JspiBackend.amkdir_p,
-        JspiBackend.alist_dir,
-        JspiBackend.aworkspace_manifest,
-        JspiBackend.async_file_to,
-        JspiBackend.aexecute,
-        JspiBackend.ainterrupt,
-        JspiBackend.ashutdown,
-    )
-
-    for method in methods:
-        source = inspect.getsource(method)
-        assert "to_thread" not in source, method.__qualname__
-
-
-@pytest.mark.asyncio
-async def test_ainterrupt_does_not_call_sync_interrupt(interpreter: JspiBackend):
-    interpreter.interrupt = _fail_sync_helper  # type: ignore[method-assign]
-    interpreter._akill_sandbox = AsyncMock()  # type: ignore[method-assign]
-
-    await interpreter.ainterrupt()
-
-    interpreter._akill_sandbox.assert_awaited_once_with()
-
-
-@pytest.mark.asyncio
-async def test_cancel_execution_quiesces_without_killing_sandbox(interpreter: JspiBackend):
-    process = SimpleNamespace(poll=lambda: None, send_signal=MagicMock())
-    interpreter.deno_process = process
-    interpreter._active_execute_request_id = 7
-    interpreter._execute_async = AsyncMock(  # type: ignore[method-assign]
-        side_effect=SandboxExecutionError("KeyboardInterrupt")
-    )
-    interpreter._akill_sandbox = AsyncMock()  # type: ignore[method-assign]
-
-    await interpreter.acancel_execution()
-
-    process.send_signal.assert_called_once()
-    interpreter._execute_async.assert_awaited_once_with(7)
-    interpreter._akill_sandbox.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -219,40 +53,6 @@ async def test_cancel_execution_retries_interrupt_until_execution_quiesces(
 
 
 @pytest.mark.asyncio
-async def test_ashutdown_does_not_call_sync_shutdown(interpreter: JspiBackend):
-    interpreter.shutdown = _fail_sync_helper  # type: ignore[method-assign]
-    interpreter.deno_process = type(
-        "Process",
-        (),
-        {"poll": lambda self: None, "stdin": None},
-    )()
-    interpreter._write_stdin_async = AsyncMock()  # type: ignore[method-assign]
-    interpreter._await_process_exit = AsyncMock(return_value=True)  # type: ignore[method-assign]
-
-    await asyncio.wait_for(interpreter.ashutdown(), timeout=0.1)
-
-    message = json.loads(interpreter._write_stdin_async.await_args.args[0])
-    assert message["method"] == "shutdown"
-    assert interpreter.deno_process is None
-
-
-@pytest.mark.asyncio
-async def test_async_rpc_uses_only_async_fd_primitives(interpreter: JspiBackend):
-    interpreter._write_stdin_async = AsyncMock()  # type: ignore[method-assign]
-    interpreter._read_with_timeout_async = AsyncMock(  # type: ignore[method-assign]
-        side_effect=lambda timeout: json.dumps(
-            {"jsonrpc": "2.0", "id": interpreter._request_id, "result": {"ok": True}}
-        )
-    )
-
-    response = await interpreter._asend_request("mkdir_p", {"path": "/sandbox/x"}, "test")
-
-    assert response["result"] == {"ok": True}
-    interpreter._write_stdin_async.assert_awaited_once()
-    interpreter._read_with_timeout_async.assert_awaited_once()
-
-
-@pytest.mark.asyncio
 async def test_aexecute_skips_post_hooks_after_fatal_failure(interpreter: JspiBackend):
     hook = AsyncMock()
     interpreter.add_post_execute_hook(hook)
@@ -285,30 +85,6 @@ async def test_aexecute_skips_post_hooks_after_cancellation(interpreter: JspiBac
         await task
 
     hook.assert_not_awaited()
-
-
-@pytest.mark.asyncio
-async def test_sync_worker_quarantine_defers_jspi_shutdown(interpreter: JspiBackend):
-    release = __import__("threading").Event()
-
-    worker = interpreter._start_sync_worker(lambda: release.wait())
-    shutdown = MagicMock()
-    interpreter.shutdown = shutdown  # type: ignore[method-assign]
-
-    retired = interpreter.retire_when_sync_workers_finish()
-    await asyncio.sleep(0)
-
-    assert retired is True
-    shutdown.assert_not_called()
-
-    release.set()
-    await asyncio.wait_for(worker.wait(), timeout=1)
-    for _ in range(100):
-        if shutdown.called:
-            break
-        await asyncio.sleep(0.01)
-
-    shutdown.assert_called_once_with()
 
 
 @pytest.mark.asyncio

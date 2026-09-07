@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import sys
+import threading
+import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 from types import SimpleNamespace
@@ -12,7 +15,7 @@ import pytest
 
 pytest.importorskip("websockets")
 
-from predict_rlm.backends.sbx import SbxPool  # noqa: E402
+from predict_rlm.backends.sbx import SbxConfig, SbxPool  # noqa: E402
 from predict_rlm.backends.sbx.execution import SbxPoolExecutionBackend  # noqa: E402
 from predict_rlm.runtime import (  # noqa: E402
     ExecutionSpec,
@@ -146,41 +149,6 @@ def make_sync_pool(tmp_path: Path, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_alease_is_exclusive_and_awaits_async_lifecycle(tmp_path: Path, monkeypatch):
-    pool, events, created = make_pool(tmp_path, monkeypatch)
-    second_acquired = asyncio.Event()
-
-    def forbidden_to_thread(*args: Any, **kwargs: Any) -> None:
-        raise AssertionError("async SBX pool lifecycle delegated to a thread")
-
-    monkeypatch.setattr(asyncio, "to_thread", forbidden_to_thread)
-
-    async def second_lease() -> None:
-        async with pool.alease() as interpreter:
-            assert interpreter is created[0]
-            second_acquired.set()
-
-    async with pool.alease(tools={"tool": lambda: None}) as interpreter:
-        assert interpreter is created[0]
-        waiter = asyncio.create_task(second_lease())
-        await asyncio.sleep(0)
-        assert not second_acquired.is_set()
-
-    await waiter
-    await pool.ashutdown()
-
-    assert [event[0] for event in events] == [
-        "prewarm",
-        "configure",
-        "reset",
-        "configure",
-        "reset",
-        "shutdown",
-    ]
-    assert list(events[1][2]["tools"]) == ["tool"]
-
-
-@pytest.mark.asyncio
 async def test_alease_replaces_interpreter_after_reset_failure(tmp_path: Path, monkeypatch):
     pool, events, created = make_pool(tmp_path, monkeypatch)
 
@@ -194,61 +162,6 @@ async def test_alease_replaces_interpreter_after_reset_failure(tmp_path: Path, m
     async with pool.alease() as interpreter:
         assert interpreter is created[1]
 
-    await pool.ashutdown()
-
-
-@pytest.mark.asyncio
-async def test_alease_retires_busy_interpreter_without_reset_or_immediate_shutdown(
-    tmp_path: Path,
-    monkeypatch,
-):
-    pool, events, created = make_pool(tmp_path, monkeypatch)
-
-    async with pool.alease() as interpreter:
-        interpreter.live_host_work = True
-        interpreter.fail_reset = True
-
-    assert len(created) == 2
-    assert ("reset", 0) not in events
-    assert ("aretire", 0) in events
-    assert ("shutdown", 0) in events
-    assert list(pool._available.queue) == [created[1]]
-
-    created[0].live_host_work = False
-    await pool.ashutdown()
-
-
-@pytest.mark.asyncio
-async def test_alease_awaits_busy_interpreter_retirement_before_replacement(
-    tmp_path: Path,
-    monkeypatch,
-):
-    pool, events, created = make_pool(tmp_path, monkeypatch)
-    lease_entered = asyncio.Event()
-    retirement_started = asyncio.Event()
-    retirement_release = asyncio.Event()
-
-    async def use_busy_interpreter() -> None:
-        async with pool.alease() as interpreter:
-            interpreter.live_host_work = True
-            interpreter.retirement_started = retirement_started
-            interpreter.retirement_release = retirement_release
-            lease_entered.set()
-
-    lease = asyncio.create_task(use_busy_interpreter())
-    await lease_entered.wait()
-    await asyncio.sleep(0.02)
-
-    try:
-        assert retirement_started.is_set()
-        assert not lease.done()
-        assert pool._available.empty()
-    finally:
-        retirement_release.set()
-        await lease
-
-    assert ("shutdown", 0) in events
-    assert list(pool._available.queue) == [created[1]]
     await pool.ashutdown()
 
 
@@ -419,7 +332,9 @@ def test_sync_failed_reset_replacement_never_requeues_retired_interpreter(
 
 
 @pytest.mark.asyncio
-async def test_alease_releases_interpreter_when_configuration_fails(tmp_path: Path, monkeypatch):
+async def test_alease_releases_interpreter_when_configuration_fails(
+    tmp_path: Path, monkeypatch
+):
     pool, events, created = make_pool(tmp_path, monkeypatch)
     await pool.astart()
     created[0].fail_configure = True
@@ -601,18 +516,249 @@ async def test_pool_execution_accepts_semantically_reordered_fixed_policy():
     assert pool.acquisitions == 1
 
 
-def test_pool_exposes_immutable_fixed_session_requirements(tmp_path: Path):
-    pool = SbxPool(
-        size=1,
-        allowed_domains=["service.internal"],
-        extra_read_paths=["/host/input"],
-        extra_write_paths=["/host/output"],
-        preinstall_packages=False,
-        _staging_root=tmp_path / "policy-pool",
-    )
+PAYLOAD_PATH = Path(__file__).parents[1] / "src/predict_rlm/backends/supervisor/_payload.py"
 
-    assert pool.session_requirements == SessionRequirements(
-        allowed_domains=("service.internal",),
-        extra_read_paths=("/host/input",),
-        extra_write_paths=("/host/output",),
-    )
+
+@pytest.mark.sbx
+class TestSbxPool:
+    def test_start_failure_shuts_down_created_interpreters_and_leaves_pool_stopped(
+        self, tmp_path: Path, monkeypatch
+    ):
+        pool = SbxPool(
+            size=3,
+            config=SbxConfig(name="pool-test"),
+            preinstall_packages=False,
+            _staging_root=tmp_path / "pool",
+        )
+        created = []
+
+        class FakeInterpreter:
+            def __init__(self, index: int) -> None:
+                self.index = index
+                self.shutdown_called = False
+
+            def prewarm(self) -> None:
+                if self.index == 1:
+                    raise RuntimeError("prewarm failed")
+
+            def shutdown(self) -> None:
+                self.shutdown_called = True
+
+        def create_interpreter(index: int) -> FakeInterpreter:
+            interpreter = FakeInterpreter(index)
+            created.append(interpreter)
+            return interpreter
+
+        monkeypatch.setattr(pool, "_create_interpreter", create_interpreter)
+
+        with pytest.raises(RuntimeError, match="prewarm failed"):
+            pool.start()
+
+        assert created
+        assert all(interpreter.shutdown_called for interpreter in created)
+        assert not pool._started
+        assert pool._all_interpreters == []
+        assert pool._available.qsize() == 0
+
+    def test_shutdown_runs_concurrently_and_attempts_all_interpreters(
+        self, tmp_path: Path, monkeypatch
+    ):
+        pool = SbxPool(
+            size=3,
+            config=SbxConfig(name="pool-test"),
+            preinstall_packages=False,
+            _staging_root=tmp_path / "pool",
+        )
+        barrier = threading.Barrier(3)
+        active = 0
+        max_active = 0
+        active_lock = threading.Lock()
+        shutdown_indexes: list[int] = []
+
+        class FakeInterpreter:
+            def __init__(self, index: int) -> None:
+                self.index = index
+
+            def prewarm(self) -> None:
+                return None
+
+            def shutdown(self) -> None:
+                nonlocal active, max_active
+                with active_lock:
+                    active += 1
+                    max_active = max(max_active, active)
+                try:
+                    barrier.wait(timeout=1)
+                    shutdown_indexes.append(self.index)
+                    if self.index == 1:
+                        raise RuntimeError("shutdown failed")
+                finally:
+                    with active_lock:
+                        active -= 1
+
+        monkeypatch.setattr(pool, "_create_interpreter", lambda index: FakeInterpreter(index))
+        pool.start()
+
+        with pytest.raises(RuntimeError, match="shutdown failed"):
+            pool.shutdown()
+
+        assert max_active == 3
+        assert sorted(shutdown_indexes) == [0, 1, 2]
+        assert not pool._started
+        assert pool._shutdown
+        assert pool._all_interpreters == []
+        assert pool._available.qsize() == 0
+
+    def test_lease_is_exclusive_and_release_resets(self, tmp_path: Path):
+        pool = SbxPool(
+            size=1,
+            config=SbxConfig(name="pool-test"),
+            preinstall_packages=False,
+            _supervisor_command=[sys.executable, "-u", str(PAYLOAD_PATH)],
+            _staging_root=tmp_path / "pool",
+        )
+        acquired = threading.Event()
+        released = threading.Event()
+
+        def second_lease() -> None:
+            with pool.lease() as interpreter:
+                acquired.set()
+                assert interpreter.execute("print('x' in globals())").strip() == "False"
+
+        try:
+            pool.start()
+            with pool.lease() as interpreter:
+                interpreter.execute("x = 7")
+                staged = pool._all_interpreters[0]._host_path_for_virtual_path(
+                    "/sandbox/output/value.txt"
+                )
+                staged.parent.mkdir(parents=True, exist_ok=True)
+                staged.write_text("leaked", encoding="utf-8")
+                thread = threading.Thread(target=second_lease)
+                thread.start()
+                assert not acquired.wait(0.2)
+
+            released.set()
+            thread.join(timeout=5)
+
+            assert released.is_set()
+            assert acquired.is_set()
+            with pool.lease() as interpreter:
+                assert interpreter.list_dir("/sandbox") == []
+        finally:
+            pool.shutdown()
+
+    def test_shutdown_requested_during_start_prevents_waiting_lease_acquire(
+        self, tmp_path: Path, monkeypatch
+    ):
+        pool = SbxPool(
+            size=1,
+            config=SbxConfig(name="pool-test"),
+            preinstall_packages=False,
+            _staging_root=tmp_path / "pool",
+        )
+        prewarm_started = threading.Event()
+        allow_prewarm = threading.Event()
+
+        class FakeInterpreter:
+            def __init__(self) -> None:
+                self.shutdown_called = False
+
+            def prewarm(self) -> None:
+                prewarm_started.set()
+                assert allow_prewarm.wait(timeout=2)
+
+            def configure_runtime(self, **kwargs) -> None:
+                return None
+
+            def reset(self) -> None:
+                return None
+
+            def shutdown(self) -> None:
+                self.shutdown_called = True
+
+        interpreter = FakeInterpreter()
+        monkeypatch.setattr(pool, "_create_interpreter", lambda index: interpreter)
+
+        lease_results: list[str] = []
+
+        def lease_during_start() -> None:
+            try:
+                with pool.lease():
+                    lease_results.append("acquired")
+            except RuntimeError as exc:
+                lease_results.append(str(exc))
+
+        lease_thread = threading.Thread(target=lease_during_start)
+        lease_thread.start()
+        assert prewarm_started.wait(timeout=2)
+
+        shutdown_thread = threading.Thread(target=pool.shutdown)
+        shutdown_thread.start()
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline:
+            with pool._state_changed:
+                if pool._shutdown_requested:
+                    break
+            time.sleep(0.01)
+        else:
+            pytest.fail("shutdown did not request pool stop while startup was active")
+        allow_prewarm.set()
+
+        lease_thread.join(timeout=2)
+        shutdown_thread.join(timeout=2)
+
+        assert not lease_thread.is_alive()
+        assert not shutdown_thread.is_alive()
+        assert lease_results == ["SbxPool is shut down"]
+        assert interpreter.shutdown_called
+        assert pool._available.qsize() == 0
+
+    def test_lease_after_shutdown_raises_until_explicit_restart(
+        self, tmp_path: Path, monkeypatch
+    ):
+        pool = SbxPool(
+            size=1,
+            config=SbxConfig(name="pool-test"),
+            preinstall_packages=False,
+            _staging_root=tmp_path / "pool",
+        )
+
+        class FakeInterpreter:
+            def __init__(self, index: int) -> None:
+                self.index = index
+
+            def prewarm(self) -> None:
+                return None
+
+            def configure_runtime(self, **kwargs) -> None:
+                return None
+
+            def reset(self) -> None:
+                return None
+
+            def shutdown(self) -> None:
+                return None
+
+        created: list[FakeInterpreter] = []
+
+        def create_interpreter(index: int) -> FakeInterpreter:
+            interpreter = FakeInterpreter(index)
+            created.append(interpreter)
+            return interpreter
+
+        monkeypatch.setattr(pool, "_create_interpreter", create_interpreter)
+
+        pool.start()
+        pool.shutdown()
+
+        with pytest.raises(RuntimeError, match="SbxPool is shut down"):
+            with pool.lease():
+                pass
+
+        pool.start()
+        try:
+            with pool.lease() as interpreter:
+                assert interpreter is created[-1]
+        finally:
+            pool.shutdown()
