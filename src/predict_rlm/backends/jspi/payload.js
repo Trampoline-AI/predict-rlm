@@ -532,7 +532,7 @@ const SIGINT = 2;
 const interruptBuffer = new Int32Array(new SharedArrayBuffer(8));
 let interruptTimerWorker = null;
 let interruptArmId = 0;
-const pendingInterruptArms = new Map();
+const pendingInterruptRequests = new Map();
 
 try {
   pyodide.setInterruptBuffer(interruptBuffer);
@@ -581,6 +581,7 @@ self.onmessage = (event) => {
     self.postMessage({ type: "armed", armId: data.armId });
   } else if (data.type === "disarm") {
     clearTimer(true);
+    self.postMessage({ type: "disarmed", armId: data.armId });
   }
 };
 `], { type: "application/javascript" })), { type: "module" });
@@ -593,11 +594,11 @@ self.onmessage = (event) => {
         resolve(data.cancellationSignalReady === true);
         return;
       }
-      if (data.type !== "armed") return;
-      const pending = pendingInterruptArms.get(data.armId);
+      if (data.type !== "armed" && data.type !== "disarmed") return;
+      const pending = pendingInterruptRequests.get(data.armId);
       if (!pending) return;
       clearTimeout(pending.timerId);
-      pendingInterruptArms.delete(data.armId);
+      pendingInterruptRequests.delete(data.armId);
       pending.resolve(true);
     };
   });
@@ -616,10 +617,10 @@ const armExecutionInterrupt = async (timeoutSeconds) => {
   const armId = ++interruptArmId;
   const armed = new Promise((resolve) => {
     const timerId = setTimeout(() => {
-      pendingInterruptArms.delete(armId);
+      pendingInterruptRequests.delete(armId);
       resolve(false);
     }, 1000);
-    pendingInterruptArms.set(armId, { resolve, timerId });
+    pendingInterruptRequests.set(armId, { resolve, timerId });
   });
   interruptTimerWorker.postMessage({
     type: "arm",
@@ -630,14 +631,19 @@ const armExecutionInterrupt = async (timeoutSeconds) => {
   return await armed;
 };
 
-const disarmExecutionInterrupt = () => {
-  if (interruptTimerWorker) {
-    interruptTimerWorker.postMessage({ type: "disarm", buffer: interruptBuffer });
-  }
-  for (const [armId, pending] of pendingInterruptArms) {
+const disarmExecutionInterrupt = async () => {
+  for (const [armId, pending] of pendingInterruptRequests) {
     clearTimeout(pending.timerId);
     pending.resolve(false);
-    pendingInterruptArms.delete(armId);
+    pendingInterruptRequests.delete(armId);
+  }
+  if (interruptTimerWorker) {
+    const armId = ++interruptArmId;
+    const disarmed = new Promise((resolve) => {
+      pendingInterruptRequests.set(armId, { resolve, timerId: null });
+    });
+    interruptTimerWorker.postMessage({ type: "disarm", buffer: interruptBuffer, armId });
+    await disarmed;
   }
   Atomics.store(interruptBuffer, 0, 0);
   Atomics.store(interruptBuffer, 1, 0);
@@ -667,12 +673,12 @@ sys.settrace(__predict_rlm_timeout_trace)
 };
 
 const disablePythonExecutionTimeout = () => {
-  pyodide.globals.set("__predict_rlm_timeout_disabled", true);
   try {
+    pyodide.globals.set("__predict_rlm_timeout_disabled", true);
     pyodide.runPython("import sys\nsys.settrace(None)");
   } catch (e) {
-    // The JS interrupt buffer is still the fallback for states where Python
-    // tracing cannot safely run cleanup code.
+    // CPython clears a trace callback that raises while cleanup enters Python.
+    console.error(`[timeout] Python tracing interrupted cleanup: ${e}`);
   }
 };
 
@@ -1294,10 +1300,10 @@ await micropip.install([__predict_rlm_package], verbose=False)
           enablePythonExecutionTimeout(executionTimeoutSeconds);
         }
         const result = await pyodide.runPythonAsync(code);
+        await disarmExecutionInterrupt();
         if (hasExecutionTimeout) {
           disablePythonExecutionTimeout();
         }
-        disarmExecutionInterrupt();
 
         // Signal code execution complete
         codeExecutionInProgress = false;
@@ -1323,10 +1329,10 @@ await micropip.install([__predict_rlm_package], verbose=False)
         console.log(jsonrpcResult({ output }, requestId));
       } catch (error) {
         const executionTimeoutFired = Atomics.load(interruptBuffer, 1) === 1;
+        await disarmExecutionInterrupt();
         if (hasExecutionTimeout) {
           disablePythonExecutionTimeout();
         }
-        disarmExecutionInterrupt();
         codeExecutionInProgress = false;
 
         // Signal the response reader to stop immediately
