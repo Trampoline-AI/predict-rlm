@@ -30,21 +30,14 @@ def test_host_tool_result_shapes(runtime: RuntimeHandle) -> None:
 def test_host_tools_run_concurrently(runtime: RuntimeHandle, asynchronous: bool) -> None:
     runtime.require("concurrent_tools")
     barrier = threading.Barrier(2)
-    arrivals = 0
-    both_started = None
 
     def sync_tool(value):
         barrier.wait(timeout=2)
         return value * 2
 
     async def async_tool(value):
-        nonlocal arrivals, both_started
-        if both_started is None:
-            both_started = asyncio.Event()
-        arrivals += 1
-        if arrivals == 2:
-            both_started.set()
-        await asyncio.wait_for(both_started.wait(), timeout=2)
+        # Sync SBX dispatch gives each callback its own worker event loop.
+        await asyncio.to_thread(barrier.wait, timeout=2)
         return value * 2
 
     runtime.configure(tools={"double": async_tool if asynchronous else sync_tool})
