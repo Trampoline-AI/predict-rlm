@@ -162,7 +162,17 @@ class RepositoryActions:
 @pytest.mark.integration
 @pytest.mark.skipif(shutil.which("deno") is None, reason="requires Deno")
 @pytest.mark.asyncio
-async def test_one_stateless_adapter_handles_interleaved_real_jspi_runs(tmp_path: Path):
+async def test_one_stateless_adapter_handles_interleaved_real_jspi_runs(
+    tmp_path: Path, monkeypatch
+):
+    from functools import partial
+
+    from predict_rlm.backends import JspiBackend
+
+    monkeypatch.setattr(
+        "predict_rlm.backends.jspi.execution.JspiBackend",
+        partial(JspiBackend, preinstall_packages=False),
+    )
     adapter = MutableRepositoryAdapter()
     repositories = []
     for name in ("first", "second"):
