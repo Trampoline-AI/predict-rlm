@@ -19,6 +19,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - JSPI timeout cleanup now waits for the interrupt worker to disarm before
   entering Python, and preserves the timeout response if tracing interrupts
   cleanup instead of leaving the host waiting for an uncorrelated error.
+- JSPI deadlines no longer interrupt asyncio scheduler callbacks; suspended
+  executions are cancelled without orphaning their result promises, and the
+  previous Python SIGINT handler is restored after bounded execution.
 
 ### Breaking Changes
 
