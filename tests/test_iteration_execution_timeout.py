@@ -82,17 +82,30 @@ async def test_jspi_silent_iteration_timeout_recovery_failure_is_bounded(monkeyp
 
 
 @pytest.mark.integration
-def test_predict_rlm_jspi_timeout_preserves_state_history_and_predict_tool():
+def test_predict_rlm_jspi_timeout_preserves_state_history_and_predict_tool(monkeypatch):
+    from functools import partial
+
     from predict_rlm import PredictRLM
+    from predict_rlm.backends import JspiBackend
     from predict_rlm.predict_rlm import dspy
+
+    monkeypatch.setattr(
+        "predict_rlm.backends.jspi.execution.JspiBackend",
+        partial(JspiBackend, preinstall_packages=False),
+    )
 
     actions = _SequentialActions(
         SimpleNamespace(
-            reasoning="call predict before a bounded risky loop",
+            reasoning="prepare state before the bounded operation",
             code=(
                 "first = await predict('question: str -> answer: str', "
                 "question='first call')\n"
                 "saved = {'first': first['answer'], 'marker': 123}\n"
+            ),
+        ),
+        SimpleNamespace(
+            reasoning="run a bounded risky loop using prepared state",
+            code=(
                 "print('first predict:', saved['first'])\n"
                 "print('marker before timeout:', saved['marker'])\n"
                 "while True:\n"
@@ -121,7 +134,7 @@ def test_predict_rlm_jspi_timeout_preserves_state_history_and_predict_tool():
     rlm = PredictRLM(
         "prompt -> answer",
         sub_lm=mock_lm,
-        max_iterations=2,
+        max_iterations=3,
         sandbox_backend="jspi",
     )
     rlm.generate_action = actions
@@ -130,8 +143,8 @@ def test_predict_rlm_jspi_timeout_preserves_state_history_and_predict_tool():
         prediction = rlm(prompt="exercise deno timeout recovery")
 
     assert prediction.answer == "pre-timeout prediction -> post-timeout prediction / 123"
-    assert len(prediction.trace.steps) == 2
-    timeout_step, final_step = prediction.trace.steps
+    assert len(prediction.trace.steps) == 3
+    _, timeout_step, final_step = prediction.trace.steps
     assert (
         "[Timeout] Iteration execution timed out after 0.2s" in timeout_step.untruncated_output
     )
@@ -140,9 +153,42 @@ def test_predict_rlm_jspi_timeout_preserves_state_history_and_predict_tool():
     assert final_step.output == (
         "FINAL: {'answer': 'pre-timeout prediction -> post-timeout prediction / 123'}"
     )
-    second_history = str(actions.calls[1]["repl_history"])
+    second_history = str(actions.calls[2]["repl_history"])
     assert "[Timeout] Iteration execution timed out after 0.2s" in second_history
     assert "first predict: pre-timeout prediction" in second_history
+
+
+@pytest.mark.integration
+def test_jspi_timeout_during_async_sleep_preserves_state_and_recovers(monkeypatch):
+    import predict_rlm.execution_timeout as execution_timeout
+    from predict_rlm.backends import JspiBackend
+    from predict_rlm.execution_timeout import RecoverableExecutionTimeout
+
+    monkeypatch.setattr(
+        execution_timeout,
+        "DEFAULT_RECOVERABLE_EXECUTION_TIMEOUT_GRACE_SECONDS",
+        2,
+    )
+    interpreter = JspiBackend(preinstall_packages=False)
+    try:
+        interpreter.execute(
+            "import asyncio, signal\nsaved = 42\n"
+            "previous_sigint = signal.getsignal(signal.SIGINT)"
+        )
+        result = interpreter.execute(
+            "print('before sleep')\nawait asyncio.sleep(0.3)",
+            timeout=0.05,
+        )
+        assert isinstance(result, RecoverableExecutionTimeout)
+        assert result.stdout == "before sleep\n"
+        assert (
+            interpreter.execute(
+                "assert signal.getsignal(signal.SIGINT) is previous_sigint\nprint(saved)"
+            )
+            == "42\n"
+        )
+    finally:
+        interpreter.shutdown()
 
 
 @pytest.mark.asyncio

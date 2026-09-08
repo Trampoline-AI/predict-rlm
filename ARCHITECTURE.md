@@ -256,8 +256,11 @@ Python error.
 ### JSPI / Deno / Pyodide
 
 - Successful execute: same live Pyodide VM; full globals persist.
-- Cooperative timeout: Pyodide is interrupted by trace deadline and JS interrupt
-  buffer; stdout/stderr are returned and the VM remains live.
+- Cooperative timeout: deadline tracing is scoped to generated code. The JS
+  interrupt buffer stops active user code; an interrupt in an asyncio scheduler
+  callback cancels the suspended execution task instead of raising through the
+  scheduler. stdout/stderr are returned and the VM remains live. Cleanup waits
+  for the watchdog to disarm and restores the previous Python SIGINT handler.
 - Hard timeout or crash: the host watchdog kills Deno and raises
   `SandboxFatalError`; the interpreter is dead and no state is recovered.
 

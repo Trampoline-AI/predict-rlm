@@ -653,6 +653,8 @@ const enablePythonExecutionTimeout = (timeoutSeconds) => {
   pyodide.globals.set("__predict_rlm_timeout_seconds", timeoutSeconds);
   pyodide.globals.set("__predict_rlm_timeout_disabled", false);
   pyodide.runPython(`
+import asyncio
+import signal
 import sys
 import time
 
@@ -660,14 +662,32 @@ class PredictRLMExecutionTimeout(BaseException):
     pass
 
 __predict_rlm_timeout_deadline = time.monotonic() + float(__predict_rlm_timeout_seconds)
+__predict_rlm_execution_task = None
+__predict_rlm_previous_sigint = signal.getsignal(signal.SIGINT)
+
+def __predict_rlm_execution_interrupt(signum, frame):
+    while frame is not None:
+        if frame.f_code.co_filename == "<predict-rlm>":
+            if time.monotonic() >= __predict_rlm_timeout_deadline:
+                raise PredictRLMExecutionTimeout()
+            raise KeyboardInterrupt()
+        frame = frame.f_back
+    if __predict_rlm_execution_task is not None:
+        __predict_rlm_execution_task.cancel()
 
 def __predict_rlm_timeout_trace(frame, event, arg):
+    global __predict_rlm_execution_task
     if globals().get("__predict_rlm_timeout_disabled", False):
         return None
+    if frame.f_code.co_filename != "<predict-rlm>":
+        return None
+    if __predict_rlm_execution_task is None:
+        __predict_rlm_execution_task = asyncio.current_task()
     if time.monotonic() >= __predict_rlm_timeout_deadline:
         raise PredictRLMExecutionTimeout()
     return __predict_rlm_timeout_trace
 
+signal.signal(signal.SIGINT, __predict_rlm_execution_interrupt)
 sys.settrace(__predict_rlm_timeout_trace)
 `);
 };
@@ -675,7 +695,7 @@ sys.settrace(__predict_rlm_timeout_trace)
 const disablePythonExecutionTimeout = () => {
   try {
     pyodide.globals.set("__predict_rlm_timeout_disabled", true);
-    pyodide.runPython("import sys\nsys.settrace(None)");
+    pyodide.runPython("import sys, signal\nsys.settrace(None)\nsignal.signal(signal.SIGINT, __predict_rlm_previous_sigint)\n__predict_rlm_execution_task = None");
   } catch (e) {
     // CPython clears a trace callback that raises while cleanup enters Python.
     console.error(`[timeout] Python tracing interrupted cleanup: ${e}`);
@@ -1296,10 +1316,10 @@ await micropip.install([__predict_rlm_package], verbose=False)
 
         // Run the user's code
         if (hasExecutionTimeout) {
-          await armExecutionInterrupt(executionTimeoutSeconds);
           enablePythonExecutionTimeout(executionTimeoutSeconds);
+          await armExecutionInterrupt(executionTimeoutSeconds);
         }
-        const result = await pyodide.runPythonAsync(code);
+        const result = await pyodide.runPythonAsync(code, { filename: "<predict-rlm>" });
         await disarmExecutionInterrupt();
         if (hasExecutionTimeout) {
           disablePythonExecutionTimeout();
@@ -1404,7 +1424,7 @@ await micropip.install([__predict_rlm_package], verbose=False)
           hasExecutionTimeout &&
           (
             pythonExecutionTimeoutFired ||
-            (executionTimeoutFired && errorType === "KeyboardInterrupt")
+            (executionTimeoutFired && (errorType === "KeyboardInterrupt" || errorType === "CancelledError"))
           )
         ) {
           let capturedStdout = "";

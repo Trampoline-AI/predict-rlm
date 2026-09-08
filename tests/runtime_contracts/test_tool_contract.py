@@ -117,14 +117,16 @@ def test_timeout_during_concurrent_host_tools_is_recoverable(
     runtime: RuntimeHandle,
     tmp_path: Path,
 ) -> None:
-    result_queue = multiprocessing.Queue()
-    process = multiprocessing.Process(
+    context = multiprocessing.get_context("spawn")
+    result_queue = context.Queue()
+    process = context.Process(
         target=_run_timeout_repro,
         args=(runtime.spec.name, str(tmp_path / "staging"), result_queue),
     )
     process.start()
     try:
-        status, *payload = _get_message(process, result_queue, 30)
+        # Spawn imports the Python dependencies before the backend's own startup.
+        status, *payload = _get_message(process, result_queue, 60)
         if status == "skip":
             pytest.skip(payload[0])
         assert status == "ready", payload
