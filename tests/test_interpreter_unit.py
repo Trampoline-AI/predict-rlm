@@ -62,6 +62,33 @@ def _make_interpreter():
     return JspiBackend.__new__(JspiBackend)
 
 
+def test_pydantic_input_serialization_uses_json_native_values():
+    import ast
+    from datetime import UTC, datetime
+    from enum import StrEnum
+
+    from pydantic import BaseModel
+
+    class SourceKind(StrEnum):
+        DRIVE = "drive"
+
+    class Packet(BaseModel):
+        kind: SourceKind
+        updated_at: datetime
+
+    packet = Packet(
+        kind=SourceKind.DRIVE,
+        updated_at=datetime(2026, 9, 9, 1, 52, 12, tzinfo=UTC),
+    )
+
+    serialized = _make_interpreter()._serialize_value(packet)
+
+    assert ast.literal_eval(serialized) == {
+        "kind": "drive",
+        "updated_at": "2026-09-09T01:52:12Z",
+    }
+
+
 def _attach_telemetry(interp: JspiBackend) -> ListTelemetrySink:
     sink = ListTelemetrySink()
     interp._telemetry_context = TelemetryContext(sink=sink, trace_id="trace-1")
