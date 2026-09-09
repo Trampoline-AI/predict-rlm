@@ -390,3 +390,41 @@ async def test_codex_wslm_websocket_401_is_codex_lm_auth_expired(
     assert exc_info.value.failure_kind == "codex_lm_auth_expired"
     assert exc_info.value.failure_code == 401
     assert "auth expired" in str(exc_info.value)
+
+
+@pytest.mark.asyncio
+async def test_codex_wslm_websocket_503_is_retryable_stream_error(
+    monkeypatch,
+    unused_tcp_port,
+):
+    monkeypatch.setattr("dspy_codex_lm.lm.CODEX_STREAM_MAX_ATTEMPTS", 1)
+
+    async def service_unavailable(_request):
+        return web.Response(status=503, text="temporarily unavailable")
+
+    app = web.Application()
+    app.router.add_get("/backend-api/codex/responses", service_unavailable)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    port = unused_tcp_port
+    site = web.TCPSite(runner, "127.0.0.1", port)
+    await site.start()
+
+    try:
+        lm = CodexWSLM(
+            model="gpt-5.3-codex",
+            access_token="fake-token",
+            account_id="fake-account",
+            ws_base="http://127.0.0.1:%d/backend-api/codex" % port,
+            cache=False,
+            ws_fallback=False,
+        )
+
+        with pytest.raises(CodexStreamError) as exc_info:
+            await lm.aforward(prompt="hello", cache=False)
+    finally:
+        await runner.cleanup()
+
+    assert exc_info.value.failure_kind == "codex_lm_ws_handshake"
+    assert exc_info.value.failure_code == 503
+    assert "503" in str(exc_info.value)
