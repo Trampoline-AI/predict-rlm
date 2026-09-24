@@ -654,6 +654,7 @@ const enablePythonExecutionTimeout = (timeoutSeconds) => {
   pyodide.globals.set("__predict_rlm_timeout_disabled", false);
   pyodide.runPython(`
 import asyncio
+import inspect
 import signal
 import sys
 import time
@@ -664,10 +665,20 @@ class PredictRLMExecutionTimeout(BaseException):
 __predict_rlm_timeout_deadline = time.monotonic() + float(__predict_rlm_timeout_seconds)
 __predict_rlm_execution_task = None
 __predict_rlm_previous_sigint = signal.getsignal(signal.SIGINT)
+__predict_rlm_coroutine_flags = (
+    inspect.CO_COROUTINE | inspect.CO_ITERABLE_COROUTINE | inspect.CO_ASYNC_GENERATOR
+)
+
+def __predict_rlm_is_execution_frame(frame):
+    # Coroutine exceptions unwind through tasks, not scheduler callbacks.
+    return (
+        frame.f_code.co_filename == "<predict-rlm>"
+        or frame.f_code.co_flags & __predict_rlm_coroutine_flags
+    )
 
 def __predict_rlm_execution_interrupt(signum, frame):
     while frame is not None:
-        if frame.f_code.co_filename == "<predict-rlm>":
+        if __predict_rlm_is_execution_frame(frame):
             if time.monotonic() >= __predict_rlm_timeout_deadline:
                 raise PredictRLMExecutionTimeout()
             raise KeyboardInterrupt()
@@ -679,9 +690,9 @@ def __predict_rlm_timeout_trace(frame, event, arg):
     global __predict_rlm_execution_task
     if globals().get("__predict_rlm_timeout_disabled", False):
         return None
-    if frame.f_code.co_filename != "<predict-rlm>":
+    if not __predict_rlm_is_execution_frame(frame):
         return None
-    if __predict_rlm_execution_task is None:
+    if __predict_rlm_execution_task is None and frame.f_code.co_filename == "<predict-rlm>":
         __predict_rlm_execution_task = asyncio.current_task()
     if time.monotonic() >= __predict_rlm_timeout_deadline:
         raise PredictRLMExecutionTimeout()

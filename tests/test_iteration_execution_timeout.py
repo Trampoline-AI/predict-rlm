@@ -191,6 +191,58 @@ def test_jspi_timeout_during_async_sleep_preserves_state_and_recovers(monkeypatc
         interpreter.shutdown()
 
 
+@pytest.mark.integration
+@pytest.mark.parametrize("definition", ["exec", "module", "async-generator"])
+def test_jspi_timeout_interrupts_child_code_from_other_filenames(monkeypatch, definition):
+    import predict_rlm.execution_timeout as execution_timeout
+    from predict_rlm.backends import JspiBackend
+    from predict_rlm.execution_timeout import RecoverableExecutionTimeout
+
+    monkeypatch.setattr(
+        execution_timeout,
+        "DEFAULT_RECOVERABLE_EXECUTION_TIMEOUT_GRACE_SECONDS",
+        2,
+    )
+    if definition == "async-generator":
+        source = "async def spin():\n    yield 1\n    while True: pass"
+        setup = f"exec({source!r})"
+        operation = (
+            "async def consume():\n"
+            "    async for value in spin():\n"
+            "        pass\n"
+            "await asyncio.gather(consume())"
+        )
+    else:
+        source = "async def spin():\n    while True: pass"
+        if definition == "module":
+            setup = (
+                "import sys\nsys.path.insert(0, '/tmp')\n"
+                f"with open('/tmp/timeout_child.py', 'w') as module:\n"
+                f"    module.write({source!r})\n"
+                "from timeout_child import spin"
+            )
+        else:
+            setup = f"exec({source!r})"
+        operation = "await asyncio.gather(spin())"
+    interpreter = JspiBackend(preinstall_packages=False)
+    try:
+        interpreter.execute(
+            "import asyncio, signal\nsaved = 42\n"
+            "previous_sigint = signal.getsignal(signal.SIGINT)\n" + setup
+        )
+        result = interpreter.execute("print('before child')\n" + operation, timeout=0.1)
+        assert isinstance(result, RecoverableExecutionTimeout)
+        assert result.stdout == "before child\n"
+        assert (
+            interpreter.execute(
+                "assert signal.getsignal(signal.SIGINT) is previous_sigint\nprint(saved)"
+            )
+            == "42\n"
+        )
+    finally:
+        interpreter.shutdown()
+
+
 @pytest.mark.asyncio
 async def test_nonfinite_model_deadline_fails_before_execution():
     from dspy.primitives.repl_types import REPLHistory

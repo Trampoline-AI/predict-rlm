@@ -129,17 +129,25 @@ class TestWorkspaceSyncState:
             with open(conflict, "w") as f:
                 f.write("host concurrent change")
 
+            sandbox_files = {
+                "clean.txt": "sandbox clean",
+                "conflict.txt": "sandbox conflict",
+            }
             repl = MagicMock()
             repl.workspace_manifest.return_value = {
-                "clean.txt": self._info("sandbox clean"),
-                "conflict.txt": self._info("sandbox conflict"),
+                name: self._info(content) for name, content in sandbox_files.items()
             }
+            repl.sync_file_to.side_effect = lambda sandbox_path, host_path: Path(
+                host_path
+            ).write_text(sandbox_files[Path(sandbox_path).name])
 
             with pytest.raises(WorkspaceSyncConflictError, match="conflict.txt"):
                 state.sync_from_sandbox(repl)
 
             with open(clean) as f:
                 assert f.read() == "base clean"
+            with open(conflict) as f:
+                assert f.read() == "host concurrent change"
 
     def test_workspace_manifest_failure_conflicts_instead_of_deleting_host_files(self):
         with tempfile.TemporaryDirectory() as tmpdir:

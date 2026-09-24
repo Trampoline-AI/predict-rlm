@@ -256,7 +256,8 @@ Python error.
 ### JSPI / Deno / Pyodide
 
 - Successful execute: same live Pyodide VM; full globals persist.
-- Cooperative timeout: deadline tracing is scoped to generated code. The JS
+- Cooperative timeout: deadline tracing covers generated code and coroutine
+  frames, including child code defined by `exec` or imported modules. The JS
   interrupt buffer stops active user code; an interrupt in an asyncio scheduler
   callback cancels the suspended execution task instead of raising through the
   scheduler. stdout/stderr are returned and the VM remains live. Cleanup waits
