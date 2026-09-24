@@ -22,6 +22,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - JSPI deadlines no longer interrupt asyncio scheduler callbacks; suspended
   executions are cancelled without orphaning their result promises, and the
   previous Python SIGINT handler is restored after bounded execution.
+- JSPI deadlines interrupt CPU-bound child coroutines defined by `exec` or
+  imported modules without killing the sandbox or losing execution state.
+- Workspace atomicity regression coverage now performs real host writes, so it
+  detects a transfer attempted before all conflicts have been checked.
 
 ### Breaking Changes
 
