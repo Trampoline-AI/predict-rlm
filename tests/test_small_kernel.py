@@ -4,6 +4,8 @@ import asyncio
 import shutil
 import threading
 from contextlib import asynccontextmanager, contextmanager
+from datetime import date
+from decimal import Decimal
 from pathlib import Path
 from typing import Annotated
 from unittest.mock import AsyncMock, MagicMock
@@ -11,6 +13,7 @@ from unittest.mock import AsyncMock, MagicMock
 import dspy
 import pytest
 from dspy.primitives.code_interpreter import FinalOutput
+from pydantic import BaseModel
 
 from predict_rlm.backends.adapters import (
     InterpreterBackendAdapter,
@@ -159,6 +162,33 @@ async def test_strict_evidence_rejects_lossy_event_serialization():
         await recorder.emit(RunEventKind.RUN_STARTED, unsupported=object())
 
     assert sink.events == []
+
+
+@pytest.mark.asyncio
+async def test_strict_evidence_serializes_nested_pydantic_decimals():
+    class FinancialEvidence(BaseModel):
+        asking_price_cad: Decimal
+        field_confidences: dict[str, Decimal]
+        pac: date
+
+    sink = RecordingSink()
+    ctx = RunContext(make_spec(events=(sink,)), {})
+    recorder = EvidenceRecorder(ctx, (sink,))
+
+    await recorder.emit(
+        RunEventKind.RUN_STARTED,
+        evidence=FinancialEvidence(
+            asking_price_cad=Decimal("2150000.00"),
+            field_confidences={"unit_mix": Decimal("0.7880")},
+            pac=date(2026, 10, 31),
+        ),
+    )
+
+    assert sink.events[0].data["evidence"] == {
+        "asking_price_cad": "2150000.00",
+        "field_confidences": {"unit_mix": "0.7880"},
+        "pac": "2026-10-31",
+    }
 
 
 @pytest.mark.asyncio
