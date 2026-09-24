@@ -1200,7 +1200,16 @@ class _AiohttpCodexWSTransport:
                         failure_kind="codex_lm_auth_expired",
                         failure_code=401,
                     ) from exc
-                raise
+                retry_after = _coerce_retry_after_seconds(
+                    exc.headers.get("Retry-After") if exc.headers else None
+                )
+                raise CodexStreamError(
+                    f"Codex WebSocket handshake failed with HTTP {exc.status}: "
+                    f"{exc.message}",
+                    retry_after_seconds=retry_after,
+                    failure_kind="codex_lm_ws_handshake",
+                    failure_code=exc.status,
+                ) from exc
 
 
 @dataclass
