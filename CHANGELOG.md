@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.1] - 2026-09-25
+
 ### Changed
 
 - Reduced the package regression suite to behavioral contracts; consolidated
@@ -36,4 +38,5 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the move to native asynchronous SBX execution and prevents synchronous
   shutdown from blocking its own event loop.
 
-[Unreleased]: https://github.com/Trampoline-AI/predict-rlm/compare/v0.7.2...HEAD
+[Unreleased]: https://github.com/Trampoline-AI/predict-rlm/compare/v0.8.1...HEAD
+[0.8.1]: https://github.com/Trampoline-AI/predict-rlm/compare/v0.8.0...v0.8.1
