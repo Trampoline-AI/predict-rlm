@@ -31,9 +31,9 @@ improvement versus a benchmark-specific hack. Budget knobs such as
 
 This repository ships two complementary coding-agent skills:
 
-- [`/rlm`](../../.agents/skills/rlm/SKILL.md) designs and builds the base
+- [`/rlm`](../../skills/rlm/SKILL.md) designs and builds the base
   PredictRLM.
-- [`/rlm-gepa`](../../.agents/skills/rlm-gepa/SKILL.md) adds evaluation and
+- [`/rlm-gepa`](../../skills/rlm-gepa/SKILL.md) adds evaluation and
   RLM-GEPA optimization after the base RLM works.
 
 Install the repository skills in Claude Code, Codex, Cursor, or another

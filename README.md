@@ -134,7 +134,7 @@ codex-lm usage
 
 ### With your coding agent
 
-Install the [predict-rlm skill](.agents/skills/rlm/SKILL.md) in Claude Code,
+Install the [predict-rlm skill](skills/rlm/SKILL.md) in Claude Code,
 Codex, Cursor, or any compatible coding agent:
 
 ```bash
@@ -148,7 +148,7 @@ Then ask your agent to build an RLM:
 ```
 
 For train/validation optimization of an existing RLM, use the separate
-[`/rlm-gepa` skill](.agents/skills/rlm-gepa/SKILL.md).
+[`/rlm-gepa` skill](skills/rlm-gepa/SKILL.md).
 
 ### Quick Example
 
