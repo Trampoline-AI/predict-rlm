@@ -4,6 +4,7 @@ import json
 from collections.abc import Mapping
 from typing import Any
 
+from predict_rlm.evidence import RunEvidence
 from predict_rlm.trace import RunTrace
 
 PROPOSER_FAILURE_METADATA_KEYS = frozenset(
@@ -170,6 +171,14 @@ def trace_to_proposer_json(trace: Any) -> Any:
             return proposer_trace.model_dump()
         return proposer_trace
     return trace
+
+
+def evidence_to_json(evidence: RunEvidence | None) -> Any:
+    return json.loads(evidence.to_exportable_json(indent=0)) if evidence is not None else None
+
+
+def evidence_to_proposer_json(evidence: RunEvidence) -> Any:
+    return json.loads(evidence.to_proposer_json(indent=0))
 
 
 def _banner(text: str, char: str) -> str:

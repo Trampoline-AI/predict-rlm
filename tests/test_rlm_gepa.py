@@ -10,6 +10,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from predict_rlm.evidence import RunEvidence, RunEvidenceEvent
 from predict_rlm.telemetry import JsonlTelemetrySink, TelemetryContext
 from predict_rlm.trace import (
     IterationStep,
@@ -303,6 +304,7 @@ class _PatchEvidenceAdapter:
                 "record": {
                     "Inputs": f"input for {item}",
                     "Traces": [{"steps": [{"code": f"solve({item!r})", "error": False}]}],
+                    "Evidence": [json.loads(_lifecycle_evidence().to_proposer_json())],
                     "Failure Metadata": {
                         "failure_class": "host_tool_timeout_or_leak",
                         "failure_reason": "tool timed out",
@@ -407,6 +409,13 @@ def test_patch_evidence_prefers_larger_disagreements_and_caps_records(tmp_path: 
         "train_3",
         "train_4",
     }
+    paired_rows = [
+        json.loads(line) for line in Path(evidence.paired_trace_path).read_text().splitlines()
+    ]
+    for row in paired_rows:
+        for parent in ("base_parent", "patch_source_parent"):
+            assert row[parent]["evidence"][0]["terminal_outcome"] == "completed"
+            assert "evidence" not in row[parent]["traces"][0]
 
 
 def test_patch_evidence_balances_base_and_patch_source_win_directions(tmp_path: Path):
@@ -1012,6 +1021,114 @@ def test_reflective_record_visible_to_gepa_includes_failure_metadata(tmp_path: P
     assert task_row["telemetry_ref"]["trace_id"].endswith(":0")
 
 
+def _lifecycle_evidence(*, complete: bool = True) -> RunEvidence:
+    return RunEvidence(
+        run_id="lifecycle_run",
+        complete=complete,
+        terminal_outcome="completed" if complete else None,
+        events=[
+            RunEvidenceEvent(
+                sequence=1,
+                kind="run.started",
+                timestamp_ns=10,
+                data={"inputs": {"private": "raw task input"}},
+            ),
+            RunEvidenceEvent(
+                sequence=2,
+                kind="session.finalized",
+                timestamp_ns=20,
+                data={"status": "ok"},
+            ),
+            RunEvidenceEvent(
+                sequence=3,
+                kind="run.succeeded",
+                timestamp_ns=30,
+                data={
+                    "output": {"image": "data:image/png;base64,QUJDREVGRw=="},
+                    "usage": {"cost": 0.01},
+                },
+            ),
+        ],
+    )
+
+
+@pytest.mark.parametrize("source", ["result", "exception", "timeout"])
+def test_adapter_rejects_incomplete_independent_evidence(tmp_path: Path, source: str):
+    class IncompleteEvidenceProject(_Project):
+        async def evaluate_example(self, candidate, example, context):
+            evidence = _lifecycle_evidence(complete=False)
+            if source != "result":
+                cause = asyncio.CancelledError()
+                cause.evidence = evidence
+                error_type = TimeoutError if source == "timeout" else RuntimeError
+                raise error_type("evaluation interrupted") from cause
+            return RLMGepaExampleResult(
+                score=0.0,
+                feedback="evaluation interrupted",
+                traces=[],
+                error="evaluation interrupted",
+                evidence=[evidence],
+            )
+
+    adapter = RLMGepaAdapter(
+        project=IncompleteEvidenceProject(),
+        lm=_DummyLM(),
+        sub_lm=_DummyLM(),
+        max_iterations=1,
+        concurrency=1,
+        task_timeout=1,
+        output_dir=tmp_path,
+        run_id="run_test",
+    )
+
+    with pytest.raises(ValueError, match="incomplete strict evidence"):
+        adapter.evaluate(["example"], {"skill_instructions": "seed"}, capture_traces=True)
+
+
+@pytest.mark.parametrize("error_type", [RuntimeError, TimeoutError])
+def test_adapter_archives_evidence_from_failure_without_trace(tmp_path: Path, error_type):
+    class EvidenceOnlyFailureProject(_Project):
+        async def evaluate_example(self, candidate, example, context):
+            cause = asyncio.CancelledError()
+            cause.evidence = RunEvidence(
+                run_id="cancelled_run",
+                complete=True,
+                terminal_outcome="cancelled",
+                events=[
+                    RunEvidenceEvent(
+                        sequence=1,
+                        kind="run.cancelled",
+                        timestamp_ns=10,
+                        data={"reason": "cancelled during input preparation"},
+                    )
+                ],
+            )
+            raise error_type("evaluation interrupted") from cause
+
+    adapter = RLMGepaAdapter(
+        project=EvidenceOnlyFailureProject(),
+        lm=_DummyLM(),
+        sub_lm=_DummyLM(),
+        max_iterations=1,
+        concurrency=1,
+        task_timeout=1,
+        output_dir=tmp_path,
+        run_id="run_test",
+    )
+
+    batch = adapter.evaluate(["example"], {"skill_instructions": "seed"}, capture_traces=True)
+
+    record = batch.trajectories[0]["record"]
+    assert record["Traces"] == []
+    assert record["Evidence"][0]["terminal_outcome"] == "cancelled"
+    assert record["Evidence"][0]["events"][0]["data"] == {
+        "reason": "cancelled during input preparation"
+    }
+    row = json.loads(next((tmp_path / "task_traces").glob("*.jsonl")).read_text())
+    assert row["trace"] is None
+    assert row["evidence"][0]["events"][0]["timestamp_ns"] == 10
+
+
 class _StructuredTraceProject(_Project):
     async def evaluate_example(self, candidate, example, context):
         trace = RunTrace(
@@ -1076,6 +1193,7 @@ class _StructuredTraceProject(_Project):
             score=0.5,
             feedback="partial",
             traces=[trace],
+            evidence=[_lifecycle_evidence()],
             rlm_inputs={"example": example},
             example_id=str(example),
         )
@@ -1119,6 +1237,16 @@ def test_adapter_reflective_records_include_structured_run_traces(tmp_path: Path
     assert "total_usage" not in step["predict_calls"][0]
     assert "duration_ms" not in step["predict_calls"][0]["calls"][0]
     assert "usage" not in step["predict_calls"][0]["calls"][0]
+    evidence = record["Evidence"][0]
+    assert evidence["terminal_outcome"] == "completed"
+    assert evidence["events"][0]["data"] == {}
+    assert evidence["events"][1]["kind"] == "session.finalized"
+    assert evidence["events"][1]["data"] == {"status": "ok"}
+    assert evidence["events"][2]["data"] == {
+        "output": {"image": "data:image/png;base64,<IMAGE_BASE_64_ENCODED(12)>"}
+    }
+    assert "timestamp_ns" not in evidence["events"][0]
+    assert "evidence" not in trace
 
     task_trace_path = (
         tmp_path / "task_traces" / "run_test_eval_minibatch_attempt_0000_minibatch.jsonl"
@@ -1134,6 +1262,12 @@ def test_adapter_reflective_records_include_structured_run_traces(tmp_path: Path
     assert archival_step["predict_calls"][0]["total_usage"]["input_tokens"] == 20
     assert archival_step["predict_calls"][0]["calls"][0]["usage"]["input_tokens"] == 20
     assert task_row["traces"][0]["usage"]["sub"]["cost"] == 0.002
+    archival_evidence = task_row["evidence"][0]
+    assert archival_evidence["events"][0]["data"]["inputs"] == {"private": "raw task input"}
+    assert archival_evidence["events"][0]["timestamp_ns"] == 10
+    assert archival_evidence["events"][2]["data"]["usage"] == {"cost": 0.01}
+    assert "QUJDREVGRw==" not in json.dumps(archival_evidence)
+    assert "evidence" not in archival_trace
 
 
 def test_adapter_enforces_per_example_timeout(tmp_path: Path):
@@ -1306,6 +1440,7 @@ def test_rlm_instruction_proposer_serializes_proposer_trace_records(
                 generalization_check=[],
                 trajectory=[],
                 trace=None,
+                evidence=_lifecycle_evidence(),
             )
 
     monkeypatch.setattr(proposer_module, "PredictRLM", FakePredictRLM)
@@ -1365,6 +1500,7 @@ def test_rlm_instruction_proposer_serializes_proposer_trace_records(
                     ],
                 )
             ],
+            "Evidence": [_lifecycle_evidence()],
             "Failure Metadata": {
                 "failure_class": "host_tool_timeout_or_leak",
                 "failure_reason": "tool timed out",
@@ -1406,3 +1542,7 @@ def test_rlm_instruction_proposer_serializes_proposer_trace_records(
     assert "trace_id" not in serialized_text
     assert "Trace Preview" not in serialized[0]
     assert "Generated Outputs" not in serialized[0]
+    assert serialized[0]["Evidence"][0]["events"][1]["kind"] == "session.finalized"
+    assert "inputs" not in serialized[0]["Evidence"][0]["events"][0]["data"]
+    artifact = next((tmp_path / "proposer_traces").glob("*_proposer_skill_instructions.json"))
+    assert json.loads(artifact.read_text())["run_evidence"]["terminal_outcome"] == "completed"

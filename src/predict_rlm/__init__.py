@@ -28,6 +28,8 @@ from .evidence import (
     InMemoryEvidenceSink,
     RunEvent,
     RunEventKind,
+    RunEvidence,
+    RunEvidenceEvent,
 )
 from .files import File, LocalDir, LocalFile, OutputDir, OutputFile, SyncedFile
 from .in_context import CtxStr, CtxStrInputAdapter
@@ -137,6 +139,8 @@ __all__ = [
     "PythonSupervisor",
     "RunTrace",
     "RunContext",
+    "RunEvidence",
+    "RunEvidenceEvent",
     "RunEvent",
     "RunEventKind",
     "RuntimeContribution",

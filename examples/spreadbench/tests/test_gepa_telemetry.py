@@ -80,7 +80,7 @@ def test_spreadsheet_project_writes_case_start_and_end_telemetry(
         )
 
         project = SpreadsheetGepaProject(default_config())
-        score, _feedback, _trace = await project._run_case(
+        score, _feedback, _trace, _evidence = await project._run_case(
             task,
             2,
             str(input_path),

@@ -8,10 +8,131 @@ import json
 import time
 from dataclasses import dataclass, field
 from enum import Enum
+from pathlib import Path
 from typing import Any
+
+from pydantic import BaseModel, Field
 
 from .runtime import EventSink, RunContext, immutable_mapping
 from .serialization import to_plain_data
+from .trace import _extract_from_exc, _sanitize_for_trace
+
+
+class RunEvidenceEvent(BaseModel):
+    sequence: int
+    kind: str
+    timestamp_ns: int
+    data: dict[str, Any] = Field(default_factory=dict)
+
+
+class ProposerRunEvidenceEvent(BaseModel):
+    sequence: int
+    kind: str
+    data: dict[str, Any] = Field(default_factory=dict)
+
+
+class ProposerRunEvidence(BaseModel):
+    run_id: str
+    complete: bool
+    terminal_outcome: str | None = None
+    events: list[ProposerRunEvidenceEvent] = Field(default_factory=list)
+
+
+class RunEvidence(BaseModel):
+    """Strict lifecycle evidence completed independently of the behavioral trace."""
+
+    run_id: str = Field(description="Identity of this PredictRLM invocation")
+    complete: bool = Field(
+        description="Whether lifecycle recording completed without a strict evidence failure"
+    )
+    terminal_outcome: str | None = Field(
+        default=None, description="Invocation termination: completed, error, or cancelled"
+    )
+    events: list[RunEvidenceEvent] = Field(
+        default_factory=list, description="Ordered lifecycle events retained for this invocation"
+    )
+
+    def to_exportable_json(self, path: str | Path | None = None, indent: int = 2) -> str:
+        """Export all lifecycle metadata, summarizing base64 image payloads.
+
+        Unlike ``model_dump()``, this export replaces image data URIs with
+        compact summaries. If provided, ``path`` receives the returned JSON.
+        """
+        data = _sanitize_for_trace(self.model_dump())
+        output = json.dumps(data, indent=indent, default=str)
+        if path is not None:
+            Path(path).write_text(output)
+        return output
+
+    def to_proposer(self) -> ProposerRunEvidence:
+        """Return sanitized evidence without raw inputs or accounting fields."""
+        return ProposerRunEvidence(
+            run_id=self.run_id,
+            complete=self.complete,
+            terminal_outcome=self.terminal_outcome,
+            events=[
+                ProposerRunEvidenceEvent(
+                    sequence=event.sequence,
+                    kind=event.kind,
+                    data=_proposer_evidence_data(event),
+                )
+                for event in self.events
+            ],
+        )
+
+    def to_proposer_json(self, path: str | Path | None = None, indent: int = 2) -> str:
+        """Serialize the proposer-facing evidence subset to JSON."""
+        output = json.dumps(self.to_proposer().model_dump(), indent=indent, default=str)
+        if path is not None:
+            Path(path).write_text(output)
+        return output
+
+
+_PROPOSER_ACCOUNTING_KEYS = {
+    "cache_hits",
+    "cost",
+    "duration_ms",
+    "input_tokens",
+    "output_tokens",
+    "total_tokens",
+    "total_usage",
+    "usage",
+}
+
+
+def _proposer_evidence_data(event: RunEvidenceEvent) -> dict[str, Any]:
+    data = dict(event.data)
+    if event.kind == "run.started":
+        data.pop("inputs", None)
+    elif event.kind == "iteration.recorded":
+        step = data.get("step")
+        return (
+            {"iteration": step["iteration"]}
+            if isinstance(step, dict) and "iteration" in step
+            else {}
+        )
+    return _sanitize_for_trace(_without_accounting(data))
+
+
+def _without_accounting(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {
+            key: _without_accounting(item)
+            for key, item in value.items()
+            if key not in _PROPOSER_ACCOUNTING_KEYS
+        }
+    if isinstance(value, list):
+        return [_without_accounting(item) for item in value]
+    return value
+
+
+def extract_evidence_from_exc(exc: BaseException | None) -> RunEvidence | None:
+    """Find attached evidence through exception causes and contexts.
+
+    Timeout wrappers can leave evidence on the inner cancellation exception.
+    Prefer explicit causes to implicit contexts, and stop at exception cycles.
+    """
+    return _extract_from_exc(exc, "evidence")
 
 
 class RunEventKind(str, Enum):

@@ -218,8 +218,8 @@ Use the first boundary that can express the requirement:
 8. **`RuntimeContribution` through `modules=`** — several host-side extensions
    belong together and should compose as one reusable construction-time unit.
 9. **`EventSink` through `events=`** — a consumer needs ordered lifecycle events
-   during the run. Use `prediction.trace` when only the completed trace is
-   needed.
+   during the run. Use `prediction.trace` for the completed trajectory and
+   `prediction.evidence` for the separate completed lifecycle log.
 10. **`ExecutionBackend` through `execution=`** — only for a genuinely new
     sandbox or execution substrate. Use `sandbox_backend="jspi"` or `"sbx"` for
     maintained backends.
@@ -358,6 +358,11 @@ configuration must select exactly one execution backend.
   a strict sink failure can prevent successful publication.
 - DSPy callbacks report high-level RLM iteration progress. `EventSink` reports
   ordered kernel lifecycle evidence. They solve different problems.
+- `prediction.trace` and `prediction.evidence` are independent objects. Export
+  them separately with `to_exportable_json()`. Failures after invocation creation
+  carry `exception.evidence`; a trajectory may also be available as
+  `exception.trace`. Do not read `trace.evidence` or declare an output named
+  `evidence`, which is reserved for the runtime log.
 - `RuntimeHook(target=..., phases={"before", "after", "error"})` instruments a
   dotted function inside the sandbox and emits sanitized `RuntimeHookEvent`
   values to `on_runtime_hook_event`. Runtime hooks require the SBX backend in

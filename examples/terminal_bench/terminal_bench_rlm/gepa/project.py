@@ -13,13 +13,14 @@ import time
 import tomllib
 import uuid
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from enum import StrEnum
 from pathlib import Path
 from typing import Any, Protocol
 from urllib.parse import unquote, urlparse
 
+from predict_rlm.evidence import RunEvidence
 from predict_rlm.trace import RunTrace
 from rlm_gepa import EvaluationContext, RLMGepaExampleResult, RLMGepaProject
 from terminal_bench_rlm.scoring import to_gepa_example_result
@@ -62,6 +63,7 @@ class TerminalBenchTaskRunResult:
     traces: list[Any]
     run_dir: Path | None = None
     error: str | None = None
+    evidence: list[RunEvidence] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -370,6 +372,7 @@ class HarborSubprocessHarnessRunner:
                     task_id=request.task_id,
                     trial_result=_timeout_trial_result(exc),
                     traces=[],
+                    evidence=_load_run_evidence(run_dir),
                     run_dir=run_dir,
                     error=_subprocess_timeout_error(exc),
                 )
@@ -393,6 +396,7 @@ class HarborSubprocessHarnessRunner:
                     task_id=request.task_id,
                     trial_result=_subprocess_failure_trial_result(completed),
                     traces=[],
+                    evidence=_load_run_evidence(run_dir),
                     run_dir=run_dir,
                     error=_subprocess_error(completed),
                 )
@@ -485,25 +489,36 @@ class HarborRemoteControllerHarnessRunner:
                 timeout=request.task_timeout,
                 operation="unpacking remote controller package",
             )
-            _remote_exec_checked(
-                environment,
-                f"cd {shlex.quote(remote_cwd)} && {shlex.join(remote_cmd)}",
-                timeout=_subprocess_timeout(request),
-                operation="running remote Harbor controller",
-            )
-            _remote_exec_checked(
-                environment,
-                (
-                    f"tar -czf {shlex.quote(remote_artifact_path)} "
-                    f"-C {shlex.quote(remote_output_dir)} {shlex.quote(request.run_id)}"
-                ),
-                timeout=request.task_timeout,
-                operation="packing remote Harbor artifacts",
-            )
-            _remote_download_file(environment, remote_artifact_path, str(local_artifact_path))
-            _extract_tarball(local_artifact_path, output_dir)
+            run_error: Exception | None = None
+            try:
+                _remote_exec_checked(
+                    environment,
+                    f"cd {shlex.quote(remote_cwd)} && {shlex.join(remote_cmd)}",
+                    timeout=_subprocess_timeout(request),
+                    operation="running remote Harbor controller",
+                )
+            except Exception as exc:
+                run_error = exc
+            try:
+                _remote_exec_checked(
+                    environment,
+                    (
+                        f"tar -czf {shlex.quote(remote_artifact_path)} "
+                        f"-C {shlex.quote(remote_output_dir)} {shlex.quote(request.run_id)}"
+                    ),
+                    timeout=request.task_timeout,
+                    operation="packing remote Harbor artifacts",
+                )
+                _remote_download_file(environment, remote_artifact_path, str(local_artifact_path))
+                _extract_tarball(local_artifact_path, output_dir)
+            except Exception as exc:
+                if run_error is not None:
+                    run_error.add_note(f"Could not recover remote run artifacts: {exc}")
+                    raise run_error from exc
+                raise
 
-        return _load_task_run_result(request, run_dir)
+        result = _load_task_run_result(request, run_dir)
+        return replace(result, error=str(run_error)) if run_error is not None else result
 
     def _require_controller_environment(self) -> Any:
         if self.controller_environment is None:
@@ -573,6 +588,7 @@ class TerminalBenchSubprocessHarnessRunner:
                 task_id=request.task_id,
                 trial_result=_timeout_trial_result(exc),
                 traces=[],
+                evidence=_load_run_evidence(run_dir),
                 run_dir=run_dir,
                 error=_subprocess_timeout_error(exc),
             )
@@ -583,6 +599,7 @@ class TerminalBenchSubprocessHarnessRunner:
                 task_id=request.task_id,
                 trial_result=_subprocess_failure_trial_result(completed),
                 traces=[],
+                evidence=_load_run_evidence(run_dir),
                 run_dir=run_dir,
                 error=error,
             )
@@ -692,6 +709,7 @@ class TerminalBenchGepaProject(RLMGepaProject):
         result = to_gepa_example_result(
             run_result.trial_result,
             traces=run_result.traces,
+            evidence=run_result.evidence,
             example_id=example.task_id,
             rlm_inputs={
                 "task_id": example.task_id,
@@ -1613,6 +1631,7 @@ def _load_task_run_result(
                 sub_model=_model_name(request.sub_lm),
                 max_iterations=request.max_iterations,
             ),
+            evidence=_load_run_evidence(run_dir),
             run_dir=run_dir,
         )
 
@@ -1622,6 +1641,7 @@ def _load_task_run_result(
             task_id=request.task_id,
             trial_result={"is_resolved": False, "parser_results": {}},
             traces=[],
+            evidence=_load_run_evidence(run_dir),
             run_dir=run_dir,
             error=f"Terminal-Bench completed but did not write {results_path}",
         )
@@ -1636,6 +1656,7 @@ def _load_task_run_result(
             sub_model=_model_name(request.sub_lm),
             max_iterations=request.max_iterations,
         ),
+        evidence=_load_run_evidence(run_dir),
         run_dir=run_dir,
     )
 
@@ -1794,6 +1815,13 @@ def _harbor_task_name(row: dict[str, Any]) -> str | None:
         name = task_info.get("name") or task_info.get("task_name") or task_info.get("id")
         return str(name) if name is not None else None
     return None
+
+
+def _load_run_evidence(run_dir: Path) -> list[RunEvidence]:
+    return [
+        RunEvidence.model_validate_json(path.read_text(encoding="utf-8"))
+        for path in sorted(run_dir.rglob("predict_rlm_evidence*.json"))
+    ]
 
 
 def _load_run_traces(run_dir: Path, *, model: str, sub_model: str | None, max_iterations: int) -> list[RunTrace]:

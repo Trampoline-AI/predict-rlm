@@ -6,6 +6,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from predict_rlm.evidence import RunEvidence
 from predict_rlm.trace import (
     LMUsage,
     PredictCallDetail,
@@ -122,6 +123,9 @@ def test_patch_merge_preserves_output_artifact_and_charges_main_and_sub_usage(
                 },
                 new_instructions=instructions,
                 trace=_trace_with_proposer_usage(),
+                evidence=RunEvidence(
+                    run_id="patch_run", complete=True, terminal_outcome="completed"
+                ),
                 trajectory=[],
             )
 
@@ -161,6 +165,8 @@ def test_patch_merge_preserves_output_artifact_and_charges_main_and_sub_usage(
     assert payload["new_instructions"] == instructions
     assert payload["patch_output"]["new_instructions"] == instructions
     assert payload["patch_output"]["instruction_char_delta"] == len(instructions) - len("base")
+    assert payload["run_evidence"]["terminal_outcome"] == "completed"
+    assert "evidence" not in payload["run_trace"]
 
     cost_log = [
         json.loads(line) for line in (tmp_path / "cost_log.jsonl").read_text().splitlines()

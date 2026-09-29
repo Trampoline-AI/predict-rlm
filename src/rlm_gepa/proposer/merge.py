@@ -18,8 +18,10 @@ from gepa.proposer.base import CandidateProposal
 from gepa.proposer.merge import MergeProposer
 
 from predict_rlm import File
+from predict_rlm.evidence import extract_evidence_from_exc
+from predict_rlm.trace import extract_trace_from_exc
 
-from ..runtime.trace_rendering import proposer_failure_metadata
+from ..runtime.trace_rendering import evidence_to_json, proposer_failure_metadata, trace_to_json
 from ..runtime.utils import atomic_write_json
 from .selection import pick_patch_merge_pair
 
@@ -359,6 +361,26 @@ class RlmMergeProposer(MergeProposer):
             )
             return None
         except Exception as exc:
+            event_id = (
+                f"{self.adapter.run_id}_patch_merge_attempt_{attempt_idx:04d}_"
+                f"base_{base_parent_id}_source_{patch_source_parent_id}"
+            )
+            atomic_write_json(
+                Path(self.adapter.proposer_trace_dir) / f"{event_id}_ERROR.json",
+                {
+                    "schema_version": 1,
+                    "event_id": event_id,
+                    "status": "error",
+                    "kind": "patch_merge",
+                    "attempt_idx": attempt_idx,
+                    "base_parent_id": base_parent_id,
+                    "patch_source_parent_id": patch_source_parent_id,
+                    "run_trace": trace_to_json(extract_trace_from_exc(exc)),
+                    "run_evidence": evidence_to_json(extract_evidence_from_exc(exc)),
+                    "error": str(exc),
+                    "error_type": type(exc).__name__,
+                },
+            )
             self._record_merge_status(
                 state,
                 "error",
@@ -468,6 +490,7 @@ class RlmMergeProposer(MergeProposer):
                 "inputs": rec_base.get("Inputs") or rec_source.get("Inputs") or "",
                 "base_parent": {
                     "traces": rec_base.get("Traces", []),
+                    "evidence": rec_base.get("Evidence", []),
                     "failure_metadata": proposer_failure_metadata(
                         rec_base.get("Failure Metadata", {})
                     ),
@@ -477,6 +500,7 @@ class RlmMergeProposer(MergeProposer):
                 },
                 "patch_source_parent": {
                     "traces": rec_source.get("Traces", []),
+                    "evidence": rec_source.get("Evidence", []),
                     "failure_metadata": proposer_failure_metadata(
                         rec_source.get("Failure Metadata", {})
                     ),

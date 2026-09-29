@@ -381,6 +381,9 @@ result = await predict(
 Every call to `PredictRLM` attaches a structured trace to the returned
 prediction as `prediction.trace`. The trace captures the full execution history:
 iterations, tool calls, predict() subcalls, token usage, and timings.
+Lifecycle events and recording metadata are separate: `prediction.evidence` is a
+`RunEvidence`, not a field of `RunTrace`. The output field name `evidence` is
+reserved for this runtime object.
 
 > **Note:** The trace schema is experimental and may change in future versions.
 
@@ -430,6 +433,34 @@ data = trace.model_dump()
 | `duration_ms`    | `int`                                        | Total wall-clock duration in milliseconds.                                                                 |
 | `usage`          | `LMUsage`                                    | Token usage split by main and sub LM.                                                                      |
 | `steps`          | `list[IterationStep]`                        | Per-iteration execution steps.                                                                             |
+
+#### `RunEvidence`
+
+Import `RunEvidence` and `RunEvidenceEvent` from `predict_rlm` or
+`predict_rlm.evidence`.
+
+| Field | Type | Description |
+| --- | --- | --- |
+| `run_id` | `str` | PredictRLM invocation identity. |
+| `complete` | `bool` | Whether lifecycle recording completed without a strict evidence failure; not an answer-quality judgment. |
+| `terminal_outcome` | `str \| None` | Lifecycle outcome (`completed`, `error`, or `cancelled` after termination). |
+| `events` | `list[RunEvidenceEvent]` | Ordered events, each with `sequence`, `kind`, `timestamp_ns`, and `data`. |
+
+```python
+evidence = result.evidence
+evidence.to_exportable_json("evidence.json")
+```
+
+Like trace exports, evidence exports summarize embedded base64 images; use
+`model_dump()` for full values. `to_proposer()` and `to_proposer_json()` produce
+the independent sanitized lifecycle view without accounting data or duplicated
+iteration bodies.
+
+Exceptions raised after the invocation context is created carry `exception.evidence`,
+including cancellation and input-preparation failures. `exception.trace` exists
+only when the runtime captured a trajectory. See
+[Runtime observability](observability.md#completed-artifacts-and-migration)
+for error handling and migration from `trace.evidence`.
 
 #### `LMUsage`
 

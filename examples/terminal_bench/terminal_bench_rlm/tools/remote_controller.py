@@ -9,6 +9,9 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from predict_rlm.evidence import extract_evidence_from_exc
+from predict_rlm.trace import extract_trace_from_exc
+
 from .tbench_agent import (
     DAYTONA_REMOTE_RESULT_SENTINEL,
     _build_lm,
@@ -19,6 +22,7 @@ from .tbench_agent import (
     _predict_rlm_class,
     _signature_with_task_instruction,
     _with_terminal_bench_skill,
+    _write_evidence,
     _write_trace,
 )
 
@@ -160,10 +164,12 @@ async def _run_predict_rlm_async(payload: dict[str, Any]) -> str:
         rlm = _predict_rlm_class()(signature, **rlm_kwargs)
         result = await rlm.acall()
         _write_trace(getattr(result, "trace", None), logging_dir, path=trace_export_path)
+        _write_evidence(getattr(result, "evidence", None), logging_dir)
         _write_run_status(logging_dir, "completed", has_trace=getattr(result, "trace", None) is not None)
         return _coerce_answer(result)
     except BaseException as exc:
-        _write_trace(getattr(exc, "trace", None), logging_dir, path=trace_export_path)
+        _write_trace(extract_trace_from_exc(exc), logging_dir, path=trace_export_path)
+        _write_evidence(extract_evidence_from_exc(exc), logging_dir)
         _write_run_status(
             logging_dir,
             "failed",

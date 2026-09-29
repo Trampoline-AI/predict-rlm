@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import shutil
 import threading
 from contextlib import asynccontextmanager, contextmanager
@@ -199,7 +200,7 @@ async def test_code_cancellation_emits_paired_terminal_evidence():
     assert generated.data["operation_id"] == executed.data["operation_id"]
     assert executed.data["cancelled"] is True
     assert events[-1].kind is RunEventKind.RUN_CANCELLED
-    assert raised.value.trace.evidence.complete
+    assert raised.value.evidence.complete
 
 
 @pytest.mark.asyncio
@@ -676,6 +677,105 @@ class FailingExitBackend(FinalBackend):
 
 
 @pytest.mark.asyncio
+async def test_result_exports_trajectory_separately_from_completed_evidence():
+    from predict_rlm import PredictRLM
+
+    sink = RecordingSink()
+    rlm = PredictRLM(
+        "question: str -> answer: str",
+        lm=MagicMock(history=[]),
+        execution=FinalBackend(),
+        events=[sink],
+        max_iterations=1,
+        verbose=False,
+    )
+    rlm.generate_action.acall = AsyncMock(
+        return_value=dspy.Prediction(reasoning="answer", code="SUBMIT(answer=question)")
+    )
+
+    result = await rlm.acall(question="separate artifacts")
+
+    assert result.answer == "separate artifacts"
+    trace = json.loads(result.trace.to_exportable_json())
+    assert trace["steps"][0]["code"] == "SUBMIT(answer=question)"
+    assert "evidence" not in trace
+    evidence = json.loads(result.evidence.to_exportable_json())
+    assert evidence["complete"] is True
+    assert evidence["terminal_outcome"] == "completed"
+    assert evidence["events"][-1]["kind"] == "run.succeeded"
+    assert evidence["events"][-1]["data"]["outputs"] == {"answer": "separate artifacts"}
+    assert [event["kind"] for event in evidence["events"]] == [
+        event.kind.value for event in sink.events
+    ]
+
+
+@pytest.mark.asyncio
+async def test_input_preparation_failure_exposes_evidence_without_a_trace():
+    from predict_rlm import PredictRLM
+
+    class FailingInputAdapter(InputAdapter[str]):
+        name = "failing"
+        value_type = str
+
+        async def prepare(self, field, value, ctx):
+            raise ValueError("input preparation failed")
+
+    rlm = PredictRLM(
+        "question: str -> answer: str",
+        lm=MagicMock(history=[]),
+        execution=FinalBackend(),
+        adapters=[FailingInputAdapter()],
+        verbose=False,
+    )
+
+    with pytest.raises(ValueError, match="input preparation failed") as raised:
+        await rlm.acall(question="unavailable")
+
+    assert getattr(raised.value, "trace", None) is None
+    assert raised.value.evidence.complete
+    assert raised.value.evidence.terminal_outcome == "error"
+    assert raised.value.evidence.events[-1].kind == "run.failed"
+    assert raised.value.evidence.events[-1].data["error"] == "input preparation failed"
+
+
+@pytest.mark.asyncio
+async def test_terminal_sink_failure_exposes_incomplete_evidence_separately():
+    from predict_rlm import PredictRLM
+
+    rlm = PredictRLM(
+        "question: str -> answer: str",
+        lm=MagicMock(history=[]),
+        execution=FinalBackend(),
+        events=[RecordingSink(fail_flush=True)],
+        max_iterations=1,
+        verbose=False,
+    )
+    rlm.generate_action.acall = AsyncMock(
+        return_value=dspy.Prediction(reasoning="answer", code="SUBMIT(answer=question)")
+    )
+
+    with pytest.raises(EvidenceIncompleteError) as raised:
+        await rlm.acall(question="not committed")
+
+    assert raised.value.trace.status == "error"
+    assert raised.value.evidence.complete is False
+    assert raised.value.evidence.terminal_outcome == "error"
+    assert raised.value.evidence.events[-1].kind == "run.failed"
+    assert "evidence" not in json.loads(raised.value.trace.to_exportable_json())
+
+
+def test_evidence_output_field_cannot_overwrite_runtime_evidence():
+    from predict_rlm import PredictRLM
+
+    with pytest.raises(ValueError, match="output field 'evidence' is reserved"):
+        PredictRLM(
+            "question: str -> evidence: str",
+            lm=MagicMock(history=[]),
+            execution=FinalBackend(),
+        )
+
+
+@pytest.mark.asyncio
 async def test_session_finalizes_after_input_adapter_failure_in_reverse_order():
     from predict_rlm import PredictRLM
 
@@ -815,9 +915,9 @@ async def test_pre_acquisition_finalize_failure_is_recorded_as_incomplete_eviden
 
     assert finalized == ["second", "first"]
     assert isinstance(raised.value.input_adapter_finalize_error, OSError)
-    assert raised.value.trace.evidence.complete is False
+    assert raised.value.evidence.complete is False
     assert RunEventKind.SESSION_FINALIZE_FAILED in {
-        event.kind for event in raised.value.trace.evidence.events
+        event.kind for event in raised.value.evidence.events
     }
 
 
@@ -1056,9 +1156,9 @@ async def test_finalization_failure_preserves_primary_and_marks_evidence_incompl
         await rlm.aforward(question="test")
 
     assert isinstance(raised.value.session_finalize_error, OSError)
-    assert raised.value.trace.evidence.complete is False
+    assert raised.value.evidence.complete is False
     assert "session.finalize_failed" in {
-        event.kind for event in raised.value.trace.evidence.events
+        event.kind for event in raised.value.evidence.events
     }
 
 
@@ -1238,7 +1338,7 @@ async def test_sync_tool_cancellation_holds_custom_final_backend_lease_until_wor
     )
     assert started_event.data["call_id"] == finished_event.data["call_id"]
     assert finished_event.data["cancelled"] is True
-    assert raised.value.trace.evidence.complete
+    assert raised.value.evidence.complete
 
 
 @pytest.mark.asyncio

@@ -49,9 +49,10 @@ from terminal_bench_rlm.gepa.project import (  # noqa: E402
 from terminal_bench_rlm.skills import DEFAULT_TERMINAL_BENCH_SKILL_INSTRUCTIONS  # noqa: E402
 from terminal_bench_rlm.tools import tbench_agent  # noqa: E402
 
+from predict_rlm.evidence import RunEvidence, RunEvidenceEvent  # noqa: E402
 from predict_rlm.trace import RunTrace  # noqa: E402
 from rlm_gepa import EvaluationContext, RLMGepaExampleResult  # noqa: E402
-from rlm_gepa.schema import validate_project  # noqa: E402
+from rlm_gepa.schema import validate_example_result, validate_project  # noqa: E402
 
 
 class FakeHarnessRunner:
@@ -84,9 +85,14 @@ class FakeInteractiveHarborEnvironment:
 
 
 class FakeOneShotHarborEnvironment:
-    def __init__(self, *, run_id: str = "gepa-val-task", remote_root_exists: bool = False) -> None:
+    def __init__(
+        self, *, run_id: str = "gepa-val-task", remote_root_exists: bool = False,
+        run_exit_code: int = 0, evidence: RunEvidence | None = None,
+    ) -> None:
         self.run_id = run_id
         self.remote_root_exists = remote_root_exists
+        self.run_exit_code = run_exit_code
+        self.evidence = evidence
         self.commands: list[str] = []
         self.uploads: list[tuple[str, str]] = []
         self.downloads: list[tuple[str, str]] = []
@@ -97,6 +103,8 @@ class FakeOneShotHarborEnvironment:
         self.commands.append(command)
         if self.remote_root_exists and command.startswith("test ! -e "):
             return SimpleNamespace(return_code=1, stdout="", stderr="exists")
+        if command.startswith("cd "):
+            return SimpleNamespace(return_code=self.run_exit_code, stdout="", stderr="")
         return SimpleNamespace(return_code=0, stdout="", stderr="")
 
     def upload_file(self, host_path: str, remote_path: str) -> None:
@@ -131,6 +139,12 @@ class FakeOneShotHarborEnvironment:
                 encoding="utf-8",
             )
             archive.add(result_path, arcname=f"{self.run_id}/result.json")
+            if self.evidence is not None:
+                evidence_path = Path(host_path).parent / "predict_rlm_evidence.json"
+                self.evidence.to_exportable_json(evidence_path)
+                archive.add(
+                    evidence_path, arcname=f"{self.run_id}/logs/predict_rlm_evidence.json"
+                )
 
 
 class FakeDaytonaSyncSandbox:
@@ -831,8 +845,9 @@ def test_harbor_runner_builds_harbor_run_command(monkeypatch, tmp_path: Path) ->
     assert result.trial_result["verifier_result"]["rewards"]["reward"] == 1.0
 
 
+@pytest.mark.parametrize("run_exit_code", [0, 1])
 def test_harbor_remote_controller_builds_remote_command_and_syncs_artifacts(
-    tmp_path: Path,
+    tmp_path: Path, run_exit_code: int,
 ) -> None:
     repo = tmp_path / "repo"
     cwd = repo / "examples" / "terminal_bench"
@@ -846,13 +861,18 @@ def test_harbor_remote_controller_builds_remote_command_and_syncs_artifacts(
     config.terminal_bench_output_dir = tmp_path / "local-runs"
     config.harbor_environment = "docker"
     config.harbor_remote_workdir = "/remote/tb"
-    env = FakeOneShotHarborEnvironment()
+    evidence = RunEvidence(
+        run_id="remote_run", complete=True,
+        terminal_outcome="error" if run_exit_code else "completed",
+    )
+    env = FakeOneShotHarborEnvironment(run_exit_code=run_exit_code, evidence=evidence)
 
     result = HarborRemoteControllerHarnessRunner(env, cwd=cwd)._run_sync(
         _task_request(config, tmp_path)
     )
 
-    assert result.error is None
+    assert (result.error is not None) == bool(run_exit_code)
+    assert result.evidence == [evidence]
     assert result.trial_result["verifier_result"]["rewards"]["reward"] == 1.0
     assert env.uploads
     assert env.uploads[0][1] == "/remote/tb/gepa-val-task/repo.tar.gz"
@@ -1926,6 +1946,7 @@ def test_evaluate_example_returns_gepa_result_from_fake_harness_runner(tmp_path:
             task_id="configure-git-webserver",
             trial_result=parser_result,
             traces=[],
+            evidence=[RunEvidence(run_id="interrupted_run", complete=False)],
         )
     )
     config = default_config()
@@ -1962,10 +1983,13 @@ def test_evaluate_example_returns_gepa_result_from_fake_harness_runner(tmp_path:
     assert runner.calls[0].skill_instructions.startswith("Candidate skill")
     assert runner.calls[0].lm == "executor"
     assert runner.calls[0].sub_lm == "sub"
+    with pytest.raises(ValueError, match="incomplete strict evidence"):
+        validate_example_result(result)
 
 
-def test_subprocess_runner_loads_exported_predict_rlm_trace(
-    monkeypatch, tmp_path: Path
+@pytest.mark.parametrize("returncode", [0, 1])
+def test_subprocess_runner_loads_exported_predict_rlm_evidence(
+    monkeypatch, tmp_path: Path, returncode: int
 ) -> None:
     config = default_config()
     config.terminal_bench_output_dir = tmp_path / "tbench-runs"
@@ -1985,9 +2009,23 @@ def test_subprocess_runner_loads_exported_predict_rlm_trace(
         duration_ms=1,
     )
     trace.to_exportable_json(logging_dir / "predict_rlm_trace.json")
+    evidence = RunEvidence(
+        run_id="terminal_run",
+        complete=True,
+        terminal_outcome="completed",
+        events=[
+            RunEvidenceEvent(
+                sequence=1,
+                kind="session.finalized",
+                timestamp_ns=10,
+                data={"status": "ok"},
+            )
+        ],
+    )
+    evidence.to_exportable_json(logging_dir / "predict_rlm_evidence.json")
 
     def fake_run(*_args, **_kwargs):
-        return subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr="")
+        return subprocess.CompletedProcess(args=[], returncode=returncode, stdout="", stderr="")
 
     monkeypatch.setattr(subprocess, "run", fake_run)
 
@@ -2007,9 +2045,13 @@ def test_subprocess_runner_loads_exported_predict_rlm_trace(
         )
     )
 
-    assert result.error is None
-    assert len(result.traces) == 1
-    assert result.traces[0].status == "completed"
+    assert result.evidence == [evidence]
+    if returncode == 0:
+        assert result.error is None
+        assert len(result.traces) == 1
+        assert result.traces[0].status == "completed"
+    else:
+        assert result.error is not None
 
 
 def test_in_process_runner_calls_terminal_bench_harness_and_loads_results(
