@@ -132,8 +132,8 @@ Subclass `RLMGepaProject`. Its contract is intentionally small:
   seed text.
 - `load_trainset()` and `load_valset()` return nonempty sequences.
 - `evaluate_example()` runs the candidate RLM, scores it, and returns a finite
-  `RLMGepaExampleResult` with feedback, traces, stable `example_id`, and useful
-  `rlm_inputs`.
+  `RLMGepaExampleResult` with feedback, traces, separate evidence, stable
+  `example_id`, and useful `rlm_inputs`.
 
 ```python
 from dataclasses import dataclass
@@ -185,6 +185,7 @@ class DocumentProject(RLMGepaProject):
             score=score,
             feedback=feedback,
             traces=[trace] if trace is not None else [],
+            evidence=[result.evidence],
             rlm_inputs={"example_id": example.example_id, **example.rlm_kwargs},
             example_id=example.example_id,
         )
@@ -193,6 +194,11 @@ class DocumentProject(RLMGepaProject):
 For an imperfect result, feedback must be nonempty. Good feedback identifies the
 actual failing surface: page, cell, clause, tool response, assertion, timeout,
 or schema mismatch. It describes what happened, not replacement prompt text.
+
+Forward each run's `result.evidence` independently of `result.trace`. On failures,
+recover `exc.evidence` through `predict_rlm.evidence.extract_evidence_from_exc`
+alongside trace extraction, including through cancellation/timeout cause chains.
+Incomplete captured evidence is rejected; trace-only fixtures can omit evidence.
 
 Override `task_timeout_for_example(example, default_timeout)` or
 `task_resources_for_example(example)` only when the workload genuinely has

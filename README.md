@@ -187,6 +187,18 @@ signature inputs.
 
 Every `PredictRLM` call returns a structured `prediction.trace` with iterations,
 code, output, tool calls, `predict()` subcalls, timings, token usage, and errors.
+Lifecycle events are returned separately as `prediction.evidence`; they are not
+embedded in the trace. Export either artifact independently:
+
+```python
+prediction.trace.to_exportable_json("trace.json")
+prediction.evidence.to_exportable_json("evidence.json")
+```
+
+After an invocation starts, failures and cancellation expose the lifecycle log as
+`exception.evidence`, even if no `exception.trace` was created. Live event sinks
+continue to receive the same events. See [Runtime observability](docs/observability.md).
+
 Human-readable colored trace blocks are printed to stderr by default; pass
 `verbose=False` for quiet execution. Use `debug=True` for timestamped RLM and
 sandbox lifecycle diagnostics; error-like debug records are colored red.

@@ -4,9 +4,62 @@ PredictRLM can send ordered lifecycle evidence to custom loggers, monitoring
 systems, GEPA pipelines, and durable evidence stores. This guide explains the
 event sink contract and its delivery guarantees.
 
-Use an `EventSink` when the consumer needs run lifecycle events. Use the returned
-`RunTrace` when it only needs the completed RLM trace. An event sink observes the
-runtime; it is not an input adapter or execution backend.
+Use an `EventSink` for lifecycle events during execution. The returned prediction
+has two independent artifacts: `prediction.trace` (`RunTrace`) describes the
+agent's trajectory, while `prediction.evidence` (`RunEvidence`) records the
+invocation lifecycle. An event sink observes the runtime; it is not an input
+adapter or execution backend.
+
+## Completed artifacts and migration
+
+```python
+result = await rlm.acall(question="Inspect the supplied documents.")
+result.trace.to_exportable_json("trace.json")
+result.evidence.to_exportable_json("evidence.json")
+```
+
+`RunTrace` contains steps, model information, timings, usage, and trajectory
+status. It has no `evidence` field, including in its proposer projection.
+`RunEvidence` contains `run_id`, `complete`, `terminal_outcome`, and ordered
+`events`. It is returned even when no external sink is configured.
+
+Replace `result.trace.evidence` with `result.evidence`, and `exc.trace.evidence`
+with `exc.evidence`. The evidence model types now live in `predict_rlm.evidence`
+and are also exported from `predict_rlm`.
+
+The kernel attaches evidence after lifecycle cleanup and terminal recording.
+Failures after invocation creation expose it even when input preparation failed
+before a trace existed:
+
+```python
+try:
+    result = await rlm.acall(question="Inspect the supplied documents.")
+except BaseException as exc:
+    evidence = getattr(exc, "evidence", None)
+    if evidence is not None:
+        evidence.to_exportable_json("failed-evidence.json")
+    raise
+```
+
+For wrappers such as `asyncio.wait_for`, use
+`predict_rlm.evidence.extract_evidence_from_exc(exc)` to find evidence attached to
+an inner cancellation exception.
+
+`complete` describes recording integrity, not task success: a failed or cancelled
+invocation can have a complete log. `terminal_outcome` describes the invocation's
+termination. These values belong to the evidence object, not the trajectory.
+
+Live sink event kinds, payloads, sequencing, and delivery are unchanged. In
+particular, `iteration.recorded` still contains its step payload; separating
+exports does not change existing live turn viewers. A complete evidence export
+can therefore contain data also present in the trace. Export or send only the
+artifact the consumer needs rather than automatically combining both.
+
+Downstream bridges such as Avalanche and Delta must carry the separate evidence
+metadata alongside their terminal trace message instead of reading it from the
+trace JSON. Consumers that need historical events can retain the sink stream or
+export `result.evidence` separately. GEPA evaluators supply captured logs through
+`RLMGepaExampleResult.evidence` alongside `traces`.
 
 ## Event model
 

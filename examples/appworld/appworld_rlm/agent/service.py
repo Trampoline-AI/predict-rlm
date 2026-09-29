@@ -73,8 +73,13 @@ class AppWorldRLM(dspy.Module):
             supervisor_phone_number=supervisor_phone_number,
         )
         prediction = await predictor.acall(instruction=instruction)
-        if not _trace_has_successful_complete_task(prediction):
-            self._complete_task_from_prediction(task_id, prediction)
+        try:
+            if not _trace_has_successful_complete_task(prediction):
+                self._complete_task_from_prediction(task_id, prediction)
+        except Exception as exc:
+            exc.trace = getattr(prediction, "trace", None)
+            exc.evidence = getattr(prediction, "evidence", None)
+            raise
         return prediction
 
     def _current_task_tools(self, task_id: str) -> dict[str, Callable[..., dict[str, Any]]]:

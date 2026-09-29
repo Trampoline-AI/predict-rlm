@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any
 
 from predict_rlm import File, PredictRLM
+from predict_rlm.evidence import RunEvidence, extract_evidence_from_exc
 from predict_rlm.telemetry import TelemetryContext, make_trace_id
 from predict_rlm.trace import RunTrace, extract_trace_from_exc
 from rlm_gepa import EvaluationContext, RLMGepaExampleResult, RLMGepaProject
@@ -58,10 +59,11 @@ class SpreadsheetGepaProject(RLMGepaProject):
         case_scores: list[float] = []
         feedback_lines: list[str] = []
         traces: list[RunTrace] = []
+        evidence: list[RunEvidence] = []
 
         with tempfile.TemporaryDirectory(prefix="rlm_gepa_spreadsheet_") as tmp_dir:
             for case_idx, input_path, answer_path in example.test_cases:
-                score, feedback, trace = await self._run_case(
+                score, feedback, trace, case_evidence = await self._run_case(
                     example,
                     case_idx,
                     input_path,
@@ -74,12 +76,15 @@ class SpreadsheetGepaProject(RLMGepaProject):
                 feedback_lines.append(feedback)
                 if trace is not None:
                     traces.append(trace)
+                if case_evidence is not None:
+                    evidence.append(case_evidence)
 
         score = sum(case_scores) / len(case_scores) if case_scores else 0.0
         return RLMGepaExampleResult(
             score=score,
             feedback="\n".join(feedback_lines),
             traces=traces,
+            evidence=evidence,
             rlm_inputs={
                 "task_id": example.task_id,
                 "instruction_type": example.instruction_type,
@@ -99,9 +104,10 @@ class SpreadsheetGepaProject(RLMGepaProject):
         skill: Any,
         context: EvaluationContext,
         tmp_dir: Path,
-    ) -> tuple[float, str, RunTrace | None]:
+    ) -> tuple[float, str, RunTrace | None, RunEvidence | None]:
         output_path = tmp_dir / f"{case_idx}_{task.task_id}_output.xlsx"
         trace: RunTrace | None = None
+        evidence: RunEvidence | None = None
         telemetry_context = _case_telemetry_context(context.telemetry_context, task, case_idx)
         case_start_ns = time.time_ns()
         _write_case_event(
@@ -143,6 +149,7 @@ class SpreadsheetGepaProject(RLMGepaProject):
                 timeout=context.task_timeout,
             )
             trace = getattr(result, "trace", None)
+            evidence = getattr(result, "evidence", None)
             if not (
                 result
                 and result.output_spreadsheet
@@ -158,7 +165,7 @@ class SpreadsheetGepaProject(RLMGepaProject):
                     start_time_unix_nano=case_start_ns,
                     score=score,
                 )
-                return score, f"case {case_idx}: RLM returned no output workbook", trace
+                return score, f"case {case_idx}: RLM returned no output workbook", trace, evidence
             shutil.copy2(result.output_spreadsheet.path, output_path)
         except asyncio.TimeoutError as exc:
             _write_case_event(
@@ -180,7 +187,8 @@ class SpreadsheetGepaProject(RLMGepaProject):
             return (
                 0.0,
                 f"case {case_idx}: RLM timeout at {context.task_timeout}s",
-                extract_trace_from_exc(exc),
+                extract_trace_from_exc(exc) or trace,
+                extract_evidence_from_exc(exc) or evidence,
             )
         except Exception as exc:
             _write_case_event(
@@ -199,7 +207,8 @@ class SpreadsheetGepaProject(RLMGepaProject):
             return (
                 0.0,
                 f"case {case_idx}: RLM {type(exc).__name__}: {exc}",
-                extract_trace_from_exc(exc),
+                extract_trace_from_exc(exc) or trace,
+                extract_evidence_from_exc(exc) or evidence,
             )
 
         await asyncio.to_thread(_best_effort_recalculate, output_path, telemetry_context)
@@ -213,7 +222,7 @@ class SpreadsheetGepaProject(RLMGepaProject):
                 start_time_unix_nano=case_start_ns,
                 score=score,
             )
-            return score, f"case {case_idx}: answer file not found", trace
+            return score, f"case {case_idx}: answer file not found", trace, evidence
         try:
             score, message = await asyncio.to_thread(
                 score_workbooks,
@@ -231,7 +240,7 @@ class SpreadsheetGepaProject(RLMGepaProject):
                 start_time_unix_nano=case_start_ns,
                 score=score,
             )
-            return score, f"case {case_idx}: score={score:.3f} {status}\n{message}", trace
+            return score, f"case {case_idx}: score={score:.3f} {status}\n{message}", trace, evidence
         except Exception as exc:
             _write_case_event(
                 telemetry_context,
@@ -243,7 +252,7 @@ class SpreadsheetGepaProject(RLMGepaProject):
                 status={"code": "ERROR", "message": f"comparison error: {exc}"},
                 attributes={"exception.type": type(exc).__name__},
             )
-            return 0.0, f"case {case_idx}: comparison error: {exc}", trace
+            return 0.0, f"case {case_idx}: comparison error: {exc}", trace, evidence
 
     def _load_split(self) -> tuple[list[SpreadsheetTask], list[SpreadsheetTask]]:
         if self._split is not None:

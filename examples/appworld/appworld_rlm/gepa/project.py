@@ -6,6 +6,7 @@ from collections.abc import Mapping
 from typing import Any
 
 from predict_rlm import Skill
+from predict_rlm.evidence import RunEvidence, extract_evidence_from_exc
 from predict_rlm.trace import RunTrace, extract_trace_from_exc
 from rlm_gepa import EvaluationContext, RLMGepaExampleResult, RLMGepaProject
 
@@ -79,6 +80,7 @@ class AppWorldGepaProject(RLMGepaProject):
     ) -> RLMGepaExampleResult:
         skill = Skill(name="appworld", instructions=candidate[COMPONENT_SKILL])
         trace: RunTrace | None = None
+        evidence: RunEvidence | None = None
         agent = AppWorldRLM(
             lm=context.lm,
             sub_lm=context.sub_lm,
@@ -99,20 +101,26 @@ class AppWorldGepaProject(RLMGepaProject):
                 timeout=context.task_timeout,
             )
             trace = getattr(result, "trace", None)
+            evidence = getattr(result, "evidence", None)
             evaluation_payload = agent.appworld_client.evaluate_appworld_task(example.task_id)
             score, feedback = score_runner_result(evaluation_payload)
             return RLMGepaExampleResult(
                 score=score,
                 feedback=feedback,
                 traces=[trace] if trace is not None else [],
+                evidence=[evidence] if evidence is not None else [],
                 rlm_inputs={"task_id": example.task_id, "dataset": example.dataset},
                 example_id=example.task_id,
                 error=None if trace is not None else "no RunTrace captured",
             )
         except asyncio.TimeoutError as exc:
-            return self._error_result(example, f"RLM timeout at {context.task_timeout}s", exc)
+            return self._error_result(
+                example, f"RLM timeout at {context.task_timeout}s", exc, trace, evidence
+            )
         except Exception as exc:
-            return self._error_result(example, f"RLM {type(exc).__name__}: {exc}", exc)
+            return self._error_result(
+                example, f"RLM {type(exc).__name__}: {exc}", exc, trace, evidence
+            )
         finally:
             agent.appworld_client.close_appworld_task(example.task_id)
             agent.appworld_client.close()
@@ -148,12 +156,16 @@ class AppWorldGepaProject(RLMGepaProject):
         example: AppWorldExample,
         feedback: str,
         exc: BaseException,
+        trace: RunTrace | None = None,
+        evidence: RunEvidence | None = None,
     ) -> RLMGepaExampleResult:
-        trace = extract_trace_from_exc(exc)
+        trace = extract_trace_from_exc(exc) or trace
+        evidence = extract_evidence_from_exc(exc) or evidence
         return RLMGepaExampleResult(
             score=0.0,
             feedback=feedback,
             traces=[trace] if trace is not None else [],
+            evidence=[evidence] if evidence is not None else [],
             rlm_inputs={"task_id": example.task_id, "dataset": example.dataset},
             example_id=example.task_id,
             error=None if trace is not None else feedback,

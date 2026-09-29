@@ -22,6 +22,8 @@ from typing import Any, Callable
 
 import dspy
 
+from predict_rlm.evidence import RunEvidence, extract_evidence_from_exc
+from predict_rlm.trace import extract_trace_from_exc
 from terminal_bench_rlm.skills import (
     TERMINAL_BENCH_SKILL_NAME,
     build_terminal_bench_skill,
@@ -360,6 +362,15 @@ def _write_trace(trace: Any, logging_dir: Path | None, *, path: Path | None = No
         trace_path.write_text(str(trace), encoding="utf-8")
 
 
+def _write_evidence(evidence: RunEvidence | None, logging_dir: Path | None) -> None:
+    if evidence is None or logging_dir is None:
+        return
+    logging_dir.mkdir(parents=True, exist_ok=True)
+    evidence.to_exportable_json(
+        logging_dir / f"predict_rlm_evidence_{uuid.uuid4().hex[:8]}.json"
+    )
+
+
 def _write_phase_event(
     path: Path | None,
     *,
@@ -638,10 +649,12 @@ class _TerminalBenchRLMBaseAgentMixin:
             if inspect.isawaitable(result):
                 result = asyncio.run(result)
             _write_trace(getattr(result, "trace", None), logging_dir)
+            _write_evidence(getattr(result, "evidence", None), logging_dir)
             _coerce_answer(result)
             return _make_agent_result()
         except BaseException as exc:
-            _write_trace(getattr(exc, "trace", None), logging_dir)
+            _write_trace(extract_trace_from_exc(exc), logging_dir)
+            _write_evidence(extract_evidence_from_exc(exc), logging_dir)
             raise
         finally:
             interpreter.shutdown()

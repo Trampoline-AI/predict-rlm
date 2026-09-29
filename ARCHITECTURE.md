@@ -124,6 +124,11 @@ src/predict_rlm/
   RLM inputs, outputs, and host-tool file writeback.
 - `IterationStep` and `RunTrace` (`trace.py`) are the structured record of an
   RLM run: generated code, observations, tool calls, timing, and usage metadata.
+- `RunEvidence` (`evidence.py`) is the separate invocation lifecycle log: run ID,
+  completeness, terminal outcome, and ordered events. The kernel attaches it to
+  `prediction.evidence` after cleanup, or to `exception.evidence` on failure and
+  cancellation. It is not embedded in `RunTrace`. Event sinks receive the same
+  events during execution; completed trace and evidence exports are independent.
 
 ## Invocation lifecycle and ownership
 

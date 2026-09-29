@@ -5,14 +5,13 @@ from types import SimpleNamespace
 
 import pytest
 
+from predict_rlm.evidence import RunEvidence, RunEvidenceEvent
 from predict_rlm.trace import (
     IterationStep,
     LMFinishMetadata,
     LMUsage,
     PredictCallDetail,
     PredictCallGroup,
-    RunEvidence,
-    RunEvidenceEvent,
     RunTrace,
     TokenUsage,
     ToolCall,
@@ -100,6 +99,9 @@ class TestRunTrace:
         # model_dump still has the full data
         full = trace.model_dump()
         assert b64 in full["steps"][0]["predict_calls"][0]["calls"][0]["input"]["page"]
+        assert "evidence" not in full
+        assert "evidence" not in json.loads(result)
+        assert not hasattr(trace, "evidence")
 
     def test_to_proposer_keeps_behavioral_evidence_without_accounting(self):
         trace = RunTrace(
@@ -167,6 +169,8 @@ class TestRunTrace:
 
         proposer = trace.to_proposer()
         data = proposer.model_dump()
+        assert "evidence" not in data
+        assert not hasattr(proposer, "evidence")
         step = data["steps"][0]
         predict_call = step["predict_calls"][0]["calls"][0]
 
@@ -189,78 +193,103 @@ class TestRunTrace:
         assert predict_call["lm"] == {"finish_reason": "length"}
 
         serialized = trace.to_proposer_json()
-        forbidden = ("usage", "duration_ms", "cost", "cache_hits", "total_usage")
+        forbidden = ("usage", "duration_ms", "cost", "cache_hits", "total_usage", "evidence")
         for field in forbidden:
             assert f'"{field}"' not in serialized
 
-    def test_to_proposer_projects_strict_evidence_without_raw_or_accounting_data(self):
+
+class TestRunEvidence:
+    def test_exports_full_evidence_and_filtered_proposer_view(self, tmp_path):
         b64 = "A" * 40000
-        trace = RunTrace(
-            status="error",
-            model="openai/gpt-5",
-            iterations=1,
-            max_iterations=5,
-            duration_ms=100,
-            evidence=RunEvidence(
-                run_id="run",
-                complete=False,
-                terminal_outcome="error",
-                events=[
-                    RunEvidenceEvent(
-                        sequence=1,
-                        kind="run.started",
-                        timestamp_ns=1,
-                        data={"inputs": {"image": f"data:image/png;base64,{b64}"}},
-                    ),
-                    RunEvidenceEvent(
-                        sequence=2,
-                        kind="iteration.recorded",
-                        timestamp_ns=2,
-                        data={
-                            "step": {
-                                "iteration": 1,
-                                "duration_ms": 100,
-                                "usage": {"input_tokens": 10, "cost": 0.2},
-                                "predict_calls": [
-                                    {
-                                        "total_usage": {
-                                            "output_tokens": 3,
-                                            "cache_hits": 1,
-                                        }
+        image = f"data:image/png;base64,{b64}"
+        evidence = RunEvidence(
+            run_id="run",
+            complete=False,
+            terminal_outcome="error",
+            events=[
+                RunEvidenceEvent(
+                    sequence=1,
+                    kind="run.started",
+                    timestamp_ns=1,
+                    data={"inputs": {"image": image}},
+                ),
+                RunEvidenceEvent(
+                    sequence=2,
+                    kind="iteration.recorded",
+                    timestamp_ns=2,
+                    data={
+                        "step": {
+                            "iteration": 1,
+                            "duration_ms": 100,
+                            "usage": {"input_tokens": 10, "cost": 0.2},
+                            "predict_calls": [
+                                {
+                                    "total_usage": {
+                                        "output_tokens": 3,
+                                        "cache_hits": 1,
                                     }
-                                ],
-                            }
-                        },
-                    ),
-                    RunEvidenceEvent(
-                        sequence=3,
-                        kind="tool.finished",
-                        timestamp_ns=3,
-                        data={
-                            "name": "inspect",
-                            "result": {"image": f"data:image/png;base64,{b64}"},
-                            "error": "failed usefully",
-                            "duration_ms": 9,
-                            "cost": 0.1,
-                        },
-                    ),
-                ],
-            ),
+                                }
+                            ],
+                        }
+                    },
+                ),
+                RunEvidenceEvent(
+                    sequence=3,
+                    kind="tool.finished",
+                    timestamp_ns=3,
+                    data={
+                        "name": "inspect",
+                        "result": {"image": image, "usage": {"total_tokens": 4}},
+                        "error": "failed usefully",
+                        "duration_ms": 9,
+                        "cost": 0.1,
+                    },
+                ),
+                RunEvidenceEvent(
+                    sequence=4,
+                    kind="run.failed",
+                    timestamp_ns=4,
+                    data={"error_type": "RuntimeError", "error": "failed usefully"},
+                ),
+            ],
         )
 
-        proposer = trace.to_proposer().model_dump()
-        serialized = trace.to_proposer_json()
+        full_path = tmp_path / "evidence.json"
+        exported = evidence.to_exportable_json(full_path, indent=4)
+        full = evidence.model_dump()
+        assert full["events"][0]["data"]["inputs"]["image"] == image
+        assert full["events"][2]["data"]["result"]["image"] == image
+        summary = "data:image/png;base64,<IMAGE_BASE_64_ENCODED(40000)>"
+        full["events"][0]["data"]["inputs"]["image"] = summary
+        full["events"][2]["data"]["result"]["image"] = summary
+        assert json.loads(exported) == full
+        assert full_path.read_text() == exported
+        assert "AAAA" not in exported
 
-        assert proposer["evidence"]["complete"] is False
-        assert [event["kind"] for event in proposer["evidence"]["events"]] == [
+        proposer = evidence.to_proposer().model_dump()
+        proposer_path = tmp_path / "proposer_evidence.json"
+        serialized = evidence.to_proposer_json(str(proposer_path), indent=4)
+
+        assert proposer_path.read_text() == serialized
+        assert json.loads(serialized) == proposer
+        assert proposer["run_id"] == "run"
+        assert proposer["complete"] is False
+        assert proposer["terminal_outcome"] == "error"
+        assert [event["sequence"] for event in proposer["events"]] == [1, 2, 3, 4]
+        assert [event["kind"] for event in proposer["events"]] == [
             "run.started",
             "iteration.recorded",
             "tool.finished",
+            "run.failed",
         ]
-        assert proposer["evidence"]["events"][0]["data"] == {}
-        assert proposer["evidence"]["events"][1]["data"] == {"iteration": 1}
-        assert proposer["evidence"]["events"][2]["data"]["name"] == "inspect"
-        assert proposer["evidence"]["events"][2]["data"]["error"] == "failed usefully"
+        assert proposer["events"][0]["data"] == {}
+        assert proposer["events"][1]["data"] == {"iteration": 1}
+        assert proposer["events"][2]["data"]["name"] == "inspect"
+        assert proposer["events"][2]["data"]["error"] == "failed usefully"
+        assert proposer["events"][3]["data"] == {
+            "error_type": "RuntimeError",
+            "error": "failed usefully",
+        }
         assert "AAAA" not in serialized
         assert "<IMAGE_BASE_64_ENCODED(40000)>" in serialized
         for field in (
@@ -274,8 +303,14 @@ class TestRunTrace:
             "total_usage",
             "input_tokens",
             "output_tokens",
+            "total_tokens",
         ):
             assert f'"{field}"' not in serialized
+        assert evidence.events[0].data["inputs"]["image"] == image
+        assert evidence.events[2].data["result"] == {
+            "image": image,
+            "usage": {"total_tokens": 4},
+        }
 
 
 class TestPredictCallCollector:

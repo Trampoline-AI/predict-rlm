@@ -27,6 +27,7 @@ import nest_asyncio
 from tqdm import tqdm
 
 from predict_rlm import File, PredictRLM, SbxConfig, SbxPool, Skill
+from predict_rlm.evidence import RunEvidence, extract_evidence_from_exc
 from rlm_gepa.runtime.lm_config import get_lm_config, get_sub_lm_config
 
 from ..agent.signature import ManipulateSpreadsheet
@@ -326,7 +327,7 @@ def _write_eval_trace_event(
 def _dump_eval_task_traces(log_dir: Path, task_results: list["TaskResult"]) -> None:
     """Write ``{log_dir}/task_traces.jsonl`` with one row per case.
 
-    Each row carries the full RunTrace (serialized via
+    Each row carries the full RunTrace and separate RunEvidence (serialized via
     ``to_exportable_json``) plus task_id / case_idx / score metadata so
     the log is self-describing. Best-effort; swallows errors.
     """
@@ -354,6 +355,10 @@ def _dump_eval_task_traces(log_dir: Path, task_results: list["TaskResult"]) -> N
                             row["trace"] = None
                     else:
                         row["trace"] = None
+                    row["evidence"] = (
+                        json.loads(c.evidence.to_exportable_json(indent=0))
+                        if c.evidence is not None else None
+                    )
                     f.write(json.dumps(row, default=str) + "\n")
     except Exception:
         pass  # best-effort observability
@@ -367,6 +372,7 @@ class CaseResult:
     message: str
     recalc_source: str | None = None
     log_file: str | None = None
+    evidence: RunEvidence | None = None
 
 
 @dataclass
@@ -635,6 +641,7 @@ async def _run_case(
     )
 
     run_trace: Any = None
+    evidence: RunEvidence | None = None
     async with sem:
         try:
             predictor = PredictRLM(
@@ -655,6 +662,7 @@ async def _run_case(
                 timeout=config.task_timeout,
             )
             run_trace = getattr(result, "trace", None)
+            evidence = getattr(result, "evidence", None)
             if not (
                 result
                 and result.output_spreadsheet
@@ -663,6 +671,7 @@ async def _run_case(
             ):
                 cr = CaseResult(idx, 0.0, False, "No output", log_file=log_file_str)
                 cr.run_trace = run_trace  # type: ignore[attr-defined]
+                cr.evidence = evidence
                 return cr
             shutil.copy2(result.output_spreadsheet.path, output_path)
         except asyncio.TimeoutError as e:
@@ -673,6 +682,7 @@ async def _run_case(
                 log_file=log_file_str,
             )
             cr.run_trace = extract_trace_from_exc(e)  # type: ignore[attr-defined]
+            cr.evidence = extract_evidence_from_exc(e) or evidence
             return cr
         except Exception as e:
             from predict_rlm.trace import extract_trace_from_exc
@@ -681,6 +691,7 @@ async def _run_case(
                 idx, 0.0, False, f"RLM error: {e}", log_file=log_file_str,
             )
             cr.run_trace = extract_trace_from_exc(e)  # type: ignore[attr-defined]
+            cr.evidence = extract_evidence_from_exc(e) or evidence
             return cr
 
     recalc_source: str | None = None
@@ -696,6 +707,7 @@ async def _run_case(
             recalc_source=recalc_source, log_file=log_file_str,
         )
         cr.run_trace = run_trace  # type: ignore[attr-defined]
+        cr.evidence = evidence
         return cr
 
     try:
@@ -720,6 +732,7 @@ async def _run_case(
             recalc_source=recalc_source, log_file=log_file_str,
         )
         cr.run_trace = run_trace  # type: ignore[attr-defined]
+        cr.evidence = evidence
         return cr
     except Exception as e:
         cr = CaseResult(
@@ -727,6 +740,7 @@ async def _run_case(
             recalc_source=recalc_source, log_file=log_file_str,
         )
         cr.run_trace = run_trace  # type: ignore[attr-defined]
+        cr.evidence = evidence
         return cr
 
 

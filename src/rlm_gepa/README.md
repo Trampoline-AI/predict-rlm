@@ -189,11 +189,12 @@ class MyProject(RLMGepaProject):
         traces: list[RunTrace] = [trace] if trace is not None else []
         rlm_inputs: dict[str, Any] = {"example_id": example.example_id, **example.rlm_kwargs}
 
-        # 3. Return score, feedback, and captured RunTrace objects.
+        # 3. Return score, feedback, and independently captured trace and evidence.
         return RLMGepaExampleResult(
             score=score,
             feedback=feedback,
             traces=traces,
+            evidence=[result.evidence],
             rlm_inputs=rlm_inputs,
             example_id=example.example_id,
         )
@@ -451,8 +452,16 @@ returns. In RLM-GEPA, each `evaluate_example()` should return:
 - finite `score`, usually normalized to `0.0-1.0`;
 - concrete `feedback` for imperfect outputs;
 - captured `traces` from the candidate RLM run;
+- captured `evidence` from each run, separately from its behavioral trace;
 - stable `example_id` values, especially for debugging and merge traces;
 - `rlm_inputs` with the task metadata needed to interpret a trace.
+
+Pass `result.evidence` alongside `result.trace`. For failures, use
+`predict_rlm.evidence.extract_evidence_from_exc(exc)` independently of
+`predict_rlm.trace.extract_trace_from_exc(exc)` so timeout/cancellation wrappers
+retain lifecycle evidence. Incomplete captured evidence is rejected. Trace-only
+fixtures may leave `evidence` empty. Archives store sibling evidence; proposer
+records contain a sanitized `Evidence` list separately from `Traces`.
 
 Weak feedback produces weak prompt search. Good feedback names the failing
 surface: the cell, clause, page, API response, assertion, crash reason, timeout,

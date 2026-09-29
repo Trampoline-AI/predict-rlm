@@ -40,8 +40,9 @@ from appworld_rlm.tools.runner import (
 )
 
 from predict_rlm import Skill
+from predict_rlm.evidence import RunEvidence
 from rlm_gepa.reporting.stats import render_stats
-from rlm_gepa.schema import EvaluationContext, validate_project
+from rlm_gepa.schema import EvaluationContext, validate_example_result, validate_project
 
 FIXTURE_ROOT = Path(__file__).parent / "fixtures" / "appworld_data"
 
@@ -687,6 +688,32 @@ def _run_appworld_rlm_with_prediction(monkeypatch, prediction, client):
     monkeypatch.setattr(service_module, "PredictRLM", FakePredictRLM)
     agent = AppWorldRLM(appworld_client=client, skill=_base_test_skill())
     return asyncio.run(agent.aforward(task_id="aaa111_1", instruction="do it"))
+
+
+def test_appworld_completion_failure_keeps_incomplete_evidence(monkeypatch):
+    class FailingCompleteClient(_AutoCompleteClient):
+        def complete_appworld_task(self, task_id, kwargs_json):
+            raise RuntimeError("completion failed")
+
+    prediction = SimpleNamespace(
+        answer="foo", evidence=RunEvidence(run_id="appworld_run", complete=False)
+    )
+    try:
+        _run_appworld_rlm_with_prediction(monkeypatch, prediction, FailingCompleteClient())
+    except RuntimeError as exc:
+        project = AppWorldGepaProject(AppWorldGepaConfig(data_root=FIXTURE_ROOT))
+        result = project._error_result(
+            evaluation.AppWorldExample("aaa111_1", "train", "do it"), str(exc), exc
+        )
+    else:
+        raise AssertionError("expected completion failure")
+
+    try:
+        validate_example_result(result)
+    except ValueError as exc:
+        assert "incomplete strict evidence" in str(exc)
+    else:
+        raise AssertionError("completion wrapper lost incomplete evidence")
 
 
 def test_appworld_rlm_completes_task_from_answer(monkeypatch):

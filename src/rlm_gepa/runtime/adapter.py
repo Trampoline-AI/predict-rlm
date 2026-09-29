@@ -13,6 +13,7 @@ from typing import Any
 from gepa import EvaluationBatch
 
 from predict_rlm import PredictRLM
+from predict_rlm.evidence import extract_evidence_from_exc
 from predict_rlm.telemetry import (
     TelemetryContext,
     classify_failure,
@@ -38,6 +39,8 @@ from ..schema import (
 )
 from .progress import install_rlm_log_stream, progress_write, restore_rlm_log_stream
 from .trace_rendering import (
+    evidence_to_json,
+    evidence_to_proposer_json,
     proposer_failure_metadata,
     render_inputs,
     trace_to_json,
@@ -235,21 +238,26 @@ class RLMGepaAdapter:
                             self.project.evaluate_example(candidate, example, example_context),
                             timeout=example_timeout,
                         )
-                    except asyncio.TimeoutError:
+                    except asyncio.TimeoutError as exc:
                         self._write_outer_timeout_event(example_context, example, index)
+                        trace = extract_trace_from_exc(exc)
+                        evidence = extract_evidence_from_exc(exc)
                         result = RLMGepaExampleResult(
                             score=0.0,
                             feedback=f"evaluation timeout at {example_timeout}s",
-                            traces=[],
+                            traces=[trace] if trace is not None else [],
+                            evidence=[evidence] if evidence is not None else [],
                             example_id=example_id,
                             error=f"timeout at {example_timeout}s",
                         )
                     except Exception as exc:
                         trace = extract_trace_from_exc(exc)
+                        evidence = extract_evidence_from_exc(exc)
                         result = RLMGepaExampleResult(
                             score=0.0,
                             feedback=f"evaluation {type(exc).__name__}: {exc}",
                             traces=[trace] if trace is not None else [],
+                            evidence=[evidence] if evidence is not None else [],
                             example_id=example_id,
                             error=str(exc),
                         )
@@ -343,6 +351,7 @@ class RLMGepaAdapter:
                     "rlm_inputs": dict(result.rlm_inputs),
                     "trace": trace_to_json(result.traces[0]) if result.traces else None,
                     "traces": [trace_to_json(trace) for trace in result.traces],
+                    "evidence": [evidence_to_json(item) for item in result.evidence],
                     "error": result.error,
                 }
                 failure_metadata = _row_failure_metadata(
@@ -563,6 +572,7 @@ class RLMGepaAdapter:
                 f"RLM patch merge proposer returned empty new_instructions for {call_idx}"
             )
             exc.trace = getattr(result, "trace", None)  # type: ignore[attr-defined]
+            exc.evidence = getattr(result, "evidence", None)  # type: ignore[attr-defined]
             raise exc
         selected_capability = getattr(result, "selected_capability", None)
         if selected_capability is None:
@@ -570,6 +580,7 @@ class RLMGepaAdapter:
                 f"RLM patch merge proposer returned no selected_capability for {call_idx}"
             )
             exc.trace = getattr(result, "trace", None)  # type: ignore[attr-defined]
+            exc.evidence = getattr(result, "evidence", None)  # type: ignore[attr-defined]
             raise exc
 
         patch_output = {
@@ -612,6 +623,7 @@ class RLMGepaAdapter:
             "new_instructions": new_text,
             "rlm_trajectory": getattr(result, "trajectory", []),
             "run_trace": trace_to_json(trace),
+            "run_evidence": evidence_to_json(getattr(result, "evidence", None)),
             "error": None,
         }
         atomic_write_json(
@@ -709,6 +721,7 @@ def reflective_record(
         "Inputs": render_inputs(result.rlm_inputs),
         "Score": result.score,
         "Traces": [trace_to_proposer_json(trace) for trace in result.traces],
+        "Evidence": [evidence_to_proposer_json(item) for item in result.evidence],
         "Feedback": result.feedback,
         "Error": result.error,
     }

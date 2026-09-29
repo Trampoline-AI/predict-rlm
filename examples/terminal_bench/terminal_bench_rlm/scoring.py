@@ -3,6 +3,8 @@ from __future__ import annotations
 from collections.abc import Mapping
 from typing import Any
 
+from predict_rlm.evidence import RunEvidence
+
 PASSED = "passed"
 DIAGNOSTIC_TAIL_LIMIT = 2000
 
@@ -129,6 +131,7 @@ def to_gepa_example_result(
     traces: list[Any],
     example_id: str | None = None,
     rlm_inputs: Mapping[str, Any] | None = None,
+    evidence: list[RunEvidence] | None = None,
 ):
     from rlm_gepa import RLMGepaExampleResult
 
@@ -145,6 +148,7 @@ def to_gepa_example_result(
         score=details["soft_score"],
         feedback=feedback(result_or_parser_results),
         traces=traces,
+        evidence=evidence if evidence is not None else [],
         rlm_inputs=dict(rlm_inputs or {}),
         example_id=example_id,
         objective_scores=objective_scores,

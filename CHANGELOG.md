@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Breaking Changes
+
+- `RunTrace` and its proposer/exported forms no longer contain `evidence`.
+  Successful calls return separate `prediction.trace` and `prediction.evidence`
+  objects; failures and cancellation expose `exception.evidence` independently
+  of any `exception.trace`, including failures before a trace exists.
+- Import `RunEvidence` and `RunEvidenceEvent` from `predict_rlm` or
+  `predict_rlm.evidence`, not `predict_rlm.trace`. Export the lifecycle log with
+  `prediction.evidence.to_exportable_json()` and read its `run_id`, `complete`,
+  and `terminal_outcome` directly. Event sink payloads and delivery are unchanged.
+- The signature output name `evidence` is reserved for the runtime evidence
+  object. Rename application output fields that used this name.
+- GEPA evaluation results carry lifecycle logs in a separate
+  `RLMGepaExampleResult.evidence` list. Evaluators must pass captured evidence
+  alongside traces to preserve completeness validation and lifecycle records.
+  Consumers such as Avalanche and Delta must obtain evidence metadata from the
+  separate result or exception object rather than `trace.evidence`.
+
 ## [0.8.1] - 2026-09-25
 
 ### Changed

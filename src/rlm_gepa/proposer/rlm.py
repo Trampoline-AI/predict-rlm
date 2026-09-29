@@ -15,11 +15,13 @@ import dspy
 from pydantic import BaseModel, Field
 
 from predict_rlm import File, PredictRLM
+from predict_rlm.evidence import extract_evidence_from_exc
 from predict_rlm.trace import extract_trace_from_exc
 
 from ..reporting.cost import append_trace_cost_rows
 from ..runtime.progress import install_rlm_log_stream, progress_write, restore_rlm_log_stream
 from ..runtime.trace_rendering import (
+    evidence_to_json,
     proposer_failure_metadata,
     trace_to_json,
     trace_to_proposer_json,
@@ -73,6 +75,8 @@ Good rules must name a stable runtime behavior from one of these groups:
   fields over rendered prose. `steps[*].output` can be shortened for display;
   when diagnosing sandbox or REPL output, prefer `steps[*].untruncated_output`
   if it is present.
+- `Evidence`: independent lifecycle records, including session finalization and
+  terminal outcomes. These complement behavioral `Traces`; they are not trace fields.
 - `Failure Metadata`: compact failure hints for the row. Use it to confirm or
   disambiguate repeated failure modes, especially tool/predict-call failures
   and finish-reason issues. `Failure Metadata.failure_class ==
@@ -102,7 +106,7 @@ Every proposed rule must pass all structural tests:
 # Workflow
 
 1. Load {{TRACES_FILE_MOUNT}} with JSON parsing and work from parsed records.
-   Treat `Traces` and `Failure Metadata` as primary evidence. Use regex only as
+   Treat `Traces`, `Evidence`, and `Failure Metadata` as primary evidence. Use regex only as
    a local extractor inside parsed string fields when helpful, not as the
    primary way to scan the raw trace file.
 2. Bucket scored records into bottom failures, middle partials/near-misses, and
@@ -186,7 +190,8 @@ The patched skill must work across these use cases:
   patch-source-parent trace/feedback/score. Rows with `winner="both_success"`
   are guardrails: both parents solved them, so preserve that behavior rather
   than using them as import evidence. Parent objects include structured
-  `traces` and `failure_metadata`; use those as primary behavioral evidence.
+  `traces`, sibling lifecycle `evidence`, and `failure_metadata`; use these as
+  primary behavioral evidence.
   Inspect failed rows alongside scores and feedback, then read reasoning, code,
   sandbox output, errors, tool-call inputs/outputs/errors, predict-call
   inputs/outputs/errors, and LM finish reasons to understand why one parent
@@ -515,6 +520,7 @@ class RLMInstructionProposer:
                         f"RLM proposer returned empty new_instructions for {component_name}"
                     )
                     exc.trace = getattr(result, "trace", None)  # type: ignore[attr-defined]
+                    exc.evidence = getattr(result, "evidence", None)  # type: ignore[attr-defined]
                     raise exc
             except BaseException as exc:
                 self._persist_error(
@@ -574,6 +580,7 @@ class RLMInstructionProposer:
             "reflective_dataset": serializable,
             "rlm_trajectory": getattr(result, "trajectory", []),
             "run_trace": trace_to_json(getattr(result, "trace", None)),
+            "run_evidence": evidence_to_json(getattr(result, "evidence", None)),
             "error": None,
         }
         atomic_write_json(self.trace_dir / f"{event_id}_proposer_{component_name}.json", payload)
@@ -609,6 +616,7 @@ class RLMInstructionProposer:
             "new_instructions": None,
             "generalization_check": None,
             "run_trace": trace_to_json(trace),
+            "run_evidence": evidence_to_json(extract_evidence_from_exc(exc)),
             "error": str(exc),
             "error_type": type(exc).__name__,
             "traceback": "".join(traceback.format_exception(type(exc), exc, exc.__traceback__)),

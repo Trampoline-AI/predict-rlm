@@ -70,7 +70,7 @@ from .compatibility import (
 from .compatibility import (
     files as file_compatibility,
 )
-from .evidence import EvidenceRecorder, RunEventKind
+from .evidence import EvidenceRecorder, RunEventKind, RunEvidence, RunEvidenceEvent
 from .execution_timeout import validate_execution_timeout
 from .files import File, build_file_plan, scan_file_fields
 from .in_context import CtxStrInputAdapter
@@ -109,8 +109,6 @@ from .telemetry import TelemetryContext, make_span_id
 from .trace import (
     IterationStep,
     LMUsage,
-    RunEvidence,
-    RunEvidenceEvent,
     RunTrace,
     TokenUsage,
     _RawPredictCall,
@@ -1231,6 +1229,10 @@ class PredictRLM(dspy.RLM):
             sub_lm=None,  # Disable default llm_query tools
             interpreter=interpreter,
         )
+        if "evidence" in self.signature.output_fields:
+            raise ValueError(
+                "The output field 'evidence' is reserved for the runtime RunEvidence object."
+            )
 
         from .in_context import _in_context_field_names
 
@@ -2975,7 +2977,7 @@ class PredictRLM(dspy.RLM):
                     except BaseException as cleanup_error:
                         setattr(exc, "cleanup_error", cleanup_error)
                 await recorder.finish_failure(exc)
-                self._attach_runtime_evidence(getattr(exc, "trace", None), recorder)
+                self._attach_runtime_evidence(exc, recorder)
                 raise
             else:
                 trace = getattr(prediction, "trace", None)
@@ -2992,19 +2994,17 @@ class PredictRLM(dspy.RLM):
                     if trace is not None:
                         trace.status = "error"
                         setattr(exc, "trace", trace)
-                    self._attach_runtime_evidence(trace, recorder)
+                    self._attach_runtime_evidence(exc, recorder)
                     raise
-                self._attach_runtime_evidence(trace, recorder)
+                self._attach_runtime_evidence(prediction, recorder)
                 return prediction
 
     def _attach_runtime_evidence(
         self,
-        trace: RunTrace | None,
+        target: dspy.Prediction | BaseException,
         recorder: EvidenceRecorder,
     ) -> None:
-        if trace is None:
-            return
-        trace.evidence = RunEvidence(
+        evidence = RunEvidence(
             run_id=recorder.ctx.run_id,
             complete=recorder.complete,
             terminal_outcome=recorder.ctx.terminal_outcome,
@@ -3018,6 +3018,7 @@ class PredictRLM(dspy.RLM):
                 for event in recorder.events
             ],
         )
+        setattr(target, "evidence", evidence)
 
     @asynccontextmanager
     async def _iteration_callback_scope_for_run(

@@ -9,6 +9,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from predict_rlm.evidence import RunEvidence
 from predict_rlm.telemetry import TelemetryContext
 from predict_rlm.trace import RunTrace
 
@@ -244,6 +245,7 @@ class RLMGepaExampleResult:
     example_id: str | None = None
     objective_scores: Any | None = None
     error: str | None = None
+    evidence: list[RunEvidence] = field(default_factory=list)
 
 
 class RLMGepaProject(ABC):
@@ -349,8 +351,9 @@ def validate_example_result(result: RLMGepaExampleResult) -> None:
             "RLMGepaExampleResult.traces must contain at least one RunTrace "
             "unless error is populated"
         )
-    evidence = [getattr(trace, "evidence", None) for trace in result.traces]
-    if any(item is not None and not item.complete for item in evidence):
+    if not isinstance(result.evidence, list):
+        raise ValueError("RLMGepaExampleResult.evidence must be a list")
+    if any(not item.complete for item in result.evidence):
         raise ValueError("RLMGepaExampleResult contains incomplete strict evidence")
 
 
