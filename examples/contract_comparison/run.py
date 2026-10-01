@@ -7,10 +7,12 @@ Drop two or more PDF contracts into the `sample/input/` directory, then run:
     uv run examples/contract_comparison/run.py --debug
 
 Requires:
-    pip install 'predict-rlm[examples]'   # for PDF rendering via pymupdf
+    pip install 'predict-rlm[examples,codex-lm]'
 
-Environment:
-    Set OPENAI_API_KEY (or whatever LLM provider you configure below).
+Authentication:
+    uv run codex-lm auth import default
+    # Or: uv run codex-lm auth login default --device-auth
+    uv run codex-lm auth use default
 """
 
 import argparse
@@ -21,6 +23,7 @@ from datetime import datetime
 from pathlib import Path
 
 import dspy
+from dspy_codex_lm import CodexLM
 
 from predict_rlm import File
 
@@ -34,21 +37,8 @@ from contract_comparison import ContractComparator
 # ---------------------------------------------------------------------------
 
 SOURCE_DIR = Path(__file__).parent / "sample" / "input"
-LLM_MODEL = "openai/gpt-5.4"
-SUB_LM_MODEL = "openai/gpt-5.1"
-
-
-def get_model_config(model: str):
-    if model == "openai/gpt-5.4":
-        return dict(
-            model=model,
-            num_retries=5,
-            reasoning_effort="none",
-        )
-    else:
-        return dict(
-            model=model,
-        )
+LLM_MODEL = "gpt-5.5"
+SUB_LM_MODEL = "gpt-5.4-mini"
 
 
 def parse_args():
@@ -66,12 +56,12 @@ def parse_args():
     parser.add_argument(
         "--model",
         default=LLM_MODEL,
-        help=f"LLM model to use (default: {LLM_MODEL})",
+        help=f"Codex model ID, without a provider prefix (default: {LLM_MODEL})",
     )
     parser.add_argument(
         "--sub-lm-model",
         default=SUB_LM_MODEL,
-        help=f"Sub-LM model to use (default: {SUB_LM_MODEL})",
+        help=f"Codex sub-LM model ID, without a provider prefix (default: {SUB_LM_MODEL})",
     )
     parser.add_argument(
         "--max-iterations",
@@ -115,11 +105,9 @@ async def main():
         print(f"  - {p.name}")
     print()
 
-    model_config = get_model_config(args.model)
-
     # Set up the LLMs
-    lm = dspy.LM(**model_config, cache=False)
-    sub_lm = dspy.LM(args.sub_lm_model, cache=False)
+    lm = CodexLM(args.model, num_retries=5, reasoning_effort="none", cache=False)
+    sub_lm = CodexLM(args.sub_lm_model, cache=False)
 
     # Build File references and count pages for stats
     import pymupdf

@@ -7,8 +7,13 @@ Pass image files (PNG, JPG, WEBP) and a query:
     uv run examples/image_analysis/run.py --quiet --query "Describe each image" *.png
     uv run examples/image_analysis/run.py --debug --query "Describe each image" *.png
 
-Environment:
-    Set OPENAI_API_KEY (or whatever LLM provider you configure below).
+Requires:
+    pip install 'predict-rlm[examples,codex-lm]'
+
+Authentication:
+    uv run codex-lm auth import default
+    # Or: uv run codex-lm auth login default --device-auth
+    uv run codex-lm auth use default
 """
 
 import argparse
@@ -18,6 +23,7 @@ import time
 from pathlib import Path
 
 import dspy
+from dspy_codex_lm import CodexLM
 
 from predict_rlm import File
 
@@ -32,8 +38,8 @@ from image_analysis import ImageAnalyzer
 
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp"}
 SOURCE_DIR = Path(__file__).parent / "sample" / "input"
-LLM_MODEL = "openai/gpt-5.4"
-SUB_LM_MODEL = "openai/gpt-5.1"
+LLM_MODEL = "gpt-5.5"
+SUB_LM_MODEL = "gpt-5.4-mini"
 DEFAULT_QUERY = """
 
     What letters appear in each image, and how many times does each letter appear? Always include: logo text, header address/phone/fax, header email, header website URL, "Page N" footers, etc.
@@ -48,19 +54,6 @@ DEFAULT_QUERY = """
 
     Treat uppercase and lowercase as the same letter (case-insensitive).
     Output the letter statistics in alphabetical order (A-Z)."""
-
-
-def get_model_config(model: str):
-    if model == "openai/gpt-5.4":
-        return dict(
-            model=model,
-            num_retries=5,
-            reasoning_effort="none",
-        )
-    else:
-        return dict(
-            model=model,
-        )
 
 
 def parse_args():
@@ -83,12 +76,12 @@ def parse_args():
     parser.add_argument(
         "--model",
         default=LLM_MODEL,
-        help=f"LLM model to use (default: {LLM_MODEL})",
+        help=f"Codex model ID, without a provider prefix (default: {LLM_MODEL})",
     )
     parser.add_argument(
         "--sub-lm-model",
         default=SUB_LM_MODEL,
-        help=f"Sub-LM model to use (default: {SUB_LM_MODEL})",
+        help=f"Codex sub-LM model ID, without a provider prefix (default: {SUB_LM_MODEL})",
     )
     parser.add_argument(
         "--max-iterations",
@@ -138,10 +131,8 @@ async def main():
         print(f"  - {p.name}")
     print(f"\nQuery: {args.query}\n")
 
-    model_config = get_model_config(args.model)
-
-    lm = dspy.LM(**model_config, cache=False)
-    sub_lm = dspy.LM(args.sub_lm_model, cache=False)
+    lm = CodexLM(args.model, num_retries=5, reasoning_effort="none", cache=False)
+    sub_lm = CodexLM(args.sub_lm_model, cache=False)
 
     file_refs = [File(path=str(p.resolve())) for p in images]
 

@@ -23,8 +23,7 @@ optimized skill was trained only on the non-Verified 512-task remainder.
 - [`uv`](https://docs.astral.sh/uv/)
 - Deno v2, used by the PredictRLM Pyodide/WASM sandbox
 - LibreOffice on `PATH`, used for spreadsheet recalculation/rendering
-- LiteLLM-compatible provider keys, for example `OPENAI_API_KEY` and/or
-  `ANTHROPIC_API_KEY`
+- ChatGPT/Codex subscription authentication for the default CodexLM route
 
 Run commands below from `examples/spreadbench`:
 
@@ -32,6 +31,31 @@ Run commands below from `examples/spreadbench`:
 cd examples/spreadbench
 uv sync
 ```
+
+`uv sync` installs the bundled `predict-rlm[codex-lm]` extra; no separate
+`dspy-codex-lm` checkout is needed. Inspect the selected authentication without
+making a model request:
+
+```bash
+uv run codex-lm auth status
+```
+
+If you need a saved profile, import an existing Codex login and select it:
+
+```bash
+uv run codex-lm auth import personal
+uv run codex-lm auth use personal
+# Alternatively, with the Codex CLI installed:
+# uv run codex-lm auth login personal
+```
+
+Baseline evaluation and optimization route OpenAI-family models through
+CodexLM by default. Missing bundled integration raises an error instead of
+falling back to paid APIs. Use `--no-codex-lm` to explicitly restore normal
+provider routing, or repeat `--codex-lm-exclude MODEL_SUBSTRING` to leave selected
+models unpatched. Non-OpenAI model overrides are not intercepted. These normal
+provider routes require the appropriate credentials (such as `OPENAI_API_KEY`
+or `ANTHROPIC_API_KEY`) and may incur API charges.
 
 ## Set up the data
 
@@ -53,6 +77,23 @@ This creates:
 - `data/trainset/`: 512 non-Verified tasks, used for optimization.
 - `data/testset`: symlink to the 400-task Verified held-out set, used for
   release metrics.
+
+## Run with the default models
+
+Evaluation uses `openai/gpt-5.5` with `openai/gpt-5.4-mini` as its sub-LM.
+Optimization uses that same main/sub pair for both executor and proposer.
+The `openai/` prefixes are retained for CLI interception; every default model
+role uses CodexLM.
+
+```bash
+uv run rlm-gepa eval --dataset testset --limit 5 --concurrency 5
+uv run rlm-gepa optimize --check
+uv run rlm-gepa optimize
+```
+
+Override evaluation models with `--lm` / `--sub-lm`, or optimization models with
+`--executor-lm` / `--executor-sub-lm` / `--proposer-lm` / `--proposer-sub-lm`.
+The release commands below intentionally retain the originally measured models.
 
 ## Unpack release traces
 
@@ -144,8 +185,10 @@ To run the seed baseline, omit `--run-dir` and `--cand-idx`.
 
 ## Re-run optimization
 
-The release optimization run used the parameters recorded in
-`optimization_summary.json`:
+The historical release optimization run used the parameters recorded in
+`optimization_summary.json`. Reproducing it explicitly selects an Anthropic
+proposer and requires `ANTHROPIC_API_KEY`; it does not use today's all-Codex
+defaults:
 
 ```bash
 uv run rlm-gepa optimize \

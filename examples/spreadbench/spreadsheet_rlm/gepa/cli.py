@@ -7,7 +7,12 @@ from typing import Any
 from rlm_gepa import OptimizeConfig
 from rlm_gepa.cli import run_project_cli
 
-from ..bench.cli import add_eval_subcommand, handle_eval_command, install_codex_lm
+from ..bench.cli import (
+    add_codex_lm_args,
+    add_eval_subcommand,
+    handle_eval_command,
+    install_codex_lm,
+)
 from .config import SpreadsheetGepaConfig, default_config
 from .project import build_project
 
@@ -30,27 +35,7 @@ def _add_project_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--val-ratio", type=float)
     parser.add_argument("--val-limit", type=int)
     parser.add_argument("--cases-per-task", type=int)
-    codex_group = parser.add_mutually_exclusive_group()
-    codex_group.add_argument(
-        "--codex-lm",
-        dest="codex_lm",
-        action="store_true",
-        default=None,
-        help="force routing OpenAI-family dspy.LM constructions through dspy-codex-lm",
-    )
-    codex_group.add_argument(
-        "--no-codex-lm",
-        dest="codex_lm",
-        action="store_false",
-        default=None,
-        help="disable automatic dspy-codex-lm routing",
-    )
-    parser.add_argument(
-        "--codex-lm-exclude",
-        action="append",
-        default=[],
-        help="model substring to leave unpatched when --codex-lm is enabled; repeatable",
-    )
+    add_codex_lm_args(parser)
     parser.add_argument(
         "--telemetry-redact-paths",
         action="store_true",

@@ -17,6 +17,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ignored by Git; generated documents and aggregate reports keep their existing
   locations.
 
+### Changed
+
+- Runnable examples and notebooks now default to Codex LM authentication instead
+  of API-key-backed model calls: `gpt-5.5` for main/executor and GEPA proposer
+  roles, and `gpt-5.4-mini` for sub-LM roles. Benchmark CLIs default Codex routing
+  on and retain an explicit `--no-codex-lm` opt-out.
+
 ### Breaking Changes
 
 - `RunTrace` and its proposer/exported forms no longer contain `evidence`.

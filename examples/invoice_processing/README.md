@@ -8,9 +8,15 @@ consolidated Excel spreadsheet.
 ```bash
 git clone https://github.com/Trampoline-AI/predict-rlm.git
 cd predict-rlm
-uv sync --extra examples
-export OPENAI_API_KEY=sk-...
+uv sync --extra examples --extra codex-lm
+uv run codex-lm auth import default
+# Or log in instead of importing existing Codex credentials:
+# uv run codex-lm auth login default --device-auth
+uv run codex-lm auth use default
 ```
+
+The runner uses the bundled `dspy_codex_lm.CodexLM` directly with your ChatGPT
+subscription. No OpenAI API key or external `codex-lm` execution wrapper is needed.
 
 ## Usage
 
@@ -33,8 +39,8 @@ uv run examples/invoice_processing/run.py --debug
 
 | Flag               | Default          | Description                   |
 | ------------------ | ---------------- | ----------------------------- |
-| `--model`          | `openai/gpt-5.4` | Main LM                       |
-| `--sub-lm-model`   | `openai/gpt-5.1` | Sub-LM for `predict()` calls  |
+| `--model`          | `gpt-5.5`        | Main Codex model ID (no provider prefix) |
+| `--sub-lm-model`   | `gpt-5.4-mini`   | Codex sub-LM for `predict()` calls |
 | `--max-iterations` | `30`             | Max REPL iterations           |
 | `--quiet`          | off              | Suppress RLM reasoning, code, output, tool calls, errors, and submit blocks |
 | `--debug`          | off              | Print timestamped RLM and sandbox lifecycle diagnostics to stderr |
@@ -51,6 +57,9 @@ JSON `null` when no trace is available. `.run/` is ignored by Git by default.
 The [`sample/`](sample/) directory contains 2 PDF invoices and the
 [extracted output](sample/output/) — structured data plus a consolidated Excel
 workbook.
+
+These are historical sample results; recorded model labels and costs are
+unchanged and do not describe the current Codex defaults.
 
 ## Structure
 

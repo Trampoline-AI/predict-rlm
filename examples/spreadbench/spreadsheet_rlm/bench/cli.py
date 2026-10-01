@@ -273,28 +273,31 @@ def add_eval_args(parser: argparse.ArgumentParser) -> None:
         action="store_true",
         help="print timestamped RLM and sandbox lifecycle diagnostics to stderr",
     )
+    add_codex_lm_args(parser)
+    parser.add_argument("--cache", action="store_true", help="enable dspy.LM caching")
+
+
+def add_codex_lm_args(parser: argparse.ArgumentParser) -> None:
     codex_group = parser.add_mutually_exclusive_group()
     codex_group.add_argument(
         "--codex-lm",
         dest="codex_lm",
         action="store_true",
-        default=None,
-        help="force routing OpenAI-family dspy.LM constructions through dspy-codex-lm",
+        default=True,
+        help="route OpenAI-family dspy.LM constructions through bundled CodexLM (default)",
     )
     codex_group.add_argument(
         "--no-codex-lm",
         dest="codex_lm",
         action="store_false",
-        default=None,
-        help="disable automatic dspy-codex-lm routing",
+        help="use normal provider routing instead of CodexLM; requires provider credentials",
     )
     parser.add_argument(
         "--codex-lm-exclude",
         action="append",
         default=[],
-        help="model substring to leave unpatched when --codex-lm is enabled; repeatable",
+        help="model substring to leave on normal provider routing; repeatable",
     )
-    parser.add_argument("--cache", action="store_true", help="enable dspy.LM caching")
 
 
 def resolve_eval_output_dir(path_arg: str | None, args: argparse.Namespace) -> Path:
@@ -323,15 +326,13 @@ def resolve_eval_output_dir(path_arg: str | None, args: argparse.Namespace) -> P
 
 
 def install_codex_lm(args: argparse.Namespace) -> None:
-    codex_available = importlib.util.find_spec("dspy_codex_lm") is not None
-    if args.codex_lm is False or (args.codex_lm is None and not codex_available):
+    if args.codex_lm is False:
         return
-    if not codex_available:
+    if importlib.util.find_spec("dspy_codex_lm") is None:
         raise RuntimeError(
-            "--codex-lm requires dspy-codex-lm in the uv run environment. "
-            "Use: uv run --project examples/spreadbench "
-            "--with-editable /Users/gabriel/Workspace/dspy-codex-lm "
-            "python -m spreadsheet_rlm.gepa ..."
+            "CodexLM routing requires the bundled predict-rlm[codex-lm] extra. "
+            "Install this example's dependencies with: uv sync --project examples/spreadbench. "
+            "Use --no-codex-lm only to explicitly select normal provider routing."
         )
 
     from dspy_codex_lm.cli import install_monkeypatch

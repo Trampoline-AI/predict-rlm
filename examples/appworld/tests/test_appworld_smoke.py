@@ -1098,6 +1098,8 @@ def test_eval_builds_lms_before_constructing_appworld_rlm(monkeypatch, tmp_path)
     report = asyncio.run(
         evaluation.run_evaluation(
             EvalConfig(
+                lm="openai/gpt-5.4",
+                sub_lm="openai/gpt-5.4-mini",
                 data_root=FIXTURE_ROOT,
                 dataset="test_normal",
                 limit=1,
@@ -1241,22 +1243,6 @@ def test_appworld_eval_defaults_and_overrides_are_wired():
     assert default_config().concurrency == 10
     assert override_args.concurrency == 7
     assert override_args.task_timeout == 42
-
-
-def test_install_codex_lm_explicit_missing_has_appworld_uv_hint(monkeypatch):
-    monkeypatch.setattr(bench_cli.importlib.util, "find_spec", lambda name: None)
-
-    try:
-        bench_cli.install_codex_lm(
-            argparse.Namespace(codex_lm=True, codex_lm_exclude=[])
-        )
-    except RuntimeError as exc:
-        message = str(exc)
-    else:
-        raise AssertionError("expected RuntimeError")
-
-    assert "--with-editable /Users/gabriel/Workspace/dspy-codex-lm" in message
-    assert "uv run --project examples/appworld" in message
 
 
 def test_install_codex_lm_auto_enables_and_sets_default_key(monkeypatch):

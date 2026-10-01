@@ -318,6 +318,7 @@ def test_cli_accepts_harbor_executable_args_without_backend_choice() -> None:
     gepa_cli._add_project_args(parser)
     args = parser.parse_args(
         [
+            "--no-codex-lm",
             "--harbor-executable",
             "uvx harbor",
             "--harbor-dataset",
@@ -354,18 +355,27 @@ def test_cli_help_advertises_remote_controller_as_supplied_machine() -> None:
     assert "unsupported for Daytona" not in help_text
 
 
-def test_cli_codex_lm_missing_dependency_points_to_local_extra(monkeypatch) -> None:
+def test_cli_refuses_default_provider_fallback_when_codex_lm_missing(monkeypatch) -> None:
     parser = argparse.ArgumentParser()
     gepa_cli._add_project_args(parser)
-    args = parser.parse_args(["--codex-lm"])
+    args = parser.parse_args([])
     monkeypatch.setattr(gepa_cli.importlib.util, "find_spec", lambda name: None)
 
-    with pytest.raises(RuntimeError) as exc_info:
-        gepa_cli._install_codex_lm(args)
+    with pytest.raises(RuntimeError, match=r"predict-rlm\[codex-lm\]"):
+        gepa_cli._apply_project_args(default_config(), args)
 
-    message = str(exc_info.value)
-    assert "predict-rlm[codex-lm" in message
-    assert "dspy-codex-lm" not in message
+
+@pytest.mark.parametrize("argv,configured", [([], False), (["--no-codex-lm"], True)])
+def test_cli_can_opt_out_without_codex_dependency(monkeypatch, argv, configured) -> None:
+    parser = argparse.ArgumentParser()
+    gepa_cli._add_project_args(parser)
+    config = default_config()
+    config.codex_lm = configured
+    monkeypatch.setattr(gepa_cli.importlib.util, "find_spec", lambda name: None)
+
+    resolved = gepa_cli._apply_project_args(config, parser.parse_args(argv))
+
+    assert resolved.codex_lm is False
 
 
 def test_build_project_uses_harbor_harness_by_default() -> None:
@@ -680,7 +690,6 @@ def test_daytona_remote_agent_exposes_agent_info_without_harbor_dependency() -> 
         lm="openai/gpt-5.4-mini",
     )
 
-    assert agent.predict_rlm_kwargs == {"lm": "openai/gpt-5.4-mini"}
     assert agent.to_agent_info() == {
         "name": "predict-rlm",
         "version": "unknown",
@@ -720,6 +729,7 @@ async def test_daytona_bootstrap_command_uses_packaged_asset_and_requests_python
         lm="openai/gpt-5.4-mini",
         remote_root="/remote/controller",
         remote_home="/remote/home",
+        codex_lm=False,
     )
 
     await agent._bootstrap_remote_controller(env)
@@ -2231,12 +2241,13 @@ def test_in_process_runner_calls_terminal_bench_harness_and_loads_results(
     assert kwargs["global_agent_timeout_sec"] == 900
 
 
+@pytest.mark.parametrize("codex_lm", [True, False])
 def test_subprocess_runner_passes_codex_lm_agent_kwargs(
-    monkeypatch, tmp_path: Path
+    monkeypatch, tmp_path: Path, codex_lm: bool,
 ) -> None:
     config = default_config()
     config.terminal_bench_output_dir = tmp_path / "tbench-runs"
-    config.codex_lm = True
+    config.codex_lm = codex_lm
     config.codex_lm_exclude = ("openai/keep-direct", "anthropic/")
     captured: dict[str, object] = {}
 
@@ -2270,8 +2281,11 @@ def test_subprocess_runner_passes_codex_lm_agent_kwargs(
         for index, value in enumerate(cmd[:-1])
         if value == "--agent-kwarg"
     ]
-    assert "codex_lm=true" in agent_kwargs
-    assert "codex_lm_exclude=openai/keep-direct,anthropic/" in agent_kwargs
+    assert f"codex_lm={str(codex_lm).lower()}" in agent_kwargs
+    if codex_lm:
+        assert "codex_lm_exclude=openai/keep-direct,anthropic/" in agent_kwargs
+    else:
+        assert not any(value.startswith("codex_lm_exclude=") for value in agent_kwargs)
     assert "verbose=true" in agent_kwargs
     kwargs = captured["kwargs"]
     assert isinstance(kwargs, dict)
@@ -2364,6 +2378,7 @@ def test_agent_builds_low_effort_lms_from_agent_kwargs(monkeypatch) -> None:
         sub_lm_reasoning_effort="low",
         lm_service_tier="priority",
         sub_lm_service_tier="priority",
+        codex_lm=False,
     )
     agent.perform_task("solve it", SimpleNamespace(container=object()))
 

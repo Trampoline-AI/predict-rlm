@@ -535,7 +535,7 @@ class _TerminalBenchRLMBaseAgentMixin:
         tools: dict[str, Callable[..., Any]] | list[Callable[..., Any]] | None = None,
         skill_instructions: str | None = None,
         interpreter_kwargs: dict[str, Any] | None = None,
-        codex_lm: bool | str = False,
+        codex_lm: bool | str = True,
         codex_lm_exclude: tuple[str, ...] | list[str] | str | None = None,
         lm_reasoning_effort: str | None = None,
         sub_lm_reasoning_effort: str | None = None,
@@ -579,6 +579,8 @@ class _TerminalBenchRLMBaseAgentMixin:
         )
         self.phase_log_path = Path(phase_log_path) if phase_log_path is not None else None
         self.task_id = task_id
+        predict_rlm_kwargs.setdefault("lm", "openai/gpt-5.5")
+        predict_rlm_kwargs.setdefault("sub_lm", "openai/gpt-5.4-mini")
         self.predict_rlm_kwargs = predict_rlm_kwargs
         self.codex_lm_debug = _coerce_bool(codex_lm_debug)
         self.codex_lm_debug_log = _coerce_optional_text(codex_lm_debug_log)
@@ -690,6 +692,8 @@ class HarborPredictRLMBaseAgent(_TerminalBenchRLMBaseAgentMixin, ABC):
         self.mcp_servers = mcp_servers or []
         self.skills_dir = skills_dir
         self.extra_env = extra_env or {}
+        if model_name is not None:
+            kwargs.setdefault("lm", model_name)
         super().__init__(*args, **kwargs)
 
     def version(self) -> str | None:

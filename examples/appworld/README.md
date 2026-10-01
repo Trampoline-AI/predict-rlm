@@ -16,17 +16,59 @@ while `predict-rlm` uses Pydantic v2:
 - `.venv/`: the normal `uv sync` environment for PredictRLM/RLM-GEPA.
 - `.appworld-venv/`: an isolated AppWorld runtime used only by the task runner.
 
-Run the setup script:
+Run commands below from `examples/appworld`, starting with the setup script:
 
 ```bash
 make setup
 # or: scripts/setup_appworld_data.sh
 ```
 
-The script runs `uv sync`, creates `.appworld-venv/`, installs AppWorld, unpacks
+The script runs `uv sync` (including the bundled `predict-rlm[codex-lm]` extra),
+creates `.appworld-venv/`, installs AppWorld, unpacks
 AppWorld's bundled runtime files, and downloads the dataset under `data/`. The
 AppWorld environment and dataset are intentionally gitignored, so a fresh clone
 must run setup before live AppWorld evals.
+
+Baseline evaluation and optimization use CodexLM by default, authenticated with
+your ChatGPT/Codex subscription rather than an OpenAI API key. Inspect the
+selected authentication without making a model request:
+
+```bash
+uv run codex-lm auth status
+```
+
+If you need a saved profile, import an existing Codex login and select it:
+
+```bash
+uv run codex-lm auth import personal
+uv run codex-lm auth use personal
+# Alternatively, with the Codex CLI installed:
+# uv run codex-lm auth login personal
+```
+
+No separate `dspy-codex-lm` checkout is needed. Missing bundled integration raises
+an error instead of falling back to paid API requests.
+
+## Run evaluation or optimization
+
+The default main/executor and proposer models are `openai/gpt-5.5`; the
+evaluation sub-LM, executor sub-LM, and proposer sub-LM are
+`openai/gpt-5.4-mini`. The `openai/` prefixes are retained for CLI interception;
+all these default roles use CodexLM.
+
+```bash
+uv run rlm-gepa eval --dataset validation --limit 1
+uv run rlm-gepa optimize --check
+uv run rlm-gepa optimize
+```
+
+Use `--no-codex-lm` to explicitly restore normal provider routing and supply the
+provider's credentials. Model overrides (`--lm` / `--sub-lm` for eval and
+`--executor-lm` / `--executor-sub-lm` / `--proposer-lm` /
+`--proposer-sub-lm` for optimization) remain available. Non-OpenAI providers are
+not intercepted; repeatable `--codex-lm-exclude MODEL_SUBSTRING` leaves matching
+models on normal provider routing. Those provider calls require their usual
+credentials and may incur API charges.
 
 ## Protected run artifacts
 

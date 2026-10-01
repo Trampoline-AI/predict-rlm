@@ -85,6 +85,7 @@ def test_agent_constructs_predict_rlm_with_direct_process_interpreter(monkeypatc
         lm="main",
         sub_lm="sub",
         no_rebuild=False,
+        codex_lm=False,
     )
     session = SimpleNamespace(container="container")
     result = agent.perform_task("solve it", session)
@@ -136,7 +137,7 @@ def test_agent_preserves_custom_signature_instructions(monkeypatch) -> None:
         "instruction -> answer",
         "Keep existing benchmark guidance.",
     )
-    agent = tbench_agent.TerminalBenchRLMBaseAgent(signature=base_signature)
+    agent = tbench_agent.TerminalBenchRLMBaseAgent(signature=base_signature, codex_lm=False)
 
     agent.perform_task("solve the custom task", SimpleNamespace(container="container"))
 
@@ -167,7 +168,7 @@ def test_agent_terminal_bench_submit_confirmation_mode_passes_callback(monkeypat
     monkeypatch.setattr(tbench_agent, "PredictRLM", FakePredictRLM)
 
     agent = tbench_agent.TerminalBenchRLMBaseAgent(
-        submit_confirmation_mode="terminal_bench"
+        submit_confirmation_mode="terminal_bench", codex_lm=False,
     )
     agent.perform_task(
         "Edit the config and verify the service starts.",
@@ -233,7 +234,6 @@ def test_agent_installs_codex_lm_before_constructing_predict_rlm(monkeypatch) ->
     agent = tbench_agent.TerminalBenchRLMBaseAgent(
         lm="main",
         sub_lm="sub",
-        codex_lm=True,
         codex_lm_exclude="openai/keep-direct,anthropic/",
         no_rebuild=False,
     )
@@ -250,7 +250,7 @@ def test_agent_installs_codex_lm_before_constructing_predict_rlm(monkeypatch) ->
     assert "no_rebuild" not in rlm_kwargs
 
 
-def test_agent_raises_clear_error_when_codex_lm_dependency_missing(monkeypatch) -> None:
+def test_agent_refuses_default_provider_fallback_when_codex_lm_missing(monkeypatch) -> None:
     class FakeInterpreter:
         def __init__(self, *_args, **_kwargs) -> None:
             pass
@@ -272,7 +272,7 @@ def test_agent_raises_clear_error_when_codex_lm_dependency_missing(monkeypatch) 
     monkeypatch.setattr(tbench_agent, "PredictRLM", FakePredictRLM)
     monkeypatch.setattr(tbench_agent.importlib, "import_module", fake_import_module)
 
-    agent = tbench_agent.TerminalBenchRLMBaseAgent(codex_lm=True)
+    agent = tbench_agent.TerminalBenchRLMBaseAgent()
 
     with pytest.raises(RuntimeError) as exc_info:
         agent.perform_task("solve it", SimpleNamespace(container="container"))
@@ -315,6 +315,7 @@ def test_agent_exports_canonical_runs_independent_of_logging_dir(
     monkeypatch.setattr(tbench_agent, "PredictRLM", build_rlm)
     agent = tbench_agent.TerminalBenchRLMBaseAgent(
         lm=MagicMock(history=[]), max_iterations=1, submit_confirmation_mode=False,
+        sub_lm=MagicMock(history=[]), codex_lm=False,
     )
     if fail:
         with pytest.raises(RuntimeError, match="task failed"):

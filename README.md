@@ -130,6 +130,22 @@ codex-lm usage
 | [Invoice Processing](examples/invoice_processing/) — Extract vendor info, line items, and totals from PDF invoices into a consolidated Excel spreadsheet | **Input:** PDF invoices<br>**Output:** Excel spreadsheet ([example output](examples/invoice_processing/sample/output/))          | <a href="examples/invoice_processing/sample/output/output.md"><img src="https://raw.githubusercontent.com/Trampoline-AI/predict-rlm/main/examples/invoice_processing/sample/output/screenshot.png" width="280"></a>              |
 | [Contract Comparison](examples/contract_comparison/) — Compare two contract versions and produce a structured diff report with per-section analysis      | **Input:** 2 PDF contracts<br>**Output:** Structured diff report ([example output](examples/contract_comparison/sample/output/)) | <a href="examples/contract_comparison/sample/output/comparison-report.md"><img src="https://raw.githubusercontent.com/Trampoline-AI/predict-rlm/main/examples/contract_comparison/sample/output/screenshot.png" width="280"></a> |
 
+The runnable examples use Codex LM by default: `gpt-5.5` for main/executor and
+GEPA proposer calls, and `gpt-5.4-mini` for sub-LM calls. They use a Codex auth
+profile rather than an OpenAI API key:
+
+```bash
+uv sync --extra examples --extra codex-lm
+# Import an existing Codex CLI login once:
+uv run codex-lm auth import default
+uv run codex-lm auth use default
+```
+
+Alternatively, sign in with `uv run codex-lm auth login default --device-auth`.
+The benchmark CLIs retain `--no-codex-lm` for explicitly configured API-provider
+runs. Historical sample results in the example READMEs retain the models
+used to produce them; they are not measurements of these new defaults.
+
 Every example saves each finished PredictRLM invocation under its own root:
 
 ```text
