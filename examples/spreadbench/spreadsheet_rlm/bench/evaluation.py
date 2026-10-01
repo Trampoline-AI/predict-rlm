@@ -30,6 +30,7 @@ from predict_rlm import File, PredictRLM, SbxConfig, SbxPool, Skill
 from predict_rlm.evidence import RunEvidence, extract_evidence_from_exc
 from rlm_gepa.runtime.lm_config import get_lm_config, get_sub_lm_config
 
+from ..agent.service import RUN_EXPORT_ROOT
 from ..agent.signature import ManipulateSpreadsheet
 from ..agent.skills import libreoffice_spreadsheet_skill
 from ..tools.recalculate import recalculate
@@ -652,6 +653,7 @@ async def _run_case(
                 max_iterations=config.max_iterations,
                 verbose=config.verbose_rlm or config.log_dir is not None,
                 debug=config.debug_rlm,
+                run_export_root=RUN_EXPORT_ROOT,
                 **_predict_rlm_sandbox_kwargs(config, sbx_pool),
             )
             result = await asyncio.wait_for(

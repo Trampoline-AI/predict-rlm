@@ -10,6 +10,8 @@ Usage::
     # prediction.answer — str with the analysis
 """
 
+from pathlib import Path
+
 import dspy
 
 from predict_rlm import File, PredictRLM
@@ -44,5 +46,6 @@ class ImageAnalyzer(dspy.Module):
             max_iterations=self.max_iterations,
             verbose=self.verbose,
             debug=self.debug,
+            run_export_root=Path(__file__).resolve().parent / ".run",
         )
         return await predictor.acall(images=images, query=query)

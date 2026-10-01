@@ -9,6 +9,7 @@ import json
 import logging
 import os
 import shlex
+import shutil
 import tarfile
 import tempfile
 import time
@@ -23,7 +24,6 @@ from typing import Any, Callable
 import dspy
 
 from predict_rlm.evidence import RunEvidence, extract_evidence_from_exc
-from predict_rlm.trace import extract_trace_from_exc
 from terminal_bench_rlm.skills import (
     TERMINAL_BENCH_SKILL_NAME,
     build_terminal_bench_skill,
@@ -36,6 +36,7 @@ PredictRLM: Any | None = None
 DirectPythonBackend: Any | None = None
 DAYTONA_REMOTE_ROOT = "/tmp/predict_rlm_controller"
 DAYTONA_REMOTE_HOME = "/tmp/predict_rlm_home"
+RUN_EXPORT_ROOT = Path(__file__).resolve().parents[2] / ".run"
 DAYTONA_REMOTE_RESULT_SENTINEL = "PREDICT_RLM_REMOTE_RESULT_JSON="
 logger = logging.getLogger(__name__)
 _SOURCE_BUNDLE_RELATIVE_PATHS = (
@@ -351,24 +352,31 @@ def _coerce_answer(result: Any) -> str:
     return str(result)
 
 
-def _write_trace(trace: Any, logging_dir: Path | None, *, path: Path | None = None) -> None:
-    if trace is None or logging_dir is None:
-        return
-    logging_dir.mkdir(parents=True, exist_ok=True)
-    trace_path = path or logging_dir / f"predict_rlm_trace_{uuid.uuid4().hex[:8]}.json"
-    if hasattr(trace, "to_exportable_json"):
-        trace_path.write_text(trace.to_exportable_json(), encoding="utf-8")
-    else:
-        trace_path.write_text(str(trace), encoding="utf-8")
-
-
-def _write_evidence(evidence: RunEvidence | None, logging_dir: Path | None) -> None:
+def _record_run_id(evidence: RunEvidence | None, logging_dir: Path | None) -> None:
+    """Associate harness logs with canonical exports without duplicating their payloads."""
     if evidence is None or logging_dir is None:
         return
     logging_dir.mkdir(parents=True, exist_ok=True)
-    evidence.to_exportable_json(
-        logging_dir / f"predict_rlm_evidence_{uuid.uuid4().hex[:8]}.json"
-    )
+    with (logging_dir / "predict_rlm_runs.jsonl").open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(evidence.run_id) + "\n")
+
+
+def _recover_run_exports(artifact_dir: Path) -> None:
+    """Copy transported run directories intact into this host's example root."""
+    sources = {
+        path.parent.name: path.parent
+        for path in artifact_dir.rglob(".run/*/evidence.json")
+        if (path.parent / "trace.json").is_file()
+    }
+    for source in sources.values():
+        evidence = RunEvidence.model_validate_json(
+            (source / "evidence.json").read_text(encoding="utf-8")
+        )
+        if evidence.run_id != source.name:
+            raise ValueError(f"Run directory does not match evidence run_id: {source}")
+        destination = RUN_EXPORT_ROOT / source.name
+        if source.resolve() != destination.resolve():
+            shutil.copytree(source, destination, dirs_exist_ok=True)
 
 
 def _write_phase_event(
@@ -612,6 +620,7 @@ class _TerminalBenchRLMBaseAgentMixin:
         interpreter = _interpreter_class()(**self.interpreter_kwargs)
         try:
             rlm_kwargs = dict(self.predict_rlm_kwargs)
+            rlm_kwargs["run_export_root"] = RUN_EXPORT_ROOT
             if "lm" in rlm_kwargs:
                 rlm_kwargs["lm"] = _build_lm(
                     rlm_kwargs["lm"],
@@ -648,13 +657,14 @@ class _TerminalBenchRLMBaseAgentMixin:
             result = rlm.acall()
             if inspect.isawaitable(result):
                 result = asyncio.run(result)
-            _write_trace(getattr(result, "trace", None), logging_dir)
-            _write_evidence(getattr(result, "evidence", None), logging_dir)
+            _record_run_id(getattr(result, "evidence", None), logging_dir)
             _coerce_answer(result)
             return _make_agent_result()
         except BaseException as exc:
-            _write_trace(extract_trace_from_exc(exc), logging_dir)
-            _write_evidence(extract_evidence_from_exc(exc), logging_dir)
+            try:
+                _record_run_id(extract_evidence_from_exc(exc), logging_dir)
+            except Exception as export_error:
+                exc.add_note(f"Could not record PredictRLM run id: {export_error}")
             raise
         finally:
             interpreter.shutdown()
@@ -1194,6 +1204,7 @@ class DaytonaRemotePredictRLMAgent(HarborPredictRLMBaseAgent):
         archive_local_path = self.logs_dir / "predict_rlm_logs.tar.gz"
         await _remote_download_file(environment, archive_remote_path, str(archive_local_path))
         _extract_tar_safely(archive_local_path, self.logs_dir)
+        _recover_run_exports(self.logs_dir)
 
     def _start_remote_log_stream(
         self,

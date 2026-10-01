@@ -10,7 +10,7 @@ from predict_rlm.evidence import RunEvidence, extract_evidence_from_exc
 from predict_rlm.trace import RunTrace, extract_trace_from_exc
 from rlm_gepa import EvaluationContext, RLMGepaExampleResult, RLMGepaProject
 
-from ..agent.service import AppWorldRLM
+from ..agent.service import RUN_EXPORT_ROOT, AppWorldRLM
 from ..agent.skills import get_appworld_skill
 from ..bench.dataset import AppWorldExample, load_dataset, split_train_validation
 from .config import APPWORLD_SPEC, AppWorldGepaConfig, default_config
@@ -56,6 +56,7 @@ class AppWorldGepaProject(RLMGepaProject):
     project_name = "appworld-rlm"
     components = (COMPONENT_SKILL,)
     agent_spec = APPWORLD_SPEC
+    run_export_root = RUN_EXPORT_ROOT
 
     def __init__(self, config: AppWorldGepaConfig):
         self.config = config

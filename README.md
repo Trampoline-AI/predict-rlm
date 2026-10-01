@@ -130,6 +130,20 @@ codex-lm usage
 | [Invoice Processing](examples/invoice_processing/) — Extract vendor info, line items, and totals from PDF invoices into a consolidated Excel spreadsheet | **Input:** PDF invoices<br>**Output:** Excel spreadsheet ([example output](examples/invoice_processing/sample/output/))          | <a href="examples/invoice_processing/sample/output/output.md"><img src="https://raw.githubusercontent.com/Trampoline-AI/predict-rlm/main/examples/invoice_processing/sample/output/screenshot.png" width="280"></a>              |
 | [Contract Comparison](examples/contract_comparison/) — Compare two contract versions and produce a structured diff report with per-section analysis      | **Input:** 2 PDF contracts<br>**Output:** Structured diff report ([example output](examples/contract_comparison/sample/output/)) | <a href="examples/contract_comparison/sample/output/comparison-report.md"><img src="https://raw.githubusercontent.com/Trampoline-AI/predict-rlm/main/examples/contract_comparison/sample/output/screenshot.png" width="280"></a> |
 
+Every example saves each finished PredictRLM invocation under its own root:
+
+```text
+examples/<example>/.run/<run_id>/
+  trace.json
+  evidence.json
+```
+
+These folders are ignored by Git. The directory name matches the evidence
+`run_id`; concurrent calls and GEPA task/proposer runs get separate directories.
+Failures and cancellation also export artifacts. If failure occurs before a
+trace exists, `trace.json` contains `null` and `evidence.json` records the failure.
+Generated documents and benchmark summary reports retain their existing locations.
+
 ## Quick start
 
 ### With your coding agent

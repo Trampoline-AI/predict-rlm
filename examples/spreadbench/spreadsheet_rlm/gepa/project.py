@@ -16,6 +16,7 @@ from predict_rlm.telemetry import TelemetryContext, make_trace_id
 from predict_rlm.trace import RunTrace, extract_trace_from_exc
 from rlm_gepa import EvaluationContext, RLMGepaExampleResult, RLMGepaProject
 
+from ..agent.service import RUN_EXPORT_ROOT
 from ..agent.signature import ManipulateSpreadsheet
 from ..agent.skills import libreoffice_spreadsheet_skill
 from ..bench.dataset import SpreadsheetTask, load_dataset
@@ -31,6 +32,7 @@ class SpreadsheetGepaProject(RLMGepaProject):
     project_name = "spreadsheet-rlm"
     components = (COMPONENT_SKILL,)
     agent_spec = SPREADSHEET_SPEC
+    run_export_root = RUN_EXPORT_ROOT
 
     def __init__(self, config: SpreadsheetGepaConfig):
         self.config = config
@@ -140,6 +142,7 @@ class SpreadsheetGepaProject(RLMGepaProject):
                 verbose=context.verbose_rlm,
                 debug=context.debug_rlm,
                 telemetry_context=telemetry_context,
+                run_export_root=self.run_export_root,
             )
             result = await asyncio.wait_for(
                 predictor.acall(

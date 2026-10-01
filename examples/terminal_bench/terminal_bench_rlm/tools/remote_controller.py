@@ -14,6 +14,7 @@ from predict_rlm.trace import extract_trace_from_exc
 
 from .tbench_agent import (
     DAYTONA_REMOTE_RESULT_SENTINEL,
+    RUN_EXPORT_ROOT,
     _build_lm,
     _build_submit_confirmation,
     _coerce_answer,
@@ -22,8 +23,6 @@ from .tbench_agent import (
     _predict_rlm_class,
     _signature_with_task_instruction,
     _with_terminal_bench_skill,
-    _write_evidence,
-    _write_trace,
 )
 
 
@@ -119,12 +118,17 @@ async def _run_predict_rlm_async(payload: dict[str, Any]) -> str:
     interpreter_kwargs = dict(payload.get("interpreter_kwargs") or {})
     interpreter = _local_process_interpreter_class()(**interpreter_kwargs)
     logging_dir = _logging_dir(payload)
-    trace_export_path = logging_dir / "predict_rlm_trace.json" if logging_dir else None
+    # A hard-stopped controller cannot finalize evidence; retain its latest live
+    # trace separately, and remove it once the canonical pair has been exported.
+    trace_export_path = logging_dir / "in_progress_trace.json" if logging_dir else None
+    run_export_root = logging_dir / ".run" if logging_dir else RUN_EXPORT_ROOT
+    evidence = None
     _write_run_status(logging_dir, "running")
     try:
         rlm_kwargs = dict(payload.get("predict_rlm_kwargs") or {})
+        rlm_kwargs["run_export_root"] = run_export_root
         if trace_export_path is not None:
-            rlm_kwargs.setdefault("trace_export_path", trace_export_path)
+            rlm_kwargs["trace_export_path"] = trace_export_path
         if "lm" in rlm_kwargs:
             rlm_kwargs["lm"] = _build_lm(
                 rlm_kwargs["lm"],
@@ -163,22 +167,32 @@ async def _run_predict_rlm_async(payload: dict[str, Any]) -> str:
         )
         rlm = _predict_rlm_class()(signature, **rlm_kwargs)
         result = await rlm.acall()
-        _write_trace(getattr(result, "trace", None), logging_dir, path=trace_export_path)
-        _write_evidence(getattr(result, "evidence", None), logging_dir)
+        evidence = getattr(result, "evidence", None)
         _write_run_status(logging_dir, "completed", has_trace=getattr(result, "trace", None) is not None)
         return _coerce_answer(result)
     except BaseException as exc:
-        _write_trace(extract_trace_from_exc(exc), logging_dir, path=trace_export_path)
-        _write_evidence(extract_evidence_from_exc(exc), logging_dir)
-        _write_run_status(
-            logging_dir,
-            "failed",
-            error_type=type(exc).__name__,
-            error=str(exc),
-            has_trace=getattr(exc, "trace", None) is not None,
-        )
+        evidence = extract_evidence_from_exc(exc)
+        try:
+            _write_run_status(
+                logging_dir,
+                "failed",
+                error_type=type(exc).__name__,
+                error=str(exc),
+                has_trace=extract_trace_from_exc(exc) is not None,
+            )
+        except Exception as status_error:
+            exc.add_note(f"Could not write controller status: {status_error}")
         raise
     finally:
+        if evidence is not None and trace_export_path is not None:
+            run_dir = run_export_root / evidence.run_id
+            if (run_dir / "trace.json").is_file() and (run_dir / "evidence.json").is_file():
+                try:
+                    trace_export_path.unlink(missing_ok=True)
+                except OSError:
+                    logging.getLogger(__name__).warning(
+                        "Could not remove finalized live trace %s", trace_export_path, exc_info=True,
+                    )
         _restore_verbose_rlm_log_stream(verbose_log_state)
         await asyncio.to_thread(interpreter.shutdown)
 

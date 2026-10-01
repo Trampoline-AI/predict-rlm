@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `PredictRLM(run_export_root=...)` saves `trace.json` and `evidence.json` under a
+  unique invocation run ID after success, failure, or cancellation. A run without
+  a captured trace writes JSON `null` to `trace.json`.
+- All examples, including notebook and benchmark/GEPA paths, use
+  `<example>/.run/<run_id>/` for these artifacts. Example `.run` directories are
+  ignored by Git; generated documents and aggregate reports keep their existing
+  locations.
+
 ### Breaking Changes
 
 - `RunTrace` and its proposer/exported forms no longer contain `evidence`.
@@ -24,6 +34,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   alongside traces to preserve completeness validation and lifecycle records.
   Consumers such as Avalanche and Delta must obtain evidence metadata from the
   separate result or exception object rather than `trace.evidence`.
+- Example artifact readers must use `.run/<run_id>/trace.json` and
+  `evidence.json`: invoice processing no longer writes `output/<timestamp>/run_trace.json`,
+  and Terminal-Bench no longer writes final `predict_rlm_trace*.json` or
+  `predict_rlm_evidence*.json` sidecars in harness logs.
 
 ## [0.8.1] - 2026-09-25
 

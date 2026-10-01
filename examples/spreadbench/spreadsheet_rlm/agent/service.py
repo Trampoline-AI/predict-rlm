@@ -1,9 +1,13 @@
+from pathlib import Path
+
 import dspy
 
 from predict_rlm import File, PredictRLM
 
 from .signature import ManipulateSpreadsheet
 from .skills import libreoffice_spreadsheet_skill
+
+RUN_EXPORT_ROOT = Path(__file__).resolve().parents[2] / ".run"
 
 
 class SpreadsheetRLM(dspy.Module):
@@ -30,6 +34,7 @@ class SpreadsheetRLM(dspy.Module):
             max_iterations=self.max_iterations,
             verbose=self.verbose,
             debug=self.debug,
+            run_export_root=RUN_EXPORT_ROOT,
         )
         result = await predictor.acall(
             input_spreadsheet=spreadsheet,

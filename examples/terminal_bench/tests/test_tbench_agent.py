@@ -5,10 +5,13 @@ import sys
 import types
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock
 
+import dspy
 import pytest
+from dspy.primitives.code_interpreter import FinalOutput
 
-from predict_rlm.evidence import RunEvidence, RunEvidenceEvent
+from predict_rlm import PredictRLM
 
 _EXAMPLE_DIR = Path(__file__).resolve().parent.parent
 if str(_EXAMPLE_DIR) not in sys.path:
@@ -280,63 +283,55 @@ def test_agent_raises_clear_error_when_codex_lm_dependency_missing(monkeypatch) 
 
 
 @pytest.mark.parametrize("fail", [False, True])
-def test_agent_exports_predict_rlm_artifacts_to_logging_dir(monkeypatch, tmp_path: Path, fail) -> None:
-    evidence = RunEvidence(
-        run_id="terminal_run",
-        complete=True,
-        terminal_outcome="error" if fail else "completed",
-        events=[
-            RunEvidenceEvent(
-                sequence=1,
-                kind="session.finalized",
-                timestamp_ns=10,
-                data={"image": "data:image/png;base64,QUJDREVGRw=="},
-            )
-        ],
-    )
-
-    class FakeTrace:
-        def to_exportable_json(self) -> str:
-            return '{"status":"completed","model":"main","sub_model":null,"iterations":0,"max_iterations":1,"duration_ms":1,"usage":{"main":{"prompt_tokens":0,"completion_tokens":0,"total_tokens":0,"cost_usd":0.0},"sub":{"prompt_tokens":0,"completion_tokens":0,"total_tokens":0,"cost_usd":0.0}},"telemetry_ref":null,"steps":[]}'
+def test_agent_exports_canonical_runs_independent_of_logging_dir(
+    monkeypatch, tmp_path: Path, fail: bool
+) -> None:
+    export_root = tmp_path / "example" / ".run"
+    logging_dir = tmp_path / "harness" / "agent"
+    caller_dir = tmp_path / "caller"
+    caller_dir.mkdir()
+    monkeypatch.chdir(caller_dir)
+    monkeypatch.setattr(tbench_agent, "RUN_EXPORT_ROOT", export_root)
 
     class FakeInterpreter:
-        def __init__(self, *_args, **_kwargs) -> None:
-            pass
+        def __init__(self, **_kwargs) -> None:
+            self.tools = {}
+
+        def execute(self, code, **_kwargs):
+            return FinalOutput({"answer": "done"}) if code.startswith("SUBMIT") else ""
 
         def shutdown(self) -> None:
             pass
 
-    class FakePredictRLM:
-        def __init__(self, *_args, **_kwargs) -> None:
-            pass
-
-        async def acall(self, **_kwargs):
-            if fail:
-                cause = RuntimeError("task failed")
-                cause.trace = FakeTrace()
-                cause.evidence = evidence
-                raise RuntimeError("runner wrapper") from cause
-            return SimpleNamespace(answer="done", trace=FakeTrace(), evidence=evidence)
+    def build_rlm(signature, **kwargs):
+        rlm = PredictRLM(signature, **kwargs)
+        rlm.generate_action.acall = AsyncMock(
+            side_effect=RuntimeError("task failed") if fail else None,
+            return_value=dspy.Prediction(reasoning="done", code="SUBMIT(answer='done')"),
+        )
+        return rlm
 
     monkeypatch.setattr(tbench_agent, "DirectPythonBackend", FakeInterpreter)
-    monkeypatch.setattr(tbench_agent, "PredictRLM", FakePredictRLM)
-
-    agent = tbench_agent.TerminalBenchRLMBaseAgent()
+    monkeypatch.setattr(tbench_agent, "PredictRLM", build_rlm)
+    agent = tbench_agent.TerminalBenchRLMBaseAgent(
+        lm=MagicMock(history=[]), max_iterations=1, submit_confirmation_mode=False,
+    )
     if fail:
-        with pytest.raises(RuntimeError, match="runner wrapper"):
-            agent.perform_task("solve it", SimpleNamespace(container="container"), logging_dir=tmp_path)
+        with pytest.raises(RuntimeError, match="task failed"):
+            agent.perform_task("solve it", logging_dir=logging_dir)
     else:
-        agent.perform_task("solve it", SimpleNamespace(container="container"), logging_dir=tmp_path)
+        agent.perform_task("solve it", logging_dir=logging_dir)
 
-    trace_files = list(tmp_path.glob("predict_rlm_trace*.json"))
-    assert len(trace_files) == 1
-    assert '\"status\":\"completed\"' in trace_files[0].read_text()
-    evidence_path = next(tmp_path.glob("predict_rlm_evidence_*.json"))
-    evidence_payload = json.loads(evidence_path.read_text())
-    assert evidence_payload["terminal_outcome"] == ("error" if fail else "completed")
-    assert evidence_payload["events"][0]["data"] == {
-        "image": "data:image/png;base64,<IMAGE_BASE_64_ENCODED(12)>"
-    }
+    run_id = json.loads((logging_dir / "predict_rlm_runs.jsonl").read_text())
+    run_dir = export_root / run_id
+    evidence = json.loads((run_dir / "evidence.json").read_text())
+    assert evidence["run_id"] == run_id
+    assert evidence["terminal_outcome"] == ("error" if fail else "completed")
+    assert json.loads((run_dir / "trace.json").read_text())["status"] == (
+        "error" if fail else "completed"
+    )
+    assert sorted(path.name for path in logging_dir.iterdir()) == ["predict_rlm_runs.jsonl"]
+    assert not (caller_dir / ".run").exists()
 
 
 def test_agent_rejects_terminal_wrapper_tools() -> None:

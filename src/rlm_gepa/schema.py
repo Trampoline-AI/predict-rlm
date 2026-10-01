@@ -252,6 +252,7 @@ class RLMGepaProject(ABC):
     project_name: str
     components: tuple[str, ...]
     agent_spec: AgentSpec
+    run_export_root: Path | None = None
 
     @abstractmethod
     def seed_candidate(self) -> dict[str, str]: ...

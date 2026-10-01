@@ -45,6 +45,13 @@ uv run examples/document_redaction/run.py --debug
 Outputs (redacted PDFs + report) are saved to `output/{timestamp}/` inside this
 directory.
 
+Every CLI, service, or notebook invocation automatically saves `trace.json`
+and `evidence.json` to `.run/<run_id>/` inside this example directory, including
+failed or cancelled runs. `<run_id>` is the evidence run ID; `trace.json` is
+JSON `null` when no trace is available. `.run/` is ignored by Git by default.
+Run the notebook with this example directory as its working directory, as
+required by its sample input paths.
+
 ## How it works
 
 The RLM is an **autonomous executor that modifies files**. It inspects pages,

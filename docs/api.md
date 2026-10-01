@@ -26,6 +26,7 @@ rlm = PredictRLM(
     allowed_domains=None,     # Domains the sandbox can access
     debug=False,              # Print timestamped lifecycle diagnostics
     output_dir=None,          # Collection root for generated File outputs
+    run_export_root=None,     # Root for per-invocation trace.json/evidence.json
 )
 ```
 
@@ -50,6 +51,7 @@ rlm = PredictRLM(
 | `allowed_domains`  | `list[str] \| None`                              | `None`   | Domains/IPs the sandbox can access via network. By default, no network access. Example: `["api.example.com", "192.168.1.100:8080"]`                                                                               |
 | `debug`            | `bool`                                           | `False`  | Print timestamped RLM and sandbox lifecycle diagnostics to stderr. Error-like debug records are colored red when the terminal supports ANSI colors.                                                               |
 | `output_dir`       | `str \| Path \| None`                            | `None`   | Constructor convenience that collects generated `File` and `list[File]` outputs under `<output_dir>/<field>/`. It does not redirect scalar/JSON outputs, logs, or traces. `FileOutputAdapter` is the lower-level configurable equivalent. |
+| `run_export_root`  | `str \| Path \| None`                            | `None`   | Save completed invocation artifacts under `<root>/<run_id>/trace.json` and `evidence.json`. Disabled by default; repository examples configure their own `.run/` directory. |
 
 Adapter names must be unique within each role; an input and output adapter may
 share a name. A configured adapter with the same name as a built-in
@@ -461,6 +463,24 @@ including cancellation and input-preparation failures. `exception.trace` exists
 only when the runtime captured a trajectory. See
 [Runtime observability](observability.md#completed-artifacts-and-migration)
 for error handling and migration from `trace.evidence`.
+
+To save both artifacts automatically, configure `run_export_root`:
+
+```python
+rlm = PredictRLM("question -> answer", run_export_root=".run")
+result = await rlm.acall(question="What is 2 + 2?")
+# .run/<result.evidence.run_id>/trace.json
+# .run/<result.evidence.run_id>/evidence.json
+```
+
+The root is resolved at construction. Each invocation uses a fresh evidence run
+ID, so concurrent calls do not overwrite one another. Files are written after
+cleanup and terminal evidence recording on success, failure, or cancellation;
+they are not live snapshots. A failure before trace creation writes JSON `null`
+to `trace.json`. Both exports use the same image sanitization as manual exports.
+An export failure raises its filesystem/serialization error with the completed
+artifacts attached. If the invocation already failed, its original exception is
+preserved with an explanatory note and a `run_export_error` attribute.
 
 #### `LMUsage`
 

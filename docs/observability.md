@@ -23,6 +23,13 @@ status. It has no `evidence` field, including in its proposer projection.
 `RunEvidence` contains `run_id`, `complete`, `terminal_outcome`, and ordered
 `events`. It is returned even when no external sink is configured.
 
+Set `PredictRLM(..., run_export_root=path)` to save both automatically as
+`<path>/<run_id>/trace.json` and `evidence.json` after each invocation finishes.
+Repository examples use their own Git-ignored `.run/` directory, including
+notebook, benchmark, and GEPA proposer runs. Failure and cancellation export the
+same pair; `trace.json` is JSON `null` when no trajectory exists yet. Abrupt
+process termination cannot run this final export.
+
 Replace `result.trace.evidence` with `result.evidence`, and `exc.trace.evidence`
 with `exc.evidence`. The evidence model types now live in `predict_rlm.evidence`
 and are also exported from `predict_rlm`.

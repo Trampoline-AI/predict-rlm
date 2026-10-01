@@ -107,6 +107,15 @@ For RLM observability during evals, add:
 - `--debug-rlm` to print timestamped RLM and sandbox lifecycle diagnostics to
   stderr.
 
+Every PredictRLM invocation writes `trace.json` and `evidence.json` under
+`examples/spreadbench/.run/<evidence.run_id>/`, resolved from the source
+location, independently of the working directory or `--run-dir`. This covers
+direct spreadsheet service calls, each baseline/optimized evaluation case,
+optimization rollouts, instruction proposers, and patch-merge proposers,
+including failures and cancellation. `trace.json` is JSON `null` when no trace
+was captured. Existing scored JSONL reports, cost logs, and optimizer artifacts
+remain in their report directories.
+
 ## Re-run other release evals
 
 Use the same candidate and swap executor settings:
