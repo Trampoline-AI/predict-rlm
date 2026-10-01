@@ -68,27 +68,31 @@ def _add_project_args(parser: argparse.ArgumentParser) -> None:
         dest="codex_lm",
         action="store_true",
         default=None,
-        help="force routing OpenAI-family dspy.LM constructions through dspy-codex-lm",
+        help="route OpenAI-family dspy.LM constructions through bundled CodexLM (default)",
     )
     codex_group.add_argument(
         "--no-codex-lm",
         dest="codex_lm",
         action="store_false",
         default=None,
-        help="disable automatic dspy-codex-lm routing",
+        help="disable bundled CodexLM routing and use direct provider access",
     )
     parser.add_argument(
         "--codex-lm-exclude",
         action="append",
-        default=[],
-        help="model substring to leave unpatched when --codex-lm is enabled; repeatable",
+        default=None,
+        help="model substring to leave unpatched by CodexLM; repeatable",
     )
 
 
 def _apply_project_args(config: OptimizeConfig, args: Any) -> TerminalBenchGepaConfig:
-    codex_lm_enabled = _install_codex_lm(args)
     if not isinstance(config, TerminalBenchGepaConfig):
         config = TerminalBenchGepaConfig(**config.to_dict())
+    if args.codex_lm is None:
+        args.codex_lm = config.codex_lm
+    if args.codex_lm_exclude is None:
+        args.codex_lm_exclude = config.codex_lm_exclude
+    codex_lm_enabled = _install_codex_lm(args)
     if args.dataset_name is not None:
         config.dataset_name = args.dataset_name
     if args.dataset_version is not None:
@@ -141,18 +145,18 @@ def _apply_project_args(config: OptimizeConfig, args: Any) -> TerminalBenchGepaC
 
 
 def _install_codex_lm(args: Any) -> bool:
-    codex_available = importlib.util.find_spec("dspy_codex_lm") is not None
-    if args.codex_lm is False or (args.codex_lm is None and not codex_available):
+    if args.codex_lm is False:
         return False
-    if not codex_available:
+    if importlib.util.find_spec("dspy_codex_lm") is None:
         raise RuntimeError(
-            "--codex-lm requires predict-rlm[codex-lm] in the uv run environment. "
+            "Default CodexLM routing requires predict-rlm[codex-lm]. "
             "Use: uv sync --project examples/terminal_bench, then "
-            "uv run --project examples/terminal_bench rlm-gepa optimize --codex-lm ..."
+            "uv run --project examples/terminal_bench rlm-gepa optimize ... "
+            "Use --no-codex-lm to explicitly select direct provider access."
         )
 
     from dspy_codex_lm.cli import install_monkeypatch
 
-    install_monkeypatch(exclude=args.codex_lm_exclude)
+    install_monkeypatch(exclude=args.codex_lm_exclude or ())
     os.environ.setdefault("OPENAI_API_KEY", "codex-lm")
     return True

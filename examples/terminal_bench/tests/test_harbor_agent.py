@@ -26,6 +26,13 @@ if str(_EXAMPLE_DIR) not in sys.path:
 from terminal_bench_rlm.tools import remote_controller, tbench_agent  # noqa: E402
 
 
+@pytest.fixture(autouse=True)
+def isolated_codex_home(monkeypatch, tmp_path: Path) -> None:
+    home = tmp_path / "isolated_home"
+    (home / ".codex-lm").mkdir(parents=True)
+    monkeypatch.setenv("HOME", str(home))
+
+
 def _bootstrap_command_args(command: str) -> list[str]:
     return shlex.split(shlex.split(command)[-1])
 
@@ -481,27 +488,21 @@ def test_daytona_remote_agent_log_stream_shutdown_failure_does_not_block_answer(
     assert context.answer == "controller finished"
 
 
-def test_daytona_remote_agent_bootstrap_invokes_packaged_script(tmp_path: Path) -> None:
+def test_daytona_remote_agent_opt_out_needs_no_codex_auth(monkeypatch, tmp_path: Path) -> None:
     env = FakeDaytonaRemoteEnvironment(answer="remote done")
-    agent = tbench_agent.DaytonaRemotePredictRLMAgent(logs_dir=tmp_path)
+    monkeypatch.setenv("HOME", str(tmp_path / "no_credentials"))
+    agent = tbench_agent.DaytonaRemotePredictRLMAgent(logs_dir=tmp_path, codex_lm=False)
 
     asyncio.run(agent.setup(env))
+    context = SimpleNamespace()
+    asyncio.run(agent.run("solve remotely", env, context))
 
     setup_command = next(command for command in env.commands if "bootstrap_controller.sh" in command)
     bootstrap_args = _bootstrap_command_args(setup_command)
-    assert bootstrap_args == [
-        "sh",
-        "/tmp/predict_rlm_controller/repo/src/predict_rlm/remote/bootstrap_controller.sh",
-        "--root",
-        "/tmp/predict_rlm_controller",
-        "--repo",
-        "/tmp/predict_rlm_controller/repo",
-        "--python",
-        "3.12",
-    ]
-    assert "apt-get install -y python3 python3-pip python3-venv" not in setup_command
-    assert "apk add --no-cache python3 py3-pip" not in setup_command
-    assert "python3 -m venv /tmp/predict_rlm_controller/uv-bootstrap" not in setup_command
+    assert "--extra" not in bootstrap_args
+    assert env.upload_dirs == []
+    assert env.payloads[-1]["codex_lm"] is False
+    assert context.answer == "remote done"
 
 
 def test_daytona_remote_agent_codex_lm_uploads_opaque_auth_dir(
@@ -517,7 +518,6 @@ def test_daytona_remote_agent_codex_lm_uploads_opaque_auth_dir(
     context = SimpleNamespace()
     agent = tbench_agent.DaytonaRemotePredictRLMAgent(
         logs_dir=tmp_path,
-        codex_lm=True,
     )
 
     asyncio.run(agent.setup(env))
@@ -527,6 +527,7 @@ def test_daytona_remote_agent_codex_lm_uploads_opaque_auth_dir(
     bootstrap_args = _bootstrap_command_args(setup_command)
     assert bootstrap_args[bootstrap_args.index("--extra") + 1] == "[codex-lm]"
     assert context.answer == "codex answer"
+    assert env.payloads[-1]["codex_lm"] is True
     assert env.upload_dirs == [
         (str(credentials_dir), "/tmp/predict_rlm_home/.codex-lm"),
     ]

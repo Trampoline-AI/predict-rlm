@@ -36,9 +36,9 @@ class AppWorldGepaConfig(OptimizeConfig):
 
 def default_config() -> AppWorldGepaConfig:
     return AppWorldGepaConfig(
-        executor_lm="openai/gpt-5.4-mini",
+        executor_lm="openai/gpt-5.5",
         executor_sub_lm="openai/gpt-5.4-mini",
-        proposer_lm="anthropic/claude-sonnet-4-6",
+        proposer_lm="openai/gpt-5.5",
         proposer_sub_lm="openai/gpt-5.4-mini",
         seed=13,
         minibatch_size=5,

@@ -2,15 +2,18 @@
 
 Usage::
 
+    import dspy
+    from dspy_codex_lm import CodexLM
     from predict_rlm import File
 
     documents = [File(path="report.pdf"), File(path="appendix.pdf")]
-    analyzer = DocumentAnalyzer(sub_lm="openai/gpt-5.1")
-    result = await analyzer.aforward(
-        documents=documents,
-        criteria="Extract key dates, entities, and a summary.",
-    )
-    print(result.report)
+    analyzer = DocumentAnalyzer(sub_lm=CodexLM("gpt-5.4-mini"))
+    with dspy.context(lm=CodexLM("gpt-5.5")):
+        prediction = await analyzer.aforward(
+            documents=documents,
+            criteria="Extract key dates, entities, and a summary.",
+        )
+    print(prediction.result.report)
 """
 
 from pathlib import Path

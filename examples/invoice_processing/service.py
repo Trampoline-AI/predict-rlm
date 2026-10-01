@@ -2,11 +2,14 @@
 
 Usage::
 
+    import dspy
+    from dspy_codex_lm import CodexLM
     from predict_rlm import File
 
     invoices = [File(path="invoice1.pdf"), File(path="invoice2.pdf")]
-    processor = InvoiceProcessor(sub_lm="openai/gpt-5.1")
-    prediction = await processor.aforward(invoices=invoices)
+    processor = InvoiceProcessor(sub_lm=CodexLM("gpt-5.4-mini"))
+    with dspy.context(lm=CodexLM("gpt-5.5")):
+        prediction = await processor.aforward(invoices=invoices)
     # prediction.result — InvoiceExtractionResult with structured invoice data
     # prediction.workbook — File with the Excel workbook
 """

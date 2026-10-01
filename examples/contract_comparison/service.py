@@ -2,11 +2,14 @@
 
 Usage::
 
+    import dspy
+    from dspy_codex_lm import CodexLM
     from predict_rlm import File
 
     contracts = [File(path="contract-v1.pdf"), File(path="contract-v2.pdf")]
-    comparator = ContractComparator(sub_lm="openai/gpt-5.1")
-    result = await comparator.aforward(contracts=contracts)
+    comparator = ContractComparator(sub_lm=CodexLM("gpt-5.4-mini"))
+    with dspy.context(lm=CodexLM("gpt-5.5")):
+        result = await comparator.aforward(contracts=contracts)
     # result — ComparisonResult with report, section diffs, and key differences
 """
 

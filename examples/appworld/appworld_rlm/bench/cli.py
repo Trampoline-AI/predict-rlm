@@ -6,7 +6,13 @@ import json
 import os
 from pathlib import Path
 
-from .config import DEFAULT_CONCURRENCY, DEFAULT_TASK_TIMEOUT, EvalConfig
+from .config import (
+    DEFAULT_CONCURRENCY,
+    DEFAULT_EVAL_LM,
+    DEFAULT_EVAL_SUB_LM,
+    DEFAULT_TASK_TIMEOUT,
+    EvalConfig,
+)
 from .evaluation import run_evaluation_sync
 
 
@@ -19,8 +25,8 @@ def add_eval_subcommand(subparsers: argparse._SubParsersAction) -> None:
     parser.add_argument("--cand-idx", type=int)
     parser.add_argument("--limit", type=int)
     parser.add_argument("--task-id", dest="task_ids", action="append")
-    parser.add_argument("--lm", default="openai/gpt-5.4")
-    parser.add_argument("--sub-lm", default="openai/gpt-5.4-mini")
+    parser.add_argument("--lm", default=DEFAULT_EVAL_LM)
+    parser.add_argument("--sub-lm", default=DEFAULT_EVAL_SUB_LM)
     parser.add_argument("--reasoning-effort", default="low")
     parser.add_argument("--concurrency", type=int, default=DEFAULT_CONCURRENCY)
     parser.add_argument("--max-iterations", type=int, default=50)
@@ -88,34 +94,31 @@ def add_codex_lm_args(parser: argparse.ArgumentParser) -> None:
         "--codex-lm",
         dest="codex_lm",
         action="store_true",
-        default=None,
-        help="force routing OpenAI-family dspy.LM constructions through dspy-codex-lm",
+        default=True,
+        help="route OpenAI-family dspy.LM constructions through bundled CodexLM (default)",
     )
     codex_group.add_argument(
         "--no-codex-lm",
         dest="codex_lm",
         action="store_false",
-        default=None,
-        help="disable automatic dspy-codex-lm routing",
+        help="use normal provider routing instead of CodexLM; requires provider credentials",
     )
     parser.add_argument(
         "--codex-lm-exclude",
         action="append",
         default=[],
-        help="model substring to leave unpatched when --codex-lm is enabled; repeatable",
+        help="model substring to leave on normal provider routing; repeatable",
     )
 
 
 def install_codex_lm(args: argparse.Namespace) -> None:
-    codex_available = importlib.util.find_spec("dspy_codex_lm") is not None
-    if args.codex_lm is False or (args.codex_lm is None and not codex_available):
+    if args.codex_lm is False:
         return
-    if not codex_available:
+    if importlib.util.find_spec("dspy_codex_lm") is None:
         raise RuntimeError(
-            "--codex-lm requires dspy-codex-lm in the uv run environment. "
-            "Use: uv run --project examples/appworld "
-            "--with-editable /Users/gabriel/Workspace/dspy-codex-lm "
-            "rlm-gepa ..."
+            "CodexLM routing requires the bundled predict-rlm[codex-lm] extra. "
+            "Install this example's dependencies with: uv sync --project examples/appworld. "
+            "Use --no-codex-lm only to explicitly select normal provider routing."
         )
 
     from dspy_codex_lm.cli import install_monkeypatch

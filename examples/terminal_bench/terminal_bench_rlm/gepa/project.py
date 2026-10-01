@@ -1014,6 +1014,7 @@ def _agent_kwargs(
         "task_id": request.task_id,
         "phase_log_path": _phase_log_path_text(request, output_dir=output_dir),
         "submit_confirmation_mode": "terminal_bench",
+        "codex_lm": "true" if config.codex_lm else "false",
     }
     lm_reasoning_effort = _reasoning_effort(request.lm)
     if lm_reasoning_effort is not None:
@@ -1030,7 +1031,6 @@ def _agent_kwargs(
     if request.verbose_rlm:
         kwargs["verbose"] = "true"
     if config.codex_lm:
-        kwargs["codex_lm"] = "true"
         if os.environ.get("CODEX_LM_DEBUG"):
             kwargs["codex_lm_debug"] = os.environ["CODEX_LM_DEBUG"]
         if os.environ.get("CODEX_LM_DEBUG_LOG"):

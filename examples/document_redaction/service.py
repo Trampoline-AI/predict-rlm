@@ -2,14 +2,17 @@
 
 Usage::
 
+    import dspy
+    from dspy_codex_lm import CodexLM
     from predict_rlm import File
 
     documents = [File(path="contract.pdf"), File(path="appendix.pdf")]
-    redactor = DocumentRedactor(sub_lm="anthropic/claude-sonnet-4-5-20250929")
-    prediction = await redactor.aforward(
-        documents=documents,
-        criteria="Redact all personal names, phone numbers, and email addresses.",
-    )
+    redactor = DocumentRedactor(sub_lm=CodexLM("gpt-5.4-mini"))
+    with dspy.context(lm=CodexLM("gpt-5.5")):
+        prediction = await redactor.aforward(
+            documents=documents,
+            criteria="Redact all personal names, phone numbers, and email addresses.",
+        )
     # prediction.result — RedactionResult with counts and targets
     # prediction.redacted_documents — list[File] with redacted PDFs
 """

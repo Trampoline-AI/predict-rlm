@@ -20,6 +20,10 @@ DEFAULT_VAL_TASK_IDS = ("super-benchmark-upet",)
 class TerminalBenchGepaConfig(OptimizeConfig):
     """Configuration for optimizing the Terminal-Bench PredictRLM agent."""
 
+    executor_lm: str = "openai/gpt-5.5"
+    executor_sub_lm: str = "openai/gpt-5.4-mini"
+    proposer_lm: str = "openai/gpt-5.5"
+    proposer_sub_lm: str = "openai/gpt-5.4-mini"
     dataset_name: str = "terminal-bench-core"
     dataset_version: str = "0.1.1"
     harbor_dataset: str = "terminal-bench/terminal-bench-2-1"
@@ -47,7 +51,7 @@ class TerminalBenchGepaConfig(OptimizeConfig):
     cleanup: bool = True
     no_rebuild: bool = False
     upload_results: bool = False
-    codex_lm: bool = False
+    codex_lm: bool = True
     codex_lm_exclude: tuple[str, ...] = ()
 
     def to_dict(self) -> dict[str, Any]:
@@ -72,10 +76,6 @@ class TerminalBenchGepaConfig(OptimizeConfig):
 
 def default_config() -> TerminalBenchGepaConfig:
     return TerminalBenchGepaConfig(
-        executor_lm="openai/gpt-5.4-mini",
-        executor_sub_lm="openai/gpt-5.4-mini",
-        proposer_lm="anthropic/claude-sonnet-4-6",
-        proposer_sub_lm="openai/gpt-5.4-mini",
         max_metric_calls=2,
         minibatch_size=1,
         concurrency=1,
