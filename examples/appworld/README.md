@@ -30,10 +30,18 @@ must run setup before live AppWorld evals.
 
 ## Protected run artifacts
 
-Raw run artifacts live under `runs/` and are intentionally gitignored. They
-include task traces, proposer traces, candidate policies, evaluator outputs,
-configs, and cost logs. Treat the complete contents as protected
-benchmark-derived data.
+Every PredictRLM invocation writes `trace.json` and `evidence.json` under
+`examples/appworld/.run/<evidence.run_id>/`, resolved from the source location
+rather than the working directory. This includes direct service calls, baseline
+evaluation, optimization rollouts, instruction proposers, and patch-merge
+proposers, including failed or cancelled runs. `trace.json` is JSON `null` when
+no behavioral trace was captured; lifecycle evidence is still exported.
+
+Aggregate reports and optimizer artifacts remain under `runs/` and are
+intentionally gitignored. They include scored task/proposer reports, candidate
+policies, evaluator outputs, configs, and cost logs. Both `.run/` and `runs/`
+contain protected benchmark-derived data; the archive commands below cover
+`runs/`, not `.run/`.
 
 The encrypted hosted archive is published at:
 

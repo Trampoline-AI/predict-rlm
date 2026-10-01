@@ -10,6 +10,8 @@ Usage::
     # result — ComparisonResult with report, section diffs, and key differences
 """
 
+from pathlib import Path
+
 import dspy
 
 from predict_rlm import File, PredictRLM
@@ -42,6 +44,7 @@ class ContractComparator(dspy.Module):
             max_iterations=self.max_iterations,
             verbose=self.verbose,
             debug=self.debug,
+            run_export_root=Path(__file__).resolve().parent / ".run",
         )
         prediction = await predictor.acall(contracts=contracts)
         return prediction.result

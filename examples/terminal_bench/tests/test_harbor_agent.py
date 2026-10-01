@@ -9,8 +9,15 @@ import sys
 import tarfile
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock
 
+import dspy
 import pytest
+from dspy.primitives.code_interpreter import FinalOutput
+
+from predict_rlm import PredictRLM
+from predict_rlm.evidence import RunEvidence
+from predict_rlm.trace import RunTrace
 
 _EXAMPLE_DIR = Path(__file__).resolve().parent.parent
 if str(_EXAMPLE_DIR) not in sys.path:
@@ -70,65 +77,73 @@ class FakeDaytonaRemoteEnvironment:
             pass
 
 
-def _write_remote_trace_archive(env: FakeDaytonaRemoteEnvironment, tmp_path: Path) -> None:
+def _write_remote_run_archive(
+    env: FakeDaytonaRemoteEnvironment, tmp_path: Path, outcome: str
+) -> Path:
+    run_dir = tmp_path / "source" / ".run" / "remote_run"
+    run_dir.mkdir(parents=True)
+    RunEvidence(
+        run_id=run_dir.name, complete=True, terminal_outcome=outcome,
+    ).to_exportable_json(run_dir / "evidence.json")
+    if outcome == "completed":
+        RunTrace(
+            status="completed", model="main", sub_model=None,
+            iterations=1, max_iterations=1, duration_ms=1,
+        ).to_exportable_json(run_dir / "trace.json")
+    else:
+        (run_dir / "trace.json").write_text("null")
+
     def download_file(remote_path: str, host_path: str) -> None:
         env.downloads.append((remote_path, host_path))
-
         with tarfile.open(host_path, "w:gz") as archive:
-            trace_path = tmp_path / "predict_rlm_trace_remote.json"
-            trace_path.write_text('{"status":"completed","cost_usd":1.23}')
-            archive.add(trace_path, arcname="predict_rlm_trace_remote.json")
+            archive.add(run_dir, arcname=f".run/{run_dir.name}")
 
     env.download_file = download_file
+    return run_dir
 
 
-def test_daytona_remote_agent_downloads_remote_predict_rlm_traces(tmp_path: Path) -> None:
-    env = FakeDaytonaRemoteEnvironment(answer="remote done")
-    _write_remote_trace_archive(env, tmp_path)
-    context = SimpleNamespace()
-    agent = tbench_agent.DaytonaRemotePredictRLMAgent(logs_dir=tmp_path)
-
-    asyncio.run(agent.run("solve remotely", env, context))
-
-    assert context.answer == "remote done"
-    assert env.downloads == [
-        ("/tmp/predict_rlm_controller/logs.tar.gz", str(tmp_path / "predict_rlm_logs.tar.gz"))
-    ]
-    assert (tmp_path / "predict_rlm_trace_remote.json").read_text() == (
-        '{"status":"completed","cost_usd":1.23}'
-    )
-
-
-def test_daytona_remote_agent_downloads_remote_predict_rlm_traces_on_cancellation(
-    tmp_path: Path,
+@pytest.mark.parametrize("outcome", ["completed", "error", "cancelled"])
+def test_daytona_remote_agent_recovers_canonical_run_pairs(
+    monkeypatch, tmp_path: Path, outcome: str,
 ) -> None:
     env = FakeDaytonaRemoteEnvironment(answer="remote done")
-    _write_remote_trace_archive(env, tmp_path)
-
+    source = _write_remote_run_archive(env, tmp_path, outcome)
+    export_root = tmp_path / "host_example" / ".run"
+    monkeypatch.setattr(tbench_agent, "RUN_EXPORT_ROOT", export_root)
     original_exec = env.exec
 
-    def exec_cancel_controller(*, command: str, timeout_sec: int | None = None):
+    def exec_controller(*, command: str, timeout_sec: int | None = None):
         if "terminal_bench_rlm.tools.remote_controller" in command:
-            raise asyncio.CancelledError
+            if outcome == "cancelled":
+                raise asyncio.CancelledError
+            if outcome == "error":
+                payload = {"ok": False, "error_type": "RuntimeError", "error": "task failed"}
+                return SimpleNamespace(
+                    returncode=1,
+                    stdout=tbench_agent.DAYTONA_REMOTE_RESULT_SENTINEL + json.dumps(payload),
+                )
         return original_exec(command=command, timeout_sec=timeout_sec)
 
-    env.exec = exec_cancel_controller
+    env.exec = exec_controller
     context = SimpleNamespace()
-    agent = tbench_agent.DaytonaRemotePredictRLMAgent(logs_dir=tmp_path)
-
-    try:
+    logs_dir = tmp_path / "harness_logs"
+    logs_dir.mkdir()
+    agent = tbench_agent.DaytonaRemotePredictRLMAgent(logs_dir=logs_dir)
+    if outcome == "completed":
         asyncio.run(agent.run("solve remotely", env, context))
-    except asyncio.CancelledError:
-        pass
+        assert context.answer == "remote done"
     else:
-        raise AssertionError("expected cancellation")
+        error_type = asyncio.CancelledError if outcome == "cancelled" else RuntimeError
+        with pytest.raises(error_type):
+            asyncio.run(agent.run("solve remotely", env, context))
 
+    for filename in ("trace.json", "evidence.json"):
+        assert (export_root / "remote_run" / filename).read_bytes() == (
+            source / filename
+        ).read_bytes()
     assert env.downloads == [
-        ("/tmp/predict_rlm_controller/logs.tar.gz", str(tmp_path / "predict_rlm_logs.tar.gz"))
+        ("/tmp/predict_rlm_controller/logs.tar.gz", str(logs_dir / "predict_rlm_logs.tar.gz"))
     ]
-    assert (tmp_path / "predict_rlm_trace_remote.json").read_text() == (
-        '{"status":"completed","cost_usd":1.23}'
-    )
 
 
 def test_daytona_remote_agent_payload_is_non_secret_and_uses_remote_home(tmp_path: Path) -> None:
@@ -293,35 +308,49 @@ def test_remote_controller_verbose_streams_rlm_iteration_logs(monkeypatch, tmp_p
     assert "RLM turn 1/2" in log_path.read_text()
 
 
-def test_remote_controller_wires_live_trace_export_path(monkeypatch, tmp_path: Path) -> None:
-    captured: dict[str, object] = {}
-
+@pytest.mark.parametrize("fail", [False, True])
+def test_remote_controller_finalizes_pair_and_removes_live_snapshot(
+    monkeypatch, tmp_path: Path, fail: bool,
+) -> None:
     class FakeInterpreter:
+        def __init__(self, **_kwargs) -> None:
+            self.tools = {}
+
+        def execute(self, code, **_kwargs):
+            return FinalOutput({"answer": "done"}) if code.startswith("SUBMIT") else ""
+
         def shutdown(self) -> None:
             pass
 
-    class FakePredictRLM:
-        def __init__(self, _signature, **kwargs) -> None:
-            captured["rlm_kwargs"] = kwargs
-
-        async def acall(self):
-            return SimpleNamespace(answer="done", trace=None)
+    def build_rlm(signature, **kwargs):
+        rlm = PredictRLM(signature, lm=MagicMock(history=[]), **kwargs)
+        rlm.generate_action.acall = AsyncMock(
+            side_effect=RuntimeError("task failed") if fail else None,
+            return_value=dspy.Prediction(reasoning="done", code="SUBMIT(answer='done')"),
+        )
+        return rlm
 
     monkeypatch.setattr(remote_controller, "_local_process_interpreter_class", lambda: FakeInterpreter)
-    monkeypatch.setattr(remote_controller, "_predict_rlm_class", lambda: FakePredictRLM)
+    monkeypatch.setattr(remote_controller, "_predict_rlm_class", lambda: build_rlm)
+    payload = {
+        "instruction": "solve",
+        "logging_dir": str(tmp_path),
+        "predict_rlm_kwargs": {"max_iterations": 1},
+    }
+    if fail:
+        with pytest.raises(RuntimeError, match="task failed"):
+            remote_controller._run_predict_rlm(payload)
+    else:
+        assert remote_controller._run_predict_rlm(payload) == "done"
 
-    answer = remote_controller._run_predict_rlm(
-        {
-            "instruction": "solve",
-            "logging_dir": str(tmp_path),
-            "predict_rlm_kwargs": {},
-        }
+    evidence_path, = (tmp_path / ".run").glob("*/evidence.json")
+    evidence = json.loads(evidence_path.read_text())
+    assert evidence_path.parent.name == evidence["run_id"]
+    assert evidence["terminal_outcome"] == ("error" if fail else "completed")
+    assert json.loads((evidence_path.parent / "trace.json").read_text())["status"] == (
+        "error" if fail else "completed"
     )
-
-    assert answer == "done"
-    rlm_kwargs = captured["rlm_kwargs"]
-    assert isinstance(rlm_kwargs, dict)
-    assert rlm_kwargs["trace_export_path"] == tmp_path / "predict_rlm_trace.json"
+    assert not (tmp_path / "in_progress_trace.json").exists()
 
 
 def test_daytona_remote_agent_payload_carries_submit_confirmation_mode(tmp_path: Path) -> None:

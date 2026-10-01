@@ -397,6 +397,7 @@ class RLMInstructionProposer:
         run_id: str = "run",
         component_focus: Callable[[str], str] | None = None,
         debug_rlm: bool = False,
+        run_export_root: Path | None = None,
     ):
         self.spec = spec
         self.lm = lm
@@ -410,6 +411,7 @@ class RLMInstructionProposer:
         self.run_id = run_id
         self.component_focus = component_focus or (lambda _component: "")
         self.debug_rlm = debug_rlm
+        self.run_export_root = run_export_root
         self._call_count = 0
 
     def propose_new_texts(
@@ -473,6 +475,7 @@ class RLMInstructionProposer:
                 max_iterations=self.max_iterations,
                 verbose=True,
                 debug=self.debug_rlm,
+                run_export_root=self.run_export_root,
             )
             kwargs: dict[str, Any] = {
                 "current_instructions": current_text,

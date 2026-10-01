@@ -677,7 +677,7 @@ class FailingExitBackend(FinalBackend):
 
 
 @pytest.mark.asyncio
-async def test_result_exports_trajectory_separately_from_completed_evidence():
+async def test_result_exports_trajectory_separately_from_completed_evidence(tmp_path):
     from predict_rlm import PredictRLM
 
     sink = RecordingSink()
@@ -688,6 +688,7 @@ async def test_result_exports_trajectory_separately_from_completed_evidence():
         events=[sink],
         max_iterations=1,
         verbose=False,
+        run_export_root=tmp_path / ".run",
     )
     rlm.generate_action.acall = AsyncMock(
         return_value=dspy.Prediction(reasoning="answer", code="SUBMIT(answer=question)")
@@ -707,10 +708,13 @@ async def test_result_exports_trajectory_separately_from_completed_evidence():
     assert [event["kind"] for event in evidence["events"]] == [
         event.kind.value for event in sink.events
     ]
+    directory = tmp_path / ".run" / result.evidence.run_id
+    assert json.loads((directory / "trace.json").read_text()) == trace
+    assert json.loads((directory / "evidence.json").read_text()) == evidence
 
 
 @pytest.mark.asyncio
-async def test_input_preparation_failure_exposes_evidence_without_a_trace():
+async def test_input_preparation_failure_exposes_evidence_without_a_trace(tmp_path):
     from predict_rlm import PredictRLM
 
     class FailingInputAdapter(InputAdapter[str]):
@@ -726,6 +730,7 @@ async def test_input_preparation_failure_exposes_evidence_without_a_trace():
         execution=FinalBackend(),
         adapters=[FailingInputAdapter()],
         verbose=False,
+        run_export_root=tmp_path / ".run",
     )
 
     with pytest.raises(ValueError, match="input preparation failed") as raised:
@@ -736,10 +741,13 @@ async def test_input_preparation_failure_exposes_evidence_without_a_trace():
     assert raised.value.evidence.terminal_outcome == "error"
     assert raised.value.evidence.events[-1].kind == "run.failed"
     assert raised.value.evidence.events[-1].data["error"] == "input preparation failed"
+    directory = tmp_path / ".run" / raised.value.evidence.run_id
+    assert json.loads((directory / "trace.json").read_text()) is None
+    assert json.loads((directory / "evidence.json").read_text())["terminal_outcome"] == "error"
 
 
 @pytest.mark.asyncio
-async def test_terminal_sink_failure_exposes_incomplete_evidence_separately():
+async def test_terminal_sink_failure_exposes_incomplete_evidence_separately(tmp_path):
     from predict_rlm import PredictRLM
 
     rlm = PredictRLM(
@@ -749,6 +757,7 @@ async def test_terminal_sink_failure_exposes_incomplete_evidence_separately():
         events=[RecordingSink(fail_flush=True)],
         max_iterations=1,
         verbose=False,
+        run_export_root=tmp_path / ".run",
     )
     rlm.generate_action.acall = AsyncMock(
         return_value=dspy.Prediction(reasoning="answer", code="SUBMIT(answer=question)")
@@ -762,6 +771,52 @@ async def test_terminal_sink_failure_exposes_incomplete_evidence_separately():
     assert raised.value.evidence.terminal_outcome == "error"
     assert raised.value.evidence.events[-1].kind == "run.failed"
     assert "evidence" not in json.loads(raised.value.trace.to_exportable_json())
+    directory = tmp_path / ".run" / raised.value.evidence.run_id
+    assert json.loads((directory / "trace.json").read_text())["status"] == "error"
+    assert json.loads((directory / "evidence.json").read_text())["complete"] is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("run_fails", [False, True])
+async def test_run_export_errors_are_visible_without_replacing_primary_failure(tmp_path, run_fails):
+    from predict_rlm import PredictRLM
+
+    export_root = tmp_path / "not-a-directory"
+    export_root.write_text("occupied")
+    primary = ValueError("input preparation failed")
+
+    class FailingInputAdapter(InputAdapter[str]):
+        name = "failing"
+        value_type = str
+
+        async def prepare(self, field, value, ctx):
+            raise primary
+
+    rlm = PredictRLM(
+        "question: str -> answer: str",
+        lm=MagicMock(history=[]),
+        execution=FinalBackend(),
+        adapters=[FailingInputAdapter()] if run_fails else [],
+        run_export_root=export_root,
+        max_iterations=1,
+        verbose=False,
+    )
+    rlm.generate_action.acall = AsyncMock(
+        return_value=dspy.Prediction(reasoning="answer", code="SUBMIT(answer=question)")
+    )
+
+    with pytest.raises(ValueError if run_fails else OSError) as raised:
+        await rlm.acall(question="export failure")
+
+    error = raised.value
+    if run_fails:
+        assert error is primary
+        assert isinstance(error.run_export_error, OSError)
+        assert str(export_root) in "\n".join(error.__notes__)
+        assert error.evidence.terminal_outcome == "error"
+    else:
+        assert error.trace.status == "completed"
+        assert error.evidence.terminal_outcome == "completed"
 
 
 def test_evidence_output_field_cannot_overwrite_runtime_evidence():

@@ -13,6 +13,8 @@ Usage::
     print(result.report)
 """
 
+from pathlib import Path
+
 import dspy
 
 from predict_rlm import File, PredictRLM
@@ -49,5 +51,6 @@ class DocumentAnalyzer(dspy.Module):
             verbose=self.verbose,
             debug=self.debug,
             sandbox_backend="sbx",
+            run_export_root=Path(__file__).resolve().parent / ".run",
         )
         return await predictor.acall(documents=documents)

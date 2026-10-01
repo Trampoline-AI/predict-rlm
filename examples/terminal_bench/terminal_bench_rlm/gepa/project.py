@@ -25,6 +25,7 @@ from predict_rlm.trace import RunTrace
 from rlm_gepa import EvaluationContext, RLMGepaExampleResult, RLMGepaProject
 from terminal_bench_rlm.scoring import to_gepa_example_result
 from terminal_bench_rlm.skills import DEFAULT_TERMINAL_BENCH_SKILL_INSTRUCTIONS
+from terminal_bench_rlm.tools import tbench_agent
 
 from .config import (
     COMPONENT_SKILL,
@@ -371,7 +372,7 @@ class HarborSubprocessHarnessRunner:
                 return TerminalBenchTaskRunResult(
                     task_id=request.task_id,
                     trial_result=_timeout_trial_result(exc),
-                    traces=[],
+                    traces=_load_run_traces(run_dir),
                     evidence=_load_run_evidence(run_dir),
                     run_dir=run_dir,
                     error=_subprocess_timeout_error(exc),
@@ -395,7 +396,7 @@ class HarborSubprocessHarnessRunner:
                 return TerminalBenchTaskRunResult(
                     task_id=request.task_id,
                     trial_result=_subprocess_failure_trial_result(completed),
-                    traces=[],
+                    traces=_load_run_traces(run_dir),
                     evidence=_load_run_evidence(run_dir),
                     run_dir=run_dir,
                     error=_subprocess_error(completed),
@@ -455,6 +456,8 @@ class HarborRemoteControllerHarnessRunner:
         remote_root = _remote_run_root(request)
         remote_repo_dir = f"{remote_root}/repo"
         remote_output_dir = f"{remote_root}/harbor-runs"
+        remote_run_dir = f"{remote_output_dir}/{request.run_id}"
+        remote_export_root = f"{remote_repo_dir}/examples/terminal_bench/.run"
         remote_archive_path = f"{remote_root}/repo.tar.gz"
         remote_artifact_path = f"{remote_root}/artifacts.tar.gz"
         repo_root = _repo_root_for_cwd(self.cwd)
@@ -489,7 +492,7 @@ class HarborRemoteControllerHarnessRunner:
                 timeout=request.task_timeout,
                 operation="unpacking remote controller package",
             )
-            run_error: Exception | None = None
+            run_error: BaseException | None = None
             try:
                 _remote_exec_checked(
                     environment,
@@ -497,12 +500,16 @@ class HarborRemoteControllerHarnessRunner:
                     timeout=_subprocess_timeout(request),
                     operation="running remote Harbor controller",
                 )
-            except Exception as exc:
+            except BaseException as exc:
                 run_error = exc
             try:
                 _remote_exec_checked(
                     environment,
                     (
+                        f"mkdir -p {shlex.quote(remote_run_dir)} && "
+                        f"if [ -d {shlex.quote(remote_export_root)} ]; then "
+                        f"cp -a {shlex.quote(remote_export_root)} {shlex.quote(remote_run_dir)}/; "
+                        "fi && "
                         f"tar -czf {shlex.quote(remote_artifact_path)} "
                         f"-C {shlex.quote(remote_output_dir)} {shlex.quote(request.run_id)}"
                     ),
@@ -511,12 +518,15 @@ class HarborRemoteControllerHarnessRunner:
                 )
                 _remote_download_file(environment, remote_artifact_path, str(local_artifact_path))
                 _extract_tarball(local_artifact_path, output_dir)
+                tbench_agent._recover_run_exports(run_dir)
             except Exception as exc:
                 if run_error is not None:
                     run_error.add_note(f"Could not recover remote run artifacts: {exc}")
                     raise run_error from exc
                 raise
 
+        if run_error is not None and not isinstance(run_error, Exception):
+            raise run_error
         result = _load_task_run_result(request, run_dir)
         return replace(result, error=str(run_error)) if run_error is not None else result
 
@@ -587,7 +597,7 @@ class TerminalBenchSubprocessHarnessRunner:
             return TerminalBenchTaskRunResult(
                 task_id=request.task_id,
                 trial_result=_timeout_trial_result(exc),
-                traces=[],
+                traces=_load_run_traces(run_dir),
                 evidence=_load_run_evidence(run_dir),
                 run_dir=run_dir,
                 error=_subprocess_timeout_error(exc),
@@ -598,7 +608,7 @@ class TerminalBenchSubprocessHarnessRunner:
             return TerminalBenchTaskRunResult(
                 task_id=request.task_id,
                 trial_result=_subprocess_failure_trial_result(completed),
-                traces=[],
+                traces=_load_run_traces(run_dir),
                 evidence=_load_run_evidence(run_dir),
                 run_dir=run_dir,
                 error=error,
@@ -644,6 +654,7 @@ class TerminalBenchInProcessHarnessRunner:
 
 class TerminalBenchGepaProject(RLMGepaProject):
     project_name = "terminal-bench-rlm"
+    run_export_root = tbench_agent.RUN_EXPORT_ROOT
     components = (COMPONENT_SKILL,)
     agent_spec = TERMINAL_BENCH_SPEC
 
@@ -1289,7 +1300,7 @@ def _git_tracked_repo_paths(repo_root: Path) -> list[Path] | None:
         if not raw_relpath:
             continue
         relpath = Path(os.fsdecode(raw_relpath))
-        if relpath.is_absolute() or ".." in relpath.parts:
+        if relpath.is_absolute() or ".." in relpath.parts or ".run" in relpath.parts:
             continue
         path = repo_root / relpath
         if path.is_file() or path.is_symlink():
@@ -1322,6 +1333,7 @@ def _exclude_from_remote_package(path: Path, repo_root: Path) -> bool:
         ".mypy_cache",
         ".pytest_cache",
         ".ruff_cache",
+        ".run",
         ".terminal-bench-venv",
         ".venv",
         "__pycache__",
@@ -1625,12 +1637,7 @@ def _load_task_run_result(
         return TerminalBenchTaskRunResult(
             task_id=request.task_id,
             trial_result=_attach_harbor_verifier_details(trial, trial_dir),
-            traces=_load_run_traces(
-                run_dir,
-                model=_model_name(request.lm),
-                sub_model=_model_name(request.sub_lm),
-                max_iterations=request.max_iterations,
-            ),
+            traces=_load_run_traces(run_dir),
             evidence=_load_run_evidence(run_dir),
             run_dir=run_dir,
         )
@@ -1640,7 +1647,7 @@ def _load_task_run_result(
         return TerminalBenchTaskRunResult(
             task_id=request.task_id,
             trial_result={"is_resolved": False, "parser_results": {}},
-            traces=[],
+            traces=_load_run_traces(run_dir),
             evidence=_load_run_evidence(run_dir),
             run_dir=run_dir,
             error=f"Terminal-Bench completed but did not write {results_path}",
@@ -1650,12 +1657,7 @@ def _load_task_run_result(
     return TerminalBenchTaskRunResult(
         task_id=request.task_id,
         trial_result=trial,
-        traces=_load_run_traces(
-            run_dir,
-            model=_model_name(request.lm),
-            sub_model=_model_name(request.sub_lm),
-            max_iterations=request.max_iterations,
-        ),
+        traces=_load_run_traces(run_dir),
         evidence=_load_run_evidence(run_dir),
         run_dir=run_dir,
     )
@@ -1817,29 +1819,40 @@ def _harbor_task_name(row: dict[str, Any]) -> str | None:
     return None
 
 
+def _run_export_dirs(run_dir: Path) -> list[Path]:
+    directories = {
+        path.parent.name: path.parent
+        for path in sorted(run_dir.rglob(".run/*/evidence.json"))
+        if (path.parent / "trace.json").is_file()
+    }
+    for index_path in sorted(run_dir.rglob("predict_rlm_runs.jsonl")):
+        for line in index_path.read_text(encoding="utf-8").splitlines():
+            run_id = json.loads(line)
+            if not isinstance(run_id, str) or Path(run_id).name != run_id:
+                raise ValueError(f"Invalid PredictRLM run id in {index_path}")
+            canonical = tbench_agent.RUN_EXPORT_ROOT / run_id
+            if (canonical / "evidence.json").is_file() and (canonical / "trace.json").is_file():
+                directories[run_id] = canonical
+    return [directories[run_id] for run_id in sorted(directories)]
+
+
 def _load_run_evidence(run_dir: Path) -> list[RunEvidence]:
     return [
-        RunEvidence.model_validate_json(path.read_text(encoding="utf-8"))
-        for path in sorted(run_dir.rglob("predict_rlm_evidence*.json"))
+        RunEvidence.model_validate_json((path / "evidence.json").read_text(encoding="utf-8"))
+        for path in _run_export_dirs(run_dir)
     ]
 
 
-def _load_run_traces(run_dir: Path, *, model: str, sub_model: str | None, max_iterations: int) -> list[RunTrace]:
-    traces: list[RunTrace] = []
-    for path in sorted(run_dir.rglob("predict_rlm_trace*.json")):
-        traces.append(RunTrace.model_validate_json(path.read_text(encoding="utf-8")))
-    if traces:
-        return traces
-    return [
-        RunTrace(
-            status="completed",
-            model=model,
-            sub_model=sub_model,
-            iterations=0,
-            max_iterations=max_iterations,
-            duration_ms=0,
-        )
-    ]
+def _load_run_traces(run_dir: Path) -> list[RunTrace]:
+    paths = [path / "trace.json" for path in _run_export_dirs(run_dir)]
+    # Hard-stopped controllers may only have a live snapshot, never final evidence.
+    paths.extend(sorted(run_dir.rglob("in_progress_trace.json")))
+    traces = []
+    for path in paths:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        if payload is not None:
+            traces.append(RunTrace.model_validate(payload))
+    return traces
 
 
 def _subprocess_error(completed: subprocess.CompletedProcess[str]) -> str:

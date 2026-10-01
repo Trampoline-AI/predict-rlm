@@ -43,6 +43,11 @@ uv run examples/contract_comparison/run.py --debug
 
 Outputs are saved to `output/{timestamp}/` inside this directory.
 
+Every CLI or service invocation automatically saves `trace.json` and
+`evidence.json` to `.run/<run_id>/` inside this example directory, including
+failed or cancelled runs. `<run_id>` is the evidence run ID; `trace.json` is
+JSON `null` when no trace is available. `.run/` is ignored by Git by default.
+
 ## Sample output
 
 The [`sample/`](sample/) directory contains two versions of a microFIT contract

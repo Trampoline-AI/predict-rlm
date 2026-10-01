@@ -13,6 +13,8 @@ from ..tools.runner import AppWorldSessionClient
 from .signature import build_solve_appworld_task_signature
 from .skills import get_appworld_skill
 
+RUN_EXPORT_ROOT = Path(__file__).resolve().parents[2] / ".run"
+
 
 class AppWorldRLM(dspy.Module):
     def __init__(
@@ -56,6 +58,7 @@ class AppWorldRLM(dspy.Module):
             max_iterations=self.max_iterations,
             verbose=self.verbose,
             debug=self.debug,
+            run_export_root=RUN_EXPORT_ROOT,
         )
 
     async def aforward(

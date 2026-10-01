@@ -39,7 +39,12 @@ uv run examples/invoice_processing/run.py --debug
 | `--quiet`          | off              | Suppress RLM reasoning, code, output, tool calls, errors, and submit blocks |
 | `--debug`          | off              | Print timestamped RLM and sandbox lifecycle diagnostics to stderr |
 
-Outputs (Excel workbook + run trace) are saved to `output/{timestamp}/` inside this directory.
+Excel workbooks are saved to `output/{timestamp}/` inside this directory.
+
+Every CLI or service invocation automatically saves `trace.json` and
+`evidence.json` to `.run/<run_id>/` inside this example directory, including
+failed or cancelled runs. `<run_id>` is the evidence run ID; `trace.json` is
+JSON `null` when no trace is available. `.run/` is ignored by Git by default.
 
 ## Sample output
 

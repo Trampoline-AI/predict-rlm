@@ -156,12 +156,6 @@ async def main():
     output_dir = Path(__file__).parent / "output" / run_id
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    trace = getattr(prediction, "trace", None)
-    if trace is not None:
-        trace_path = output_dir / "run_trace.json"
-        trace.to_exportable_json(trace_path)
-        print(f"Run trace file: {trace_path}")
-
     workbook_path = prediction.workbook.path
     if workbook_path:
         for f in Path(workbook_path).parent.glob("*.xlsx"):

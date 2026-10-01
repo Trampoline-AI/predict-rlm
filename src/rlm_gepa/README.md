@@ -121,6 +121,7 @@ def build_rlm(
     max_iterations: int = 30,
     verbose: bool = False,
     debug: bool = False,
+    run_export_root=None,
 ):
     return PredictRLM(
         AnalyzeDocuments,
@@ -129,6 +130,7 @@ def build_rlm(
         max_iterations=max_iterations,
         verbose=verbose,
         debug=debug,
+        run_export_root=run_export_root,
         skills=[Skill(name="document-analysis", instructions=skill_instructions)],
     )
 
@@ -177,6 +179,7 @@ class MyProject(RLMGepaProject):
             max_iterations=context.max_iterations,
             verbose=context.verbose_rlm,
             debug=context.debug_rlm,
+            run_export_root=self.run_export_root,
         )
         # 2. Run it on the concrete example shape for this project, then score it.
         # `rlm_kwargs` should match the DSPy signature fields passed to build_rlm(...).
@@ -324,9 +327,25 @@ Every optimization run writes artifacts under `run_dir`:
 - `gepa_state.bin`: optimizer state and candidate lineage;
 - `optimization_summary.json`: best candidate and aggregate scores;
 - `all_candidates.json`: all candidate texts and scores;
-- `task_traces/`: per-example rollout traces;
-- `proposer_traces/`: proposer RLM traces;
+- `task_traces/`: scored rollout JSONL reports;
+- `proposer_traces/`: instruction/merge reports with inputs, outputs, and traces;
 - `cost_log.jsonl`: token/cost accounting.
+
+Canonical per-invocation exports are separately opt-in: set the project's
+`run_export_root: Path | None` to an absolute source-relative directory such as
+`Path(__file__).resolve().parents[2] / ".run"` for a project module located at
+`<example>/<package>/gepa/project.py`. The default is `None`, so generic GEPA
+projects do not create extra exports. The adapter forwards this setting to
+instruction and patch-merge proposers; project-owned task PredictRLMs must also
+receive `run_export_root=self.run_export_root`, as in `build_rlm` above.
+
+Each enabled PredictRLM invocation writes `<run_export_root>/<evidence.run_id>/`
+containing `trace.json` and `evidence.json`, even on failure or cancellation.
+`trace.json` is JSON `null` if no behavioral trace was captured. These files are
+written by PredictRLM's shared exporter, not the optimizer reporting layer.
+AppWorld, SpreadBench, and Terminal-Bench enable this for all task and proposer
+runs under their own example `.run/` directories, independent of the optimizer
+`run_dir` and the caller's working directory.
 
 After `optimize` prints a `run_dir`, use the project CLI to inspect stats:
 

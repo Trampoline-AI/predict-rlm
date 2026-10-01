@@ -120,6 +120,7 @@ class RLMGepaAdapter:
                 run_id=run_id,
                 component_focus=project.component_focus,
                 debug_rlm=debug_rlm,
+                run_export_root=project.run_export_root,
             )
             self.propose_new_texts = proposer.propose_new_texts
 
@@ -538,6 +539,7 @@ class RLMGepaAdapter:
             max_iterations=self.proposer_max_iterations,
             verbose=True,
             debug=self.debug_rlm,
+            run_export_root=self.project.run_export_root,
         )
         progress_write("\n" + "=" * 80)
         progress_write(f"RLM PATCH MERGE PROPOSER STARTING (call {call_idx})")

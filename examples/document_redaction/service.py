@@ -14,6 +14,8 @@ Usage::
     # prediction.redacted_documents — list[File] with redacted PDFs
 """
 
+from pathlib import Path
+
 import dspy
 
 from predict_rlm import File, PredictRLM
@@ -56,5 +58,6 @@ class DocumentRedactor(dspy.Module):
             max_iterations=self.max_iterations,
             verbose=self.verbose,
             debug=self.debug,
+            run_export_root=Path(__file__).resolve().parent / ".run",
         )
         return await predictor.acall(documents=documents)

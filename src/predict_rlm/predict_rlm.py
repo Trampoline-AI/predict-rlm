@@ -1031,6 +1031,7 @@ class PredictRLM(dspy.RLM):
         modules: tuple[RuntimeModule | RuntimeContribution, ...]
         | list[RuntimeModule | RuntimeContribution] = (),
         events: Sequence[EventSink] = (),
+        run_export_root: str | Path | None = None,
     ):
         """
         Args:
@@ -1082,6 +1083,11 @@ class PredictRLM(dspy.RLM):
             trace_export_path: Optional path for best-effort atomic RunTrace
                        snapshots while the run is in progress. The file is
                        replaced in place and trace export failures are ignored.
+            run_export_root: Optional root for completed invocation artifacts.
+                       Writes <root>/<run_id>/trace.json and evidence.json after
+                       cleanup on success, failure, or cancellation. A missing
+                       trace is exported as JSON null. Export errors are raised,
+                       or attached as run_export_error to an existing failure.
             model_execution_timeout: Whether the action LM may set a per-iteration
                        ``execution_timeout_seconds`` to soft-cap (recoverably
                        interrupt) its own code blocks. Off by default — models
@@ -1181,6 +1187,9 @@ class PredictRLM(dspy.RLM):
         self._submit_confirmation = submit_confirmation
         self._trace_export_path = Path(trace_export_path) if trace_export_path else None
         self._trace_export_context: _TraceExportContext | None = None
+        self._run_export_root = (
+            Path(run_export_root).resolve() if run_export_root is not None else None
+        )
 
         # Merge skills into instructions, packages, modules, and tools
         self._skill_instructions = ""
@@ -3019,6 +3028,32 @@ class PredictRLM(dspy.RLM):
             ],
         )
         setattr(target, "evidence", evidence)
+        if self._run_export_root is not None:
+            self._export_run_artifacts(target, evidence, self._run_export_root / evidence.run_id)
+
+    def _export_run_artifacts(
+        self,
+        target: dspy.Prediction | BaseException,
+        evidence: RunEvidence,
+        directory: Path,
+    ) -> None:
+        trace = getattr(target, "trace", None)
+        try:
+            directory.mkdir(parents=True, exist_ok=False)
+            evidence.to_exportable_json(directory / "evidence.json")
+            if trace is None:
+                (directory / "trace.json").write_text("null\n", encoding="utf-8")
+            else:
+                trace.to_exportable_json(directory / "trace.json")
+        except Exception as error:
+            if isinstance(target, BaseException):
+                target.add_note(f"Could not export run artifacts to {directory}: {error}")
+                setattr(target, "run_export_error", error)
+            else:
+                setattr(error, "evidence", evidence)
+                if trace is not None:
+                    setattr(error, "trace", trace)
+                raise
 
     @asynccontextmanager
     async def _iteration_callback_scope_for_run(

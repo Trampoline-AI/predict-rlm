@@ -140,10 +140,13 @@ class FakeOneShotHarborEnvironment:
             )
             archive.add(result_path, arcname=f"{self.run_id}/result.json")
             if self.evidence is not None:
-                evidence_path = Path(host_path).parent / "predict_rlm_evidence.json"
-                self.evidence.to_exportable_json(evidence_path)
+                run_dir = Path(host_path).parent / ".run" / self.evidence.run_id
+                run_dir.mkdir(parents=True)
+                self.evidence.to_exportable_json(run_dir / "evidence.json")
+                (run_dir / "trace.json").write_text("null")
+                archive.add(run_dir, arcname=f"{self.run_id}/.run/{self.evidence.run_id}")
                 archive.add(
-                    evidence_path, arcname=f"{self.run_id}/logs/predict_rlm_evidence.json"
+                    run_dir, arcname=f"{self.run_id}/logs/agent/.run/{self.evidence.run_id}",
                 )
 
 
@@ -847,7 +850,7 @@ def test_harbor_runner_builds_harbor_run_command(monkeypatch, tmp_path: Path) ->
 
 @pytest.mark.parametrize("run_exit_code", [0, 1])
 def test_harbor_remote_controller_builds_remote_command_and_syncs_artifacts(
-    tmp_path: Path, run_exit_code: int,
+    monkeypatch, tmp_path: Path, run_exit_code: int,
 ) -> None:
     repo = tmp_path / "repo"
     cwd = repo / "examples" / "terminal_bench"
@@ -866,6 +869,8 @@ def test_harbor_remote_controller_builds_remote_command_and_syncs_artifacts(
         terminal_outcome="error" if run_exit_code else "completed",
     )
     env = FakeOneShotHarborEnvironment(run_exit_code=run_exit_code, evidence=evidence)
+    export_root = tmp_path / "host_example" / ".run"
+    monkeypatch.setattr(tbench_agent, "RUN_EXPORT_ROOT", export_root)
 
     result = HarborRemoteControllerHarnessRunner(env, cwd=cwd)._run_sync(
         _task_request(config, tmp_path)
@@ -873,6 +878,10 @@ def test_harbor_remote_controller_builds_remote_command_and_syncs_artifacts(
 
     assert (result.error is not None) == bool(run_exit_code)
     assert result.evidence == [evidence]
+    canonical = export_root / evidence.run_id
+    assert RunEvidence.model_validate_json((canonical / "evidence.json").read_text()) == evidence
+    assert json.loads((canonical / "trace.json").read_text()) is None
+    assert result.traces == []
     assert result.trial_result["verifier_result"]["rewards"]["reward"] == 1.0
     assert env.uploads
     assert env.uploads[0][1] == "/remote/tb/gepa-val-task/repo.tar.gz"
@@ -889,6 +898,90 @@ def test_harbor_remote_controller_builds_remote_command_and_syncs_artifacts(
     assert "--job-name gepa-val-task" in joined_commands
     assert "phase_log_path=/remote/tb/gepa-val-task/harbor-runs/gepa-val-task/task_phase_events.jsonl" in joined_commands
     assert (config.terminal_bench_output_dir / "gepa-val-task" / "result.json").exists()
+
+
+def test_outer_controller_recovers_exports_before_propagating_cancellation(
+    monkeypatch, tmp_path: Path,
+) -> None:
+    repo = tmp_path / "repo"
+    cwd = repo / "examples" / "terminal_bench"
+    cwd.mkdir(parents=True)
+    (repo / "pyproject.toml").write_text("[project]\nname = 'transport-test'\n")
+    evidence = RunEvidence(run_id="cancelled_run", complete=True, terminal_outcome="cancelled")
+    env = FakeOneShotHarborEnvironment(evidence=evidence)
+    original_exec = env.exec
+
+    def cancel_controller(*, command: str, timeout_sec: int):
+        if command.startswith("cd "):
+            raise asyncio.CancelledError
+        return original_exec(command=command, timeout_sec=timeout_sec)
+
+    env.exec = cancel_controller
+    export_root = cwd / ".run"
+    monkeypatch.setattr(tbench_agent, "RUN_EXPORT_ROOT", export_root)
+    config = default_config()
+    config.terminal_bench_output_dir = tmp_path / "jobs"
+    with pytest.raises(asyncio.CancelledError):
+        HarborRemoteControllerHarnessRunner(env, cwd=cwd)._run_sync(_task_request(config, tmp_path))
+
+    recovered = export_root / evidence.run_id
+    assert RunEvidence.model_validate_json((recovered / "evidence.json").read_text()) == evidence
+    assert json.loads((recovered / "trace.json").read_text()) is None
+
+
+@pytest.mark.parametrize("returncode", [0, 1])
+def test_outer_controller_recovers_source_relative_exports_with_real_archive(
+    monkeypatch, tmp_path: Path, returncode: int,
+) -> None:
+    repo = tmp_path / "repo"
+    cwd = repo / "examples" / "terminal_bench"
+    cwd.mkdir(parents=True)
+    (repo / "pyproject.toml").write_text("[project]\nname = 'transport-test'\n")
+    export_root = cwd / ".run"
+    stale = export_root / "unrelated_old_run"
+    stale.mkdir(parents=True)
+    (stale / "evidence.json").write_text("{}")
+    (stale / "trace.json").write_text("null")
+    monkeypatch.setattr(tbench_agent, "RUN_EXPORT_ROOT", export_root)
+    evidence = RunEvidence(
+        run_id="fresh_run", complete=True,
+        terminal_outcome="error" if returncode else "completed",
+    )
+    trace_json = "null" if returncode else RunTrace(
+        status="completed", model="main", sub_model=None,
+        iterations=1, max_iterations=1, duration_ms=1,
+    ).to_exportable_json()
+    (cwd / "harness.py").write_text(
+        "import json, sys\n"
+        "from pathlib import Path\n"
+        "args = sys.argv\n"
+        "job = Path(args[args.index('--jobs-dir') + 1]) / args[args.index('--job-name') + 1]\n"
+        "job.mkdir(parents=True, exist_ok=True)\n"
+        "job.joinpath('result.json').write_text(json.dumps("
+        "{'trial_results': [{'task_name': 'task', 'verifier_result': {'rewards': {'reward': 1}}}]}))\n"
+        "run = Path(__file__).resolve().parent / '.run' / 'fresh_run'\n"
+        "run.mkdir(parents=True)\n"
+        f"run.joinpath('evidence.json').write_text({evidence.to_exportable_json()!r})\n"
+        f"run.joinpath('trace.json').write_text({trace_json!r})\n"
+        f"sys.exit({returncode})\n"
+    )
+    config = default_config()
+    config.harbor_executable = shlex.join([sys.executable, "harness.py"])
+    config.harbor_remote_workdir = str(tmp_path / "remote")
+    config.terminal_bench_output_dir = tmp_path / "jobs"
+    request = _task_request(config, tmp_path)
+    result = HarborRemoteControllerHarnessRunner(
+        LocalShellRemoteControllerEnvironment(), cwd=cwd,
+    )._run_sync(request)
+
+    assert (result.error is not None) == bool(returncode)
+    assert result.evidence == [evidence]
+    assert (export_root / "fresh_run" / "trace.json").read_text() == trace_json
+    assert (export_root / "fresh_run" / "evidence.json").read_text() == evidence.to_exportable_json()
+    remote_example = (
+        Path(config.harbor_remote_workdir) / request.run_id / "repo" / "examples" / "terminal_bench"
+    )
+    assert not (remote_example / ".run" / "unrelated_old_run").exists()
 
 
 def test_harbor_remote_controller_allows_daytona_when_controller_is_supplied(
@@ -977,6 +1070,9 @@ def test_harbor_remote_controller_package_uploads_only_tracked_files(
     (repo / "bug_reports" / "stale.md").write_text("untracked report\n", encoding="utf-8")
     (repo / ".hermes").mkdir()
     (repo / ".hermes" / "checkpoint.json").write_text("checkpoint\n", encoding="utf-8")
+    stale_run = cwd / ".run" / "old"
+    stale_run.mkdir(parents=True)
+    (stale_run / "evidence.json").write_text("{}")
 
     def fake_git_ls_files(cmd, **kwargs):
         assert cmd == ["git", "ls-files", "-z"]
@@ -988,6 +1084,7 @@ def test_harbor_remote_controller_package_uploads_only_tracked_files(
                 b"pyproject.toml\0"
                 b"examples/terminal_bench/pyproject.toml\0"
                 b"tracked.txt\0"
+                b"examples/terminal_bench/.run/old/evidence.json\0"
             ),
             stderr=b"",
         )
@@ -1004,6 +1101,7 @@ def test_harbor_remote_controller_package_uploads_only_tracked_files(
     assert "repo/early_failures.txt" not in env.upload_archive_members
     assert "repo/bug_reports/stale.md" not in env.upload_archive_members
     assert "repo/.hermes/checkpoint.json" not in env.upload_archive_members
+    assert "repo/examples/terminal_bench/.run/old/evidence.json" not in env.upload_archive_members
 
 
 def test_extract_tarball_rejects_path_traversal_without_tar_filter(tmp_path: Path) -> None:
@@ -1997,6 +2095,10 @@ def test_subprocess_runner_loads_exported_predict_rlm_evidence(
     run_dir = config.terminal_bench_output_dir / run_id
     logging_dir = run_dir / "logs" / "agent"
     logging_dir.mkdir(parents=True)
+    export_root = tmp_path / "example" / ".run"
+    exported_run = export_root / "terminal_run"
+    exported_run.mkdir(parents=True)
+    monkeypatch.setattr(tbench_agent, "RUN_EXPORT_ROOT", export_root)
     (run_dir / "results.json").write_text(
         json.dumps({"results": [{"task_id": "task", "is_resolved": True, "parser_results": {}}]})
     )
@@ -2008,7 +2110,7 @@ def test_subprocess_runner_loads_exported_predict_rlm_evidence(
         max_iterations=1,
         duration_ms=1,
     )
-    trace.to_exportable_json(logging_dir / "predict_rlm_trace.json")
+    trace.to_exportable_json(exported_run / "trace.json")
     evidence = RunEvidence(
         run_id="terminal_run",
         complete=True,
@@ -2022,7 +2124,8 @@ def test_subprocess_runner_loads_exported_predict_rlm_evidence(
             )
         ],
     )
-    evidence.to_exportable_json(logging_dir / "predict_rlm_evidence.json")
+    evidence.to_exportable_json(exported_run / "evidence.json")
+    (logging_dir / "predict_rlm_runs.jsonl").write_text(json.dumps(evidence.run_id) + "\n")
 
     def fake_run(*_args, **_kwargs):
         return subprocess.CompletedProcess(args=[], returncode=returncode, stdout="", stderr="")
@@ -2046,12 +2149,24 @@ def test_subprocess_runner_loads_exported_predict_rlm_evidence(
     )
 
     assert result.evidence == [evidence]
+    assert result.traces == [trace]
     if returncode == 0:
         assert result.error is None
-        assert len(result.traces) == 1
-        assert result.traces[0].status == "completed"
     else:
         assert result.error is not None
+
+
+def test_interrupted_controller_snapshot_does_not_fabricate_final_evidence(tmp_path: Path) -> None:
+    trace = RunTrace(
+        status="in_progress", model="main", sub_model=None,
+        iterations=1, max_iterations=3, duration_ms=5,
+    )
+    logs_dir = tmp_path / "logs" / "agent"
+    logs_dir.mkdir(parents=True)
+    trace.to_exportable_json(logs_dir / "in_progress_trace.json")
+
+    assert gepa_project._load_run_traces(tmp_path) == [trace]
+    assert gepa_project._load_run_evidence(tmp_path) == []
 
 
 def test_in_process_runner_calls_terminal_bench_harness_and_loads_results(
@@ -2263,41 +2378,3 @@ def test_agent_builds_low_effort_lms_from_agent_kwargs(monkeypatch) -> None:
     assert sub_lm.kwargs["service_tier"] == "priority"
 
 
-def test_subprocess_runner_synthesizes_trace_when_agent_does_not_export_one(
-    monkeypatch, tmp_path: Path
-) -> None:
-    config = default_config()
-    config.terminal_bench_output_dir = tmp_path / "tbench-runs"
-    run_id = "gepa-val-task"
-    run_dir = config.terminal_bench_output_dir / run_id
-    run_dir.mkdir(parents=True)
-    (run_dir / "results.json").write_text(
-        json.dumps({"results": [{"task_id": "task", "is_resolved": True, "parser_results": {}}]})
-    )
-
-    def fake_run(*_args, **_kwargs):
-        return subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr="")
-
-    monkeypatch.setattr(subprocess, "run", fake_run)
-
-    result = TerminalBenchSubprocessHarnessRunner(cwd=tmp_path)._run_sync(
-        TerminalBenchTaskRunRequest(
-            task_id="task",
-            instruction="",
-            skill_instructions="skill",
-            lm="main",
-            sub_lm="sub",
-            max_iterations=3,
-            task_timeout=30,
-            verbose_rlm=False,
-            output_dir=tmp_path,
-            run_id=run_id,
-            config=config,
-        )
-    )
-
-    assert result.error is None
-    assert len(result.traces) == 1
-    assert result.traces[0].model == "main"
-    assert result.traces[0].sub_model == "sub"
-    assert result.traces[0].max_iterations == 3
