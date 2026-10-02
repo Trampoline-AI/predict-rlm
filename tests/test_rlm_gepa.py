@@ -318,7 +318,7 @@ class _PatchEvidenceAdapter:
                     "Feedback": f"score {score}",
                 },
             }
-            for item, score in zip(batch, selected_scores, strict=False)
+            for item, score in zip(batch, selected_scores, strict=True)
         ]
         return SimpleNamespace(scores=selected_scores, trajectories=trajectories)
 
@@ -380,6 +380,60 @@ def _make_patch_evidence_proposer(
         rng=_FirstKRng(),
     )
     return proposer
+
+
+@pytest.mark.parametrize("invalid_capture", ["scores", "trajectories", "missing_capture"])
+def test_patch_evidence_rejects_unaligned_captures(
+    tmp_path: Path, monkeypatch, invalid_capture
+):
+    proposer = _make_patch_evidence_proposer(
+        tmp_path, base_scores=[1.0, 0.0], source_scores=[0.0, 1.0], merge_minibatch_size=2
+    )
+    evaluate = proposer.adapter.evaluate
+
+    def invalid_evaluate(*args, **kwargs):
+        evaluation = evaluate(*args, **kwargs)
+        if invalid_capture == "missing_capture":
+            evaluation.trajectories = None
+        else:
+            getattr(evaluation, invalid_capture).pop()
+        return evaluation
+
+    monkeypatch.setattr(proposer.adapter, "evaluate", invalid_evaluate)
+
+    with pytest.raises(ValueError, match="patch evaluation"):
+        proposer._build_patch_disagreement_evidence(
+            state=_patch_evidence_state(),
+            iteration=1,
+            attempt_idx=0,
+            base_parent_id=1,
+            patch_source_parent_id=2,
+        )
+    assert not list(tmp_path.glob("*.jsonl"))
+
+
+def test_patch_evidence_rejects_unaligned_reflective_records(tmp_path: Path, monkeypatch):
+    proposer = _make_patch_evidence_proposer(
+        tmp_path, base_scores=[1.0, 0.0], source_scores=[0.0, 1.0], merge_minibatch_size=2
+    )
+    make_reflective_dataset = proposer.adapter.make_reflective_dataset
+
+    def incomplete_dataset(*args, **kwargs):
+        dataset = make_reflective_dataset(*args, **kwargs)
+        dataset["skill_instructions"].pop()
+        return dataset
+
+    monkeypatch.setattr(proposer.adapter, "make_reflective_dataset", incomplete_dataset)
+
+    with pytest.raises(ValueError):
+        proposer._build_patch_disagreement_evidence(
+            state=_patch_evidence_state(),
+            iteration=1,
+            attempt_idx=0,
+            base_parent_id=1,
+            patch_source_parent_id=2,
+        )
+    assert not list(tmp_path.glob("*.jsonl"))
 
 
 def test_patch_evidence_prefers_larger_disagreements_and_caps_records(tmp_path: Path):

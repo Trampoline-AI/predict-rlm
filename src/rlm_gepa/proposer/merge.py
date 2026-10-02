@@ -411,6 +411,8 @@ class RlmMergeProposer(MergeProposer):
         sample_size = min(2 * self.merge_minibatch_size, len(all_train_ids))
         task_data_ids = self.rng.sample(all_train_ids, k=sample_size)
         batch = self.trainset.fetch(task_data_ids)
+        if len(batch) != len(task_data_ids):
+            raise ValueError("patch trace minibatch must match sampled task count")
 
         with self.adapter.progress_label(
             f"Iteration {iteration} Patch Base Parent #{base_parent_id} Trace"
@@ -433,13 +435,25 @@ class RlmMergeProposer(MergeProposer):
             )
         state.total_num_evals += len(task_data_ids)
 
+        for parent, evaluation in (("base", eval_base), ("patch source", eval_source)):
+            if evaluation.trajectories is None:
+                raise ValueError(f"{parent} patch evaluation requires captured trajectories")
+            if len(evaluation.scores) != len(batch) or len(evaluation.trajectories) != len(
+                batch
+            ):
+                raise ValueError(
+                    f"{parent} patch evaluation must align scores and trajectories with "
+                    f"minibatch: expected {len(batch)}, got {len(evaluation.scores)} scores "
+                    f"and {len(evaluation.trajectories)} trajectories"
+                )
+
         trace_task_ids = [
-            str(traj.get("task_id") or traj.get("example_id") or traj)
-            for traj in (eval_base.trajectories or [])
+            str(traj.get("task_id") or traj.get("example_id") or data_id)
+            for data_id, traj in zip(task_data_ids, eval_base.trajectories, strict=True)
         ]
         source_trace_task_ids = [
-            str(traj.get("task_id") or traj.get("example_id") or traj)
-            for traj in (eval_source.trajectories or [])
+            str(traj.get("task_id") or traj.get("example_id") or data_id)
+            for data_id, traj in zip(task_data_ids, eval_source.trajectories, strict=True)
         ]
         if trace_task_ids != source_trace_task_ids:
             raise RuntimeError("task_id misalignment between paired patch trace captures")
@@ -448,18 +462,24 @@ class RlmMergeProposer(MergeProposer):
             state.program_candidates[base_parent_id],
             eval_base,
             [self.component_name],
-        ).get(self.component_name, [])
+        )[self.component_name]
         reflective_source = self.adapter.make_reflective_dataset(
             state.program_candidates[patch_source_parent_id],
             eval_source,
             [self.component_name],
-        ).get(self.component_name, [])
+        )[self.component_name]
 
         records: list[dict[str, Any]] = []
         both_success_records: list[dict[str, Any]] = []
-        for index, data_id in enumerate(task_data_ids):
-            score_base = eval_base.scores[index] if index < len(eval_base.scores) else 0.0
-            score_source = eval_source.scores[index] if index < len(eval_source.scores) else 0.0
+        for data_id, task_id, score_base, score_source, rec_base, rec_source in zip(
+            task_data_ids,
+            trace_task_ids,
+            eval_base.scores,
+            eval_source.scores,
+            reflective_base,
+            reflective_source,
+            strict=True,
+        ):
             abs_delta = abs(score_base - score_source)
             if score_base > score_source + eps:
                 winner = "base"
@@ -473,9 +493,6 @@ class RlmMergeProposer(MergeProposer):
             else:
                 continue
 
-            rec_base = reflective_base[index] if index < len(reflective_base) else {}
-            rec_source = reflective_source[index] if index < len(reflective_source) else {}
-            task_id = trace_task_ids[index] if index < len(trace_task_ids) else str(data_id)
             record = {
                 "schema_version": 1,
                 "data_id": data_id,
@@ -487,25 +504,25 @@ class RlmMergeProposer(MergeProposer):
                 "winner": winner,
                 "abs_delta": abs_delta,
                 "evidence_role": evidence_role,
-                "inputs": rec_base.get("Inputs") or rec_source.get("Inputs") or "",
+                "inputs": rec_base["Inputs"],
                 "base_parent": {
-                    "traces": rec_base.get("Traces", []),
+                    "traces": rec_base["Traces"],
                     "evidence": rec_base["Evidence"],
                     "failure_metadata": proposer_failure_metadata(
                         rec_base.get("Failure Metadata", {})
                     ),
                     "error": rec_base.get("Error"),
-                    "feedback": rec_base.get("Feedback", ""),
+                    "feedback": rec_base["Feedback"],
                     "score": score_base,
                 },
                 "patch_source_parent": {
-                    "traces": rec_source.get("Traces", []),
+                    "traces": rec_source["Traces"],
                     "evidence": rec_source["Evidence"],
                     "failure_metadata": proposer_failure_metadata(
                         rec_source.get("Failure Metadata", {})
                     ),
                     "error": rec_source.get("Error"),
-                    "feedback": rec_source.get("Feedback", ""),
+                    "feedback": rec_source["Feedback"],
                     "score": score_source,
                 },
             }
