@@ -369,11 +369,12 @@ class HarborSubprocessHarnessRunner:
                     attempt=attempt,
                     max_attempts=max_attempts,
                 )
+                traces, evidence = _load_run_artifacts(run_dir)
                 return TerminalBenchTaskRunResult(
                     task_id=request.task_id,
                     trial_result=_timeout_trial_result(exc),
-                    traces=_load_run_traces(run_dir),
-                    evidence=_load_run_evidence(run_dir),
+                    traces=traces,
+                    evidence=evidence,
                     run_dir=run_dir,
                     error=_subprocess_timeout_error(exc),
                 )
@@ -393,11 +394,12 @@ class HarborSubprocessHarnessRunner:
                 max_attempts=max_attempts,
             )
             if completed.returncode != 0:
+                traces, evidence = _load_run_artifacts(run_dir)
                 return TerminalBenchTaskRunResult(
                     task_id=request.task_id,
                     trial_result=_subprocess_failure_trial_result(completed),
-                    traces=_load_run_traces(run_dir),
-                    evidence=_load_run_evidence(run_dir),
+                    traces=traces,
+                    evidence=evidence,
                     run_dir=run_dir,
                     error=_subprocess_error(completed),
                 )
@@ -594,22 +596,24 @@ class TerminalBenchSubprocessHarnessRunner:
             completed = subprocess.run(cmd, **_subprocess_run_kwargs(request, cwd=self.cwd))
         except subprocess.TimeoutExpired as exc:
             run_dir = output_dir / request.run_id
+            traces, evidence = _load_run_artifacts(run_dir)
             return TerminalBenchTaskRunResult(
                 task_id=request.task_id,
                 trial_result=_timeout_trial_result(exc),
-                traces=_load_run_traces(run_dir),
-                evidence=_load_run_evidence(run_dir),
+                traces=traces,
+                evidence=evidence,
                 run_dir=run_dir,
                 error=_subprocess_timeout_error(exc),
             )
         run_dir = output_dir / request.run_id
         if completed.returncode != 0:
             error = _subprocess_error(completed)
+            traces, evidence = _load_run_artifacts(run_dir)
             return TerminalBenchTaskRunResult(
                 task_id=request.task_id,
                 trial_result=_subprocess_failure_trial_result(completed),
-                traces=_load_run_traces(run_dir),
-                evidence=_load_run_evidence(run_dir),
+                traces=traces,
+                evidence=evidence,
                 run_dir=run_dir,
                 error=error,
             )
@@ -1630,6 +1634,7 @@ def _load_task_run_result(
     request: TerminalBenchTaskRunRequest,
     run_dir: Path,
 ) -> TerminalBenchTaskRunResult:
+    traces, evidence = _load_run_artifacts(run_dir)
     harbor_result_path = run_dir / "result.json"
     if harbor_result_path.exists():
         payload = json.loads(harbor_result_path.read_text(encoding="utf-8"))
@@ -1637,8 +1642,8 @@ def _load_task_run_result(
         return TerminalBenchTaskRunResult(
             task_id=request.task_id,
             trial_result=_attach_harbor_verifier_details(trial, trial_dir),
-            traces=_load_run_traces(run_dir),
-            evidence=_load_run_evidence(run_dir),
+            traces=traces,
+            evidence=evidence,
             run_dir=run_dir,
         )
 
@@ -1647,8 +1652,8 @@ def _load_task_run_result(
         return TerminalBenchTaskRunResult(
             task_id=request.task_id,
             trial_result={"is_resolved": False, "parser_results": {}},
-            traces=_load_run_traces(run_dir),
-            evidence=_load_run_evidence(run_dir),
+            traces=traces,
+            evidence=evidence,
             run_dir=run_dir,
             error=f"Terminal-Bench completed but did not write {results_path}",
         )
@@ -1657,8 +1662,8 @@ def _load_task_run_result(
     return TerminalBenchTaskRunResult(
         task_id=request.task_id,
         trial_result=trial,
-        traces=_load_run_traces(run_dir),
-        evidence=_load_run_evidence(run_dir),
+        traces=traces,
+        evidence=evidence,
         run_dir=run_dir,
     )
 
@@ -1819,12 +1824,14 @@ def _harbor_task_name(row: dict[str, Any]) -> str | None:
     return None
 
 
-def _run_export_dirs(run_dir: Path) -> list[Path]:
-    directories = {
-        path.parent.name: path.parent
-        for path in sorted(run_dir.rglob(".run/*/evidence.json"))
-        if (path.parent / "trace.json").is_file()
-    }
+def _load_run_artifacts(run_dir: Path) -> tuple[list[RunTrace], list[RunEvidence]]:
+    directories: dict[str, Path] = {}
+    finalized_scopes: set[Path] = set()
+    for evidence_path in sorted(run_dir.rglob(".run/*/evidence.json")):
+        export_dir = evidence_path.parent
+        if (export_dir / "trace.json").is_file():
+            directories[export_dir.name] = export_dir
+            finalized_scopes.add(export_dir.parent.parent)
     for index_path in sorted(run_dir.rglob("predict_rlm_runs.jsonl")):
         for line in index_path.read_text(encoding="utf-8").splitlines():
             run_id = json.loads(line)
@@ -1833,41 +1840,30 @@ def _run_export_dirs(run_dir: Path) -> list[Path]:
             canonical = tbench_agent.RUN_EXPORT_ROOT / run_id
             if (canonical / "evidence.json").is_file() and (canonical / "trace.json").is_file():
                 directories[run_id] = canonical
-    return [directories[run_id] for run_id in sorted(directories)]
+            if run_id in directories:
+                finalized_scopes.add(index_path.parent)
 
-
-def _load_run_evidence(run_dir: Path) -> list[RunEvidence]:
-    return [
-        RunEvidence.model_validate_json((path / "evidence.json").read_text(encoding="utf-8"))
-        for path in _run_export_dirs(run_dir)
-    ]
-
-
-def _load_run_traces(run_dir: Path) -> list[RunTrace]:
-    export_dirs = _run_export_dirs(run_dir)
-    paths = [path / "trace.json" for path in export_dirs]
-    exported_run_ids = {path.name for path in export_dirs}
+    trace_paths: list[Path] = []
+    evidence: list[RunEvidence] = []
+    for run_id in sorted(directories):
+        export_dir = directories[run_id]
+        trace_paths.append(export_dir / "trace.json")
+        evidence.append(
+            RunEvidence.model_validate_json(
+                (export_dir / "evidence.json").read_text(encoding="utf-8")
+            )
+        )
     # A finalized pair supersedes only the live snapshot in its controller log scope.
     for snapshot in sorted(run_dir.rglob("in_progress_trace.json")):
-        if any(
-            (path / "evidence.json").is_file() and (path / "trace.json").is_file()
-            for path in snapshot.parent.glob(".run/*")
-        ):
-            continue
-        index_path = snapshot.parent / "predict_rlm_runs.jsonl"
-        if index_path.is_file() and any(
-            json.loads(line) in exported_run_ids
-            for line in index_path.read_text(encoding="utf-8").splitlines()
-        ):
-            continue
-        # Hard-stopped controllers may only have a live snapshot, never final evidence.
-        paths.append(snapshot)
+        if snapshot.parent not in finalized_scopes:
+            # Hard-stopped controllers may only have a live snapshot, never final evidence.
+            trace_paths.append(snapshot)
     traces = []
-    for path in paths:
+    for path in trace_paths:
         payload = json.loads(path.read_text(encoding="utf-8"))
         if payload is not None:
             traces.append(RunTrace.model_validate(payload))
-    return traces
+    return traces, evidence
 
 
 def _subprocess_error(completed: subprocess.CompletedProcess[str]) -> str:
