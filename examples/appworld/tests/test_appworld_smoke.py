@@ -41,7 +41,7 @@ from appworld_rlm.tools.runner import (
 
 from predict_rlm import Skill
 from predict_rlm.evidence import RunEvidence
-from predict_rlm.trace import RunTrace
+from predict_rlm.trace import IterationStep, RunTrace, ToolCall
 from rlm_gepa.reporting.stats import render_stats
 from rlm_gepa.schema import EvaluationContext, validate_example_result, validate_project
 
@@ -678,6 +678,34 @@ class _AutoCompleteClient:
         return task_id
 
 
+def _completed_prediction(*, tool_calls=(), **outputs):
+    trace = RunTrace(
+        status="completed",
+        model="test",
+        iterations=1,
+        max_iterations=1,
+        duration_ms=1,
+        steps=[
+            IterationStep(
+                iteration=1,
+                reasoning="",
+                code="",
+                output="",
+                untruncated_output="",
+                duration_ms=1,
+                tool_calls=list(tool_calls),
+            )
+        ],
+    )
+    return SimpleNamespace(
+        trace=trace,
+        evidence=RunEvidence(
+            run_id="appworld_run", complete=True, terminal_outcome="completed"
+        ),
+        **outputs,
+    )
+
+
 def _run_appworld_rlm_with_prediction(monkeypatch, prediction, client):
     class FakePredictRLM:
         def __init__(self, *_args, **_kwargs):
@@ -691,17 +719,17 @@ def _run_appworld_rlm_with_prediction(monkeypatch, prediction, client):
     return asyncio.run(agent.aforward(task_id="aaa111_1", instruction="do it"))
 
 
-def test_appworld_completion_failure_keeps_incomplete_evidence(monkeypatch):
+def test_appworld_completion_failure_keeps_artifacts(monkeypatch):
     class FailingCompleteClient(_AutoCompleteClient):
         def complete_appworld_task(self, task_id, kwargs_json):
             raise RuntimeError("completion failed")
 
-    prediction = SimpleNamespace(
-        answer="foo", evidence=RunEvidence(run_id="appworld_run", complete=False)
-    )
+    prediction = _completed_prediction(answer="foo")
     try:
         _run_appworld_rlm_with_prediction(monkeypatch, prediction, FailingCompleteClient())
     except RuntimeError as exc:
+        assert exc.trace is prediction.trace
+        assert exc.evidence is prediction.evidence
         project = AppWorldGepaProject(AppWorldGepaConfig(data_root=FIXTURE_ROOT))
         result = project._error_result(
             evaluation.AppWorldExample("aaa111_1", "train", "do it"), str(exc), exc
@@ -709,12 +737,24 @@ def test_appworld_completion_failure_keeps_incomplete_evidence(monkeypatch):
     else:
         raise AssertionError("expected completion failure")
 
+    validate_example_result(result)
+    assert result.traces == [prediction.trace]
+    assert result.evidence == [prediction.evidence]
+
+
+def test_appworld_run_failure_keeps_incomplete_evidence():
+    exc = RuntimeError("run failed")
+    exc.evidence = RunEvidence(run_id="appworld_run", complete=False)
+    project = AppWorldGepaProject(AppWorldGepaConfig(data_root=FIXTURE_ROOT))
+    result = project._error_result(
+        evaluation.AppWorldExample("aaa111_1", "train", "do it"), str(exc), exc
+    )
     try:
         validate_example_result(result)
     except ValueError as exc:
         assert "incomplete strict evidence" in str(exc)
     else:
-        raise AssertionError("completion wrapper lost incomplete evidence")
+        raise AssertionError("run failure lost incomplete evidence")
 
 
 def test_appworld_scoring_failure_retains_artifacts_and_error(monkeypatch, tmp_path):
@@ -766,7 +806,7 @@ def test_appworld_rlm_completes_task_from_answer(monkeypatch):
 
     result = _run_appworld_rlm_with_prediction(
         monkeypatch,
-        SimpleNamespace(answer="foo"),
+        _completed_prediction(answer="foo"),
         client,
     )
 
@@ -794,7 +834,7 @@ def test_appworld_rlm_completes_task_from_raw_string_answer(monkeypatch):
 
         _run_appworld_rlm_with_prediction(
             monkeypatch,
-            SimpleNamespace(answer=answer),
+            _completed_prediction(answer=answer),
             client,
         )
 
@@ -808,7 +848,7 @@ def test_appworld_rlm_completes_task_from_nested_answer_as_raw_value(monkeypatch
 
     _run_appworld_rlm_with_prediction(
         monkeypatch,
-        SimpleNamespace(answer={"answer": 1}),
+        _completed_prediction(answer={"answer": 1}),
         client,
     )
 
@@ -819,8 +859,8 @@ def test_appworld_rlm_completes_task_from_nested_answer_as_raw_value(monkeypatch
 
 def test_appworld_rlm_completes_task_without_answer_for_missing_or_default_answer(monkeypatch):
     for prediction in (
-        SimpleNamespace(),
-        SimpleNamespace(answer=None),
+        _completed_prediction(),
+        _completed_prediction(answer=None),
     ):
         client = _AutoCompleteClient()
 
@@ -838,7 +878,7 @@ def test_appworld_rlm_does_not_fall_back_to_submission(monkeypatch):
 
     _run_appworld_rlm_with_prediction(
         monkeypatch,
-        SimpleNamespace(submission={"answer": "legacy"}),
+        _completed_prediction(submission={"answer": "legacy"}),
         client,
     )
 
@@ -847,27 +887,16 @@ def test_appworld_rlm_does_not_fall_back_to_submission(monkeypatch):
 
 def test_appworld_rlm_does_not_double_complete_after_successful_trace_call(monkeypatch):
     client = _AutoCompleteClient()
-    prediction = SimpleNamespace(
+    prediction = _completed_prediction(
         answer="foo",
-        trace=SimpleNamespace(
-            steps=[
-                SimpleNamespace(
-                    tool_calls=[
-                        SimpleNamespace(
-                            name="call_appworld_api",
-                            args=[
-                                "supervisor",
-                                "complete_task",
-                                json.dumps({"answer": "foo"}),
-                            ],
-                            kwargs={},
-                            result=json.dumps({"success": True}),
-                            error=None,
-                        )
-                    ]
-                )
-            ]
-        ),
+        tool_calls=[
+            ToolCall(
+                name="call_appworld_api",
+                args=["supervisor", "complete_task", json.dumps({"answer": "foo"})],
+                result=json.dumps({"success": True}),
+                duration_ms=1,
+            )
+        ],
     )
 
     _run_appworld_rlm_with_prediction(monkeypatch, prediction, client)
@@ -920,7 +949,7 @@ def test_service_binds_current_task_appworld_tools(monkeypatch):
 
         async def acall(self, **kwargs):
             captured_prediction_kwargs.update(kwargs)
-            return SimpleNamespace(answer=None)
+            return _completed_prediction(answer=None)
 
     monkeypatch.setattr(service_module, "PredictRLM", FakePredictRLM)
     client = FakeClient()
@@ -1042,20 +1071,16 @@ def test_gepa_project_scores_from_harness_side_evaluator(monkeypatch, tmp_path):
 
         async def acall(self, **kwargs):
             events.append(("agent", kwargs["task_id"]))
-            return SimpleNamespace(
-                trace=SimpleNamespace(
-                    steps=[
-                        SimpleNamespace(
-                            tool_calls=[
-                                SimpleNamespace(
-                                    name="evaluate_appworld_task",
-                                    result=_runner_result_text(success=False, score=0.0, feedback="stale trace result"),
-                                    error=None,
-                                )
-                            ]
-                        )
-                    ]
-                )
+            return _completed_prediction(
+                tool_calls=[
+                    ToolCall(
+                        name="evaluate_appworld_task",
+                        result=_runner_result_text(
+                            success=False, score=0.0, feedback="stale trace result"
+                        ),
+                        duration_ms=1,
+                    )
+                ],
             )
 
     monkeypatch.setattr(gepa_project_module, "AppWorldRLM", FakeAppWorldRLM)
@@ -1120,20 +1145,16 @@ def test_eval_builds_lms_before_constructing_appworld_rlm(monkeypatch, tmp_path)
             )
 
         async def acall(self, **_kwargs):
-            return SimpleNamespace(
-                trace=SimpleNamespace(
-                    steps=[
-                        SimpleNamespace(
-                            tool_calls=[
-                                SimpleNamespace(
-                                    name="evaluate_appworld_task",
-                                    result=_runner_result_text(success=False, score=0.0, feedback="stale trace result"),
-                                    error=None,
-                                )
-                            ]
-                        )
-                    ]
-                )
+            return _completed_prediction(
+                tool_calls=[
+                    ToolCall(
+                        name="evaluate_appworld_task",
+                        result=_runner_result_text(
+                            success=False, score=0.0, feedback="stale trace result"
+                        ),
+                        duration_ms=1,
+                    )
+                ],
             )
 
     monkeypatch.setattr(evaluation, "build_lm", fake_build_lm)
@@ -1193,21 +1214,17 @@ def test_run_evaluation_scores_from_harness_side_evaluator(monkeypatch, tmp_path
 
         async def acall(self, **kwargs):
             events.append(("agent", kwargs["task_id"]))
-            return SimpleNamespace(
+            return _completed_prediction(
                 answer="done",
-                trace=SimpleNamespace(
-                    steps=[
-                        SimpleNamespace(
-                            tool_calls=[
-                                SimpleNamespace(
-                                    name="evaluate_appworld_task",
-                                    result=_runner_result_text(success=False, score=0.0, feedback="rlm trace should be ignored"),
-                                    error=None,
-                                )
-                            ]
-                        )
-                    ]
-                ),
+                tool_calls=[
+                    ToolCall(
+                        name="evaluate_appworld_task",
+                        result=_runner_result_text(
+                            success=False, score=0.0, feedback="rlm trace should be ignored"
+                        ),
+                        duration_ms=1,
+                    )
+                ],
             )
 
     monkeypatch.setattr(evaluation, "build_lm", lambda *_args, **_kwargs: object())

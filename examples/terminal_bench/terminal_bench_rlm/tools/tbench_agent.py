@@ -352,9 +352,9 @@ def _coerce_answer(result: Any) -> str:
     return str(result)
 
 
-def _record_run_id(evidence: RunEvidence | None, logging_dir: Path | None) -> None:
+def _record_run_id(evidence: RunEvidence, logging_dir: Path | None) -> None:
     """Associate harness logs with canonical exports without duplicating their payloads."""
-    if evidence is None or logging_dir is None:
+    if logging_dir is None:
         return
     logging_dir.mkdir(parents=True, exist_ok=True)
     with (logging_dir / "predict_rlm_runs.jsonl").open("a", encoding="utf-8") as handle:
@@ -657,12 +657,14 @@ class _TerminalBenchRLMBaseAgentMixin:
             result = rlm.acall()
             if inspect.isawaitable(result):
                 result = asyncio.run(result)
-            _record_run_id(getattr(result, "evidence", None), logging_dir)
+            _record_run_id(result.evidence, logging_dir)
             _coerce_answer(result)
             return _make_agent_result()
         except BaseException as exc:
             try:
-                _record_run_id(extract_evidence_from_exc(exc), logging_dir)
+                evidence = extract_evidence_from_exc(exc)
+                if evidence is not None:
+                    _record_run_id(evidence, logging_dir)
             except Exception as export_error:
                 exc.add_note(f"Could not record PredictRLM run id: {export_error}")
             raise

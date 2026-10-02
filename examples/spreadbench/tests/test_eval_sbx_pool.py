@@ -7,6 +7,9 @@ from types import SimpleNamespace
 
 import pytest
 
+from predict_rlm.evidence import RunEvidence
+from predict_rlm.trace import RunTrace
+
 _EXAMPLE_DIR = Path(__file__).resolve().parent.parent
 if str(_EXAMPLE_DIR) not in sys.path:
     sys.path.insert(0, str(_EXAMPLE_DIR))
@@ -166,7 +169,19 @@ def test_run_case_passes_predict_rlm_sandbox_kwargs(
             calls.append(kwargs)
 
         async def acall(self, **kwargs):
-            return SimpleNamespace(output_spreadsheet=SimpleNamespace(path=str(produced)))
+            return SimpleNamespace(
+                output_spreadsheet=SimpleNamespace(path=str(produced)),
+                trace=RunTrace(
+                    status="completed",
+                    model="dummy/model",
+                    iterations=1,
+                    max_iterations=1,
+                    duration_ms=10,
+                ),
+                evidence=RunEvidence(
+                    run_id="case-run", complete=True, terminal_outcome="completed"
+                ),
+            )
 
     monkeypatch.setattr(evaluation, "PredictRLM", FakePredictRLM)
     monkeypatch.setattr(evaluation, "parse_answer_position", lambda *args: ("Sheet1", "A1"))

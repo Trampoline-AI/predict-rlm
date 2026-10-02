@@ -167,8 +167,8 @@ async def _run_predict_rlm_async(payload: dict[str, Any]) -> str:
         )
         rlm = _predict_rlm_class()(signature, **rlm_kwargs)
         result = await rlm.acall()
-        evidence = getattr(result, "evidence", None)
-        _write_run_status(logging_dir, "completed", has_trace=getattr(result, "trace", None) is not None)
+        evidence = result.evidence
+        _write_run_status(logging_dir, "completed", has_trace=True)
         return _coerce_answer(result)
     except BaseException as exc:
         evidence = extract_evidence_from_exc(exc)

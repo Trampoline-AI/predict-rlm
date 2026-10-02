@@ -12,12 +12,32 @@ import pytest
 from dspy.primitives.code_interpreter import FinalOutput
 
 from predict_rlm import PredictRLM
+from predict_rlm.evidence import RunEvidence
+from predict_rlm.trace import RunTrace
 
 _EXAMPLE_DIR = Path(__file__).resolve().parent.parent
 if str(_EXAMPLE_DIR) not in sys.path:
     sys.path.insert(0, str(_EXAMPLE_DIR))
 
 from terminal_bench_rlm.tools import tbench_agent  # noqa: E402
+
+
+def _successful_prediction() -> dspy.Prediction:
+    return dspy.Prediction(
+        answer="done",
+        trace=RunTrace(
+            status="completed",
+            model="main",
+            iterations=1,
+            max_iterations=1,
+            duration_ms=1,
+        ),
+        evidence=RunEvidence(
+            run_id="test_run",
+            complete=True,
+            terminal_outcome="completed",
+        ),
+    )
 
 
 def _assert_task_instruction_signature(signature, task_instruction: str) -> None:
@@ -76,7 +96,7 @@ def test_agent_constructs_predict_rlm_with_direct_process_interpreter(monkeypatc
 
         async def acall(self, **kwargs):
             events.append(("acall", kwargs))
-            return SimpleNamespace(answer="done")
+            return _successful_prediction()
 
     monkeypatch.setattr(tbench_agent, "DirectPythonBackend", FakeInterpreter)
     monkeypatch.setattr(tbench_agent, "PredictRLM", FakePredictRLM)
@@ -128,7 +148,7 @@ def test_agent_preserves_custom_signature_instructions(monkeypatch) -> None:
 
         async def acall(self, **kwargs):
             captured["call_kwargs"] = kwargs
-            return SimpleNamespace(answer="done")
+            return _successful_prediction()
 
     monkeypatch.setattr(tbench_agent, "DirectPythonBackend", FakeInterpreter)
     monkeypatch.setattr(tbench_agent, "PredictRLM", FakePredictRLM)
@@ -162,7 +182,7 @@ def test_agent_terminal_bench_submit_confirmation_mode_passes_callback(monkeypat
             captured["rlm_kwargs"] = kwargs
 
         async def acall(self, **_kwargs):
-            return SimpleNamespace(answer="done")
+            return _successful_prediction()
 
     monkeypatch.setattr(tbench_agent, "DirectPythonBackend", FakeInterpreter)
     monkeypatch.setattr(tbench_agent, "PredictRLM", FakePredictRLM)
@@ -217,7 +237,7 @@ def test_agent_installs_codex_lm_before_constructing_predict_rlm(monkeypatch) ->
             self.kwargs = kwargs
 
         async def acall(self, **_kwargs):
-            return SimpleNamespace(answer="done")
+            return _successful_prediction()
 
     def install_monkeypatch(*, exclude=()):
         events.append(("install", tuple(exclude)))

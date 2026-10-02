@@ -1075,6 +1075,27 @@ def test_reflective_record_visible_to_gepa_includes_failure_metadata(tmp_path: P
     assert task_row["telemetry_ref"]["trace_id"].endswith(":0")
 
 
+def _proposer_trace() -> RunTrace:
+    return RunTrace(
+        status="completed",
+        model="dummy/model",
+        iterations=1,
+        max_iterations=1,
+        duration_ms=10,
+        usage=LMUsage(main=TokenUsage(input_tokens=100, output_tokens=50, cost=0.01)),
+        steps=[
+            IterationStep(
+                iteration=1,
+                reasoning="Submit the proposed instructions.",
+                code="SUBMIT(new_instructions=new_instructions)",
+                output="",
+                untruncated_output="",
+                duration_ms=10,
+            )
+        ],
+    )
+
+
 def _lifecycle_evidence(*, complete: bool = True) -> RunEvidence:
     return RunEvidence(
         run_id="lifecycle_run",
@@ -1424,7 +1445,8 @@ def test_rlm_patch_merge_no_op_patch_persists_compact_audit(tmp_path: Path, monk
                     "notes": "no-op: duplicate source behavior, no clean missing facet",
                 },
                 new_instructions=base_instructions,
-                trace=None,
+                trace=_proposer_trace(),
+                evidence=_lifecycle_evidence(),
                 trajectory=[],
             )
 
@@ -1468,7 +1490,11 @@ def test_rlm_patch_merge_no_op_patch_persists_compact_audit(tmp_path: Path, monk
         (tmp_path / "proposer_traces").glob("*_patch_from_cand_10_using_cand_11.json")
     )
     assert len(artifacts) == 1
-    patch_output = json.loads(artifacts[0].read_text())["patch_output"]
+    artifact = json.loads(artifacts[0].read_text())
+    assert artifact["run_trace"]["status"] == "completed"
+    assert artifact["run_trace"]["usage"]["main"]["cost"] == 0.01
+    assert artifact["run_evidence"]["terminal_outcome"] == "completed"
+    patch_output = artifact["patch_output"]
     assert patch_output["new_instructions"] == base_instructions
     assert patch_output["instruction_char_delta"] == 0
     assert patch_output["patch_audit"]["supported_source_win_ids"] == []
@@ -1493,7 +1519,7 @@ def test_rlm_instruction_proposer_serializes_proposer_trace_records(
                 new_instructions="updated rules",
                 generalization_check=[],
                 trajectory=[],
-                trace=None,
+                trace=_proposer_trace(),
                 evidence=_lifecycle_evidence(),
             )
 
@@ -1599,4 +1625,7 @@ def test_rlm_instruction_proposer_serializes_proposer_trace_records(
     assert serialized[0]["Evidence"][0]["events"][1]["kind"] == "session.finalized"
     assert "inputs" not in serialized[0]["Evidence"][0]["events"][0]["data"]
     artifact = next((tmp_path / "proposer_traces").glob("*_proposer_skill_instructions.json"))
-    assert json.loads(artifact.read_text())["run_evidence"]["terminal_outcome"] == "completed"
+    payload = json.loads(artifact.read_text())
+    assert payload["run_trace"]["status"] == "completed"
+    assert payload["run_trace"]["usage"]["main"]["cost"] == 0.01
+    assert payload["run_evidence"]["terminal_outcome"] == "completed"

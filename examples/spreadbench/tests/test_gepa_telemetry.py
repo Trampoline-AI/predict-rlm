@@ -8,7 +8,9 @@ from types import SimpleNamespace
 
 import pytest
 
+from predict_rlm.evidence import RunEvidence
 from predict_rlm.telemetry import JsonlTelemetrySink, TelemetryContext
+from predict_rlm.trace import RunTrace
 from rlm_gepa import EvaluationContext
 
 _EXAMPLE_DIR = Path(__file__).resolve().parent.parent
@@ -34,7 +36,16 @@ class _FakePredictRLM:
         output_path.write_bytes(b"candidate")
         return SimpleNamespace(
             output_spreadsheet=SimpleNamespace(path=str(output_path)),
-            trace={"status": "ok"},
+            trace=RunTrace(
+                status="completed",
+                model="dummy/model",
+                iterations=1,
+                max_iterations=1,
+                duration_ms=10,
+            ),
+            evidence=RunEvidence(
+                run_id="case-run", complete=True, terminal_outcome="completed"
+            ),
         )
 
 
