@@ -28,6 +28,7 @@ from tqdm import tqdm
 
 from predict_rlm import File, PredictRLM, SbxConfig, SbxPool, Skill
 from predict_rlm.evidence import RunEvidence, extract_evidence_from_exc
+from predict_rlm.trace import RunTrace, extract_trace_from_exc
 from rlm_gepa.runtime.lm_config import get_lm_config, get_sub_lm_config
 
 from ..agent.service import RUN_EXPORT_ROOT
@@ -254,7 +255,7 @@ def _write_eval_trace_event(
 ) -> None:
     """Append per-(role, model) JSONL rows summarising one eval run.
 
-    Reads ``run_trace`` attached to each CaseResult by ``_run_case`` and
+    Reads ``run_trace`` from each CaseResult produced by ``_run_case`` and
     sums the token/cost across all completed cases. Best-effort; any
     failure is swallowed so the eval's main path is unaffected.
     """
@@ -270,7 +271,7 @@ def _write_eval_trace_event(
         sub_calls = 0
         for tr in task_results:
             for c in tr.cases:
-                rt = getattr(c, "run_trace", None)
+                rt = c.run_trace
                 if rt is None:
                     continue
                 traces_seen += 1
@@ -330,39 +331,32 @@ def _dump_eval_task_traces(log_dir: Path, task_results: list["TaskResult"]) -> N
 
     Each row carries the full RunTrace and separate RunEvidence (serialized via
     ``to_exportable_json``) plus task_id / case_idx / score metadata so
-    the log is self-describing. Best-effort; swallows errors.
+    the log is self-describing. Serialization and I/O errors propagate.
     """
-    try:
-        out = log_dir / "task_traces.jsonl"
-        out.parent.mkdir(parents=True, exist_ok=True)
-        with out.open("w") as f:
-            for tr in task_results:
-                for c in tr.cases:
-                    rt = getattr(c, "run_trace", None)
-                    row: dict = {
-                        "task_id": tr.task_id,
-                        "case_idx": c.idx,
-                        "score": c.score,
-                        "passed": c.passed,
-                        "message": c.message,
-                        "recalc_source": c.recalc_source,
-                    }
-                    if rt is not None:
-                        try:
-                            row["trace"] = json.loads(
-                                rt.to_exportable_json(indent=0)
-                            )
-                        except Exception:
-                            row["trace"] = None
-                    else:
-                        row["trace"] = None
-                    row["evidence"] = (
+    out = log_dir / "task_traces.jsonl"
+    out.parent.mkdir(parents=True, exist_ok=True)
+    with out.open("w") as f:
+        for tr in task_results:
+            for c in tr.cases:
+                row = {
+                    "task_id": tr.task_id,
+                    "case_idx": c.idx,
+                    "score": c.score,
+                    "passed": c.passed,
+                    "message": c.message,
+                    "recalc_source": c.recalc_source,
+                    "trace": (
+                        json.loads(c.run_trace.to_exportable_json(indent=0))
+                        if c.run_trace is not None
+                        else None
+                    ),
+                    "evidence": (
                         json.loads(c.evidence.to_exportable_json(indent=0))
-                        if c.evidence is not None else None
-                    )
-                    f.write(json.dumps(row, default=str) + "\n")
-    except Exception:
-        pass  # best-effort observability
+                        if c.evidence is not None
+                        else None
+                    ),
+                }
+                f.write(json.dumps(row) + "\n")
 
 
 @dataclass
@@ -374,6 +368,7 @@ class CaseResult:
     recalc_source: str | None = None
     log_file: str | None = None
     evidence: RunEvidence | None = None
+    run_trace: RunTrace | None = None
 
 
 @dataclass
@@ -641,7 +636,7 @@ async def _run_case(
         task.instruction, answer_range, answer_sheet, task.instruction_type
     )
 
-    run_trace: Any = None
+    run_trace: RunTrace | None = None
     evidence: RunEvidence | None = None
     async with sem:
         try:
@@ -671,30 +666,36 @@ async def _run_case(
                 and result.output_spreadsheet.path
                 and os.path.exists(result.output_spreadsheet.path)
             ):
-                cr = CaseResult(idx, 0.0, False, "No output", log_file=log_file_str)
-                cr.run_trace = run_trace  # type: ignore[attr-defined]
-                cr.evidence = evidence
-                return cr
+                return CaseResult(
+                    idx,
+                    0.0,
+                    False,
+                    "No output",
+                    log_file=log_file_str,
+                    run_trace=run_trace,
+                    evidence=evidence,
+                )
             shutil.copy2(result.output_spreadsheet.path, output_path)
         except asyncio.TimeoutError as e:
-            from predict_rlm.trace import extract_trace_from_exc
-
-            cr = CaseResult(
-                idx, 0.0, False, f"Timeout ({config.task_timeout}s)",
+            return CaseResult(
+                idx,
+                0.0,
+                False,
+                f"Timeout ({config.task_timeout}s)",
                 log_file=log_file_str,
+                run_trace=extract_trace_from_exc(e),
+                evidence=extract_evidence_from_exc(e) or evidence,
             )
-            cr.run_trace = extract_trace_from_exc(e)  # type: ignore[attr-defined]
-            cr.evidence = extract_evidence_from_exc(e) or evidence
-            return cr
         except Exception as e:
-            from predict_rlm.trace import extract_trace_from_exc
-
-            cr = CaseResult(
-                idx, 0.0, False, f"RLM error: {e}", log_file=log_file_str,
+            return CaseResult(
+                idx,
+                0.0,
+                False,
+                f"RLM error: {e}",
+                log_file=log_file_str,
+                run_trace=extract_trace_from_exc(e),
+                evidence=extract_evidence_from_exc(e) or evidence,
             )
-            cr.run_trace = extract_trace_from_exc(e)  # type: ignore[attr-defined]
-            cr.evidence = extract_evidence_from_exc(e) or evidence
-            return cr
 
     recalc_source: str | None = None
     try:
@@ -704,13 +705,16 @@ async def _run_case(
         recalc_source = f"failed: {e}"
 
     if answer_path is None:
-        cr = CaseResult(
-            idx, 0.0, False, "Answer file not found",
-            recalc_source=recalc_source, log_file=log_file_str,
+        return CaseResult(
+            idx,
+            0.0,
+            False,
+            "Answer file not found",
+            recalc_source=recalc_source,
+            log_file=log_file_str,
+            run_trace=run_trace,
+            evidence=evidence,
         )
-        cr.run_trace = run_trace  # type: ignore[attr-defined]
-        cr.evidence = evidence
-        return cr
 
     try:
         ratio, msg = await asyncio.to_thread(
@@ -729,21 +733,27 @@ async def _run_case(
                     f"{'PASS' if ratio == 1.0 else 'FAIL'}\n"
                     f"{msg}\n"
                 )
-        cr = CaseResult(
-            idx, ratio, ratio == 1.0, msg,
-            recalc_source=recalc_source, log_file=log_file_str,
+        return CaseResult(
+            idx,
+            ratio,
+            ratio == 1.0,
+            msg,
+            recalc_source=recalc_source,
+            log_file=log_file_str,
+            run_trace=run_trace,
+            evidence=evidence,
         )
-        cr.run_trace = run_trace  # type: ignore[attr-defined]
-        cr.evidence = evidence
-        return cr
     except Exception as e:
-        cr = CaseResult(
-            idx, 0.0, False, f"Comparison error: {e}",
-            recalc_source=recalc_source, log_file=log_file_str,
+        return CaseResult(
+            idx,
+            0.0,
+            False,
+            f"Comparison error: {e}",
+            recalc_source=recalc_source,
+            log_file=log_file_str,
+            run_trace=run_trace,
+            evidence=evidence,
         )
-        cr.run_trace = run_trace  # type: ignore[attr-defined]
-        cr.evidence = evidence
-        return cr
 
 
 def _predict_rlm_sandbox_kwargs(
