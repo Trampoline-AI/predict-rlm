@@ -177,8 +177,8 @@ def evidence_to_json(evidence: RunEvidence | None) -> Any:
     return json.loads(evidence.to_exportable_json(indent=0)) if evidence is not None else None
 
 
-def evidence_to_proposer_json(evidence: RunEvidence) -> Any:
-    return json.loads(evidence.to_proposer_json(indent=0))
+def evidence_to_proposer_json(evidence: RunEvidence) -> dict[str, Any]:
+    return evidence.to_proposer().model_dump()
 
 
 def _banner(text: str, char: str) -> str:
