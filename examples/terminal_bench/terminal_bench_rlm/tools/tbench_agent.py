@@ -623,20 +623,18 @@ class _TerminalBenchRLMBaseAgentMixin:
         try:
             rlm_kwargs = dict(self.predict_rlm_kwargs)
             rlm_kwargs["run_export_root"] = RUN_EXPORT_ROOT
-            if "lm" in rlm_kwargs:
-                rlm_kwargs["lm"] = _build_lm(
-                    rlm_kwargs["lm"],
-                    self.lm_reasoning_effort,
-                    self.lm_service_tier,
-                    self.lm_extra_body,
-                )
-            if "sub_lm" in rlm_kwargs:
-                rlm_kwargs["sub_lm"] = _build_lm(
-                    rlm_kwargs["sub_lm"],
-                    self.sub_lm_reasoning_effort,
-                    self.sub_lm_service_tier,
-                    self.sub_lm_extra_body,
-                )
+            rlm_kwargs["lm"] = _build_lm(
+                rlm_kwargs["lm"],
+                self.lm_reasoning_effort,
+                self.lm_service_tier,
+                self.lm_extra_body,
+            )
+            rlm_kwargs["sub_lm"] = _build_lm(
+                rlm_kwargs["sub_lm"],
+                self.sub_lm_reasoning_effort,
+                self.sub_lm_service_tier,
+                self.sub_lm_extra_body,
+            )
             rlm_kwargs["interpreter"] = interpreter
             _with_terminal_bench_skill(rlm_kwargs, self.skill_instructions)
             if "max_iterations" in rlm_kwargs:
