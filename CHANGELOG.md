@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-10-02
+
 ### Added
 
 - `PredictRLM(run_export_root=...)` saves `trace.json` and `evidence.json` under an
@@ -86,5 +88,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the move to native asynchronous SBX execution and prevents synchronous
   shutdown from blocking its own event loop.
 
-[Unreleased]: https://github.com/Trampoline-AI/predict-rlm/compare/v0.8.1...HEAD
+[Unreleased]: https://github.com/Trampoline-AI/predict-rlm/compare/v0.9.0...HEAD
+[0.9.0]: https://github.com/Trampoline-AI/predict-rlm/compare/v0.8.1...v0.9.0
 [0.8.1]: https://github.com/Trampoline-AI/predict-rlm/compare/v0.8.0...v0.8.1
