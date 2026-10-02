@@ -1844,9 +1844,24 @@ def _load_run_evidence(run_dir: Path) -> list[RunEvidence]:
 
 
 def _load_run_traces(run_dir: Path) -> list[RunTrace]:
-    paths = [path / "trace.json" for path in _run_export_dirs(run_dir)]
-    # Hard-stopped controllers may only have a live snapshot, never final evidence.
-    paths.extend(sorted(run_dir.rglob("in_progress_trace.json")))
+    export_dirs = _run_export_dirs(run_dir)
+    paths = [path / "trace.json" for path in export_dirs]
+    exported_run_ids = {path.name for path in export_dirs}
+    # A finalized pair supersedes only the live snapshot in its controller log scope.
+    for snapshot in sorted(run_dir.rglob("in_progress_trace.json")):
+        if any(
+            (path / "evidence.json").is_file() and (path / "trace.json").is_file()
+            for path in snapshot.parent.glob(".run/*")
+        ):
+            continue
+        index_path = snapshot.parent / "predict_rlm_runs.jsonl"
+        if index_path.is_file() and any(
+            json.loads(line) in exported_run_ids
+            for line in index_path.read_text(encoding="utf-8").splitlines()
+        ):
+            continue
+        # Hard-stopped controllers may only have a live snapshot, never final evidence.
+        paths.append(snapshot)
     traces = []
     for path in paths:
         payload = json.loads(path.read_text(encoding="utf-8"))

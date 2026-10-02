@@ -50,8 +50,9 @@ from terminal_bench_rlm.skills import DEFAULT_TERMINAL_BENCH_SKILL_INSTRUCTIONS 
 from terminal_bench_rlm.tools import tbench_agent  # noqa: E402
 
 from predict_rlm.evidence import RunEvidence, RunEvidenceEvent  # noqa: E402
-from predict_rlm.trace import RunTrace  # noqa: E402
+from predict_rlm.trace import LMUsage, RunTrace, TokenUsage  # noqa: E402
 from rlm_gepa import EvaluationContext, RLMGepaExampleResult  # noqa: E402
+from rlm_gepa.proposer.rlm import sum_traces  # noqa: E402
 from rlm_gepa.schema import validate_example_result, validate_project  # noqa: E402
 
 
@@ -2176,6 +2177,97 @@ def test_interrupted_controller_snapshot_does_not_fabricate_final_evidence(tmp_p
     trace.to_exportable_json(logs_dir / "in_progress_trace.json")
 
     assert gepa_project._load_run_traces(tmp_path) == [trace]
+    assert gepa_project._load_run_evidence(tmp_path) == []
+
+
+@pytest.mark.parametrize("association", ["local", "indexed"])
+def test_finalized_controller_snapshot_counts_usage_once(
+    monkeypatch, tmp_path: Path, association: str
+) -> None:
+    run_dir = tmp_path / "harness"
+    logs_dir = run_dir / "logs" / "agent"
+    logs_dir.mkdir(parents=True)
+    export_root = tmp_path / "example" / ".run"
+    monkeypatch.setattr(tbench_agent, "RUN_EXPORT_ROOT", export_root)
+    canonical = (logs_dir / ".run" if association == "local" else export_root) / "finished"
+    canonical.mkdir(parents=True)
+    trace = RunTrace(
+        status="completed",
+        model="main",
+        iterations=1,
+        max_iterations=3,
+        duration_ms=5,
+        usage=LMUsage(main=TokenUsage(input_tokens=10)),
+    )
+    trace.to_exportable_json(canonical / "trace.json")
+    RunEvidence(
+        run_id="finished", complete=True, terminal_outcome="completed"
+    ).to_exportable_json(canonical / "evidence.json")
+    trace.to_exportable_json(logs_dir / "in_progress_trace.json")
+    if association == "indexed":
+        (logs_dir / "predict_rlm_runs.jsonl").write_text(json.dumps("finished") + "\n")
+
+    traces = gepa_project._load_run_traces(run_dir)
+
+    assert sum_traces(traces)[0].input_tokens == 10
+    assert traces == [trace]
+
+
+def test_independent_controller_snapshot_with_identical_content_is_retained(
+    tmp_path: Path,
+) -> None:
+    finalized_logs = tmp_path / "finished" / "logs" / "agent"
+    canonical = finalized_logs / ".run" / "finished"
+    canonical.mkdir(parents=True)
+    unfinished_logs = tmp_path / "unfinished" / "logs" / "agent"
+    unfinished_logs.mkdir(parents=True)
+    trace = RunTrace(
+        status="completed",
+        model="main",
+        iterations=1,
+        max_iterations=3,
+        duration_ms=5,
+        usage=LMUsage(main=TokenUsage(input_tokens=10)),
+    )
+    trace.to_exportable_json(canonical / "trace.json")
+    RunEvidence(
+        run_id="finished", complete=True, terminal_outcome="completed"
+    ).to_exportable_json(canonical / "evidence.json")
+    trace.to_exportable_json(unfinished_logs / "in_progress_trace.json")
+
+    traces = gepa_project._load_run_traces(tmp_path)
+
+    assert sum_traces(traces)[0].input_tokens == 20
+    assert traces == [trace, trace]
+
+
+@pytest.mark.parametrize("missing", ["evidence.json", "trace.json"])
+def test_incomplete_canonical_pair_retains_controller_snapshot(
+    tmp_path: Path, missing: str
+) -> None:
+    logs_dir = tmp_path / "logs" / "agent"
+    canonical = logs_dir / ".run" / "unfinished"
+    canonical.mkdir(parents=True)
+    trace = RunTrace(
+        status="in_progress",
+        model="main",
+        iterations=1,
+        max_iterations=3,
+        duration_ms=5,
+        usage=LMUsage(main=TokenUsage(input_tokens=10)),
+    )
+    if missing == "evidence.json":
+        trace.to_exportable_json(canonical / "trace.json")
+    else:
+        RunEvidence(run_id="unfinished", complete=False).to_exportable_json(
+            canonical / "evidence.json"
+        )
+    trace.to_exportable_json(logs_dir / "in_progress_trace.json")
+
+    traces = gepa_project._load_run_traces(tmp_path)
+
+    assert sum_traces(traces)[0].input_tokens == 10
+    assert traces == [trace]
     assert gepa_project._load_run_evidence(tmp_path) == []
 
 
