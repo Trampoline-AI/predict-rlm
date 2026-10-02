@@ -218,6 +218,52 @@ class TestRunEvidence:
         with pytest.raises(TypeError, match="not JSON serializable"):
             getattr(evidence, serializer)()
 
+    def test_proposer_rejects_iteration_without_required_index(self):
+        evidence = RunEvidence(
+            run_id="run",
+            complete=True,
+            events=[
+                RunEvidenceEvent(
+                    sequence=1,
+                    kind="iteration.recorded",
+                    timestamp_ns=1,
+                    data={"step": {}},
+                )
+            ],
+        )
+
+        with pytest.raises(KeyError, match="iteration"):
+            evidence.to_proposer()
+
+    def test_proposer_filters_inputs_only_at_run_start_top_level(self):
+        data = {
+            "inputs": {"raw": "private"},
+            "details": [{"inputs": {"behavior": "retained", "cost": 1}, "usage": {}}],
+        }
+        evidence = RunEvidence(
+            run_id="run",
+            complete=True,
+            events=[
+                RunEvidenceEvent(
+                    sequence=index,
+                    kind=kind,
+                    timestamp_ns=index,
+                    data=data,
+                )
+                for index, kind in enumerate(("run.started", "tool.finished"), start=1)
+            ],
+        )
+        original = evidence.model_dump()
+
+        started, finished = evidence.to_proposer().events
+
+        assert started.data == {"details": [{"inputs": {"behavior": "retained"}}]}
+        assert finished.data == {
+            "inputs": {"raw": "private"},
+            "details": [{"inputs": {"behavior": "retained"}}],
+        }
+        assert evidence.model_dump() == original
+
     def test_exports_full_evidence_and_filtered_proposer_view(self, tmp_path):
         b64 = "A" * 40000
         image = f"data:image/png;base64,{b64}"

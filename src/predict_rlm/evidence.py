@@ -101,29 +101,21 @@ _PROPOSER_ACCOUNTING_KEYS = {
 
 
 def _proposer_evidence_data(event: RunEvidenceEvent) -> dict[str, Any]:
-    data = dict(event.data)
-    if event.kind == "run.started":
-        data.pop("inputs", None)
-    elif event.kind == "iteration.recorded":
-        step = data.get("step")
-        return (
-            {"iteration": step["iteration"]}
-            if isinstance(step, dict) and "iteration" in step
-            else {}
-        )
-    return _sanitize_for_trace(_without_accounting(data))
+    if event.kind == "iteration.recorded":
+        return {"iteration": event.data["step"]["iteration"]}
+    return _project_proposer_value(event.data, exclude_inputs=event.kind == "run.started")
 
 
-def _without_accounting(value: Any) -> Any:
+def _project_proposer_value(value: Any, *, exclude_inputs: bool = False) -> Any:
     if isinstance(value, dict):
         return {
-            key: _without_accounting(item)
+            key: _project_proposer_value(item)
             for key, item in value.items()
-            if key not in _PROPOSER_ACCOUNTING_KEYS
+            if key not in _PROPOSER_ACCOUNTING_KEYS and not (exclude_inputs and key == "inputs")
         }
     if isinstance(value, list):
-        return [_without_accounting(item) for item in value]
-    return value
+        return [_project_proposer_value(item) for item in value]
+    return _sanitize_for_trace(value)
 
 
 def extract_evidence_from_exc(exc: BaseException | None) -> RunEvidence | None:
