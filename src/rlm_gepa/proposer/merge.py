@@ -490,7 +490,7 @@ class RlmMergeProposer(MergeProposer):
                 "inputs": rec_base.get("Inputs") or rec_source.get("Inputs") or "",
                 "base_parent": {
                     "traces": rec_base.get("Traces", []),
-                    "evidence": rec_base.get("Evidence", []),
+                    "evidence": rec_base["Evidence"],
                     "failure_metadata": proposer_failure_metadata(
                         rec_base.get("Failure Metadata", {})
                     ),
@@ -500,7 +500,7 @@ class RlmMergeProposer(MergeProposer):
                 },
                 "patch_source_parent": {
                     "traces": rec_source.get("Traces", []),
-                    "evidence": rec_source.get("Evidence", []),
+                    "evidence": rec_source["Evidence"],
                     "failure_metadata": proposer_failure_metadata(
                         rec_source.get("Failure Metadata", {})
                     ),
