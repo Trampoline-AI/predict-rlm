@@ -38,8 +38,8 @@ from image_analysis import ImageAnalyzer
 
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp"}
 SOURCE_DIR = Path(__file__).parent / "sample" / "input"
-LLM_MODEL = "gpt-5.5"
-SUB_LM_MODEL = "gpt-5.4-mini"
+LLM_MODEL = "gpt-5.6-terra"
+SUB_LM_MODEL = "gpt-5.6-terra"
 DEFAULT_QUERY = """
 
     What letters appear in each image, and how many times does each letter appear? Always include: logo text, header address/phone/fax, header email, header website URL, "Page N" footers, etc.

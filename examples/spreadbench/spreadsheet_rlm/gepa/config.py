@@ -22,10 +22,10 @@ class SpreadsheetGepaConfig(OptimizeConfig):
 
 def default_config() -> SpreadsheetGepaConfig:
     return SpreadsheetGepaConfig(
-        executor_lm="openai/gpt-5.5",
-        executor_sub_lm="openai/gpt-5.4-mini",
-        proposer_lm="openai/gpt-5.5",
-        proposer_sub_lm="openai/gpt-5.4-mini",
+        executor_lm="openai/gpt-5.6-terra",
+        executor_sub_lm="openai/gpt-5.6-terra",
+        proposer_lm="openai/gpt-5.6-terra",
+        proposer_sub_lm="openai/gpt-5.6-terra",
     )
 
 

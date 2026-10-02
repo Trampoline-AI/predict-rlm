@@ -50,6 +50,15 @@ def make_spec(*, events=()) -> RuntimeSpec:
     )
 
 
+def test_run_ids_preserve_nanoseconds_across_second_boundary(monkeypatch):
+    timestamps = iter((999_999_999, 1_000_000_001))
+    monkeypatch.setattr("predict_rlm.runtime.time.time_ns", lambda: next(timestamps))
+
+    run_ids = [RunContext(make_spec(), {}).run_id for _ in range(2)]
+
+    assert run_ids == ["19700101T000000.999999999Z", "19700101T000001.000000001Z"]
+
+
 class RecordingSink:
     strict = True
 

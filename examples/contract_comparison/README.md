@@ -41,8 +41,8 @@ uv run examples/contract_comparison/run.py --debug
 
 | Flag               | Default          | Description                   |
 | ------------------ | ---------------- | ----------------------------- |
-| `--model`          | `gpt-5.5`        | Main Codex model ID (no provider prefix) |
-| `--sub-lm-model`   | `gpt-5.4-mini`   | Codex sub-LM for `predict()` calls |
+| `--model`          | `gpt-5.6-terra`  | Main Codex model ID (no provider prefix) |
+| `--sub-lm-model`   | `gpt-5.6-terra`  | Codex sub-LM for `predict()` calls |
 | `--max-iterations` | `30`             | Max REPL iterations           |
 | `--quiet`          | off              | Suppress RLM reasoning, code, output, tool calls, errors, and submit blocks |
 | `--debug`          | off              | Print timestamped RLM and sandbox lifecycle diagnostics to stderr |

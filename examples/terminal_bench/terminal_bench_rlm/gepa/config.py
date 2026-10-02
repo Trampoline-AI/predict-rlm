@@ -20,10 +20,10 @@ DEFAULT_VAL_TASK_IDS = ("super-benchmark-upet",)
 class TerminalBenchGepaConfig(OptimizeConfig):
     """Configuration for optimizing the Terminal-Bench PredictRLM agent."""
 
-    executor_lm: str = "openai/gpt-5.5"
-    executor_sub_lm: str = "openai/gpt-5.4-mini"
-    proposer_lm: str = "openai/gpt-5.5"
-    proposer_sub_lm: str = "openai/gpt-5.4-mini"
+    executor_lm: str = "openai/gpt-5.6-terra"
+    executor_sub_lm: str = "openai/gpt-5.6-terra"
+    proposer_lm: str = "openai/gpt-5.6-terra"
+    proposer_sub_lm: str = "openai/gpt-5.6-terra"
     dataset_name: str = "terminal-bench-core"
     dataset_version: str = "0.1.1"
     harbor_dataset: str = "terminal-bench/terminal-bench-2-1"

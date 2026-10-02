@@ -130,9 +130,9 @@ codex-lm usage
 | [Invoice Processing](examples/invoice_processing/) — Extract vendor info, line items, and totals from PDF invoices into a consolidated Excel spreadsheet | **Input:** PDF invoices<br>**Output:** Excel spreadsheet ([example output](examples/invoice_processing/sample/output/))          | <a href="examples/invoice_processing/sample/output/output.md"><img src="https://raw.githubusercontent.com/Trampoline-AI/predict-rlm/main/examples/invoice_processing/sample/output/screenshot.png" width="280"></a>              |
 | [Contract Comparison](examples/contract_comparison/) — Compare two contract versions and produce a structured diff report with per-section analysis      | **Input:** 2 PDF contracts<br>**Output:** Structured diff report ([example output](examples/contract_comparison/sample/output/)) | <a href="examples/contract_comparison/sample/output/comparison-report.md"><img src="https://raw.githubusercontent.com/Trampoline-AI/predict-rlm/main/examples/contract_comparison/sample/output/screenshot.png" width="280"></a> |
 
-The runnable examples use Codex LM by default: `gpt-5.5` for main/executor and
-GEPA proposer calls, and `gpt-5.4-mini` for sub-LM calls. They use a Codex auth
-profile rather than an OpenAI API key:
+The runnable examples use Codex LM with `gpt-5.6-terra` for every role, including
+main/executor, GEPA proposer, and sub-LM calls. They use a Codex auth profile
+rather than an OpenAI API key:
 
 ```bash
 uv sync --extra examples --extra codex-lm
@@ -154,8 +154,13 @@ examples/<example>/.run/<run_id>/
   evidence.json
 ```
 
+Run IDs are UTC creation timestamps with nanosecond precision, such as
+`20261002T143052.123456789Z`, so directory names sort by timestamp. They use the
+system wall clock: equal clock readings or clock rollback can produce duplicate
+IDs; there is no UUID suffix or monotonic counter.
+
 These folders are ignored by Git. The directory name matches the evidence
-`run_id`; concurrent calls and GEPA task/proposer runs get separate directories.
+`run_id`; GEPA task/proposer runs use the same convention.
 Failures and cancellation also export artifacts. If failure occurs before a
 trace exists, `trace.json` contains `null` and `evidence.json` records the failure.
 Generated documents and benchmark summary reports retain their existing locations.

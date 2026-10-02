@@ -7,8 +7,8 @@ Usage::
     from predict_rlm import File
 
     invoices = [File(path="invoice1.pdf"), File(path="invoice2.pdf")]
-    processor = InvoiceProcessor(sub_lm=CodexLM("gpt-5.4-mini"))
-    with dspy.context(lm=CodexLM("gpt-5.5")):
+    processor = InvoiceProcessor(sub_lm=CodexLM("gpt-5.6-terra"))
+    with dspy.context(lm=CodexLM("gpt-5.6-terra")):
         prediction = await processor.aforward(invoices=invoices)
     # prediction.result — InvoiceExtractionResult with structured invoice data
     # prediction.workbook — File with the Excel workbook

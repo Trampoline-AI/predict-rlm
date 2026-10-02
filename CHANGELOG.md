@@ -9,8 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- `PredictRLM(run_export_root=...)` saves `trace.json` and `evidence.json` under a
-  unique invocation run ID after success, failure, or cancellation. A run without
+- `PredictRLM(run_export_root=...)` saves `trace.json` and `evidence.json` under an
+  invocation run ID after success, failure, or cancellation. A run without
   a captured trace writes JSON `null` to `trace.json`.
 - All examples, including notebook and benchmark/GEPA paths, use
   `<example>/.run/<run_id>/` for these artifacts. Example `.run` directories are
@@ -19,10 +19,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Run IDs now use filename-safe UTC creation timestamps with nanosecond precision
+  (`YYYYMMDDTHHMMSS.nnnnnnnnnZ`) instead of random UUIDs.
 - Runnable examples and notebooks now default to Codex LM authentication instead
-  of API-key-backed model calls: `gpt-5.5` for main/executor and GEPA proposer
-  roles, and `gpt-5.4-mini` for sub-LM roles. Benchmark CLIs default Codex routing
-  on and retain an explicit `--no-codex-lm` opt-out.
+  of API-key-backed model calls: `gpt-5.6-terra` for all main/executor, GEPA proposer,
+  and sub-LM roles. Benchmark CLIs default Codex routing on and retain an explicit
+  `--no-codex-lm` opt-out.
 
 ### Breaking Changes
 

@@ -3,8 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 
-DEFAULT_EVAL_LM = "openai/gpt-5.5"
-DEFAULT_EVAL_SUB_LM = "openai/gpt-5.4-mini"
+DEFAULT_EVAL_LM = "openai/gpt-5.6-terra"
+DEFAULT_EVAL_SUB_LM = "openai/gpt-5.6-terra"
 
 
 @dataclass

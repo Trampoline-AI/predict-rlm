@@ -7,8 +7,8 @@ Usage::
     from predict_rlm import File
 
     images = [File(path="photo1.png"), File(path="photo2.jpg")]
-    analyzer = ImageAnalyzer(sub_lm=CodexLM("gpt-5.4-mini"))
-    with dspy.context(lm=CodexLM("gpt-5.5")):
+    analyzer = ImageAnalyzer(sub_lm=CodexLM("gpt-5.6-terra"))
+    with dspy.context(lm=CodexLM("gpt-5.6-terra")):
         prediction = await analyzer.aforward(images=images, query="What do you see?")
     # prediction.answer — str with the analysis
 """

@@ -37,8 +37,8 @@ from document_redaction import DocumentRedactor
 # ---------------------------------------------------------------------------
 
 SOURCE_DIR = Path(__file__).parent / "sample" / "input"
-LLM_MODEL = "gpt-5.5"
-SUB_LM_MODEL = "gpt-5.4-mini"
+LLM_MODEL = "gpt-5.6-terra"
+SUB_LM_MODEL = "gpt-5.6-terra"
 CRITERIA = """
 Redact all personally identifiable information (PII), including:
 
