@@ -199,6 +199,25 @@ class TestRunTrace:
 
 
 class TestRunEvidence:
+    @pytest.mark.parametrize("serializer", ["to_exportable_json", "to_proposer_json"])
+    def test_json_serializers_reject_unsupported_nested_data(self, serializer):
+        evidence = RunEvidence(
+            run_id="run",
+            complete=True,
+            terminal_outcome="completed",
+            events=[
+                RunEvidenceEvent(
+                    sequence=1,
+                    kind="tool.finished",
+                    timestamp_ns=1,
+                    data={"result": {"items": [object()]}},
+                )
+            ],
+        )
+
+        with pytest.raises(TypeError, match="not JSON serializable"):
+            getattr(evidence, serializer)()
+
     def test_exports_full_evidence_and_filtered_proposer_view(self, tmp_path):
         b64 = "A" * 40000
         image = f"data:image/png;base64,{b64}"

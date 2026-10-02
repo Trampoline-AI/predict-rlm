@@ -59,7 +59,7 @@ class RunEvidence(BaseModel):
         compact summaries. If provided, ``path`` receives the returned JSON.
         """
         data = _sanitize_for_trace(self.model_dump())
-        output = json.dumps(data, indent=indent, default=str)
+        output = json.dumps(data, indent=indent)
         if path is not None:
             Path(path).write_text(output)
         return output
@@ -82,7 +82,7 @@ class RunEvidence(BaseModel):
 
     def to_proposer_json(self, path: str | Path | None = None, indent: int = 2) -> str:
         """Serialize the proposer-facing evidence subset to JSON."""
-        output = json.dumps(self.to_proposer().model_dump(), indent=indent, default=str)
+        output = json.dumps(self.to_proposer().model_dump(), indent=indent)
         if path is not None:
             Path(path).write_text(output)
         return output
