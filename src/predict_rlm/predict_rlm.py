@@ -3041,10 +3041,12 @@ class PredictRLM(dspy.RLM):
         try:
             directory.mkdir(parents=True, exist_ok=False)
             evidence.to_exportable_json(directory / "evidence.json")
+            pending_trace = directory / "trace.json.tmp"
             if trace is None:
-                (directory / "trace.json").write_text("null\n", encoding="utf-8")
+                pending_trace.write_text("null\n", encoding="utf-8")
             else:
-                trace.to_exportable_json(directory / "trace.json")
+                trace.to_exportable_json(pending_trace)
+            pending_trace.replace(directory / "trace.json")
         except Exception as error:
             if isinstance(target, BaseException):
                 target.add_note(f"Could not export run artifacts to {directory}: {error}")

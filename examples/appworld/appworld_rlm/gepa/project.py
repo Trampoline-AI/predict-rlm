@@ -160,7 +160,8 @@ class AppWorldGepaProject(RLMGepaProject):
         trace: RunTrace | None = None,
         evidence: RunEvidence | None = None,
     ) -> RLMGepaExampleResult:
-        trace = extract_trace_from_exc(exc) or trace
+        exception_trace = extract_trace_from_exc(exc)
+        trace = exception_trace or trace
         evidence = extract_evidence_from_exc(exc) or evidence
         return RLMGepaExampleResult(
             score=0.0,
@@ -169,7 +170,7 @@ class AppWorldGepaProject(RLMGepaProject):
             evidence=[evidence] if evidence is not None else [],
             rlm_inputs={"task_id": example.task_id, "dataset": example.dataset},
             example_id=example.task_id,
-            error=None if trace is not None else feedback,
+            error=None if exception_trace is not None else feedback,
         )
 
 
