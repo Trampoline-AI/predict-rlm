@@ -140,7 +140,7 @@ def _apply_project_args(config: OptimizeConfig, args: Any) -> TerminalBenchGepaC
     if args.upload_results:
         config.upload_results = True
     config.codex_lm = codex_lm_enabled
-    config.codex_lm_exclude = tuple(args.codex_lm_exclude or ())
+    config.codex_lm_exclude = tuple(args.codex_lm_exclude)
     return config
 
 
@@ -157,6 +157,6 @@ def _install_codex_lm(args: Any) -> bool:
 
     from dspy_codex_lm.cli import install_monkeypatch
 
-    install_monkeypatch(exclude=args.codex_lm_exclude or ())
+    install_monkeypatch(exclude=args.codex_lm_exclude)
     os.environ.setdefault("OPENAI_API_KEY", "codex-lm")
     return True
