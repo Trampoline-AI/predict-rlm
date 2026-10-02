@@ -10,6 +10,7 @@ import inspect
 import os
 import posixpath
 import threading
+import time
 import types
 import typing
 import uuid
@@ -18,6 +19,7 @@ from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequenc
 from contextlib import asynccontextmanager, contextmanager
 from contextvars import ContextVar, Token
 from dataclasses import dataclass, field, replace
+from datetime import UTC, datetime
 from enum import Enum
 from pathlib import Path, PurePosixPath
 from types import MappingProxyType
@@ -1303,13 +1305,19 @@ class RuntimeSpec:
 Cleanup = Callable[[], Awaitable[None] | None]
 
 
+def _timestamp_run_id() -> str:
+    seconds, nanoseconds = divmod(time.time_ns(), 1_000_000_000)
+    timestamp = datetime.fromtimestamp(seconds, UTC)
+    return f"{timestamp:%Y%m%dT%H%M%S}.{nanoseconds:09d}Z"
+
+
 @dataclass
 class RunContext:
     """Fresh invocation-local state. A context is never reused."""
 
     spec: RuntimeSpec
     input_values: Mapping[str, Any]
-    run_id: str = field(default_factory=lambda: uuid.uuid4().hex)
+    run_id: str = field(default_factory=_timestamp_run_id)
     input_bindings: dict[str, PreparedInputBinding] = field(default_factory=dict)
     bound_input_bindings: list[PreparedInputBinding] = field(
         default_factory=list,

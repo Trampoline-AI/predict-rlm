@@ -7,8 +7,8 @@ Usage::
     from predict_rlm import File
 
     documents = [File(path="report.pdf"), File(path="appendix.pdf")]
-    analyzer = DocumentAnalyzer(sub_lm=CodexLM("gpt-5.4-mini"))
-    with dspy.context(lm=CodexLM("gpt-5.5")):
+    analyzer = DocumentAnalyzer(sub_lm=CodexLM("gpt-5.6-terra"))
+    with dspy.context(lm=CodexLM("gpt-5.6-terra")):
         prediction = await analyzer.aforward(
             documents=documents,
             criteria="Extract key dates, entities, and a summary.",

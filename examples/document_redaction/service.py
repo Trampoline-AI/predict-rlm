@@ -7,8 +7,8 @@ Usage::
     from predict_rlm import File
 
     documents = [File(path="contract.pdf"), File(path="appendix.pdf")]
-    redactor = DocumentRedactor(sub_lm=CodexLM("gpt-5.4-mini"))
-    with dspy.context(lm=CodexLM("gpt-5.5")):
+    redactor = DocumentRedactor(sub_lm=CodexLM("gpt-5.6-terra"))
+    with dspy.context(lm=CodexLM("gpt-5.6-terra")):
         prediction = await redactor.aforward(
             documents=documents,
             criteria="Redact all personal names, phone numbers, and email addresses.",

@@ -51,10 +51,9 @@ an error instead of falling back to paid API requests.
 
 ## Run evaluation or optimization
 
-The default main/executor and proposer models are `openai/gpt-5.5`; the
-evaluation sub-LM, executor sub-LM, and proposer sub-LM are
-`openai/gpt-5.4-mini`. The `openai/` prefixes are retained for CLI interception;
-all these default roles use CodexLM.
+Every default model role uses `openai/gpt-5.6-terra`: evaluation main and sub-LM,
+executor main and sub-LM, and proposer main and sub-LM. The `openai/` prefixes are
+retained for CLI interception; all these default roles use CodexLM.
 
 ```bash
 uv run rlm-gepa eval --dataset validation --limit 1

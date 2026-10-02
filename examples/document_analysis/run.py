@@ -37,8 +37,8 @@ from document_analysis import DocumentAnalyzer
 # ---------------------------------------------------------------------------
 
 SOURCE_DIR = Path(__file__).parent / "sample" / "input"
-LLM_MODEL = "gpt-5.5"
-SUB_LM_MODEL = "gpt-5.4-mini"
+LLM_MODEL = "gpt-5.6-terra"
+SUB_LM_MODEL = "gpt-5.6-terra"
 CRITERIA = """
 Analyze the document(s) and produce a comprehensive briefing report
 structured as follows.

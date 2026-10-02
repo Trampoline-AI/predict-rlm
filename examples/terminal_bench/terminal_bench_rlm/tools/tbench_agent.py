@@ -579,8 +579,8 @@ class _TerminalBenchRLMBaseAgentMixin:
         )
         self.phase_log_path = Path(phase_log_path) if phase_log_path is not None else None
         self.task_id = task_id
-        predict_rlm_kwargs.setdefault("lm", "openai/gpt-5.5")
-        predict_rlm_kwargs.setdefault("sub_lm", "openai/gpt-5.4-mini")
+        predict_rlm_kwargs.setdefault("lm", "openai/gpt-5.6-terra")
+        predict_rlm_kwargs.setdefault("sub_lm", "openai/gpt-5.6-terra")
         self.predict_rlm_kwargs = predict_rlm_kwargs
         self.codex_lm_debug = _coerce_bool(codex_lm_debug)
         self.codex_lm_debug_log = _coerce_optional_text(codex_lm_debug_log)

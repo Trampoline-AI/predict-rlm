@@ -7,8 +7,8 @@ Usage::
     from predict_rlm import File
 
     contracts = [File(path="contract-v1.pdf"), File(path="contract-v2.pdf")]
-    comparator = ContractComparator(sub_lm=CodexLM("gpt-5.4-mini"))
-    with dspy.context(lm=CodexLM("gpt-5.5")):
+    comparator = ContractComparator(sub_lm=CodexLM("gpt-5.6-terra"))
+    with dspy.context(lm=CodexLM("gpt-5.6-terra")):
         result = await comparator.aforward(contracts=contracts)
     # result — ComparisonResult with report, section diffs, and key differences
 """

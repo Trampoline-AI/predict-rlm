@@ -37,8 +37,8 @@ from contract_comparison import ContractComparator
 # ---------------------------------------------------------------------------
 
 SOURCE_DIR = Path(__file__).parent / "sample" / "input"
-LLM_MODEL = "gpt-5.5"
-SUB_LM_MODEL = "gpt-5.4-mini"
+LLM_MODEL = "gpt-5.6-terra"
+SUB_LM_MODEL = "gpt-5.6-terra"
 
 
 def parse_args():

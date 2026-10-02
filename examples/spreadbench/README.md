@@ -80,8 +80,8 @@ This creates:
 
 ## Run with the default models
 
-Evaluation uses `openai/gpt-5.5` with `openai/gpt-5.4-mini` as its sub-LM.
-Optimization uses that same main/sub pair for both executor and proposer.
+Evaluation uses `openai/gpt-5.6-terra` for both its main LM and sub-LM.
+Optimization uses `openai/gpt-5.6-terra` for all four executor and proposer roles.
 The `openai/` prefixes are retained for CLI interception; every default model
 role uses CodexLM.
 
