@@ -26,6 +26,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and sub-LM roles. Benchmark CLIs default Codex routing on and retain an explicit
   `--no-codex-lm` opt-out.
 
+### Fixed
+
+- Preserve AppWorld evaluator errors when retaining a completed agent's trace and
+  evidence, so GEPA reports harness failures as errors rather than completed runs.
+- Publish canonical traces only after successful writes, preserving Terminal-Bench
+  live snapshots when artifact export fails.
+
 ### Breaking Changes
 
 - `RunTrace` and its proposer/exported forms no longer contain `evidence`.

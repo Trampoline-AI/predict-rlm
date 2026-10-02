@@ -41,6 +41,7 @@ from appworld_rlm.tools.runner import (
 
 from predict_rlm import Skill
 from predict_rlm.evidence import RunEvidence
+from predict_rlm.trace import RunTrace
 from rlm_gepa.reporting.stats import render_stats
 from rlm_gepa.schema import EvaluationContext, validate_example_result, validate_project
 
@@ -714,6 +715,50 @@ def test_appworld_completion_failure_keeps_incomplete_evidence(monkeypatch):
         assert "incomplete strict evidence" in str(exc)
     else:
         raise AssertionError("completion wrapper lost incomplete evidence")
+
+
+def test_appworld_scoring_failure_retains_artifacts_and_error(monkeypatch, tmp_path):
+    trace = RunTrace(
+        status="completed", model="test", iterations=1, max_iterations=1, duration_ms=1,
+    )
+    evidence = RunEvidence(run_id="completed_run", complete=True, terminal_outcome="completed")
+
+    class ScoringClient:
+        def evaluate_appworld_task(self, task_id):
+            return {"score": "invalid-score"}
+
+        def close_appworld_task(self, task_id):
+            pass
+
+        def close(self):
+            pass
+
+    class CompletedAgent:
+        def __init__(self, **kwargs):
+            self.appworld_client = ScoringClient()
+
+        async def acall(self, **kwargs):
+            return SimpleNamespace(trace=trace, evidence=evidence)
+
+    monkeypatch.setattr(gepa_project_module, "AppWorldRLM", CompletedAgent)
+    project = AppWorldGepaProject(AppWorldGepaConfig(data_root=FIXTURE_ROOT))
+    context = EvaluationContext(
+        lm=None, sub_lm=None, max_iterations=1, task_timeout=10,
+        output_dir=tmp_path, kind="validation",
+    )
+    result = asyncio.run(project.evaluate_example(
+        {COMPONENT_SKILL: "Solve the task"},
+        evaluation.AppWorldExample("aaa111_1", "train", "do it"),
+        context,
+    ))
+
+    assert result.traces == [trace]
+    assert result.evidence == [evidence]
+    assert result.score == 0.0
+    assert result.error is not None
+    assert "ValueError" in result.error
+    assert "invalid-score" in result.error
+    validate_example_result(result)
 
 
 def test_appworld_rlm_completes_task_from_answer(monkeypatch):

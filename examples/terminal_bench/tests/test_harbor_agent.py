@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import errno
 import inspect
 import json
 import logging
@@ -316,8 +317,9 @@ def test_remote_controller_verbose_streams_rlm_iteration_logs(monkeypatch, tmp_p
 
 
 @pytest.mark.parametrize("fail", [False, True])
-def test_remote_controller_finalizes_pair_and_removes_live_snapshot(
-    monkeypatch, tmp_path: Path, fail: bool,
+@pytest.mark.parametrize("export_fails", [False, True])
+def test_remote_controller_keeps_live_snapshot_until_canonical_export_completes(
+    monkeypatch, tmp_path: Path, fail: bool, export_fails: bool,
 ) -> None:
     class FakeInterpreter:
         def __init__(self, **_kwargs) -> None:
@@ -344,9 +346,25 @@ def test_remote_controller_finalizes_pair_and_removes_live_snapshot(
         "logging_dir": str(tmp_path),
         "predict_rlm_kwargs": {"max_iterations": 1},
     }
+    if export_fails:
+        write_text = Path.write_text
+
+        def fail_trace_write(path, data, *args, **kwargs):
+            if path.parent.parent == tmp_path / ".run" and path.name != "evidence.json":
+                write_text(path, data[:1], *args, **kwargs)
+                raise OSError(errno.ENOSPC, "disk full")
+            return write_text(path, data, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "write_text", fail_trace_write)
     if fail:
-        with pytest.raises(RuntimeError, match="task failed"):
+        with pytest.raises(RuntimeError, match="task failed") as error:
             remote_controller._run_predict_rlm(payload)
+        if export_fails:
+            assert error.value.run_export_error.errno == errno.ENOSPC
+    elif export_fails:
+        with pytest.raises(OSError) as error:
+            remote_controller._run_predict_rlm(payload)
+        assert error.value.errno == errno.ENOSPC
     else:
         assert remote_controller._run_predict_rlm(payload) == "done"
 
@@ -354,6 +372,10 @@ def test_remote_controller_finalizes_pair_and_removes_live_snapshot(
     evidence = json.loads(evidence_path.read_text())
     assert evidence_path.parent.name == evidence["run_id"]
     assert evidence["terminal_outcome"] == ("error" if fail else "completed")
+    if export_fails:
+        live_trace = json.loads((tmp_path / "in_progress_trace.json").read_text())
+        assert live_trace["status"] == ("error" if fail else "completed")
+        return
     assert json.loads((evidence_path.parent / "trace.json").read_text())["status"] == (
         "error" if fail else "completed"
     )
