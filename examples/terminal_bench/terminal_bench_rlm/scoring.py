@@ -129,9 +129,9 @@ def to_gepa_example_result(
     result_or_parser_results: Any,
     *,
     traces: list[Any],
+    evidence: list[RunEvidence],
     example_id: str | None = None,
     rlm_inputs: Mapping[str, Any] | None = None,
-    evidence: list[RunEvidence] | None = None,
 ):
     from rlm_gepa import RLMGepaExampleResult
 
@@ -148,7 +148,7 @@ def to_gepa_example_result(
         score=details["soft_score"],
         feedback=feedback(result_or_parser_results),
         traces=traces,
-        evidence=evidence if evidence is not None else [],
+        evidence=evidence,
         rlm_inputs=dict(rlm_inputs or {}),
         example_id=example_id,
         objective_scores=objective_scores,
