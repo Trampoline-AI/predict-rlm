@@ -2176,11 +2176,15 @@ def test_interrupted_controller_snapshot_does_not_fabricate_final_evidence(tmp_p
     logs_dir.mkdir(parents=True)
     trace.to_exportable_json(logs_dir / "in_progress_trace.json")
 
-    assert gepa_project._load_run_traces(tmp_path) == [trace]
-    assert gepa_project._load_run_evidence(tmp_path) == []
+    traces, evidence = gepa_project._load_run_artifacts(tmp_path)
+
+    assert traces == [trace]
+    assert evidence == []
 
 
-@pytest.mark.parametrize("association", ["local", "indexed"])
+@pytest.mark.parametrize(
+    "association", ["local", "indexed", "transported", "transported_indexed"]
+)
 def test_finalized_controller_snapshot_counts_usage_once(
     monkeypatch, tmp_path: Path, association: str
 ) -> None:
@@ -2189,7 +2193,12 @@ def test_finalized_controller_snapshot_counts_usage_once(
     logs_dir.mkdir(parents=True)
     export_root = tmp_path / "example" / ".run"
     monkeypatch.setattr(tbench_agent, "RUN_EXPORT_ROOT", export_root)
-    canonical = (logs_dir / ".run" if association == "local" else export_root) / "finished"
+    if association == "local":
+        canonical = logs_dir / ".run" / "finished"
+    elif association == "transported":
+        canonical = run_dir / ".run" / "finished"
+    else:
+        canonical = export_root / "finished"
     canonical.mkdir(parents=True)
     trace = RunTrace(
         status="completed",
@@ -2200,17 +2209,22 @@ def test_finalized_controller_snapshot_counts_usage_once(
         usage=LMUsage(main=TokenUsage(input_tokens=10)),
     )
     trace.to_exportable_json(canonical / "trace.json")
-    RunEvidence(
-        run_id="finished", complete=True, terminal_outcome="completed"
-    ).to_exportable_json(canonical / "evidence.json")
+    evidence = RunEvidence(run_id="finished", complete=True, terminal_outcome="completed")
+    evidence.to_exportable_json(canonical / "evidence.json")
     trace.to_exportable_json(logs_dir / "in_progress_trace.json")
-    if association == "indexed":
+    if association != "local":
         (logs_dir / "predict_rlm_runs.jsonl").write_text(json.dumps("finished") + "\n")
+    if association == "transported_indexed":
+        transported = logs_dir / ".run" / "finished"
+        transported.mkdir(parents=True)
+        trace.to_exportable_json(transported / "trace.json")
+        evidence.to_exportable_json(transported / "evidence.json")
 
-    traces = gepa_project._load_run_traces(run_dir)
+    traces, loaded_evidence = gepa_project._load_run_artifacts(run_dir)
 
     assert sum_traces(traces)[0].input_tokens == 10
     assert traces == [trace]
+    assert loaded_evidence == [evidence]
 
 
 def test_independent_controller_snapshot_with_identical_content_is_retained(
@@ -2235,7 +2249,7 @@ def test_independent_controller_snapshot_with_identical_content_is_retained(
     ).to_exportable_json(canonical / "evidence.json")
     trace.to_exportable_json(unfinished_logs / "in_progress_trace.json")
 
-    traces = gepa_project._load_run_traces(tmp_path)
+    traces, _ = gepa_project._load_run_artifacts(tmp_path)
 
     assert sum_traces(traces)[0].input_tokens == 20
     assert traces == [trace, trace]
@@ -2264,11 +2278,11 @@ def test_incomplete_canonical_pair_retains_controller_snapshot(
         )
     trace.to_exportable_json(logs_dir / "in_progress_trace.json")
 
-    traces = gepa_project._load_run_traces(tmp_path)
+    traces, evidence = gepa_project._load_run_artifacts(tmp_path)
 
     assert sum_traces(traces)[0].input_tokens == 10
     assert traces == [trace]
-    assert gepa_project._load_run_evidence(tmp_path) == []
+    assert evidence == []
 
 
 def test_in_process_runner_calls_terminal_bench_harness_and_loads_results(
