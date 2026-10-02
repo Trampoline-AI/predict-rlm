@@ -446,14 +446,10 @@ class RLMInstructionProposer:
         for record in records:
             proposer_record = {
                 key: value
-                for key, value in dict(record).items()
+                for key, value in record.items()
                 if key not in {"Trace Preview", "Generated Outputs"}
             }
-            converted = _jsonable(proposer_record)
-            if isinstance(converted, dict):
-                serializable.append(converted)
-            else:
-                serializable.append({"record": converted})
+            serializable.append(_jsonable(proposer_record))
 
         with tempfile.NamedTemporaryFile(
             mode="w",
