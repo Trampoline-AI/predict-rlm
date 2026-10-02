@@ -104,7 +104,7 @@ def test_harbor_timeout_exception_class_is_preserved_in_feedback_and_objectives(
     }
 
     details = score_details(trial)
-    result = to_gepa_example_result(trial, traces=[])
+    result = to_gepa_example_result(trial, traces=[], evidence=[])
 
     assert details["failure_class"] == "outer_task_timeout"
     assert "failure_class=outer_task_timeout" in result.feedback
@@ -129,7 +129,7 @@ def test_outer_timeout_placeholder_yields_to_harbor_verifier_pass_evidence() -> 
     }
 
     details = score_details(trial)
-    result = to_gepa_example_result(trial, traces=[])
+    result = to_gepa_example_result(trial, traces=[], evidence=[])
 
     assert details["soft_score"] == 1.0
     assert details["hard_score"] == 1.0
@@ -156,7 +156,7 @@ def test_internal_timeout_yields_to_harbor_verifier_pass_evidence() -> None:
     }
 
     details = score_details(trial)
-    result = to_gepa_example_result(trial, traces=[])
+    result = to_gepa_example_result(trial, traces=[], evidence=[])
 
     assert details["soft_score"] == 1.0
     assert details["hard_score"] == 1.0
@@ -170,7 +170,7 @@ def test_internal_timeout_yields_to_harbor_verifier_pass_evidence() -> None:
 
 
 def test_gepa_objective_scores_are_numeric_when_harbor_trial_has_exception() -> None:
-    result = to_gepa_example_result({}, traces=[])
+    result = to_gepa_example_result({}, traces=[], evidence=[])
 
     assert result.objective_scores == {
         "soft_score": 0.0,
