@@ -21,7 +21,9 @@ result.evidence.to_exportable_json("evidence.json")
 `RunTrace` contains steps, model information, timings, usage, and trajectory
 status. It has no `evidence` field, including in its proposer projection.
 `RunEvidence` contains `run_id`, `complete`, `terminal_outcome`, and ordered
-`events`. It is returned even when no external sink is configured.
+`events`. Both artifacts are always present on successful predictions, even when
+no external sink is configured. Internal consumers access them directly; optional
+artifact handling is reserved for failures and cancellation.
 
 Set `PredictRLM(..., run_export_root=path)` to save both automatically as
 `<path>/<run_id>/trace.json` and `evidence.json` after each invocation finishes.

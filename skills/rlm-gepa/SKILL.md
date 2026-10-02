@@ -180,11 +180,11 @@ class DocumentProject(RLMGepaProject):
         )
         result = await rlm.acall(**example.rlm_kwargs)
         score, feedback = score_result(result, example.reference)
-        trace: RunTrace | None = getattr(result, "trace", None)
+        trace: RunTrace = result.trace
         return RLMGepaExampleResult(
             score=score,
             feedback=feedback,
-            traces=[trace] if trace is not None else [],
+            traces=[trace],
             evidence=[result.evidence],
             rlm_inputs={"example_id": example.example_id, **example.rlm_kwargs},
             example_id=example.example_id,
@@ -195,10 +195,13 @@ For an imperfect result, feedback must be nonempty. Good feedback identifies the
 actual failing surface: page, cell, clause, tool response, assertion, timeout,
 or schema mismatch. It describes what happened, not replacement prompt text.
 
-Forward each run's `result.evidence` independently of `result.trace`. On failures,
-recover `exc.evidence` through `predict_rlm.evidence.extract_evidence_from_exc`
+Successful PredictRLM predictions always provide `trace: RunTrace` and
+`evidence: RunEvidence`. Forward each run's `result.evidence` independently of
+`result.trace`, retaining both if scoring the completed run fails. On run failures,
+recover available evidence through `predict_rlm.evidence.extract_evidence_from_exc`
 alongside trace extraction, including through cancellation/timeout cause chains.
-Incomplete captured evidence is rejected; trace-only fixtures can omit evidence.
+Exceptions can lack either artifact. Incomplete captured evidence is rejected;
+fake successful predictions must provide both complete artifacts.
 
 Override `task_timeout_for_example(example, default_timeout)` or
 `task_resources_for_example(example)` only when the workload genuinely has

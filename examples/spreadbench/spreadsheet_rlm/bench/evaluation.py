@@ -658,11 +658,10 @@ async def _run_case(
                 ),
                 timeout=config.task_timeout,
             )
-            run_trace = getattr(result, "trace", None)
-            evidence = getattr(result, "evidence", None)
+            run_trace = result.trace
+            evidence = result.evidence
             if not (
-                result
-                and result.output_spreadsheet
+                result.output_spreadsheet
                 and result.output_spreadsheet.path
                 and os.path.exists(result.output_spreadsheet.path)
             ):
@@ -683,7 +682,7 @@ async def _run_case(
                 False,
                 f"Timeout ({config.task_timeout}s)",
                 log_file=log_file_str,
-                run_trace=extract_trace_from_exc(e),
+                run_trace=extract_trace_from_exc(e) or run_trace,
                 evidence=extract_evidence_from_exc(e) or evidence,
             )
         except Exception as e:
@@ -693,7 +692,7 @@ async def _run_case(
                 False,
                 f"RLM error: {e}",
                 log_file=log_file_str,
-                run_trace=extract_trace_from_exc(e),
+                run_trace=extract_trace_from_exc(e) or run_trace,
                 evidence=extract_evidence_from_exc(e) or evidence,
             )
 

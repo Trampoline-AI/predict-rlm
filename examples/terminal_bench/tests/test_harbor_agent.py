@@ -27,6 +27,24 @@ if str(_EXAMPLE_DIR) not in sys.path:
 from terminal_bench_rlm.tools import remote_controller, tbench_agent  # noqa: E402
 
 
+def _successful_prediction() -> dspy.Prediction:
+    return dspy.Prediction(
+        answer="done",
+        trace=RunTrace(
+            status="completed",
+            model="main",
+            iterations=1,
+            max_iterations=1,
+            duration_ms=1,
+        ),
+        evidence=RunEvidence(
+            run_id="test_run",
+            complete=True,
+            terminal_outcome="completed",
+        ),
+    )
+
+
 @pytest.fixture(autouse=True)
 def isolated_codex_home(monkeypatch, tmp_path: Path) -> None:
     home = tmp_path / "isolated_home"
@@ -234,7 +252,7 @@ def test_remote_controller_writes_status_before_rlm_returns(monkeypatch, tmp_pat
             assert status_path.exists()
             status = json.loads(status_path.read_text())
             assert status["status"] == "running"
-            return SimpleNamespace(answer="done", trace=None)
+            return _successful_prediction()
 
     monkeypatch.setattr(remote_controller, "_local_process_interpreter_class", lambda: FakeInterpreter)
     monkeypatch.setattr(remote_controller, "_predict_rlm_class", lambda: FakePredictRLM)
@@ -249,6 +267,7 @@ def test_remote_controller_writes_status_before_rlm_returns(monkeypatch, tmp_pat
     assert answer == "done"
     status = json.loads((tmp_path / "predict_rlm_status.json").read_text())
     assert status["status"] == "completed"
+    assert status["has_trace"] is True
 
 
 def test_remote_controller_writes_failed_status_without_trace(monkeypatch, tmp_path: Path) -> None:
@@ -298,7 +317,7 @@ def test_remote_controller_verbose_streams_rlm_iteration_logs(monkeypatch, tmp_p
 
         async def acall(self):
             logging.getLogger("predict_rlm.trace").info("RLM turn 1/2\nCode:\nprint(1)")
-            return SimpleNamespace(answer="done", trace=None)
+            return _successful_prediction()
 
     log_path = tmp_path / "predict_rlm_debug.jsonl"
     monkeypatch.setenv("PREDICT_RLM_DEBUG_LOG", str(log_path))
@@ -410,7 +429,7 @@ def test_remote_controller_reconstructs_terminal_bench_submit_confirmation_callb
             captured["rlm_kwargs"] = kwargs
 
         async def acall(self):
-            return SimpleNamespace(answer="done", trace=None)
+            return _successful_prediction()
 
     monkeypatch.setattr(remote_controller, "_local_process_interpreter_class", lambda: FakeInterpreter)
     monkeypatch.setattr(remote_controller, "_predict_rlm_class", lambda: FakePredictRLM)

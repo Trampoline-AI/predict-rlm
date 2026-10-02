@@ -101,18 +101,18 @@ class AppWorldGepaProject(RLMGepaProject):
                 ),
                 timeout=context.task_timeout,
             )
-            trace = getattr(result, "trace", None)
-            evidence = getattr(result, "evidence", None)
+            trace = result.trace
+            evidence = result.evidence
             evaluation_payload = agent.appworld_client.evaluate_appworld_task(example.task_id)
             score, feedback = score_runner_result(evaluation_payload)
             return RLMGepaExampleResult(
                 score=score,
                 feedback=feedback,
-                traces=[trace] if trace is not None else [],
-                evidence=[evidence] if evidence is not None else [],
+                traces=[trace],
+                evidence=[evidence],
                 rlm_inputs={"task_id": example.task_id, "dataset": example.dataset},
                 example_id=example.task_id,
-                error=None if trace is not None else "no RunTrace captured",
+                error=None,
             )
         except asyncio.TimeoutError as exc:
             return self._error_result(

@@ -80,8 +80,8 @@ class AppWorldRLM(dspy.Module):
             if not _trace_has_successful_complete_task(prediction):
                 self._complete_task_from_prediction(task_id, prediction)
         except Exception as exc:
-            exc.trace = getattr(prediction, "trace", None)
-            exc.evidence = getattr(prediction, "evidence", None)
+            exc.trace = prediction.trace
+            exc.evidence = prediction.evidence
             raise
         return prediction
 
@@ -153,7 +153,7 @@ def _completion_payload_from_answer(answer: Any) -> dict[str, Any]:
 
 
 def _trace_has_successful_complete_task(prediction: Any) -> bool:
-    trace = getattr(prediction, "trace", None)
+    trace = prediction.trace
     for step in getattr(trace, "steps", []) or []:
         for call in getattr(step, "tool_calls", []) or []:
             if _is_successful_complete_task_call(call):

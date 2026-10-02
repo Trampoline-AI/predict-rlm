@@ -151,11 +151,10 @@ class SpreadsheetGepaProject(RLMGepaProject):
                 ),
                 timeout=context.task_timeout,
             )
-            trace = getattr(result, "trace", None)
-            evidence = getattr(result, "evidence", None)
+            trace = result.trace
+            evidence = result.evidence
             if not (
-                result
-                and result.output_spreadsheet
+                result.output_spreadsheet
                 and result.output_spreadsheet.path
                 and os.path.exists(result.output_spreadsheet.path)
             ):

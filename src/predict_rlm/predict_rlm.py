@@ -2989,20 +2989,19 @@ class PredictRLM(dspy.RLM):
                 self._attach_runtime_evidence(exc, recorder)
                 raise
             else:
-                trace = getattr(prediction, "trace", None)
+                trace = prediction.trace
                 outputs = {
                     name: getattr(prediction, name, None)
                     for name in self.signature.output_fields
                 }
                 try:
                     await recorder.finish_success(
-                        status=getattr(trace, "status", "completed"),
+                        status=trace.status,
                         outputs=outputs,
                     )
                 except BaseException as exc:
-                    if trace is not None:
-                        trace.status = "error"
-                        setattr(exc, "trace", trace)
+                    trace.status = "error"
+                    setattr(exc, "trace", trace)
                     self._attach_runtime_evidence(exc, recorder)
                     raise
                 self._attach_runtime_evidence(prediction, recorder)
@@ -3037,7 +3036,11 @@ class PredictRLM(dspy.RLM):
         evidence: RunEvidence,
         directory: Path,
     ) -> None:
-        trace = getattr(target, "trace", None)
+        trace = (
+            getattr(target, "trace", None)
+            if isinstance(target, BaseException)
+            else target.trace
+        )
         try:
             directory.mkdir(parents=True, exist_ok=False)
             evidence.to_exportable_json(directory / "evidence.json")
@@ -3053,8 +3056,7 @@ class PredictRLM(dspy.RLM):
                 setattr(target, "run_export_error", error)
             else:
                 setattr(error, "evidence", evidence)
-                if trace is not None:
-                    setattr(error, "trace", trace)
+                setattr(error, "trace", trace)
                 raise
 
     @asynccontextmanager

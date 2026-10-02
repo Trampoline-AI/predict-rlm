@@ -518,8 +518,8 @@ class RLMInstructionProposer:
                     exc = RuntimeError(
                         f"RLM proposer returned empty new_instructions for {component_name}"
                     )
-                    exc.trace = getattr(result, "trace", None)  # type: ignore[attr-defined]
-                    exc.evidence = getattr(result, "evidence", None)  # type: ignore[attr-defined]
+                    exc.trace = result.trace  # type: ignore[attr-defined]
+                    exc.evidence = result.evidence  # type: ignore[attr-defined]
                     raise exc
             except BaseException as exc:
                 self._persist_error(
@@ -532,7 +532,7 @@ class RLMInstructionProposer:
                 )
                 raise
 
-            trace = getattr(result, "trace", None)
+            trace = result.trace
             self._write_trace_cost(
                 event="proposer_call",
                 event_id=event_id,
@@ -578,8 +578,8 @@ class RLMInstructionProposer:
             "generalization_check": getattr(result, "generalization_check", None),
             "reflective_dataset": serializable,
             "rlm_trajectory": getattr(result, "trajectory", []),
-            "run_trace": trace_to_json(getattr(result, "trace", None)),
-            "run_evidence": evidence_to_json(getattr(result, "evidence", None)),
+            "run_trace": trace_to_json(result.trace),
+            "run_evidence": evidence_to_json(result.evidence),
             "error": None,
         }
         atomic_write_json(self.trace_dir / f"{event_id}_proposer_{component_name}.json", payload)

@@ -188,8 +188,8 @@ class MyProject(RLMGepaProject):
         feedback: str
         score, feedback = score_result(result, example.reference)
 
-        trace: RunTrace | None = getattr(result, "trace", None)
-        traces: list[RunTrace] = [trace] if trace is not None else []
+        trace: RunTrace = result.trace
+        traces: list[RunTrace] = [trace]
         rlm_inputs: dict[str, Any] = {"example_id": example.example_id, **example.rlm_kwargs}
 
         # 3. Return score, feedback, and independently captured trace and evidence.
@@ -202,6 +202,11 @@ class MyProject(RLMGepaProject):
             example_id=example.example_id,
         )
 ```
+
+Successful PredictRLM predictions always provide `trace: RunTrace` and
+`evidence: RunEvidence`. Forward both artifacts even when scoring the completed
+run fails. Exceptions raised before a run completes can lack either artifact;
+recover available artifacts through the trace and evidence exception extractors.
 
 `seed_candidate()` must return exactly the keys listed in `components`. Each
 value is a mutable text component. The most common single-component setup is

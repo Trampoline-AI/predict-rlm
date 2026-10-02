@@ -144,7 +144,16 @@ class FakeOneShotHarborEnvironment:
                 run_dir = Path(host_path).parent / ".run" / self.evidence.run_id
                 run_dir.mkdir(parents=True)
                 self.evidence.to_exportable_json(run_dir / "evidence.json")
-                (run_dir / "trace.json").write_text("null")
+                if self.evidence.terminal_outcome == "completed":
+                    RunTrace(
+                        status="completed",
+                        model="main",
+                        iterations=1,
+                        max_iterations=1,
+                        duration_ms=1,
+                    ).to_exportable_json(run_dir / "trace.json")
+                else:
+                    (run_dir / "trace.json").write_text("null")
                 archive.add(run_dir, arcname=f"{self.run_id}/.run/{self.evidence.run_id}")
                 archive.add(
                     run_dir, arcname=f"{self.run_id}/logs/agent/.run/{self.evidence.run_id}",
@@ -891,8 +900,13 @@ def test_harbor_remote_controller_builds_remote_command_and_syncs_artifacts(
     assert result.evidence == [evidence]
     canonical = export_root / evidence.run_id
     assert RunEvidence.model_validate_json((canonical / "evidence.json").read_text()) == evidence
-    assert json.loads((canonical / "trace.json").read_text()) is None
-    assert result.traces == []
+    if run_exit_code:
+        assert json.loads((canonical / "trace.json").read_text()) is None
+        assert result.traces == []
+    else:
+        trace = RunTrace.model_validate_json((canonical / "trace.json").read_text())
+        assert trace.status == "completed"
+        assert result.traces == [trace]
     assert result.trial_result["verifier_result"]["rewards"]["reward"] == 1.0
     assert env.uploads
     assert env.uploads[0][1] == "/remote/tb/gepa-val-task/repo.tar.gz"
@@ -2019,7 +2033,21 @@ def test_seed_candidate_skill_is_passed_to_terminal_bench_agent(monkeypatch) -> 
             captured["kwargs"] = kwargs
 
         async def acall(self, **_kwargs):
-            return SimpleNamespace(answer="done")
+            return SimpleNamespace(
+                answer="done",
+                trace=RunTrace(
+                    status="completed",
+                    model="main",
+                    iterations=1,
+                    max_iterations=1,
+                    duration_ms=1,
+                ),
+                evidence=RunEvidence(
+                    run_id="skill_run",
+                    complete=True,
+                    terminal_outcome="completed",
+                ),
+            )
 
     class FakeInterpreter:
         def __init__(self, *_args, **_kwargs) -> None:
@@ -2453,7 +2481,21 @@ def test_agent_builds_low_effort_lms_from_agent_kwargs(monkeypatch) -> None:
             captured["kwargs"] = kwargs
 
         async def acall(self, **_kwargs):
-            return SimpleNamespace(answer="done")
+            return SimpleNamespace(
+                answer="done",
+                trace=RunTrace(
+                    status="completed",
+                    model="main",
+                    iterations=1,
+                    max_iterations=1,
+                    duration_ms=1,
+                ),
+                evidence=RunEvidence(
+                    run_id="model_run",
+                    complete=True,
+                    terminal_outcome="completed",
+                ),
+            )
 
     class FakeInterpreter:
         def __init__(self, *_args, **_kwargs) -> None:

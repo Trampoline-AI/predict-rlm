@@ -36,8 +36,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Breaking Changes
 
 - `RunTrace` and its proposer/exported forms no longer contain `evidence`.
-  Successful calls return separate `prediction.trace` and `prediction.evidence`
-  objects; failures and cancellation expose `exception.evidence` independently
+  Successful calls always return separate `prediction.trace` and `prediction.evidence`
+  objects; internal consumers require both. Failures and cancellation expose `exception.evidence` independently
   of any `exception.trace`, including failures before a trace exists.
 - Import `RunEvidence` and `RunEvidenceEvent` from `predict_rlm` or
   `predict_rlm.evidence`, not `predict_rlm.trace`. Export the lifecycle log with

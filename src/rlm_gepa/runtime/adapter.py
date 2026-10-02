@@ -573,16 +573,16 @@ class RLMGepaAdapter:
             exc = RuntimeError(
                 f"RLM patch merge proposer returned empty new_instructions for {call_idx}"
             )
-            exc.trace = getattr(result, "trace", None)  # type: ignore[attr-defined]
-            exc.evidence = getattr(result, "evidence", None)  # type: ignore[attr-defined]
+            exc.trace = result.trace  # type: ignore[attr-defined]
+            exc.evidence = result.evidence  # type: ignore[attr-defined]
             raise exc
         selected_capability = getattr(result, "selected_capability", None)
         if selected_capability is None:
             exc = RuntimeError(
                 f"RLM patch merge proposer returned no selected_capability for {call_idx}"
             )
-            exc.trace = getattr(result, "trace", None)  # type: ignore[attr-defined]
-            exc.evidence = getattr(result, "evidence", None)  # type: ignore[attr-defined]
+            exc.trace = result.trace  # type: ignore[attr-defined]
+            exc.evidence = result.evidence  # type: ignore[attr-defined]
             raise exc
 
         patch_output = {
@@ -595,7 +595,7 @@ class RLMGepaAdapter:
             "instruction_char_delta": len(new_text) - len(base_parent_instructions),
             "new_instructions": new_text,
         }
-        trace = getattr(result, "trace", None)
+        trace = result.trace
         self._write_trace_cost(
             event="patch_merge_proposer_call",
             event_id=event_id,
@@ -617,7 +617,9 @@ class RLMGepaAdapter:
             "patch_source_parent_id": patch_source_parent_id,
             "trace_task_ids": trace_task_ids,
             "paired_disagreement_trace_path": str(
-                getattr(paired_disagreement_traces_file, "path", paired_disagreement_traces_file)
+                getattr(
+                    paired_disagreement_traces_file, "path", paired_disagreement_traces_file
+                )
             ),
             "base_parent_instructions": base_parent_instructions,
             "patch_source_parent_instructions": patch_source_parent_instructions,
@@ -625,7 +627,7 @@ class RLMGepaAdapter:
             "new_instructions": new_text,
             "rlm_trajectory": getattr(result, "trajectory", []),
             "run_trace": trace_to_json(trace),
-            "run_evidence": evidence_to_json(getattr(result, "evidence", None)),
+            "run_evidence": evidence_to_json(result.evidence),
             "error": None,
         }
         atomic_write_json(
