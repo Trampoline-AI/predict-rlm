@@ -16,9 +16,16 @@ _KNOWN_MODEL_COSTS: dict[str, dict[str, Any]] = {
 }
 
 
+# Codex-only slugs without a public API price, billed like their parent model.
+_PRICE_ALIASES: dict[str, str] = {
+    "gpt-5.3-codex-spark": "gpt-5.4",
+}
+
+
 def compute_cost(model: str, usage: dict[str, Any]) -> float:
     """Estimate equivalent API token cost; unpriced models return 0.0."""
     slug = model.split("/")[-1]
+    slug = _PRICE_ALIASES.get(slug, slug)
     prices = _KNOWN_MODEL_COSTS.get(slug) or model_info("openai", slug)
     if not prices:
         return 0.0

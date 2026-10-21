@@ -562,7 +562,9 @@ def _http_request(request):
     extra_body = body.pop("extra_body", None) or {}
     body.update(extra_body)
     body.pop("stream", None)
-    return client_options, body
+    # Unset DSPy defaults (e.g. temperature=None) must be omitted, not sent as
+    # JSON null; Codex rejects null-valued options. Matches the WebSocket path.
+    return client_options, {key: value for key, value in body.items() if value is not None}
 
 
 @dataclass
