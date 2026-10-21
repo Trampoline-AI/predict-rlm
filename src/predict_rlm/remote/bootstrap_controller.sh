@@ -200,4 +200,13 @@ rm -rf "$UV_BOOTSTRAP" "$CONTROLLER_VENV"
 python3 -m venv "$UV_BOOTSTRAP"
 "$UV_BOOTSTRAP/bin/python" -m pip install --disable-pip-version-check uv
 $UV_COMMAND venv --seed --python "$REQUESTED_PYTHON" "$CONTROLLER_VENV"
-"$CONTROLLER_VENV/bin/python" -m pip install --disable-pip-version-check -e "$REPO$EXTRA"
+# DSPy declares litellm as a core dependency on Python < 3.15. pip ignores
+# [tool.uv] exclusions, so install through uv with an explicit exclusion and
+# fail closed if litellm is still importable.
+EXCLUDES="$ROOT/uv-excludes.txt"
+printf 'litellm\n' > "$EXCLUDES"
+$UV_COMMAND pip install --python "$CONTROLLER_VENV/bin/python" --excludes "$EXCLUDES" -e "$REPO$EXTRA"
+if ! "$CONTROLLER_VENV/bin/python" -c 'import importlib.util, sys; sys.exit(importlib.util.find_spec("litellm") is not None)'; then
+    echo "bootstrap_controller.sh: litellm is installed in the controller venv; refusing to continue" >&2
+    exit 1
+fi

@@ -17,6 +17,7 @@ import aiohttp
 import dspy
 from dspy.clients._http import retry_after_seconds
 from dspy.clients.lm import _convert_chat_request_to_responses_request
+from dspy.clients.model_metadata import apreload as _preload_model_prices
 from openai import APIError, APIStatusError, AsyncOpenAI, OpenAI
 from openai.types.responses import (
     Response,
@@ -1044,6 +1045,9 @@ class CodexHTTPLM(dspy.LM):
     # ------- async path -------
 
     async def aforward(self, prompt=None, messages=None, **kwargs):
+        # compute_cost() reads DSPy's price table, whose first load does
+        # blocking network I/O; load it off the event loop first.
+        await _preload_model_prices()
         request, headers = self._build_request(prompt, messages, kwargs)
         auth_metadata = request.pop("_codex_lm_auth_metadata", {})
         proxy_url = request.pop("_codex_lm_proxy_url", None)
@@ -1424,6 +1428,7 @@ class CodexWSLM(CodexHTTPLM):
         return results
 
     async def aforward(self, prompt=None, messages=None, **kwargs):
+        await _preload_model_prices()
         if self._ws_fallback_active:
             return await self._fallback_lm.aforward(prompt=prompt, messages=messages, **kwargs)
 
