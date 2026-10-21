@@ -1432,6 +1432,12 @@ class PredictRLM(dspy.RLM):
             return self._skill_instructions
         return "\n\n".join(spec.instructions)
 
+    def _validate_inputs(self, input_args: dict[str, Any]) -> None:
+        """Validate signature inputs separately from runtime output destinations."""
+        super()._validate_inputs(
+            {name: value for name, value in input_args.items() if name in self.signature.input_fields}
+        )
+
     def _create_predict_tool(self) -> Callable[..., dict[str, Any]]:
         """Create the predict tool for running DSPy signatures."""
         # Capture self to access _sub_lm at call time

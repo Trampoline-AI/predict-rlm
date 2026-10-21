@@ -358,6 +358,7 @@ class JspiBackend(SyncWorkerTracker, PythonInterpreter):
             tools=tools,
             output_fields=output_fields,
         )
+        self._request_id = 0
         # Raw-fd I/O state (initialised in _ensure_deno_process)
         self._stdout_fd: int = -1
         self._stdin_fd: int = -1
