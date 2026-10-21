@@ -33,7 +33,7 @@ def test_proxy_environment_is_restored_after_request(monkeypatch):
         assert os.environ["HTTP_PROXY"] == "http://127.0.0.1:8898"
         return iter(build_stream_events("ok"))
 
-    with mock.patch("dspy_codex_lm.lm.litellm.responses", side_effect=transport):
+    with mock.patch("dspy_codex_lm.lm._responses", side_effect=transport):
         response = lm.forward(prompt="hi", cache=False)
     assert response.output[0].content[0].text == "ok"
     assert os.environ["HTTPS_PROXY"] == "http://original:8080"

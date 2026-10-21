@@ -23,7 +23,7 @@ def test_stream_failure_logs_do_not_expose_credentials(lm, monkeypatch, tmp_path
     )
     reset_debug_logger_for_tests()
     try:
-        with mock.patch("dspy_codex_lm.lm.litellm.responses", return_value=iter([event])):
+        with mock.patch("dspy_codex_lm.lm._responses", return_value=iter([event])):
             with pytest.raises(CodexStreamError):
                 lm.forward(prompt="hi", cache=False)
         text = log_path.read_text()

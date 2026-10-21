@@ -152,7 +152,7 @@ def install_monkeypatch(
             whose name contains one of these strings will NOT be
             intercepted, even if it matches OPENAI_MODEL_PATTERNS.
             Pass e.g. ``["mercury"]`` to let ``openai/mercury-2`` through
-            to LiteLLM unmodified.
+            to DSPy's native provider routing unmodified.
 
     Returns the original (``dspy.LM``, ``dspy.clients.lm.LM``) pair so tests
     can restore them.
@@ -294,7 +294,7 @@ def _print_main_help(*, file=None, full: bool = True) -> None:
         "  --exclude=SUBSTR  skip interception for models containing SUBSTR\n"
         "                    (case-insensitive, repeatable). E.g.\n"
         "                    --exclude=mercury lets openai/mercury-2 through\n"
-        "                    to LiteLLM unmodified.\n"
+        "                    to DSPy's native provider routing unmodified.\n"
         "  --color=MODE      colorize CLI output: auto, always, or never\n"
         "  --no-color        disable ANSI color output\n"
         "\n"

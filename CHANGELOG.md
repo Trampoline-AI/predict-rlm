@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.0] - 2026-10-21
+
+### Security
+
+- Removed the direct LiteLLM dependency after the compromised `litellm` 1.107.0
+  PyPI release. The `codex-lm` extra no longer requires `litellm`, and the
+  project's own uv resolution excludes it via `[tool.uv] exclude-dependencies`.
+  DSPy still declares `litellm` for pip installs on Python < 3.15; uv consumers
+  should add `exclude-dependencies = ["litellm"]` to their root project.
+
+### Changed
+
+- Upgraded DSPy to `>=3.4.1,<3.5` and use its native `lm15` engines.
+- `dspy_codex_lm` now streams the Codex Responses API through the OpenAI SDK
+  instead of `litellm.responses`, and prices calls from a local cost table.
+- Context-overflow and rate-limit handling use `dspy.ContextWindowExceededError`
+  and `dspy.LMRateLimitError`.
+- Routes without native DSPy support (for example `bedrock/`, `vertex_ai/`,
+  `huggingface/`, `together_ai/`) require installing `dspy[litellm]` or declaring a
+  native provider. The legacy `thinking_budget` option is rejected.
+
 ## [0.9.0] - 2026-10-02
 
 ### Added

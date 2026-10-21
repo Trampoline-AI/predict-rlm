@@ -1,10 +1,9 @@
 from __future__ import annotations
 
-import logging
+import os
 from typing import Any
 
 import dspy
-import litellm
 from tenacity import (
     Retrying,
     retry_if_exception_type,
@@ -12,27 +11,23 @@ from tenacity import (
     wait_exponential_jitter,
 )
 
-_LITELLM_LOGGER_NAMES = ("LiteLLM", "LiteLLM Router", "LiteLLM Proxy")
 _RATE_LIMIT_RETRY_ATTEMPTS = 10
 _RATE_LIMIT_RETRY_WAIT = wait_exponential_jitter(initial=1, max=60, jitter=1)
 
 
-def configure_litellm_logging() -> None:
-    litellm.turn_off_message_logging = True
-    for logger_name in _LITELLM_LOGGER_NAMES:
-        logging.getLogger(logger_name).setLevel(logging.CRITICAL)
-
-
 def validate_lm_env(lm: str) -> None:
-    check = litellm.validate_environment(model=lm)
-    if check.get("keys_in_environment"):
-        return
-    missing_keys = check.get("missing_keys") or []
-    if missing_keys:
+    providers = tuple(provider.definition for provider in dspy.lm15.registered_providers())
+    with dspy.lm15.LMRouter(dspy.lm15.RouterConfig(providers=providers)) as router:
+        resolution = router.resolve_openai_chat(lm)
+    if (
+        resolution.credential_policy == "key"
+        and resolution.placeholder_key is None
+        and resolution.env_key
+        and not os.environ.get(resolution.env_key)
+    ):
         raise RuntimeError(
-            f"{lm} is missing required environment variables: {', '.join(missing_keys)}"
+            f"{lm} is missing required environment variables: {resolution.env_key}"
         )
-    raise RuntimeError(f"{lm} is missing required provider environment configuration")
 
 
 def get_lm_config(
@@ -40,20 +35,23 @@ def get_lm_config(
     reasoning_effort: str | None = None,
     thinking_budget: int | None = None,
 ) -> dict[str, Any]:
-    configure_litellm_logging()
     validate_lm_env(lm)
+    if thinking_budget is not None:
+        raise dspy.LMUnsupportedFeatureError(
+            "thinking_budget is not supported by DSPy 3.4's keyword bridge; "
+            "use reasoning_effort or supply a native LM with canonical request configuration.",
+            model=lm,
+        )
 
-    config: dict[str, Any] = {"model": lm, "num_retries": 5}
+    config: dict[str, Any] = {"model": lm, "engine": "lm15", "num_retries": 5}
     if _is_moonshot_kimi_model(lm):
         if reasoning_effort == "none":
-            config["extra_body"] = {"thinking": {"type": "disabled"}}
+            config["thinking"] = {"type": "disabled"}
         elif reasoning_effort:
-            config["extra_body"] = {"thinking": {"type": "enabled"}}
+            config["reasoning_effort"] = reasoning_effort
     elif reasoning_effort and reasoning_effort != "none":
         config["reasoning_effort"] = reasoning_effort
 
-    if thinking_budget is not None:
-        config["thinking_budget"] = thinking_budget
     return config
 
 
@@ -68,7 +66,7 @@ def get_sub_lm_config(lm: str, reasoning_effort: str | None = "none") -> dict[st
 
 def _forward_with_rate_limit_retry(self: dspy.LM, *args: Any, **kwargs: Any) -> Any:
     retryer = Retrying(
-        retry=retry_if_exception_type(litellm.RateLimitError),
+        retry=retry_if_exception_type(dspy.LMRateLimitError),
         wait=_RATE_LIMIT_RETRY_WAIT,
         stop=stop_after_attempt(_RATE_LIMIT_RETRY_ATTEMPTS),
         reraise=True,
@@ -101,6 +99,3 @@ def build_lm(model_or_lm: Any, *, reasoning_effort: str | None = None, cache: bo
         return model_or_lm
     lm_class = _rate_limit_retry_lm_class()
     return lm_class(**get_lm_config(model_or_lm, reasoning_effort), cache=cache)
-
-
-configure_litellm_logging()

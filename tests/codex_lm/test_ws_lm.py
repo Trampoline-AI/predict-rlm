@@ -61,7 +61,7 @@ def test_exhausted_websocket_stays_on_http_for_later_invocations():
         fallback_lm=fallback,
     )
     with mock.patch(
-        "dspy_codex_lm.lm.litellm.responses",
+        "dspy_codex_lm.lm._responses",
         side_effect=[
             iter(build_stream_events("first", input_tokens=5, output_tokens=1)),
             iter(build_stream_events("second", input_tokens=9, output_tokens=2)),

@@ -64,15 +64,15 @@ version = "0.0.0"
 requires-python = ">=3.12"
 dependencies = [
     "deno>=2",
-    "dspy>=3.1.2",
+    "aiohttp>=3.10",
+    "dspy>=3.4.1,<3.5",
     "nest-asyncio>=1.6.0",
     "pydantic>=2.8.2,<3",
 ]
 
 [project.optional-dependencies]
 codex-lm = [
-    "litellm>=1.50",
-    "openai>=1.60",
+    "openai>=1.66.2",
     "tenacity>=9.1.4",
 ]
 gepa = [
@@ -83,6 +83,9 @@ gepa-viz = [
     "plotly>=5.0.0",
     "kaleido>=0.2.0",
 ]
+
+[tool.uv]
+exclude-dependencies = ["litellm"]
 
 [tool.hatch.build.targets.wheel]
 packages = [
@@ -99,6 +102,9 @@ name = "terminal-bench-rlm"
 version = "0.0.0"
 requires-python = ">=3.12"
 dependencies = ["predict-rlm[codex-lm,gepa,gepa-viz]"]
+
+[tool.uv]
+exclude-dependencies = ["litellm"]
 
 [tool.hatch.build.targets.wheel]
 packages = ["terminal_bench_rlm"]

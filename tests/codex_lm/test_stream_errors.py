@@ -36,7 +36,7 @@ def _error_event(code: str, message: str) -> SimpleNamespace:
 
 def _patch_responses(events):
     return mock.patch(
-        "dspy_codex_lm.lm.litellm.responses",
+        "dspy_codex_lm.lm._responses",
         side_effect=lambda **_: iter(events),
     )
 
