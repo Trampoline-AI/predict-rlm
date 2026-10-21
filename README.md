@@ -52,9 +52,41 @@ already enough.
 
 ## Installation
 
+This checkout uses DSPy 3.4.1's native `lm15` engine without LiteLLM. Before
+installing in another uv project, add this to that project's `pyproject.toml`:
+
+```toml
+[tool.uv]
+exclude-dependencies = ["litellm"]
+```
+
+Then install:
+
 ```bash
 uv add predict-rlm
 ```
+
+The exclusion is a **root-project uv setting**, not published package metadata.
+DSPy 3.4.1 still declares LiteLLM as a dependency on Python below 3.15, so
+`pip install predict-rlm` and uv projects without this setting still install it
+transitively. The repository's `uv lock` / `uv sync` exclude it; `uv.lock` remains
+ignored, following the library's existing convention.
+
+Native routes include `openai/`, `anthropic/`, `gemini/`, `moonshot/` (Kimi),
+and `openrouter/`. Credentials follow lm15's provider conventions: for example,
+Moonshot uses `MOONSHOTAI_API_KEY`; Gemini accepts `GEMINI_API_KEY` or
+`GOOGLE_API_KEY`. Prefer `dspy.LM(..., engine="lm15")` to refuse compatibility
+fallbacks explicitly. Unsupported routes, legacy text-completion mode, or
+request/client options lm15 cannot represent require DSPy's `dspy[litellm]`
+compatibility path and **do not work with this exclusion**. For an
+OpenAI-compatible gateway, pass `api_base` explicitly or register a native
+provider with `dspy.lm15.register_provider`; provider API-base environment
+variables can make DSPy's default `auto` engine select the compatibility path.
+GEPA's config helpers force `lm15`. Their legacy `thinking_budget` keyword is
+not representable by DSPy 3.4's keyword bridge and is rejected; use
+`reasoning_effort` or supply a native LM with canonical request configuration.
+The Codex extra below uses its own OpenAI-SDK HTTP/SSE and native WebSocket
+transports, independently of DSPy's provider routing.
 
 Optional extras are available for adjacent tooling:
 

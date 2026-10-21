@@ -34,13 +34,13 @@ from typing import (
 import dspy
 import json_repair
 import regex
+from dspy import ContextWindowExceededError
 from dspy.adapters.base import Adapter
 from dspy.adapters.chat_adapter import ChatAdapter
 from dspy.adapters.json_adapter import JSONAdapter
 from dspy.primitives.code_interpreter import CodeInterpreter, CodeInterpreterError, FinalOutput
 from dspy.utils.callback import ACTIVE_CALL_ID
 from dspy.utils.exceptions import AdapterParseError
-from litellm import ContextWindowExceededError
 from pydantic import ConfigDict, Field, ValidationError, create_model
 
 from ._logging import (
@@ -1230,14 +1230,15 @@ class PredictRLM(dspy.RLM):
         # Note: we pass sub_lm=None since we don't want the default llm_query tools
         super().__init__(
             signature=signature,
-            max_iterations=max_iterations,
+            max_iters=max_iterations,
             max_llm_calls=max_llm_calls,
             max_output_chars=max_output_chars,
             verbose=verbose,
             tools=tools_list,
             sub_lm=None,  # Disable default llm_query tools
-            interpreter=interpreter,
         )
+        self.max_iterations = max_iterations
+        self._interpreter = interpreter
         if "evidence" in self.signature.output_fields:
             raise ValueError(
                 "The output field 'evidence' is reserved for the runtime RunEvidence object."
@@ -2780,10 +2781,7 @@ class PredictRLM(dspy.RLM):
         # Per-RLM instance ``lm`` has its own history (isolated via
         # ``lm.copy()`` in ``__init__``) so ``usage_since`` is free of
         # the shared-history concurrency bug that plagued the old
-        # delta-read pattern. Cost is populated by DSPy's
-        # ``BaseLM._process_lm_response`` from
-        # ``_hidden_params["response_cost"]`` — LiteLLM's authoritative
-        # number with cache/batch discounts baked in.
+        # delta-read pattern. DSPy's history carries provider token-cost estimates.
         main_usage = usage_since(lm, lm_hist_start)
         sub_usage = (
             usage_since(sub_lm, sub_hist_start)
@@ -4551,9 +4549,7 @@ class PredictRLM(dspy.RLM):
         # Snapshot lm.history lengths at run start so ``usage_since`` can
         # sum the delta at end. Per-RLM ``lm.copy()`` in __init__ means
         # each PredictRLM instance has its OWN history — concurrent runs
-        # don't cross-contaminate. DSPy's BaseLM populates
-        # ``entry["cost"]`` from ``_hidden_params["response_cost"]``, so
-        # ``usage_since`` returns LiteLLM-computed authoritative cost.
+        # don't cross-contaminate. ``usage_since`` sums DSPy's history estimates.
         lm_hist_start = snapshot_lm_history_len(lm)
         sub_hist_start = snapshot_lm_history_len(sub_lm) if sub_lm and sub_lm is not lm else 0
         steps: list[IterationStep] = []

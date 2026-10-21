@@ -30,7 +30,7 @@ async def test_concurrent_requests_keep_results_and_cache_entries_isolated(lm):
         return stream()
 
     prompts = ["first", "second"]
-    with mock.patch("dspy_codex_lm.lm.litellm.aresponses", side_effect=fake_aresponses):
+    with mock.patch("dspy_codex_lm.lm._aresponses", side_effect=fake_aresponses):
         fresh = await asyncio.wait_for(
             asyncio.gather(*(lm.aforward(prompt=prompt) for prompt in prompts)),
             timeout=3,
@@ -40,7 +40,7 @@ async def test_concurrent_requests_keep_results_and_cache_entries_isolated(lm):
     expected = [response.output[0].content[0].text for response in fresh]
 
     with mock.patch(
-        "dspy_codex_lm.lm.litellm.aresponses",
+        "dspy_codex_lm.lm._aresponses",
         side_effect=AssertionError("cache hit reached transport"),
     ):
         cached = await asyncio.gather(*(lm.aforward(prompt=prompt) for prompt in prompts))

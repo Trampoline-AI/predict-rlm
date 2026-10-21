@@ -82,7 +82,7 @@ def test_retry_uses_alternate_rotation_profile_after_stream_stall(tmp_path, monk
         return iter(copy.deepcopy(good_events))
 
     monkeypatch.setattr("dspy_codex_lm.lm.random.choice", choose_credentials)
-    with mock.patch("dspy_codex_lm.lm.litellm.responses", side_effect=fake_responses):
+    with mock.patch("dspy_codex_lm.lm._responses", side_effect=fake_responses):
         response = CodexLM(model="gpt-5.3-codex").forward(prompt="hi")
 
     assert response.output[0].content[0].text == "ok"
@@ -102,7 +102,7 @@ def test_retries_exhausted_raises_codex_stream_error(lm, monkeypatch):
         attempts["n"] += 1
         return iter(copy.deepcopy(_failed_events(code="503", msg="upstream down")))
 
-    with mock.patch("dspy_codex_lm.lm.litellm.responses", side_effect=fake):
+    with mock.patch("dspy_codex_lm.lm._responses", side_effect=fake):
         with pytest.raises(CodexStreamError, match="upstream down") as caught:
             lm.forward(prompt="hi")
 

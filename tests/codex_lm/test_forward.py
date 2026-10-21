@@ -15,7 +15,7 @@ def test_stream_assembly_accounts_for_cached_input_and_output(lm):
         make_text_delta("lo"),
         make_completed(input_tokens=100, cached_tokens=80, output_tokens=10),
     ]
-    with mock.patch("dspy_codex_lm.lm.litellm.responses", return_value=iter(events)):
+    with mock.patch("dspy_codex_lm.lm._responses", return_value=iter(events)):
         response = lm.forward(prompt="hi", cache=False)
 
     assert response.output[0].content[0].text == "hello"
@@ -29,7 +29,7 @@ def test_cached_calls_do_not_double_count_usage_or_mutate_fresh_history(lm):
     tracker = UsageTracker()
     with dspy.settings.context(usage_tracker=tracker):
         with mock.patch(
-            "dspy_codex_lm.lm.litellm.responses",
+            "dspy_codex_lm.lm._responses",
             side_effect=lambda **_: iter(copy.deepcopy(events)),
         ) as transport:
             assert lm(prompt="same")[0]["text"] == "hi"
@@ -61,7 +61,7 @@ async def test_async_prediction_exposes_parsed_answer_and_billable_usage(lm):
         return stream()
 
     with dspy.settings.context(lm=lm, track_usage=True):
-        with mock.patch("dspy_codex_lm.lm.litellm.aresponses", side_effect=fake_aresponses):
+        with mock.patch("dspy_codex_lm.lm._aresponses", side_effect=fake_aresponses):
             prediction = await dspy.Predict("question -> answer").acall(
                 question="six times seven?"
             )

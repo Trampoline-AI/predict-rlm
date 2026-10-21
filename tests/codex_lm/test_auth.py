@@ -313,7 +313,7 @@ def test_long_lived_lm_refreshes_disabled_and_reenabled_accounts(fake_home, monk
         assert api_key == account.removeprefix("acct-") + "-token"
         return iter(build_stream_events(account))
 
-    monkeypatch.setattr("dspy_codex_lm.lm.litellm.responses", transport)
+    monkeypatch.setattr("dspy_codex_lm.lm._responses", transport)
     lm = CodexHTTPLM(model="gpt-5.3-codex", auth_config_refresh_seconds=60.0)
     assert lm.forward(prompt="one", cache=False).output[0].content[0].text == "acct-alpha"
     enable_auth_profile("alpha", enabled=False)

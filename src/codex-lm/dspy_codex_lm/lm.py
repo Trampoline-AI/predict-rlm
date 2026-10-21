@@ -5,7 +5,6 @@ import logging
 import os
 import random
 import uuid
-import warnings
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -16,10 +15,15 @@ from urllib.parse import urlparse, urlunparse
 
 import aiohttp
 import dspy
-import litellm
+from dspy.clients._http import retry_after_seconds
 from dspy.clients.lm import _convert_chat_request_to_responses_request
-from litellm.types.llms.openai import ResponseAPIUsage, ResponsesAPIResponse
-from openai.types.responses import ResponseOutputMessage, ResponseOutputText
+from openai import APIError, APIStatusError, AsyncOpenAI, OpenAI
+from openai.types.responses import (
+    Response,
+    ResponseOutputMessage,
+    ResponseOutputText,
+    ResponseUsage,
+)
 from tenacity import (
     AsyncRetrying,
     Retrying,
@@ -36,23 +40,11 @@ from dspy_codex_lm.auth import (
     profile_auth_path,
     resolve_auth_source,
 )
-from dspy_codex_lm.cost import compute_cost, register_known_model_costs
+from dspy_codex_lm.cost import compute_cost
 
 CODEX_BASE = "https://chatgpt.com/backend-api/codex"
 CODEX_WS_BETA_HEADER = "responses_websockets=2026-02-06"
 CODEX_AUTH_CONFIG_REFRESH_SECONDS: float = 60.0
-
-register_known_model_costs()
-
-# Register models that litellm doesn't know about yet so that
-# supports_native_streaming() returns True and litellm doesn't
-# downgrade to fake_stream (which strips "stream": true from
-# the request body — fatal for the Codex backend).
-_GPT54_ENTRY = litellm.model_cost.get("gpt-5.4", {})
-for _slug in ("gpt-5.3-codex-spark", "gpt-5.5"):
-    if _slug not in litellm.model_cost and _GPT54_ENTRY:
-        litellm.model_cost[_slug] = {**_GPT54_ENTRY}
-        litellm.model_cost[f"openai/{_slug}"] = {**_GPT54_ENTRY}
 
 # Retry config for transient Codex stream failures (rate limits,
 # incomplete streams, dropped connections). 5 total attempts (initial +
@@ -420,57 +412,6 @@ def _iter_stream_with_heartbeat(stream: Any):
         executor.shutdown(wait=False)
 
 
-def _install_pydantic_warning_filter() -> None:
-    """Silence ``PydanticSerializationUnexpectedValue(... ResponseAPIUsage ...)``.
-
-    When a downstream pydantic model declares a field as
-    ``ResponseAPIUsage`` and receives our enriched ``ResponseAPIUsage``
-    (which carries Chat-Completions-shaped aliases ``prompt_tokens`` and
-    ``completion_tokens`` so downstream consumers like DSPy's history
-    and cost trackers see populated token counts), pydantic's serializer
-    warns that the value "may not be as expected". The extras are
-    intentional and load-bearing — the warning is just noise.
-    """
-    # `warnings.filterwarnings` compiles the message via ``re.match`` (no
-    # ``re.DOTALL``) so ``.*`` won't cross the newline in pydantic's
-    # multi-line message. Use ``(?s)`` to enable DOTALL inline so the
-    # pattern matches from the start through "ResponseAPIUsage" regardless
-    # of embedded newlines.
-    warnings.filterwarnings(
-        "ignore",
-        message=r"(?s).*ResponseAPIUsage.*",
-        category=UserWarning,
-    )
-
-
-_install_pydantic_warning_filter()
-
-
-def _disable_litellm_stream_logging(stream: Any) -> Any:
-    """Keep LiteLLM stream logging from reassembling Codex responses.
-
-    CodexLM consumes the stream, assembles the final ResponsesAPIResponse, and
-    fires DSPy's usage tracker itself. Recent LiteLLM versions try to do a
-    second private logging pass on ``response.completed`` and can receive a
-    dict-shaped ``response`` from the Codex backend, which raises before
-    CodexLM can assemble the result.
-    """
-
-    def noop(*args, **kwargs):
-        return None
-
-    for name in (
-        "_handle_logging_completed_response",
-        "_handle_logging_failed_response",
-    ):
-        if hasattr(stream, name):
-            try:
-                setattr(stream, name, noop)
-            except Exception:
-                pass
-    return stream
-
-
 def _coerce_retry_after_seconds(value: Any) -> float | None:
     if value is None:
         return None
@@ -584,13 +525,116 @@ class _AuthConfigSnapshot:
     rotating: bool = False
 
 
+@contextmanager
+def _codex_api_errors():
+    try:
+        yield
+    except APIError as exc:
+        if (
+            isinstance(exc, APIStatusError)
+            and exc.status_code not in {408, 409, 429}
+            and exc.status_code < 500
+        ):
+            raise
+        body = exc.body or {}
+        error = _g(body, "error") or body
+        retry_after = _retry_after_seconds_from_error(error)
+        if retry_after is None:
+            response = getattr(exc, "response", None)
+            if response is not None:
+                retry_after = retry_after_seconds(response.headers.get("retry-after"))
+        raise CodexStreamError(
+            str(exc),
+            retry_after_seconds=retry_after,
+            failure_kind="http_sse",
+            failure_code=_g(error, "code") or getattr(exc, "status_code", None),
+        ) from exc
+
+
+def _http_request(request):
+    body = dict(request)
+    client_options = {
+        "api_key": body.pop("api_key"),
+        "base_url": body.pop("api_base", CODEX_BASE),
+        "timeout": body.pop("timeout", CODEX_STREAM_HEARTBEAT_SEC),
+        "max_retries": 0,
+    }
+    extra_body = body.pop("extra_body", None) or {}
+    body.update(extra_body)
+    body.pop("stream", None)
+    return client_options, body
+
+
+@dataclass
+class _OwnedResponseStream:
+    stream: Any
+    client: Any
+
+    def __iter__(self):
+        with _codex_api_errors():
+            yield from self.stream
+
+    def close(self):
+        try:
+            self.stream.close()
+        finally:
+            self.client.close()
+
+    async def __aiter__(self):
+        with _codex_api_errors():
+            async for event in self.stream:
+                yield event
+
+    async def aclose(self):
+        try:
+            await self.stream.close()
+        finally:
+            await self.client.close()
+
+
+def _responses(*, headers, num_retries, **request):
+    options, body = _http_request(request)
+    client = OpenAI(default_headers=headers, **options)
+    try:
+        with _codex_api_errors():
+            stream = client.responses.create(
+                model=body.pop("model"),
+                input=body.pop("input"),
+                stream=True,
+                extra_body=body,
+            )
+    except BaseException:
+        client.close()
+        raise
+
+    return _OwnedResponseStream(stream, client)
+
+
+async def _aresponses(*, headers, num_retries, **request):
+    options, body = _http_request(request)
+    client = AsyncOpenAI(default_headers=headers, **options)
+    try:
+        with _codex_api_errors():
+            stream = await client.responses.create(
+                model=body.pop("model"),
+                input=body.pop("input"),
+                stream=True,
+                extra_body=body,
+            )
+    except BaseException:
+        await client.close()
+        raise
+
+    return _OwnedResponseStream(stream, client)
+
+
 class CodexHTTPLM(dspy.LM):
     """DSPy LM that routes calls through the ChatGPT subscription HTTP/SSE backend.
 
     Reads the OAuth access token from ``~/.codex/auth.json`` (or a provided
     path / explicit token). Streams the Responses API, assembles a full
-    ``ResponsesAPIResponse``, stamps it with real-rate cost from
-    ``litellm.model_cost``, and routes everything through DSPy's cache layer.
+    ``Response``, stamps it with equivalent API token cost from
+    DSPy's bundled model metadata, and routes everything through DSPy's cache layer.
 
     Sync (``forward``) and async (``aforward``) are both supported.
     """
@@ -666,7 +710,6 @@ class CodexHTTPLM(dspy.LM):
 
         request["store"] = False
         request["stream"] = True
-        request["custom_llm_provider"] = "openai"
         request.setdefault("instructions", self._instructions)
 
         headers = dict(request.pop("headers", None) or {})
@@ -865,7 +908,7 @@ class CodexHTTPLM(dspy.LM):
         usage_raw: Any,
         response_id: str,
         model_name: str,
-    ) -> ResponsesAPIResponse:
+    ) -> Response:
         text = "".join(text_parts)
         output_items = [
             ResponseOutputMessage(
@@ -890,31 +933,38 @@ class CodexHTTPLM(dspy.LM):
         else:
             usage_dict = dict(usage_raw)
 
-        # Chat Completions-style aliases so downstream consumers that read
-        # LiteLLM's Chat Completions usage shape (DSPy history, cost trackers,
-        # per-role summaries) see non-zero token counts alongside the
-        # Responses-API-native input_tokens/output_tokens fields.
+        # Keep Chat Completions aliases for DSPy history and per-role summaries.
         usage_dict["prompt_tokens"] = usage_dict.get("input_tokens", 0)
         usage_dict["completion_tokens"] = usage_dict.get("output_tokens", 0)
 
         # For pricing lookup, prefer the requested model slug (self.model —
         # e.g. "openai/gpt-5.4-mini") over the Codex backend's reported
         # model name (e.g. "gpt-5.4-mini-2026-03-17"), which is a dated
-        # snapshot identifier and is typically NOT in LiteLLM's price
-        # registry. Falling back to model_name preserves behaviour for
-        # any caller that constructed CodexLM without self.model set.
+        # snapshot identifier and may not be in the pricing metadata.
         pricing_model = getattr(self, "model", None) or model_name
         cost = compute_cost(pricing_model, usage_dict)
         usage_dict["cost"] = cost
-        usage_obj = ResponseAPIUsage.model_validate(usage_dict)
+        usage_dict["input_tokens_details"] = {
+            "cached_tokens": 0,
+            "cache_write_tokens": 0,
+            **(usage_dict.get("input_tokens_details") or {}),
+        }
+        usage_dict["output_tokens_details"] = {
+            "reasoning_tokens": 0,
+            **(usage_dict.get("output_tokens_details") or {}),
+        }
+        usage_obj = ResponseUsage.model_validate(usage_dict)
 
-        response = ResponsesAPIResponse(
+        response = Response(
             id=response_id,
             created_at=0,
             object="response",
             output=output_items,
             model=model_name,
             status="completed",
+            parallel_tool_calls=False,
+            tool_choice="auto",
+            tools=[],
             usage=usage_obj,
         )
         response._hidden_params = {"response_cost": cost}
@@ -951,17 +1001,21 @@ class CodexHTTPLM(dspy.LM):
                     timing.emit_start()
                     try:
                         with _scoped_proxy_env(proxy_url):
-                            stream = litellm.responses(
+                            stream = _responses(
                                 headers=headers,
                                 num_retries=num_retries,
                                 **request,
                             )
-                        stream = _disable_litellm_stream_logging(stream)
-                        for event in _iter_stream_with_heartbeat(stream):
-                            timing.observe_event(event)
-                            self._handle_event(event, state)
-                            if state["completed"] or state["failure"] is not None:
-                                break
+                        try:
+                            for event in _iter_stream_with_heartbeat(stream):
+                                timing.observe_event(event)
+                                self._handle_event(event, state)
+                                if state["completed"] or state["failure"] is not None:
+                                    break
+                        finally:
+                            close_stream = getattr(stream, "close", None)
+                            if callable(close_stream):
+                                close_stream()
                         timing.mark_stream_end()
                         self._raise_if_failed(state)
                         result = self._assemble(
@@ -976,11 +1030,11 @@ class CodexHTTPLM(dspy.LM):
                         timing.emit_error(state, exc)
                         raise
 
-        completion_fn, litellm_cache_args = self._get_cached_completion_fn(_completion, cache)
+        completion_fn, cache_args = self._get_cached_completion_fn(_completion, cache)
         results = completion_fn(
             request=request,
             num_retries=self.num_retries,
-            cache=litellm_cache_args,
+            cache=cache_args,
         )
         _fire_usage_tracker_hook(self.model, results)
         return results
@@ -1016,17 +1070,21 @@ class CodexHTTPLM(dspy.LM):
                     timing.emit_start()
                     try:
                         with _scoped_proxy_env(proxy_url):
-                            stream = await litellm.aresponses(
+                            stream = await _aresponses(
                                 headers=headers,
                                 num_retries=num_retries,
                                 **request,
                             )
-                        stream = _disable_litellm_stream_logging(stream)
-                        async for event in _aiter_stream_with_heartbeat(stream):
-                            timing.observe_event(event)
-                            self._handle_event(event, state)
-                            if state["completed"] or state["failure"] is not None:
-                                break
+                        try:
+                            async for event in _aiter_stream_with_heartbeat(stream):
+                                timing.observe_event(event)
+                                self._handle_event(event, state)
+                                if state["completed"] or state["failure"] is not None:
+                                    break
+                        finally:
+                            close_stream = getattr(stream, "aclose", None)
+                            if callable(close_stream):
+                                await close_stream()
                         timing.mark_stream_end()
                         self._raise_if_failed(state)
                         result = self._assemble(
@@ -1041,11 +1099,11 @@ class CodexHTTPLM(dspy.LM):
                         timing.emit_error(state, exc)
                         raise
 
-        completion_fn, litellm_cache_args = self._get_cached_completion_fn(_acompletion, cache)
+        completion_fn, cache_args = self._get_cached_completion_fn(_acompletion, cache)
         results = await completion_fn(
             request=request,
             num_retries=self.num_retries,
-            cache=litellm_cache_args,
+            cache=cache_args,
         )
         _fire_usage_tracker_hook(self.model, results)
         return results
@@ -1347,13 +1405,13 @@ class CodexWSLM(CodexHTTPLM):
                         timing.emit_error(state, exc)
                         raise
 
-        completion_fn, litellm_cache_args = self._get_cached_completion_fn(_completion, cache)
+        completion_fn, cache_args = self._get_cached_completion_fn(_completion, cache)
         try:
             results = completion_fn(
                 request=request,
                 headers=headers,
                 num_retries=self.num_retries,
-                cache=litellm_cache_args,
+                cache=cache_args,
             )
         except CodexStreamError:
             if not self._ws_fallback_enabled:
@@ -1423,13 +1481,13 @@ class CodexWSLM(CodexHTTPLM):
                         timing.emit_error(state, exc)
                         raise
 
-        completion_fn, litellm_cache_args = self._get_cached_completion_fn(_acompletion, cache)
+        completion_fn, cache_args = self._get_cached_completion_fn(_acompletion, cache)
         try:
             results = await completion_fn(
                 request=request,
                 headers=headers,
                 num_retries=self.num_retries,
-                cache=litellm_cache_args,
+                cache=cache_args,
             )
         except CodexStreamError:
             if not self._ws_fallback_enabled:
@@ -1448,16 +1506,9 @@ CodexLM = CodexWSLM
 
 
 def _fire_usage_tracker_hook(model: str, results: Any) -> None:
-    """Replicate ``dspy.clients.lm.LM.(a)forward``'s usage_tracker hook.
-
-    DSPy's LM base class fires this at lines 167 and 205 of ``clients/lm.py``
-    after each call so ``dspy.track_usage()`` can attribute tokens to the
-    prediction. CodexLM overrides the whole method, which historically
-    bypassed the hook and left ``pred.get_lm_usage()`` empty — the reason
-    every downstream cost tracker saw $0 after routing through CodexLM.
-    Mirror DSPy's conditions exactly: skip cache hits, require a usage
-    tracker in context, and require the response to have a ``usage`` field.
-    """
+    """Account direct forward calls; DSPy 3.4 owns accounting within LM calls."""
+    if dspy.settings.get("_lm_stream_progress") is not None:
+        return
     if getattr(results, "cache_hit", False):
         return
     tracker = getattr(dspy.settings, "usage_tracker", None)
