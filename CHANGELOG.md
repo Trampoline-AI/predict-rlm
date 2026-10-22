@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- The action, extract, and `predict()` calls now default to `ValidatingJSONAdapter`
+  instead of `ValidatingChatAdapter`. Chat-format replies that failed to parse were
+  silently re-sent in full through JSON, often on 20–35% of main-model calls. Pass
+  `adapter=ValidatingChatAdapter()` to restore the previous format.
+
+### Added
+
+- `PredictRLM(adapter=...)` selects the DSPy adapter; `ValidatingJSONAdapter` and
+  `ValidatingChatAdapter` are exported from `predict_rlm`.
+- `IterationStep.adapter_fallbacks` and `RunTrace.adapter_fallbacks` count
+  ChatAdapter → JSON re-sends. Each re-send also logs a warning and is recorded on
+  the `rlm.action_generation.*` telemetry spans.
+
+### Fixed
+
+- `ValidatingChatAdapter` only falls back to JSON on parse failures; rate limits,
+  timeouts, and other LM errors are no longer re-sent through a second request.
+  The fallback keeps the native function-calling settings and DSPy's streaming
+  guard.
+- `ValidatingChatAdapter` parses replies whose `[[ ## field ## ]]` markers are inline
+  or whose code marker is missing before a fenced code block, instead of re-sending.
+
 ## [0.10.0] - 2026-10-21
 
 ### Security

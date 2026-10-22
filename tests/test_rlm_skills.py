@@ -36,7 +36,8 @@ def test_composed_skills_execute_together_in_the_rlm_loop():
                         "reasoning": "compose both skills",
                         "code": "value = await double(21)\nSUBMIT(answer=await label(value))",
                     }
-                ]
+                ],
+                adapter=dspy.JSONAdapter(),
             )
         ):
             result = rlm(query="compute")

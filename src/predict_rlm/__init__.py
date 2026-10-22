@@ -10,6 +10,10 @@ File I/O:
     Workspace — Mutable input directory mounted into the sandbox and synced back.
     CtxStr — String input whose prepared value is injected into the outer prompt.
 
+LM adapters (pass via ``PredictRLM(adapter=...)``):
+    ValidatingJSONAdapter — default; JSON/structured output with client-side validation
+    ValidatingChatAdapter — ``[[ ## field ## ]]`` format; re-sends via JSON on parse failure
+
 Lifecycle callbacks:
     IterationStep — payload passed to ``on_rlm_iteration_end`` callbacks.
                     Subclass ``dspy.utils.callback.BaseCallback`` and
@@ -33,7 +37,12 @@ from .evidence import (
 )
 from .files import File, LocalDir, LocalFile, OutputDir, OutputFile, SyncedFile
 from .in_context import CtxStr, CtxStrInputAdapter
-from .predict_rlm import PredictRLM, SubmitConfirmationContext
+from .predict_rlm import (
+    PredictRLM,
+    SubmitConfirmationContext,
+    ValidatingChatAdapter,
+    ValidatingJSONAdapter,
+)
 from .rlm_skills import Skill
 from .runtime import (
     Artifact,
@@ -154,6 +163,8 @@ __all__ = [
     "SessionRequirements",
     "UnsupportedOperationError",
     "SubmitConfirmationContext",
+    "ValidatingChatAdapter",
+    "ValidatingJSONAdapter",
     "DEFAULT_SBX_TEMPLATE",
     "BackendName",
     "Skill",

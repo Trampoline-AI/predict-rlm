@@ -41,7 +41,8 @@ def test_file_roundtrip_preserves_binary_data_and_hides_host_destination(tmp_pat
                         "SUBMIT(result=str(output))"
                     ),
                 }
-            ]
+            ],
+            adapter=dspy.JSONAdapter(),
         ),
         max_iterations=1,
     )
@@ -82,7 +83,8 @@ def test_file_list_collects_generated_outputs_without_stale_host_files(tmp_path)
                         "SUBMIT(results=[str(root / 'first/result.txt')])"
                     ),
                 }
-            ]
+            ],
+            adapter=dspy.JSONAdapter(),
         ),
         output_dir=output_dir,
         max_iterations=1,
