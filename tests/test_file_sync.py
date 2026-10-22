@@ -4,6 +4,7 @@ import shutil
 from pathlib import Path
 from typing import Annotated
 
+import dspy
 import pytest
 from dspy.utils.dummies import DummyLM
 
@@ -42,7 +43,7 @@ SUBMIT(answer='roundtrip complete')
     rlm = PredictRLM(
         "query -> answer",
         tools={"invert": invert},
-        lm=DummyLM([{"reasoning": "round trip", "code": code}]),
+        lm=DummyLM([{"reasoning": "round trip", "code": code}], adapter=dspy.JSONAdapter()),
         max_iterations=1,
     )
     prediction = rlm(query="invert twice")

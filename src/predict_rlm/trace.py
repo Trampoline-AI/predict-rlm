@@ -268,6 +268,13 @@ class IterationStep(BaseModel):
             "call and any sub-LM predict() calls made during this iteration"
         ),
     )
+    adapter_fallbacks: int = Field(
+        default=0,
+        description=(
+            "Times this iteration's action request was re-sent in full through "
+            "ValidatingJSONAdapter because the ChatAdapter reply failed to parse"
+        ),
+    )
 
 
 class RunTrace(BaseModel):
@@ -295,6 +302,9 @@ class RunTrace(BaseModel):
     duration_ms: int = Field(description="Total wall-clock duration in milliseconds")
     usage: LMUsage = Field(
         default_factory=LMUsage, description="Token usage split by main and sub LM"
+    )
+    adapter_fallbacks: int = Field(
+        default=0, description="Sum of steps[].adapter_fallbacks across the run"
     )
     telemetry_ref: dict[str, Any] | None = Field(
         default=None,
@@ -561,6 +571,42 @@ def init_tool_call_collector() -> Token:
 def reset_tool_call_collector(token: Token) -> None:
     """Restore the previous tool call collector."""
     _tool_calls.reset(token)
+
+
+class _AdapterFallbackCounter:
+    def __init__(self) -> None:
+        self.count = 0
+
+
+# ContextVar counting ChatAdapter -> JSONAdapter re-sends during the current run.
+_adapter_fallbacks: ContextVar[_AdapterFallbackCounter] = ContextVar("_adapter_fallbacks")
+
+
+def record_adapter_fallback() -> None:
+    """Count one ChatAdapter -> JSONAdapter re-send in the current run."""
+    try:
+        counter = _adapter_fallbacks.get()
+    except LookupError:
+        return
+    counter.count += 1
+
+
+def adapter_fallback_count() -> int:
+    """Return how many adapter re-sends the current run has recorded so far."""
+    try:
+        return _adapter_fallbacks.get().count
+    except LookupError:
+        return 0
+
+
+def init_adapter_fallback_counter() -> Token:
+    """Initialize (or reset) the adapter fallback counter for a new run."""
+    return _adapter_fallbacks.set(_AdapterFallbackCounter())
+
+
+def reset_adapter_fallback_counter(token: Token) -> None:
+    """Restore the previous adapter fallback counter."""
+    _adapter_fallbacks.reset(token)
 
 
 def snapshot_lm_history_len(lm: Any) -> int:

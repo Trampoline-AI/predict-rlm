@@ -8,8 +8,7 @@ import pytest
 from dspy.primitives.repl_types import REPLHistory
 from dspy.utils.exceptions import AdapterParseError
 
-from predict_rlm import PredictRLM
-from predict_rlm.predict_rlm import _ValidatingChatAdapter
+from predict_rlm import PredictRLM, ValidatingChatAdapter
 
 
 class ScriptedLM:
@@ -45,7 +44,7 @@ def _adapter_inputs():
 
 
 def test_empty_chat_action_recovers_through_json_fallback():
-    result = _ValidatingChatAdapter()(
+    result = ValidatingChatAdapter()(
         ScriptedLM('{"reasoning": "retry succeeded", "code": "print(1)"}'),
         **_adapter_inputs(),
     )
@@ -57,7 +56,7 @@ def test_empty_chat_action_recovers_through_json_fallback():
 async def test_invalid_json_fallback_exhausts_recovery():
     with pytest.raises(AdapterParseError):
         await asyncio.wait_for(
-            _ValidatingChatAdapter().acall(
+            ValidatingChatAdapter().acall(
                 ScriptedLM('{"reasoning": "still invalid", "code": null}'),
                 **_adapter_inputs(),
             ),

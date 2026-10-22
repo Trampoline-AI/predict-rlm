@@ -69,7 +69,7 @@ def test_predict_reconstructs_nested_sandbox_models_and_serializes_items_field()
     rlm = PredictRLM(
         "query -> answer",
         interpreter=interpreter,
-        sub_lm=DummyLM([{"items": [payload]}]),
+        sub_lm=DummyLM([{"items": [payload]}], adapter=dspy.JSONAdapter()),
         max_iterations=1,
     )
     code = """
@@ -89,7 +89,8 @@ extracted = await predict("text: str -> items: list[Order]", text="repair urgent
 SUBMIT(answer=json.dumps({"items": [order.model_dump() for order in extracted.items]}))
 """
     try:
-        with dspy.context(lm=DummyLM([{"reasoning": "extract", "code": code}])):
+        lm = DummyLM([{"reasoning": "extract", "code": code}], adapter=dspy.JSONAdapter())
+        with dspy.context(lm=lm):
             result = rlm(query="extract repairs")
         assert json.loads(result.answer) == {"items": [payload]}
     finally:
@@ -158,7 +159,8 @@ async def test_async_loop_executes_actions_recovers_errors_and_submits_output():
                 "code": "```repl\nvalue = 6\nprint('before failure')\nraise ValueError('retry')\n```",
             },
             {"reasoning": "recover", "code": "SUBMIT(answer=str(value * 7))"},
-        ]
+        ],
+        adapter=dspy.JSONAdapter(),
     )
     try:
         rlm = PredictRLM("query -> answer", interpreter=interpreter, max_iterations=2)

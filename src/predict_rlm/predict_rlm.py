@@ -34,8 +34,6 @@ from typing import (
 import dspy
 import json_repair
 import regex
-from dspy import ContextWindowExceededError
-from dspy.adapters.base import Adapter
 from dspy.adapters.chat_adapter import ChatAdapter
 from dspy.adapters.json_adapter import JSONAdapter
 from dspy.primitives.code_interpreter import CodeInterpreter, CodeInterpreterError, FinalOutput
@@ -112,14 +110,18 @@ from .trace import (
     RunTrace,
     TokenUsage,
     _RawPredictCall,
+    adapter_fallback_count,
     drain_predict_calls,
     drain_tool_calls,
+    init_adapter_fallback_counter,
     init_predict_call_collector,
     init_tool_call_collector,
     lm_completion_metadata_since,
     lm_finish_since,
     ms_since,
+    record_adapter_fallback,
     record_predict_call,
+    reset_adapter_fallback_counter,
     reset_predict_call_collector,
     reset_tool_call_collector,
     snapshot_lm_history_len,
@@ -435,7 +437,7 @@ class _ValidatingOutputAdapterMixin:
         return values
 
 
-class _ValidatingJSONAdapter(_ValidatingOutputAdapterMixin, JSONAdapter):
+class ValidatingJSONAdapter(_ValidatingOutputAdapterMixin, JSONAdapter):
     """JSONAdapter that rejects raw nulls for required output fields."""
 
     def parse(self, signature: type[Any], completion: str) -> dict[str, Any]:
@@ -490,10 +492,44 @@ class _ValidatingJSONAdapter(_ValidatingOutputAdapterMixin, JSONAdapter):
                 )
 
 
-class _ValidatingChatAdapter(_ValidatingOutputAdapterMixin, ChatAdapter):
-    """ChatAdapter whose fallback preserves client-side output validation."""
+_INLINE_CHAT_FIELD_MARKER = re.compile(r"(?<=\S)[ \t]*(\[\[ ## \w+ ## \]\])")
+_UNMARKED_CODE_FENCE = re.compile(r"^```(?:python|py|repl)\b", re.MULTILINE)
+
+
+def _repair_chat_field_markers(signature: type[Any], completion: str) -> str:
+    """Restore the ChatAdapter layout models most often break.
+
+    ChatAdapter only recognizes ``[[ ## field ## ]]`` markers at the start of a
+    line. Action LMs tend to end a sentence with ``[[ ## code ## ]]`` or skip the
+    code marker and open the fenced code block directly.
+    """
+    repaired = _INLINE_CHAT_FIELD_MARKER.sub(r"\n\1", completion)
+    if "code" in signature.output_fields and "[[ ## code ## ]]" not in repaired:
+        repaired = _UNMARKED_CODE_FENCE.sub(
+            lambda fence: f"[[ ## code ## ]]\n{fence.group(0)}", repaired, count=1
+        )
+    return repaired
+
+
+class ValidatingChatAdapter(_ValidatingOutputAdapterMixin, ChatAdapter):
+    """ChatAdapter with client-side output validation and a visible JSON fallback.
+
+    Replies whose field markers are inline or missing are repaired before giving
+    up. A reply that still fails to parse or validate is re-sent in full through
+    ``ValidatingJSONAdapter``. Every re-send is logged as a warning; re-sends of
+    action requests are also counted in ``IterationStep.adapter_fallbacks``.
+    """
 
     def parse(self, signature: type[Any], completion: str) -> dict[str, Any]:
+        try:
+            return self._parse_validated(signature, completion)
+        except AdapterParseError:
+            repaired = _repair_chat_field_markers(signature, completion)
+            if repaired == completion:
+                raise
+            return self._parse_validated(signature, repaired)
+
+    def _parse_validated(self, signature: type[Any], completion: str) -> dict[str, Any]:
         try:
             fields = super().parse(signature, completion)
         except AdapterParseError as exc:
@@ -511,47 +547,17 @@ class _ValidatingChatAdapter(_ValidatingOutputAdapterMixin, ChatAdapter):
         )
         return fields
 
-    def __call__(
-        self,
-        lm: Any,
-        lm_kwargs: dict[str, Any],
-        signature: type[Any],
-        demos: list[dict[str, Any]],
-        inputs: dict[str, Any],
-    ) -> list[dict[str, Any]]:
-        try:
-            return Adapter.__call__(self, lm, lm_kwargs, signature, demos, inputs)
-        except Exception as e:
-            if isinstance(e, ContextWindowExceededError) or not self.use_json_adapter_fallback:
-                raise e
-            return _ValidatingJSONAdapter()(
-                lm,
-                lm_kwargs,
-                signature,
-                demos,
-                inputs,
-            )
-
-    async def acall(
-        self,
-        lm: Any,
-        lm_kwargs: dict[str, Any],
-        signature: type[Any],
-        demos: list[dict[str, Any]],
-        inputs: dict[str, Any],
-    ) -> list[dict[str, Any]]:
-        try:
-            return await Adapter.acall(self, lm, lm_kwargs, signature, demos, inputs)
-        except Exception as e:
-            if isinstance(e, ContextWindowExceededError) or not self.use_json_adapter_fallback:
-                raise e
-            return await _ValidatingJSONAdapter().acall(
-                lm,
-                lm_kwargs,
-                signature,
-                demos,
-                inputs,
-            )
+    def _make_json_adapter_fallback(self) -> ValidatingJSONAdapter:
+        logger.warning(
+            "ChatAdapter could not parse the LM reply; re-sending the full request "
+            "through ValidatingJSONAdapter. Pass adapter=ValidatingJSONAdapter() to "
+            "PredictRLM to avoid paying for both calls."
+        )
+        record_adapter_fallback()
+        return ValidatingJSONAdapter(
+            use_native_function_calling=self.use_native_function_calling,
+            parallel_tool_calls=self.parallel_tool_calls,
+        )
 
 
 _NO_RECOVERABLE_DEFAULT = object()
@@ -999,6 +1005,7 @@ class PredictRLM(dspy.RLM):
     _trace_export_context = _RunStateField("_trace_export_context")
     _pending_submit_confirmation = _RunStateField("_pending_submit_confirmation")
     _last_action_lm_usage = _RunStateField("_last_action_lm_usage")
+    _last_action_adapter_fallbacks = _RunStateField("_last_action_adapter_fallbacks")
     _last_action_lm_metadata = _RunStateField("_last_action_lm_metadata")
 
     def __init__(
@@ -1026,6 +1033,7 @@ class PredictRLM(dspy.RLM):
         on_runtime_hook_event: Callable[[RuntimeHookEvent], Any] | None = None,
         model_execution_timeout: bool = False,
         *,
+        adapter: dspy.Adapter | None = None,
         adapters: Sequence[InputAdapter[Any] | OutputAdapter[Any]] = (),
         execution: ExecutionBackend | None = None,
         modules: tuple[RuntimeModule | RuntimeContribution, ...]
@@ -1096,6 +1104,12 @@ class PredictRLM(dspy.RLM):
                        (``SbxConfig.exec_timeout`` / JSPI ``exec_timeout``, default
                        300s) remains as the hang guard. Set True to restore the
                        model-chosen timeout knob.
+            adapter: DSPy adapter that formats LM requests and parses replies for
+                       the action, extract, and predict() calls. Defaults to the
+                       active ``dspy.settings.adapter``, else ``ValidatingJSONAdapter``,
+                       which uses native structured output where the provider
+                       supports it. ``ValidatingChatAdapter`` re-sends the whole
+                       request through JSON when a reply fails to parse.
             adapters: Additional input and output adapters contributed to the runtime.
             execution: Small-kernel execution backend. Mutually exclusive with
                        interpreter and sandbox backend options.
@@ -1136,6 +1150,7 @@ class PredictRLM(dspy.RLM):
         self._runtime_hooks = runtime_hooks
         self._on_runtime_hook_event = on_runtime_hook_event
         self._model_execution_timeout = model_execution_timeout
+        self._adapter = adapter
         self._sbx_pool = sbx_pool
         self._sbx_config = sbx_config
 
@@ -2293,8 +2308,11 @@ class PredictRLM(dspy.RLM):
         active_lm = run_ctx.state.get("lm") if run_ctx is not None else self._lm
         if active_lm is not None:
             context_kwargs["lm"] = active_lm
-        if getattr(dspy.settings, "adapter", None) is None:
-            context_kwargs["adapter"] = _ValidatingChatAdapter()
+        context_kwargs["adapter"] = (
+            self._adapter
+            or getattr(dspy.settings, "adapter", None)
+            or ValidatingJSONAdapter()
+        )
 
         with dspy.context(**context_kwargs):
             self._context_lm = dspy.settings.lm
@@ -2803,6 +2821,7 @@ class PredictRLM(dspy.RLM):
             max_iterations=self.max_iterations,
             duration_ms=ms_since(run_start),
             usage=LMUsage(main=main_usage, **({"sub": sub_usage} if sub_usage else {})),
+            adapter_fallbacks=sum(step.adapter_fallbacks for step in trace_steps),
             telemetry_ref=self._telemetry_ref() if status == "error" else None,
             steps=trace_steps,
         )
@@ -3543,21 +3562,23 @@ class PredictRLM(dspy.RLM):
         iteration: int,
         action_start_ns: int,
         lm_metadata: Any,
+        adapter_fallbacks: int,
     ) -> None:
         self._write_telemetry_span(
             "rlm.action_generation.parse_error",
             iteration=iteration + 1,
             status=self._action_generation_error_status(exc),
-            attributes=self._action_generation_error_attrs(
-                exc,
-                lm_metadata=lm_metadata,
-            ),
+            attributes={
+                **self._action_generation_error_attrs(exc, lm_metadata=lm_metadata),
+                "adapter_fallbacks": adapter_fallbacks,
+            },
             start_time_unix_nano=action_start_ns,
         )
         self._log_lifecycle(
             "rlm.action_generation.error",
             iteration=iteration + 1,
             error_type=type(exc).__name__,
+            adapter_fallbacks=adapter_fallbacks,
         )
 
     def _record_action_generation_ok(
@@ -3567,6 +3588,7 @@ class PredictRLM(dspy.RLM):
         iteration: int,
         action_start_ns: int,
         lm_hist_before_action: int,
+        adapter_fallbacks: int,
         execution_timeout: float | None,
     ) -> Any:
         self._write_telemetry_span(
@@ -3577,6 +3599,7 @@ class PredictRLM(dspy.RLM):
                 "has_code": True,
                 "code_chars": len(getattr(pred, "code", "") or ""),
                 "reasoning_chars": len(getattr(pred, "reasoning", "") or ""),
+                "adapter_fallbacks": adapter_fallbacks,
                 **(
                     {"execution_timeout_seconds": execution_timeout}
                     if execution_timeout is not None
@@ -3589,9 +3612,11 @@ class PredictRLM(dspy.RLM):
             iteration=iteration + 1,
             code_chars=len(getattr(pred, "code", "") or ""),
             reasoning_chars=len(getattr(pred, "reasoning", "") or ""),
+            adapter_fallbacks=adapter_fallbacks,
             execution_timeout_seconds=execution_timeout,
         )
         self._last_action_lm_usage = usage_since(dspy.settings.lm, lm_hist_before_action)
+        self._last_action_adapter_fallbacks = adapter_fallbacks
         return lm_finish_since(dspy.settings.lm, lm_hist_before_action)
 
     def _prepare_iteration_execution(self, pred: Any, iteration: int) -> tuple[str, bool]:
@@ -3915,6 +3940,7 @@ class PredictRLM(dspy.RLM):
             variables,
             iteration,
         )
+        fallbacks_before_action = adapter_fallback_count()
         try:
             lm_hist_before_action = snapshot_lm_history_len(dspy.settings.lm)
             run_ctx = current_run_context()
@@ -3937,6 +3963,7 @@ class PredictRLM(dspy.RLM):
                 iteration=iteration,
                 action_start_ns=action_start_ns,
                 lm_metadata=lm_metadata,
+                adapter_fallbacks=adapter_fallback_count() - fallbacks_before_action,
             )
             raise
         lm_metadata = self._record_action_generation_ok(
@@ -3944,6 +3971,7 @@ class PredictRLM(dspy.RLM):
             iteration=iteration,
             action_start_ns=action_start_ns,
             lm_hist_before_action=lm_hist_before_action,
+            adapter_fallbacks=adapter_fallback_count() - fallbacks_before_action,
             execution_timeout=execution_timeout,
         )
         code, iteration_log_open = self._prepare_iteration_execution(pred, iteration)
@@ -3998,6 +4026,7 @@ class PredictRLM(dspy.RLM):
             variables,
             iteration,
         )
+        fallbacks_before_action = adapter_fallback_count()
         try:
             lm_hist_before_action = snapshot_lm_history_len(dspy.settings.lm)
             run_ctx = current_run_context()
@@ -4024,6 +4053,7 @@ class PredictRLM(dspy.RLM):
                 iteration=iteration,
                 action_start_ns=action_start_ns,
                 lm_metadata=lm_metadata,
+                adapter_fallbacks=adapter_fallback_count() - fallbacks_before_action,
             )
             raise
         lm_metadata = self._record_action_generation_ok(
@@ -4031,6 +4061,7 @@ class PredictRLM(dspy.RLM):
             iteration=iteration,
             action_start_ns=action_start_ns,
             lm_hist_before_action=lm_hist_before_action,
+            adapter_fallbacks=adapter_fallback_count() - fallbacks_before_action,
             execution_timeout=execution_timeout,
         )
         code, iteration_log_open = self._prepare_iteration_execution(pred, iteration)
@@ -4346,6 +4377,8 @@ class PredictRLM(dspy.RLM):
 
         predict_calls = drain_predict_calls()
         iteration_usage = self._build_iteration_usage(predict_calls)
+        adapter_fallbacks = getattr(self, "_last_action_adapter_fallbacks", None) or 0
+        self._last_action_adapter_fallbacks = None
 
         return (
             IterationStep(
@@ -4360,6 +4393,7 @@ class PredictRLM(dspy.RLM):
                 predict_calls=predict_calls,
                 lm=action_lm_metadata,
                 usage=iteration_usage,
+                adapter_fallbacks=adapter_fallbacks,
             ),
             isinstance(result, dspy.Prediction),
         )
@@ -4416,6 +4450,7 @@ class PredictRLM(dspy.RLM):
 
                 predict_token = init_predict_call_collector()
                 tool_token = init_tool_call_collector()
+                fallback_token = init_adapter_fallback_counter()
 
                 try:
                     status = "max_iterations"
@@ -4517,6 +4552,7 @@ class PredictRLM(dspy.RLM):
                     self._export_run_trace(prediction.trace)
                     return prediction
                 finally:
+                    reset_adapter_fallback_counter(fallback_token)
                     reset_tool_call_collector(tool_token)
                     reset_predict_call_collector(predict_token)
         except BaseException as exc:
@@ -4586,6 +4622,7 @@ class PredictRLM(dspy.RLM):
 
                 predict_token = init_predict_call_collector()
                 tool_token = init_tool_call_collector()
+                fallback_token = init_adapter_fallback_counter()
 
                 try:
                     status = "max_iterations"
@@ -4691,6 +4728,7 @@ class PredictRLM(dspy.RLM):
                     self._export_run_trace(prediction.trace)
                     return prediction
                 finally:
+                    reset_adapter_fallback_counter(fallback_token)
                     reset_tool_call_collector(tool_token)
                     reset_predict_call_collector(predict_token)
         except BaseException as exc:

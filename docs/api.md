@@ -18,6 +18,7 @@ rlm = PredictRLM(
     verbose=True,             # Print human-readable iteration trace blocks
     tools=None,               # Additional tool functions
     interpreter=None,         # CodeInterpreter-shaped compatibility option
+    adapter=None,             # DSPy LM adapter (default ValidatingJSONAdapter)
     adapters=(),              # Input and output adapter instances
     execution=None,           # Custom root execution backend
     modules=(),               # Runtime contributions or factories
@@ -43,6 +44,7 @@ rlm = PredictRLM(
 | `verbose`          | `bool`                                           | `True`   | Print human-readable RLM iteration blocks to stderr: reasoning, generated code, output, tool calls, errors, and `SUBMIT` payloads. Pass `False` for quiet execution.                                              |
 | `tools`            | `dict[str, Callable] \| list[Callable] \| None`  | `None`   | Additional tool functions callable from the sandbox. Accepts a dict mapping names to callables, or a list of callables (names inferred from `__name__`). `predict` is added automatically.                        |
 | `interpreter`      | `CodeInterpreter \| None`                        | `None`   | Compatibility option for CodeInterpreter-shaped integrations, including the current `DirectPythonBackend`.                                                                                                       |
+| `adapter`          | `dspy.Adapter \| None`                           | `None`   | DSPy adapter that formats LM requests and parses replies for the action, extract, and `predict()` calls. If `None`, uses `dspy.settings.adapter` when set, else `ValidatingJSONAdapter` (native structured output where the provider supports it). `ValidatingChatAdapter` uses the `[[ ## field ## ]]` format and re-sends the whole request through JSON when a reply fails to parse; each re-send is logged and counted in `IterationStep.adapter_fallbacks`. |
 | `adapters`         | `Sequence[InputAdapter \| OutputAdapter]`        | `()`     | Input and output adapter instances. Pass a list such as `adapters=[MyInputAdapter(), MyOutputAdapter()]`; each adapter's base class determines its role.                                                          |
 | `execution`        | `ExecutionBackend \| None`                       | `None`   | Preferred option for session-native execution integrations. CodeInterpreter-shaped compatibility integrations belong under `interpreter=`.                                                                       |
 | `modules`          | `Sequence[RuntimeContribution \| RuntimeModule]` | `()`     | Runtime contributions or zero-argument factories. Factories expand once at construction.                                                                                                                          |
@@ -434,6 +436,7 @@ data = trace.model_dump()
 | `max_iterations` | `int`                                        | Maximum iterations allowed.                                                                                |
 | `duration_ms`    | `int`                                        | Total wall-clock duration in milliseconds.                                                                 |
 | `usage`          | `LMUsage`                                    | Token usage split by main and sub LM.                                                                      |
+| `adapter_fallbacks` | `int`                                     | Sum of `steps[].adapter_fallbacks`.                                                                        |
 | `steps`          | `list[IterationStep]`                        | Per-iteration execution steps.                                                                             |
 
 #### `RunEvidence`
@@ -510,6 +513,7 @@ preserved with an explanatory note and a `run_export_error` attribute.
 | `duration_ms`        | `int`                    | Wall-clock duration of this iteration.                                 |
 | `tool_calls`         | `list[ToolCall]`         | Tool calls made during this iteration (excluding predict).             |
 | `predict_calls`      | `list[PredictCallGroup]` | predict() subcalls, grouped by signature.                              |
+| `adapter_fallbacks`  | `int`                    | Times the action request was re-sent in full through `ValidatingJSONAdapter` after a ChatAdapter parse failure. |
 
 #### `ToolCall`
 
