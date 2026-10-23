@@ -196,6 +196,13 @@ Module wiring PredictRLM) -> `run.py` (CLI entry point).
 Repo-local guidance files for agents. Read the linked Markdown directly when the
 trigger applies.
 
+### Release preparation
+
+- **When to load:** always, before any release-related action: choosing a
+  version, bumping `[project].version`, cutting the changelog, creating or
+  pushing a release tag, or publishing to PyPI. Never do these steps ad hoc.
+- **Path:** `.agents/skills/release-prep/SKILL.md`
+
 ### Long-running local runs
 
 - **When to load:** before starting, monitoring, or recovering evals,
