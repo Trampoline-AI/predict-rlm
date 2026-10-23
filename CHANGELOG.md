@@ -7,8 +7,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.11.0] - 2026-10-23
-
 ### Changed
 
 - The action signature's output field is now `plan` ("Your next action and why, in
@@ -16,6 +14,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `generate_action` predictor or mock must return `plan`; returning only `reasoning`
   now fails validation. Trace steps, REPL history, `SubmitConfirmationContext`, and
   telemetry still call it `reasoning`.
+
+### Fixed
+
+- Claude Sonnet 5.5 no longer refuses every action call (`stop_reason: "refusal"`,
+  category `reasoning_extraction`, surfaced as "The LM returned an empty or null
+  response."). It refused requests for a `reasoning` output field and for long
+  step-by-step reasoning (#69).
+
+## [0.11.0] - 2026-10-23
+
+### Changed
+
 - The action, extract, and `predict()` calls now default to `ValidatingJSONAdapter`
   instead of `ValidatingChatAdapter`. Chat-format replies that failed to parse were
   silently re-sent in full through JSON, often on 20–35% of main-model calls. Pass
@@ -31,10 +41,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- Claude Sonnet 5.5 no longer refuses every action call (`stop_reason: "refusal"`,
-  category `reasoning_extraction`, surfaced as "The LM returned an empty or null
-  response."). It refused requests for a `reasoning` output field and for long
-  step-by-step reasoning (#69).
 - `ValidatingChatAdapter` only falls back to JSON on parse failures; rate limits,
   timeouts, and other LM errors are no longer re-sent through a second request.
   The fallback keeps the native function-calling settings and DSPy's streaming
