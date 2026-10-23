@@ -258,8 +258,8 @@ class TestCallbacksIntegration:
             rlm.callbacks = [cb]
 
             scripted = [
-                dspy.Prediction(reasoning="probe", code="print('hello-from-sandbox')"),
-                dspy.Prediction(reasoning="finish", code="SUBMIT(answer='42')"),
+                dspy.Prediction(plan="probe", code="print('hello-from-sandbox')"),
+                dspy.Prediction(plan="finish", code="SUBMIT(answer='42')"),
             ]
             rlm.generate_action = MagicMock(side_effect=scripted)
 

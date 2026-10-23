@@ -96,7 +96,7 @@ def test_predict_rlm_jspi_timeout_preserves_state_history_and_predict_tool(monke
 
     actions = _SequentialActions(
         SimpleNamespace(
-            reasoning="prepare state before the bounded operation",
+            plan="prepare state before the bounded operation",
             code=(
                 "first = await predict('question: str -> answer: str', "
                 "question='first call')\n"
@@ -104,7 +104,7 @@ def test_predict_rlm_jspi_timeout_preserves_state_history_and_predict_tool(monke
             ),
         ),
         SimpleNamespace(
-            reasoning="run a bounded risky loop using prepared state",
+            plan="run a bounded risky loop using prepared state",
             code=(
                 "print('first predict:', saved['first'])\n"
                 "print('marker before timeout:', saved['marker'])\n"
@@ -114,7 +114,7 @@ def test_predict_rlm_jspi_timeout_preserves_state_history_and_predict_tool(monke
             execution_timeout_seconds=0.2,
         ),
         SimpleNamespace(
-            reasoning="continue with preserved state and call predict again",
+            plan="continue with preserved state and call predict again",
             code=(
                 "print('marker after timeout:', saved['marker'])\n"
                 "second = await predict('question: str -> answer: str', "
@@ -253,7 +253,7 @@ async def test_nonfinite_model_deadline_fails_before_execution():
     rlm.generate_action = MagicMock()
     rlm.generate_action.acall = AsyncMock(
         return_value=dspy.Prediction(
-            reasoning="invalid cap",
+            plan="invalid cap",
             code="while True: pass",
             execution_timeout_seconds=float("nan"),
         )

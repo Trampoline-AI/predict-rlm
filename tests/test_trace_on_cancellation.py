@@ -26,8 +26,8 @@ def _cancelling_run(error):
 
     rlm = PredictRLM("query -> answer", max_iterations=3)
     actions = [
-        dspy.Prediction(reasoning="first", code="print('committed output')"),
-        dspy.Prediction(reasoning="pending", code="await slow_tool()"),
+        dspy.Prediction(plan="first", code="print('committed output')"),
+        dspy.Prediction(plan="pending", code="await slow_tool()"),
     ]
     rlm.generate_action = MagicMock(side_effect=actions)
     rlm.generate_action.acall = AsyncMock(side_effect=actions)

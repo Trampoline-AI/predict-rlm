@@ -194,7 +194,7 @@ async def test_code_cancellation_emits_paired_terminal_evidence():
         verbose=False,
     )
     rlm.generate_action.acall = AsyncMock(
-        return_value=dspy.Prediction(reasoning="block", code="await block()")
+        return_value=dspy.Prediction(plan="block", code="await block()")
     )
 
     task = asyncio.create_task(rlm.aforward(question="test"))
@@ -494,7 +494,7 @@ async def test_cancelled_execution_defers_adapter_work_until_session_is_idle():
         verbose=False,
     )
     rlm.generate_action.acall = AsyncMock(
-        return_value=dspy.Prediction(reasoning="block", code="await block()")
+        return_value=dspy.Prediction(plan="block", code="await block()")
     )
 
     invocation = asyncio.create_task(rlm.aforward(value="input"))
@@ -547,7 +547,7 @@ async def test_input_adapter_after_execution_failure_is_fatal(execution_fails: b
         verbose=False,
     )
     rlm.generate_action.acall = AsyncMock(
-        return_value=dspy.Prediction(reasoning="run", code="work")
+        return_value=dspy.Prediction(plan="run", code="work")
     )
 
     expected = ValueError if execution_fails else OSError
@@ -602,7 +602,7 @@ async def test_cancellation_remains_primary_when_finalization_fails(
         verbose=False,
     )
     rlm.generate_action.acall = AsyncMock(
-        return_value=dspy.Prediction(reasoning="submit", code="SUBMIT(answer=value)")
+        return_value=dspy.Prediction(plan="submit", code="SUBMIT(answer=value)")
     )
 
     invocation = asyncio.create_task(rlm.aforward(value="input"))
@@ -700,7 +700,7 @@ async def test_result_exports_trajectory_separately_from_completed_evidence(tmp_
         run_export_root=tmp_path / ".run",
     )
     rlm.generate_action.acall = AsyncMock(
-        return_value=dspy.Prediction(reasoning="answer", code="SUBMIT(answer=question)")
+        return_value=dspy.Prediction(plan="answer", code="SUBMIT(answer=question)")
     )
 
     result = await rlm.acall(question="separate artifacts")
@@ -769,7 +769,7 @@ async def test_terminal_sink_failure_exposes_incomplete_evidence_separately(tmp_
         run_export_root=tmp_path / ".run",
     )
     rlm.generate_action.acall = AsyncMock(
-        return_value=dspy.Prediction(reasoning="answer", code="SUBMIT(answer=question)")
+        return_value=dspy.Prediction(plan="answer", code="SUBMIT(answer=question)")
     )
 
     with pytest.raises(EvidenceIncompleteError) as raised:
@@ -811,7 +811,7 @@ async def test_run_export_errors_are_visible_without_replacing_primary_failure(t
         verbose=False,
     )
     rlm.generate_action.acall = AsyncMock(
-        return_value=dspy.Prediction(reasoning="answer", code="SUBMIT(answer=question)")
+        return_value=dspy.Prediction(plan="answer", code="SUBMIT(answer=question)")
     )
 
     with pytest.raises(ValueError if run_fails else OSError) as raised:
@@ -1134,7 +1134,7 @@ async def test_failed_backend_exit_emits_release_failure_not_release_success():
     )
     rlm.generate_action.acall = AsyncMock(
         return_value=dspy.Prediction(
-            reasoning="submit",
+            plan="submit",
             code="SUBMIT(answer=question)",
         )
     )
@@ -1181,7 +1181,7 @@ async def test_cancellation_waits_for_owned_finalization_before_backend_release(
     )
     rlm.generate_action.acall = AsyncMock(
         return_value=dspy.Prediction(
-            reasoning="submit",
+            plan="submit",
             code="SUBMIT(answer=question)",
         )
     )
@@ -1322,7 +1322,7 @@ def test_sync_forward_awaits_owned_sbx_host_retirement_before_loop_teardown(
         verbose=False,
     )
     rlm.generate_action.acall = AsyncMock(
-        return_value=dspy.Prediction(reasoning="submit", code="SUBMIT(answer='done')")
+        return_value=dspy.Prediction(plan="submit", code="SUBMIT(answer='done')")
     )
 
     result = rlm.forward(question="test")
@@ -1377,7 +1377,7 @@ async def test_sync_tool_cancellation_holds_custom_final_backend_lease_until_wor
         verbose=False,
     )
     rlm.generate_action.acall = AsyncMock(
-        return_value=dspy.Prediction(reasoning="block", code="block()")
+        return_value=dspy.Prediction(plan="block", code="block()")
     )
 
     invocation = asyncio.create_task(rlm.aforward(question="test"))

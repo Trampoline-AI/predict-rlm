@@ -33,7 +33,7 @@ def test_composed_skills_execute_together_in_the_rlm_loop():
             lm=DummyLM(
                 [
                     {
-                        "reasoning": "compose both skills",
+                        "plan": "compose both skills",
                         "code": "value = await double(21)\nSUBMIT(answer=await label(value))",
                     }
                 ],

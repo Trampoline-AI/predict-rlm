@@ -89,7 +89,7 @@ extracted = await predict("text: str -> items: list[Order]", text="repair urgent
 SUBMIT(answer=json.dumps({"items": [order.model_dump() for order in extracted.items]}))
 """
     try:
-        lm = DummyLM([{"reasoning": "extract", "code": code}], adapter=dspy.JSONAdapter())
+        lm = DummyLM([{"plan": "extract", "code": code}], adapter=dspy.JSONAdapter())
         with dspy.context(lm=lm):
             result = rlm(query="extract repairs")
         assert json.loads(result.answer) == {"items": [payload]}
@@ -155,10 +155,10 @@ async def test_async_loop_executes_actions_recovers_errors_and_submits_output():
     lm = DummyLM(
         [
             {
-                "reasoning": "probe",
+                "plan": "probe",
                 "code": "```repl\nvalue = 6\nprint('before failure')\nraise ValueError('retry')\n```",
             },
-            {"reasoning": "recover", "code": "SUBMIT(answer=str(value * 7))"},
+            {"plan": "recover", "code": "SUBMIT(answer=str(value * 7))"},
         ],
         adapter=dspy.JSONAdapter(),
     )
@@ -174,12 +174,21 @@ async def test_async_loop_executes_actions_recovers_errors_and_submits_output():
         interpreter.shutdown()
 
 
+def test_action_signature_asks_for_a_short_plan_instead_of_reasoning():
+    """Claude Sonnet 5.5 refuses requests for a ``reasoning`` output field or long step-by-step thinking."""
+    output_fields = PredictRLM("query -> answer").generate_action.signature.output_fields
+
+    assert "plan" in output_fields
+    assert "reasoning" not in output_fields
+    assert "step-by-step" not in output_fields["plan"].json_schema_extra["desc"].lower()
+
+
 class TestSubmitConfirmation:
     """Tests for configurable submit confirmation in the main RLM loop."""
 
     @staticmethod
-    def _prediction(code: str, reasoning: str = "thinking") -> dspy.Prediction:
-        return dspy.Prediction(reasoning=reasoning, code=code)
+    def _prediction(code: str, plan: str = "thinking") -> dspy.Prediction:
+        return dspy.Prediction(plan=plan, code=code)
 
     def _run_sync(
         self,
@@ -238,8 +247,8 @@ class TestSubmitConfirmation:
         result = self._run_sync(
             rlm,
             [
-                self._prediction("SUBMIT(answer='done')", reasoning="first submit"),
-                self._prediction("SUBMIT(answer='done')", reasoning="second submit"),
+                self._prediction("SUBMIT(answer='done')", plan="first submit"),
+                self._prediction("SUBMIT(answer='done')", plan="second submit"),
             ],
             repl=repl,
         )
@@ -254,6 +263,11 @@ class TestSubmitConfirmation:
         context = seen_contexts[0]
         assert context.inputs == {"images": ["img"], "query": "Original task"}
         assert context.submitted_payload == {"answer": "done"}
+        assert context.reasoning == "first submit"
+        assert [step.reasoning for step in result.trace.steps] == [
+            "first submit",
+            "second submit",
+        ]
 
     def test_non_submit_after_confirmation_clears_pending_confirmation(self):
         prompts = []
@@ -324,7 +338,7 @@ class TestFatalExecutionErrors:
         mock_repl.execute = MagicMock(side_effect=SandboxFatalError("fatal"))
 
         mock_pred = MagicMock()
-        mock_pred.reasoning = "thinking"
+        mock_pred.plan = "thinking"
         mock_pred.code = "print('hello')"
         rlm.generate_action = MagicMock(return_value=mock_pred)
 
@@ -349,7 +363,7 @@ class TestFatalExecutionErrors:
         mock_repl.aexecute = AsyncMock(side_effect=SandboxFatalError("fatal"))
 
         mock_pred = MagicMock()
-        mock_pred.reasoning = "thinking"
+        mock_pred.plan = "thinking"
         mock_pred.code = "print('hello')"
         rlm.generate_action = MagicMock()
         rlm.generate_action.acall = AsyncMock(return_value=mock_pred)

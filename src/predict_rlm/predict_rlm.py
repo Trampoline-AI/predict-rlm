@@ -2383,7 +2383,7 @@ class PredictRLM(dspy.RLM):
     def _generated_code_attributes(
         self, *, iteration: int, pred: Any, code: str
     ) -> dict[str, Any]:
-        reasoning = getattr(pred, "reasoning", "") or ""
+        reasoning = getattr(pred, "plan", "") or ""
         return self._telemetry_attrs(
             iteration=iteration + 1,
             extra={
@@ -2412,10 +2412,14 @@ class PredictRLM(dspy.RLM):
             return
 
     def _process_execution_result(self, pred: Any, *args: Any) -> dspy.Prediction | Any:
+        # DSPy's RLM records each step's thinking as ``reasoning``. The action
+        # signature asks for a short ``plan`` instead because Claude Sonnet 5.5
+        # refuses requests for a ``reasoning`` field or long visible reasoning.
+        dspy_action = dspy.Prediction(reasoning=pred.plan, code=pred.code)
         original_verbose = self.verbose
         self.verbose = False
         try:
-            return super()._process_execution_result(pred, *args)
+            return super()._process_execution_result(dspy_action, *args)
         finally:
             self.verbose = original_verbose
 
@@ -2518,7 +2522,7 @@ class PredictRLM(dspy.RLM):
         emit_trace_iteration_start(
             iteration=iteration + 1,
             max_iterations=self.max_iterations,
-            reasoning=getattr(pred, "reasoning", "") or "",
+            reasoning=getattr(pred, "plan", "") or "",
             code=code,
             execution_timeout_seconds=execution_timeout,
         )
@@ -3544,9 +3548,9 @@ class PredictRLM(dspy.RLM):
         return variables_info, action_start_ns
 
     def _validate_iteration_action(self, pred: Any) -> None:
-        if not isinstance(getattr(pred, "reasoning", None), str):
+        if not isinstance(getattr(pred, "plan", None), str):
             raise RuntimeError(
-                "PredictRLM action adapter returned invalid reasoning; "
+                "PredictRLM action adapter returned invalid plan; "
                 "expected a validated non-null string."
             )
         if not isinstance(getattr(pred, "code", None), str) or len(pred.code) < 1:
@@ -3598,7 +3602,7 @@ class PredictRLM(dspy.RLM):
             attributes={
                 "has_code": True,
                 "code_chars": len(getattr(pred, "code", "") or ""),
-                "reasoning_chars": len(getattr(pred, "reasoning", "") or ""),
+                "reasoning_chars": len(getattr(pred, "plan", "") or ""),
                 "adapter_fallbacks": adapter_fallbacks,
                 **(
                     {"execution_timeout_seconds": execution_timeout}
@@ -3611,7 +3615,7 @@ class PredictRLM(dspy.RLM):
             "rlm.action_generation.ok",
             iteration=iteration + 1,
             code_chars=len(getattr(pred, "code", "") or ""),
-            reasoning_chars=len(getattr(pred, "reasoning", "") or ""),
+            reasoning_chars=len(getattr(pred, "plan", "") or ""),
             adapter_fallbacks=adapter_fallbacks,
             execution_timeout_seconds=execution_timeout,
         )
@@ -3632,7 +3636,7 @@ class PredictRLM(dspy.RLM):
         from dspy.primitives.repl_types import REPLEntry
 
         self._partial_pending_entry = REPLEntry(
-            reasoning=getattr(pred, "reasoning", "") or "",
+            reasoning=getattr(pred, "plan", "") or "",
             code=code,
             output="",
         )

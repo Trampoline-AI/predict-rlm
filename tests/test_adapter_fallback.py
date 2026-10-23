@@ -39,7 +39,7 @@ class SubmitRepl:
         return self.execute(code)
 
 
-JSON_ACTION = '{"reasoning": "ok", "code": "print(1)"}'
+JSON_ACTION = '{"plan": "ok", "code": "print(1)"}'
 
 
 def _call_action_adapter(adapter, lm):
@@ -69,27 +69,26 @@ class TestChatAdapterFallback:
 
     def test_inline_field_marker_parses_without_resending(self):
         lm = ScriptedLM(
-            "[[ ## reasoning ## ]]\nI will print. [[ ## code ## ]]\n"
+            "[[ ## plan ## ]]\nI will print. [[ ## code ## ]]\n"
             "```repl\nprint(1)\n```\n[[ ## completed ## ]]"
         )
         result = _call_action_adapter(ValidatingChatAdapter(), lm)
         assert lm.calls == 1
-        assert result[0]["reasoning"] == "I will print."
+        assert result[0]["plan"] == "I will print."
         assert "print(1)" in result[0]["code"]
 
     def test_missing_code_marker_before_repl_block_parses_without_resending(self):
         lm = ScriptedLM(
-            "[[ ## reasoning ## ]]\nI will print.\n```repl\nprint(1)\n```\n"
-            "[[ ## completed ## ]]"
+            "[[ ## plan ## ]]\nI will print.\n```repl\nprint(1)\n```\n[[ ## completed ## ]]"
         )
         result = _call_action_adapter(ValidatingChatAdapter(), lm)
         assert lm.calls == 1
-        assert result[0]["reasoning"] == "I will print."
+        assert result[0]["plan"] == "I will print."
         assert result[0]["code"] == "```repl\nprint(1)\n```"
 
     def test_marker_text_inside_well_formed_code_is_preserved(self):
         lm = ScriptedLM(
-            "[[ ## reasoning ## ]]\nok\n\n[[ ## code ## ]]\n"
+            "[[ ## plan ## ]]\nok\n\n[[ ## code ## ]]\n"
             "print('see [[ ## code ## ]]')\n\n[[ ## completed ## ]]"
         )
         result = _call_action_adapter(ValidatingChatAdapter(), lm)
@@ -121,7 +120,7 @@ class TestAdapterSelection:
 class TestFallbackTrace:
     def _run(self, *, use_async: bool):
         rlm = PredictRLM("images, query -> answer", sub_lm=MagicMock(), max_iterations=2)
-        submit = {"reasoning": "done", "code": "SUBMIT(answer='done')"}
+        submit = {"plan": "done", "code": "SUBMIT(answer='done')"}
         lm = DummyLM([submit, submit], adapter=dspy.JSONAdapter())
         with (
             dspy.context(lm=lm, adapter=ValidatingChatAdapter()),
