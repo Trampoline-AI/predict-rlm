@@ -138,7 +138,7 @@ class RepositoryActions:
         del kwargs
         if iteration == "1/2":
             return dspy.Prediction(
-                reasoning="mutate before a recoverable failure",
+                plan="mutate before a recoverable failure",
                 code=(
                     "from pathlib import Path\n"
                     "root = Path(repository)\n"
@@ -147,7 +147,7 @@ class RepositoryActions:
                 ),
             )
         return dspy.Prediction(
-            reasoning="complete the repository update",
+            plan="complete the repository update",
             code=(
                 "from pathlib import Path\n"
                 "root = Path(repository)\n"
@@ -342,7 +342,7 @@ def test_owned_sbx_enforces_external_read_only_mount(tmp_path: Path):
     )
     rlm.generate_action.acall = AsyncMock(
         return_value=dspy.Prediction(
-            reasoning="verify that the mounted dataset is immutable",
+            plan="verify that the mounted dataset is immutable",
             code=(
                 "from pathlib import Path\n"
                 "try:\n"

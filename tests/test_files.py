@@ -31,7 +31,7 @@ def test_file_roundtrip_preserves_binary_data_and_hides_host_destination(tmp_pat
         lm=DummyLM(
             [
                 {
-                    "reasoning": "transform the mounted file without seeing a host output path",
+                    "plan": "transform the mounted file without seeing a host output path",
                     "code": (
                         "from pathlib import Path\n"
                         "assert 'result' not in globals()\n"
@@ -71,7 +71,7 @@ def test_file_list_collects_generated_outputs_without_stale_host_files(tmp_path)
         lm=DummyLM(
             [
                 {
-                    "reasoning": "retain nested paths and discover an unsubmitted output",
+                    "plan": "retain nested paths and discover an unsubmitted output",
                     "code": (
                         "from pathlib import Path\n"
                         "inputs = {Path(path).name: Path(path) for path in source}\n"

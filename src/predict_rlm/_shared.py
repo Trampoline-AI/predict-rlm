@@ -161,10 +161,8 @@ def build_rlm_signatures(
         type_=str,
     )
     action_sig = action_sig.append(
-        "reasoning",
-        dspy.OutputField(
-            desc="Think step-by-step: what do you know? What remains? Plan your next action."
-        ),
+        "plan",
+        dspy.OutputField(desc="Your next action and why, in one or two sentences."),
         type_=str,
     )
     if model_execution_timeout:

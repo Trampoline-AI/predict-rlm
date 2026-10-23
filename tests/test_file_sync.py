@@ -43,7 +43,7 @@ SUBMIT(answer='roundtrip complete')
     rlm = PredictRLM(
         "query -> answer",
         tools={"invert": invert},
-        lm=DummyLM([{"reasoning": "round trip", "code": code}], adapter=dspy.JSONAdapter()),
+        lm=DummyLM([{"plan": "round trip", "code": code}], adapter=dspy.JSONAdapter()),
         max_iterations=1,
     )
     prediction = rlm(query="invert twice")

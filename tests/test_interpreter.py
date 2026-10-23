@@ -478,7 +478,7 @@ async def test_jspi_cancellation_flushes_mirror_before_sandbox_shutdown(tmp_path
     )
     rlm.generate_action.acall = AsyncMock(
         return_value=dspy.Prediction(
-            reasoning="mutate the workspace and remain active",
+            plan="mutate the workspace and remain active",
             code=(
                 "from pathlib import Path\n"
                 "Path('/sandbox/workspace/source.txt').write_text('after-cancel')\n"

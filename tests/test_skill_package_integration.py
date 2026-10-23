@@ -56,7 +56,7 @@ def _real_sbx_available() -> bool:
 def _run_skill_package_rlm(**kwargs) -> None:
     actions = SequentialActions(
         SimpleNamespace(
-            reasoning="import and use the package declared by the skill",
+            plan="import and use the package declared by the skill",
             code=SLUGIFY_CODE,
         )
     )

@@ -20,8 +20,7 @@ class ScriptedLM:
         self.fallback = fallback
         self.responses = iter(
             [
-                "[[ ## reasoning ## ]]\ntry an action\n\n"
-                "[[ ## code ## ]]\n\n[[ ## completed ## ]]",
+                "[[ ## plan ## ]]\ntry an action\n\n[[ ## code ## ]]\n\n[[ ## completed ## ]]",
                 fallback,
             ]
         )
@@ -45,11 +44,11 @@ def _adapter_inputs():
 
 def test_empty_chat_action_recovers_through_json_fallback():
     result = ValidatingChatAdapter()(
-        ScriptedLM('{"reasoning": "retry succeeded", "code": "print(1)"}'),
+        ScriptedLM('{"plan": "retry succeeded", "code": "print(1)"}'),
         **_adapter_inputs(),
     )
     assert result[0]["code"] == "print(1)"
-    assert result[0]["reasoning"] == "retry succeeded"
+    assert result[0]["plan"] == "retry succeeded"
 
 
 @pytest.mark.asyncio
@@ -57,7 +56,7 @@ async def test_invalid_json_fallback_exhausts_recovery():
     with pytest.raises(AdapterParseError):
         await asyncio.wait_for(
             ValidatingChatAdapter().acall(
-                ScriptedLM('{"reasoning": "still invalid", "code": null}'),
+                ScriptedLM('{"plan": "still invalid", "code": null}'),
                 **_adapter_inputs(),
             ),
             timeout=3,
@@ -68,9 +67,7 @@ async def test_invalid_json_fallback_exhausts_recovery():
 async def test_custom_predictor_empty_code_never_reaches_execution():
     rlm = PredictRLM("q -> answer")
     rlm.generate_action = MagicMock()
-    rlm.generate_action.acall = AsyncMock(
-        return_value=dspy.Prediction(reasoning="attempt", code="")
-    )
+    rlm.generate_action.acall = AsyncMock(return_value=dspy.Prediction(plan="attempt", code=""))
     repl = MagicMock()
     repl.aexecute = AsyncMock(side_effect=AssertionError("invalid code was executed"))
     with pytest.raises(RuntimeError, match="invalid code"):

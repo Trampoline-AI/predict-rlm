@@ -262,7 +262,7 @@ class _WorkspaceMutationActions:
         del kwargs
         if iteration == "1/2":
             return dspy.Prediction(
-                reasoning="persist a mutation from a failed generated attempt",
+                plan="persist a mutation from a failed generated attempt",
                 code=(
                     "from pathlib import Path\n"
                     "root = Path(workspace)\n"
@@ -271,7 +271,7 @@ class _WorkspaceMutationActions:
                 ),
             )
         return dspy.Prediction(
-            reasoning="complete the workspace mutation",
+            plan="complete the workspace mutation",
             code=(
                 "from pathlib import Path\n"
                 "root = Path(workspace)\n"
@@ -341,7 +341,7 @@ async def test_workspace_conflict_through_maintained_jspi_preserves_host(tmp_pat
     )
     rlm.generate_action.acall = AsyncMock(
         return_value=dspy.Prediction(
-            reasoning="create a host/sandbox conflict",
+            plan="create a host/sandbox conflict",
             code=(
                 "from pathlib import Path\n"
                 "await change_host()\n"
