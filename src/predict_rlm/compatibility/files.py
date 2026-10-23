@@ -6,7 +6,7 @@ import os
 import tempfile
 import typing
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path, PurePosixPath
 from typing import Any
 
@@ -27,10 +27,12 @@ from predict_rlm.runtime import (
     MutableDirectorySession,
     OutputAdapter,
     OutputReservation,
+    PathMode,
     PreparedInput,
     RunContext,
     SandboxRootReservation,
     SessionRequirements,
+    compile_prepared_input,
 )
 from predict_rlm.workspace import Workspace, WorkspaceMode, WorkspaceSyncState
 
@@ -124,8 +126,7 @@ def validate_file_workspace_signature(signature: Any) -> None:
             )
         if _annotation_contains(field.annotation, File) and not field.matches(File):
             raise ValueError(
-                f"Unsupported File annotation for output {field_name!r}: "
-                f"{field.annotation!r}"
+                f"Unsupported File annotation for output {field_name!r}: {field.annotation!r}"
             )
 
 
@@ -139,7 +140,10 @@ def _output_destination(artifact: Artifact, sandbox_path: str) -> Path:
             f"{str(sandbox_root)!r}"
         )
     try:
-        relative = source.relative_to(sandbox_root)
+        if artifact.metadata.get("in_place") and source.is_relative_to(destination.resolve()):
+            relative = source.relative_to(destination.resolve())
+        else:
+            relative = source.relative_to(sandbox_root)
     except ValueError as exc:
         raise ValueError(
             f"Submitted output path {sandbox_path!r} is outside the reserved output root "
@@ -150,7 +154,13 @@ def _output_destination(artifact: Artifact, sandbox_path: str) -> Path:
             f"Submitted output path must identify a file under the reserved output root "
             f"{str(sandbox_root)!r}"
         )
-    return destination.joinpath(*relative.parts)
+    target = destination.joinpath(*relative.parts)
+    if not target.resolve().is_relative_to(destination.resolve()):
+        raise ValueError(
+            f"Submitted output path {sandbox_path!r} escapes the reserved output root "
+            f"{str(destination)!r}"
+        )
+    return target
 
 
 class ValueInputAdapter(InputAdapter[Any]):
@@ -173,10 +183,15 @@ class ValueInputAdapter(InputAdapter[Any]):
 
 
 class FileInputAdapter(InputAdapter[File]):
-    """Prepare current File values as opaque file artifacts."""
+    """Expose File paths by copy (default) or read-only live host mount."""
 
     name = "file"
     value_type = File
+
+    def __init__(
+        self, *, mode: PathMode | typing.Literal["copy", "mount"] = PathMode.COPY
+    ) -> None:
+        self.mode = PathMode(mode)
 
     async def prepare(
         self,
@@ -197,54 +212,28 @@ class FileInputAdapter(InputAdapter[File]):
                 raise TypeError("File inputs must contain File values with a path")
             if not os.path.isfile(item.path):
                 raise FileNotFoundError(item.path)
-        if all(item is not None for item in items):
-            sources = [
-                item.path
-                for item in items
-                if isinstance(item, File) and item.path is not None
-            ]
-            instructions = (
-                f"Input file field `{field.name}` is available at its sandbox path.",
-            )
-            if field.is_list:
-                return PreparedInput.paths(sources, instructions=instructions)
-            return PreparedInput.path(sources[0], instructions=instructions)
-
-        artifacts: list[Artifact] = []
-        read_paths: list[str] = []
-        model_paths: list[str | None] = []
-        for item in field.unpack(value):
-            if item is None and field.item_allows_none:
-                model_paths.append(None)
-                continue
-            if not isinstance(item, File) or not item.path:
-                raise TypeError("File inputs must contain File values with a path")
-            if not os.path.isfile(item.path):
-                raise FileNotFoundError(item.path)
-            read_paths.append(os.path.abspath(item.path))
-            sandbox_path = f"/sandbox/input/{field.name}/{os.path.basename(item.path)}"
-            artifacts.append(
-                Artifact(
-                    id=f"file-input-{uuid.uuid4().hex}",
-                    kind="compat.file",
-                    metadata={
-                        "source_path": item.path,
-                        "sandbox_path": sandbox_path,
-                    },
-                )
-            )
-            model_paths.append(sandbox_path)
-
-        model_value = field.pack(model_paths)
-        return PreparedInput(
-            model_value=model_value,
-            artifacts=tuple(artifacts),
-            sandbox_roots=(
-                SandboxRootReservation(f"/sandbox/input/{field.name}"),
+        sources = [
+            item.path for item in items if isinstance(item, File) and item.path is not None
+        ]
+        basenames = [os.path.basename(source) for source in sources]
+        if len(basenames) != len(set(basenames)):
+            raise ValueError(f"Duplicate File input basenames for field {field.name!r}")
+        prepared = compile_prepared_input(
+            field,
+            PreparedInput.paths(
+                sources,
+                mode=self.mode,
+                read_only=True,
+                instructions=(
+                    f"Input file field `{field.name}` is available at its sandbox path.",
+                ),
             ),
-            requirements=SessionRequirements(extra_read_paths=tuple(read_paths)),
-            instructions=(
-                f"Input file field `{field.name}` is available at {model_value!r}.",
+        )
+        paths = iter(prepared.model_value)
+        return replace(
+            prepared,
+            model_value=field.pack(
+                [next(paths) if item is not None else None for item in items]
             ),
         )
 
@@ -292,9 +281,11 @@ class WorkspaceInputAdapter(InputAdapter[Workspace]):
                 host_directory_mount = HostDirectoryMount(
                     host_path=workspace_root,
                     sandbox_path=sandbox_path,
+                    read_only=workspace.read_only,
                 )
                 host_directory_mounts.append(host_directory_mount)
-                writable_workspace_roots.append(workspace_root)
+                if not workspace.read_only:
+                    writable_workspace_roots.append(workspace_root)
             else:
                 sandbox_path = workspace.mount_path
                 sync_state = WorkspaceSyncState(workspace)
@@ -360,9 +351,7 @@ class WorkspaceInputAdapter(InputAdapter[Workspace]):
                         f"Execution session {session.name!r} does not support host "
                         "directory mounts"
                     )
-                sandbox_path = await session.mount_host_directory(
-                    state.host_directory_mount
-                )
+                sandbox_path = await session.mount_host_directory(state.host_directory_mount)
             else:
                 if not isinstance(session, DirectoryCreationSession):
                     raise TypeError(
@@ -460,8 +449,7 @@ class WorkspaceInputAdapter(InputAdapter[Workspace]):
                 ):
                     if not isinstance(session, MutableDirectorySession):
                         raise TypeError(
-                            "Execution session does not support mutable "
-                            "directory inputs"
+                            "Execution session does not support mutable directory inputs"
                         )
                     await state.sync_state.async_sync_from_sandbox(session)
             except BaseException as exc:
@@ -495,8 +483,10 @@ class FileOutputAdapter(OutputAdapter[File]):
         import tempfile
 
         host_base = self.output_dir or tempfile.mkdtemp(prefix="predict-rlm-")
-        host_dir = value.path if isinstance(value, File) and value.path else os.path.join(
-            host_base, field.name
+        host_dir = (
+            value.path
+            if isinstance(value, File) and value.path
+            else os.path.join(host_base, field.name)
         )
         Path(host_dir).mkdir(parents=True, exist_ok=True)
         ctx.state.setdefault("output_host_dirs", {})[field.name] = host_dir
@@ -529,7 +519,13 @@ class FileOutputAdapter(OutputAdapter[File]):
             kind=artifact.kind,
             metadata={
                 **artifact.metadata,
-                "sandbox_path": binding.path,
+                "sandbox_path": sandbox_dir
+                if binding.metadata.get("in_place")
+                else binding.path,
+                "in_place": bool(binding.metadata.get("in_place")),
+                "destination_path": binding.path
+                if binding.metadata.get("in_place")
+                else host_dir,
             },
         )
         model_value = f"{binding.path.rstrip('/')}/"
@@ -566,6 +562,8 @@ class FileOutputAdapter(OutputAdapter[File]):
             submitted_path = submitted_path.strip()
             if PurePosixPath(submitted_path).is_absolute():
                 destination = _output_destination(artifact, submitted_path)
+                if artifact.metadata.get("in_place") and destination.is_file():
+                    return File(path=str(destination))
                 selected = Artifact(
                     id=artifact.id,
                     kind="compat.file",
@@ -592,6 +590,12 @@ class FileOutputAdapter(OutputAdapter[File]):
         session: ExecutionSession,
     ) -> list[File]:
         destination = Path(str(artifact.metadata["destination_path"]))
+        generated: dict[str, File] = {}
+        if artifact.metadata.get("in_place"):
+            for source in sorted(destination.rglob("*")):
+                _output_destination(artifact, str(source))
+                if source.is_file() and not source.is_symlink():
+                    generated[str(source)] = File(path=str(source))
         destination.parent.mkdir(parents=True, exist_ok=True)
         with tempfile.TemporaryDirectory(
             prefix=f".{destination.name}-collect-",
@@ -609,13 +613,17 @@ class FileOutputAdapter(OutputAdapter[File]):
                     },
                 )
             )
-            generated: list[File] = []
             for source in sorted(
                 path for path in staging.rglob("*") if path.is_file() and not path.is_symlink()
             ):
                 relative = source.relative_to(staging)
-                target = destination.joinpath(*relative.parts)
+                virtual_path = str(
+                    PurePosixPath(artifact.metadata["sandbox_path"]) / relative.as_posix()
+                )
+                target = _output_destination(artifact, virtual_path)
+                if str(target) in generated:
+                    continue
                 target.parent.mkdir(parents=True, exist_ok=True)
                 os.replace(source, target)
-                generated.append(File(path=str(target)))
-            return generated
+                generated[str(target)] = File(path=str(target))
+            return [generated[path] for path in sorted(generated)]

@@ -7,6 +7,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.13.0] - 2026-10-23
+
+### Added
+
+- Opt-in read-only File input mounts with `FileInputAdapter(mode="mount")` or
+  `compatibility.files(input_mode="mount")`. Inputs use live host-path mounts
+  without copy artifacts; unsupported backends fail instead of copying. The
+  default remains `"copy"`.
+- `Workspace(read_only=True)` requests read-only direct-mode host mounts; existing
+  writable direct-mode and mirror-mode defaults are unchanged.
+
+### Fixed
+
+- DirectPython File outputs expose the reserved host directory under
+  `output_dir/<field>/` and accept both host and virtual submission paths.
+  Files already in place are returned without copying; paths escaping the
+  reserved field directory, including symlink escapes, are rejected.
+- File input mount mode and direct Workspace mounts now work on
+  `DirectPythonBackend` via host-path passthrough, without copies or sandbox-path
+  aliases. Read-only is advisory on DirectPython; the host must provide a
+  read-only path (for example, a Delta Mesa snapshot) to enforce protection.
+  Host permissions and default copy behavior are unchanged. JSPI, pooled SBX,
+  and named/reused SBX still reject mount mode.
+- File lists containing nulls now reject duplicate basenames, just like other
+  File lists, instead of silently overwriting an input in the sandbox.
+
+### Documentation
+
+- Documented per-step/attempt File output collection using the existing
+  `PredictRLM(output_dir=...)` and `FileOutputAdapter(output_dir=...)` APIs,
+  mount backend support, and direct versus mirror Workspace policy.
+
 ## [0.12.0] - 2026-10-23
 
 ### Changed

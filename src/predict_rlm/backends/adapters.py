@@ -117,6 +117,14 @@ class InterpreterExecutionSession:
 
         if artifact.kind == "compat.output.directory":
             await self._run_sync(self.interpreter.mkdir_p, sandbox_path)
+            mount_output = getattr(self.interpreter, "mount_output_directory", None)
+            if callable(mount_output):
+                host_path = await self._run_sync(mount_output, source_path)
+                return ArtifactBinding(
+                    artifact_id=artifact.id,
+                    path=host_path,
+                    metadata={"directory": True, "in_place": True},
+                )
             directory = True
         elif os.path.isdir(source_path):
             await self._mount_directory(source_path, sandbox_path)
@@ -190,6 +198,9 @@ class InterpreterExecutionSession:
             raise UnsupportedOperationError(
                 "Host directory mounts must be declared before backend acquisition"
             )
+        mount_host_directory = getattr(self.interpreter, "mount_host_directory", None)
+        if callable(mount_host_directory):
+            return await self._run_sync(mount_host_directory, mount)
         return mount.sandbox_path
 
     async def transfer_file(self, transfer: FileTransfer) -> str:
