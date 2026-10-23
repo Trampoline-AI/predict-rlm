@@ -295,6 +295,78 @@ async def test_direct_workspace_mount_honors_read_only(tmp_path, read_only):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["file", "files_module", "workspace", "workspace_alias"])
+async def test_direct_python_mounts_pass_through_host_paths_without_copy(
+    tmp_path, monkeypatch, kind
+):
+    from predict_rlm import DirectPythonBackend, PredictRLM
+
+    source_root = tmp_path / "source"
+    source_root.mkdir()
+    source = source_root / "input.bin"
+    source.write_bytes(b"binary\x00")
+    alias = tmp_path / "unused-alias"
+    if kind.startswith("workspace"):
+        adapter = WorkspaceInputAdapter()
+        field = FieldDescriptor("document", Workspace)
+        options = {"mount_path": str(alias)} if kind == "workspace_alias" else {}
+        value = Workspace(path=str(source_root), mode="direct", read_only=True, **options)
+        expected_path = str(source_root)
+    else:
+        adapter = FileInputAdapter(mode="mount")
+        field = FieldDescriptor("document", File)
+        value = File(path=str(source))
+        expected_path = str(source.resolve())
+    interpreter = DirectPythonBackend(
+        runner_path=str(tmp_path / "runner.py"), workdir=str(tmp_path), exec_timeout=10
+    )
+    if kind == "files_module":
+        agent = PredictRLM(
+            "document -> answer", interpreter=interpreter, modules=[files(input_mode="mount")]
+        )
+    else:
+        agent = PredictRLM("document -> answer", interpreter=interpreter, adapters=[adapter])
+    adapter = next(
+        item for item in agent.runtime_spec.input_adapters if item.name == adapter.name
+    )
+    ctx = SimpleNamespace(state={})
+    prepared = compile_prepared_input(field, await adapter.prepare(field, value, ctx))
+    assert prepared.host_directory_mounts[0].read_only
+    assert not any("source_path" in artifact.metadata for artifact in prepared.artifacts)
+
+    def reject_copy(*args, **kwargs):
+        pytest.fail("DirectPython mounts must not copy host inputs")
+
+    monkeypatch.setattr(interpreter.adapter, "copy_to", reject_copy)
+    spec = ExecutionSpec(host_directory_mounts=prepared.host_directory_mounts)
+    try:
+        async with agent.runtime_spec.execution.start(spec, ctx) as session:
+            bound = await adapter.bind(field, prepared, ctx, session)
+            assert bound.model_value == expected_path
+            assert bound.bindings[0].path == expected_path
+            runtime_path = (
+                str(Path(bound.model_value) / source.name)
+                if kind.startswith("workspace")
+                else bound.model_value
+            )
+            code = (
+                "from pathlib import Path\n"
+                f"print(Path({runtime_path!r}).read_bytes())\n"
+                f"print(Path({runtime_path!r}).stat().st_ino)"
+            )
+            result = await session.run_code(code)
+            assert result.value == f"{source.read_bytes()!r}\n{source.stat().st_ino}\n"
+            source.write_bytes(b"live update")
+            result = await session.run_code(code)
+            assert result.value == f"{b'live update'!r}\n{source.stat().st_ino}\n"
+    finally:
+        interpreter.shutdown()
+    assert not (interpreter.adapter.sandbox_root / "input").exists()
+    assert not alias.exists()
+    assert list(source_root.iterdir()) == [source]
+
+
+@pytest.mark.asyncio
 async def test_file_mount_mode_is_rejected_by_jspi_before_acquisition(tmp_path):
     from predict_rlm.backends.jspi.execution import JspiExecutionBackend
     from predict_rlm.runtime import UnsupportedOperationError

@@ -190,6 +190,9 @@ class InterpreterExecutionSession:
             raise UnsupportedOperationError(
                 "Host directory mounts must be declared before backend acquisition"
             )
+        mount_host_directory = getattr(self.interpreter, "mount_host_directory", None)
+        if callable(mount_host_directory):
+            return await self._run_sync(mount_host_directory, mount)
         return mount.sandbox_path
 
     async def transfer_file(self, transfer: FileTransfer) -> str:

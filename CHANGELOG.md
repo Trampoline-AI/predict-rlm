@@ -13,11 +13,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `compatibility.files(input_mode="mount")`. Inputs use live host-path mounts
   without copy artifacts; unsupported backends fail instead of copying. The
   default remains `"copy"`.
-- `Workspace(read_only=True)` makes direct-mode host mounts read-only; existing
+- `Workspace(read_only=True)` requests read-only direct-mode host mounts; existing
   writable direct-mode and mirror-mode defaults are unchanged.
 
 ### Fixed
 
+- File input mount mode and direct Workspace mounts now work on
+  `DirectPythonBackend` via host-path passthrough, without copies or sandbox-path
+  aliases. Read-only is advisory on DirectPython; the host must provide a
+  read-only path (for example, a Delta Mesa snapshot) to enforce protection.
+  Host permissions and default copy behavior are unchanged. JSPI, pooled SBX,
+  and named/reused SBX still reject mount mode.
 - File lists containing nulls now reject duplicate basenames, just like other
   File lists, instead of silently overwriting an input in the sandbox.
 

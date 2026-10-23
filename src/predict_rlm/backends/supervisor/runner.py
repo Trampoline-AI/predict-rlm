@@ -37,6 +37,7 @@ from predict_rlm.execution_timeout import (
     recoverable_timeout_host_deadline_seconds,
     validate_execution_timeout,
 )
+from predict_rlm.runtime import HostDirectoryMount
 
 PYTHON_RUNNER_RECOVERABLE_TIMEOUT_GRACE_SECONDS = (
     DEFAULT_RECOVERABLE_EXECUTION_TIMEOUT_GRACE_SECONDS
@@ -1137,7 +1138,18 @@ class PythonSupervisor(SupervisorClient, LegacyExecutionBackend):
 
 
 class DirectPythonBackend(PythonSupervisor):
-    """PredictRLM interpreter that runs the persistent Python supervisor locally."""
+    """Local Python supervisor with no-copy host mounts and advisory read-only access.
+
+    Mounted inputs use their host paths, not sandbox aliases. Filesystem write
+    protection must be supplied by the host; this backend does not isolate it.
+    """
+
+    def configure_direct_workspace_mounts(self, mounts: list[HostDirectoryMount]) -> None:
+        """Host paths are already accessible to the local supervisor."""
+        del mounts
+
+    def mount_host_directory(self, mount: HostDirectoryMount) -> str:
+        return mount.host_path
 
     def __init__(
         self,

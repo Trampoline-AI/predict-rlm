@@ -141,15 +141,23 @@ agent = PredictRLM(
 
 `FileInputAdapter(*, mode="copy" | "mount")` defaults to `"copy"`. Mount mode
 uses `PreparedInput.paths(..., mode="mount", read_only=True)` and exposes each
-file at `/sandbox/input/<field>/<basename>`; there are no input copy artifacts.
-Scalar, optional, list and nullable-list fields keep their shape. Duplicate
-basenames within a field are rejected in both modes, including lists with nulls.
+file at `/sandbox/input/<field>/<basename>` on SBX; there are no input copy
+artifacts. Scalar, optional, list and nullable-list fields keep their shape.
+Duplicate basenames within a field are rejected in both modes, including lists
+with nulls.
 
-Mounts require a fresh per-invocation SBX backend, or a custom execution backend
-that implements live host-path mounts and enforces their `read_only` flag. JSPI,
-prewarmed SBX pools, named/reused SBX, and the local `DirectPythonBackend` do not
-support this capability and raise `UnsupportedOperationError`, never silently
-falling back to a copy. The ordinary copy mode works on those backends.
+Mounts work on fresh per-invocation SBX backends and the local
+`DirectPythonBackend`, or a custom execution backend implementing live host-path
+mounts. SBX enforces `read_only` at the mount boundary. DirectPython uses the
+bound host path itself as the model-visible path, without copying or creating a
+sandbox-path alias (including when a Workspace requests a custom `mount_path`).
+Read-only is **advisory** on DirectPython: agent code shares the host filesystem,
+so the host must supply a read-only path, such as Delta's Mesa snapshot, when
+write protection is required. DirectPython does not change host permissions.
+
+JSPI, prewarmed SBX pools, and named/reused SBX raise
+`UnsupportedOperationError`, never silently falling back to a copy. The ordinary
+copy mode is unchanged and works on those backends.
 
 The existing `PredictRLM(output_dir=...)` option collects generated `File` and
 `list[File]` outputs under `<output_dir>/<field>/`, preserving nested paths, and
@@ -165,7 +173,8 @@ its output adapter owns the root, so do not also set the constructor's
 composition.
 
 `Workspace(path=..., mode="direct", read_only=True)` similarly exposes a
-read-only directory mount. Direct mode remains writable by default. `read_only`
+read-only directory mount (advisory on DirectPython, as above). Direct mode
+remains writable by default. `read_only`
 is direct-mode-only; `exclude`, `max_file_bytes` and `sync_back` are mirror-mode
 settings, not restrictions on a direct mount. A direct mount exposes the entire
 specified directory and does not apply the mirror's file-size cap.
