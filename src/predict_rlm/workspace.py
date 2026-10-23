@@ -52,6 +52,10 @@ class Workspace(BaseModel):
             "and syncs changes back; 'direct' uses an SBX passthrough mount."
         ),
     )
+    read_only: bool = Field(
+        default=False,
+        description="Expose a direct-mode host mount read-only. Has no effect in mirror mode.",
+    )
     sync_back: bool = Field(
         default=True,
         description=(
@@ -182,7 +186,10 @@ async def _ahost_workspace_manifest(
                 continue
             if not stat.S_ISREG(file_stat.st_mode):
                 continue
-            if workspace.max_file_bytes is not None and file_stat.st_size > workspace.max_file_bytes:
+            if (
+                workspace.max_file_bytes is not None
+                and file_stat.st_size > workspace.max_file_bytes
+            ):
                 continue
             digest = hashlib.sha256()
             with open(host_path, "rb") as file:
@@ -310,9 +317,7 @@ class WorkspaceSyncState:
         if not self.workspace.sync_back:
             return []
         try:
-            raw_sandbox_manifest = await transport.inspect_directory(
-                self.workspace.mount_path
-            )
+            raw_sandbox_manifest = await transport.inspect_directory(self.workspace.mount_path)
         except Exception as exc:
             raise WorkspaceSyncConflictError(
                 "Workspace sync conflict: workspace mount could not be inspected "

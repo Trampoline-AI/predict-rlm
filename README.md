@@ -121,6 +121,55 @@ codex-lm usage
 - **Structured sub-LM calls** — native Pydantic and DSPy signature support for
   type-safe sub-LM invocations with structured outputs.
 
+## File inputs and output roots
+
+`File(path=...)` describes a local file. Inputs are copied into the sandbox by
+default. To expose them as read-only host mounts without copying, replace the
+built-in input adapter:
+
+```python
+from predict_rlm import PredictRLM
+from predict_rlm.compatibility import FileInputAdapter
+
+agent = PredictRLM(
+    signature,  # your DSPy signature with File / list[File] fields
+    sandbox_backend="sbx",
+    adapters=[FileInputAdapter(mode="mount")],
+    output_dir=run_workspace / ".outputs" / step / attempt,
+)
+```
+
+`FileInputAdapter(*, mode="copy" | "mount")` defaults to `"copy"`. Mount mode
+uses `PreparedInput.paths(..., mode="mount", read_only=True)` and exposes each
+file at `/sandbox/input/<field>/<basename>`; there are no input copy artifacts.
+Scalar, optional, list and nullable-list fields keep their shape. Duplicate
+basenames within a field are rejected in both modes, including lists with nulls.
+
+Mounts require a fresh per-invocation SBX backend, or a custom execution backend
+that implements live host-path mounts and enforces their `read_only` flag. JSPI,
+prewarmed SBX pools, named/reused SBX, and the local `DirectPythonBackend` do not
+support this capability and raise `UnsupportedOperationError`, never silently
+falling back to a copy. The ordinary copy mode works on those backends.
+
+The existing `PredictRLM(output_dir=...)` option collects generated `File` and
+`list[File]` outputs under `<output_dir>/<field>/`, preserving nested paths, and
+returns `File(path=...)` values there. Omitting it retains temporary output
+storage. Choose a distinct root for each step and attempt; output collection is
+still an explicit sandbox-to-host export, not an in-place output mount. Legacy
+explicit per-field output destinations continue to take precedence.
+
+For module-based configuration, use
+`modules=[compatibility.files(input_mode="mount", output_dir=...)]` instead;
+its output adapter owns the root, so do not also set the constructor's
+`output_dir`. `FileOutputAdapter(output_dir=...)` is available for custom adapter
+composition.
+
+`Workspace(path=..., mode="direct", read_only=True)` similarly exposes a
+read-only directory mount. Direct mode remains writable by default. `read_only`
+is direct-mode-only; `exclude`, `max_file_bytes` and `sync_back` are mirror-mode
+settings, not restrictions on a direct mount. A direct mount exposes the entire
+specified directory and does not apply the mirror's file-size cap.
+
 ## Demos
 
 | Description                                                                                                                                              | Input / Output                                                                                                                   | Preview                                                                                                                                                                                                                          |

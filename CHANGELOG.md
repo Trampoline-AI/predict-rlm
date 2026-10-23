@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Opt-in read-only File input mounts with `FileInputAdapter(mode="mount")` or
+  `compatibility.files(input_mode="mount")`. Inputs use live host-path mounts
+  without copy artifacts; unsupported backends fail instead of copying. The
+  default remains `"copy"`.
+- `Workspace(read_only=True)` makes direct-mode host mounts read-only; existing
+  writable direct-mode and mirror-mode defaults are unchanged.
+
+### Fixed
+
+- File lists containing nulls now reject duplicate basenames, just like other
+  File lists, instead of silently overwriting an input in the sandbox.
+
+### Documentation
+
+- Documented per-step/attempt File output collection using the existing
+  `PredictRLM(output_dir=...)` and `FileOutputAdapter(output_dir=...)` APIs,
+  mount backend support, and direct versus mirror Workspace policy.
+
 ## [0.12.0] - 2026-10-23
 
 ### Changed

@@ -1,6 +1,8 @@
 """Built-in modules that preserve pre-kernel PredictRLM behavior."""
 
-from predict_rlm.runtime import RuntimeContribution
+from typing import Literal
+
+from predict_rlm.runtime import PathMode, RuntimeContribution
 
 from .backends import execution_from_options
 from .files import (
@@ -13,10 +15,15 @@ from .files import (
 from .synced_files import SyncedFileToolOperation
 
 
-def files(*, output_dir: str | None = None) -> RuntimeContribution:
+def files(
+    *,
+    input_mode: PathMode | Literal["copy", "mount"] = PathMode.COPY,
+    output_dir: str | None = None,
+) -> RuntimeContribution:
+    """Configure File ingress and the host root for generated File outputs."""
     return RuntimeContribution(
         adapters=(
-            FileInputAdapter(),
+            FileInputAdapter(mode=input_mode),
             WorkspaceInputAdapter(),
             FileOutputAdapter(output_dir),
         ),
@@ -27,6 +34,7 @@ def files(*, output_dir: str | None = None) -> RuntimeContribution:
 def synced_files() -> RuntimeContribution:
     """Enable the legacy SyncedFile tool annotation compatibility behavior."""
     return RuntimeContribution(tool_operations=(SyncedFileToolOperation(),))
+
 
 __all__ = [
     "FileInputAdapter",
