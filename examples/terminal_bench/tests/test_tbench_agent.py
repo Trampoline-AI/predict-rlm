@@ -327,7 +327,7 @@ def test_agent_exports_canonical_runs_independent_of_logging_dir(
         rlm = PredictRLM(signature, **kwargs)
         rlm.generate_action.acall = AsyncMock(
             side_effect=RuntimeError("task failed") if fail else None,
-            return_value=dspy.Prediction(reasoning="done", code="SUBMIT(answer='done')"),
+            return_value=dspy.Prediction(plan="done", code="SUBMIT(answer='done')"),
         )
         return rlm
 
