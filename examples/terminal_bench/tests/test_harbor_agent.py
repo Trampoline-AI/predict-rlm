@@ -354,7 +354,7 @@ def test_remote_controller_keeps_live_snapshot_until_canonical_export_completes(
         rlm = PredictRLM(signature, lm=MagicMock(history=[]), **kwargs)
         rlm.generate_action.acall = AsyncMock(
             side_effect=RuntimeError("task failed") if fail else None,
-            return_value=dspy.Prediction(reasoning="done", code="SUBMIT(answer='done')"),
+            return_value=dspy.Prediction(plan="done", code="SUBMIT(answer='done')"),
         )
         return rlm
 
