@@ -462,6 +462,80 @@ async def test_file_output_caller_root_collects_under_field(tmp_path, is_list):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("is_list", [False, True])
+@pytest.mark.parametrize("submitted_form", ["host", "virtual"])
+async def test_direct_python_file_outputs_use_reserved_host_directory(
+    tmp_path, monkeypatch, is_list, submitted_form
+):
+    import dspy
+
+    from predict_rlm import DirectPythonBackend, PredictRLM
+
+    root = tmp_path / ".outputs" / "step" / "attempt" / "invocation"
+    interpreter = DirectPythonBackend(
+        runner_path=str(tmp_path / "runner.py"), workdir=str(tmp_path), exec_timeout=10
+    )
+    annotation = list[File] if is_list else File
+    program = PredictRLM(
+        dspy.Signature({"result": (annotation, dspy.OutputField())}),
+        interpreter=interpreter,
+        output_dir=root,
+    )
+    adapter = next(a for a in program.runtime_spec.output_adapters if a.name == "file")
+    field = FieldDescriptor("result", annotation)
+    ctx = SimpleNamespace(state={}, bind=lambda binding: None)
+    requirements = await adapter.prepare_session(field, None, ctx)
+    expected = root / "result" / "nested" / "result.bin"
+    virtual = "/sandbox/output/result/nested/result.bin"
+
+    def reject_copy(*args, **kwargs):
+        pytest.fail("DirectPython outputs already in place must not be copied")
+
+    monkeypatch.setattr(interpreter.adapter, "_copy_path", reject_copy)
+    try:
+        async with program.runtime_spec.execution.start(
+            ExecutionSpec(extra_write_paths=requirements.extra_write_paths), ctx
+        ) as session:
+            reservation = await adapter.reserve(field, None, ctx, session)
+            assert reservation.model_value == f"{root / 'result'}/"
+            runtime_path = str(expected) if submitted_form == "host" else virtual
+            await session.run_code(
+                "from pathlib import Path\n"
+                f"p = Path({str(expected)!r})\n"
+                "p.parent.mkdir(parents=True, exist_ok=True)\n"
+                "p.write_bytes(b'result\\x00')"
+            )
+            inode = expected.stat().st_ino
+            submitted = File(path=runtime_path)
+            result = await adapter.materialize(
+                reservation, [submitted] if is_list else submitted, ctx, session
+            )
+            expected_file = File(path=str(expected))
+            assert result == ([expected_file] if is_list else expected_file)
+            assert expected.read_bytes() == b"result\x00"
+            assert expected.stat().st_ino == inode
+
+            outside = root / "outside.bin"
+            outside.write_bytes(b"outside")
+            (root / "result" / "escape.bin").symlink_to(outside)
+            for escaped in (
+                str(outside),
+                str(root / "result-other" / "result.bin"),
+                str(root / "result" / ".." / "outside.bin"),
+                str(root / "result" / "escape.bin"),
+                "/sandbox/output/result/../outside.bin",
+                "/sandbox/output/result/escape.bin",
+            ):
+                value = File(path=escaped)
+                with pytest.raises(ValueError, match="reserved output root"):
+                    await adapter.materialize(
+                        reservation, [value] if is_list else value, ctx, session
+                    )
+    finally:
+        interpreter.shutdown()
+
+
+@pytest.mark.asyncio
 async def test_files_contribution_mount_mode(tmp_path):
     contribution = files(input_mode="mount", output_dir=str(tmp_path))
     adapter = next(a for a in contribution.adapters if isinstance(a, FileInputAdapter))

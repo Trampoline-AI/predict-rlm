@@ -140,7 +140,10 @@ def _output_destination(artifact: Artifact, sandbox_path: str) -> Path:
             f"{str(sandbox_root)!r}"
         )
     try:
-        relative = source.relative_to(sandbox_root)
+        if artifact.metadata.get("in_place") and source.is_relative_to(destination.resolve()):
+            relative = source.relative_to(destination.resolve())
+        else:
+            relative = source.relative_to(sandbox_root)
     except ValueError as exc:
         raise ValueError(
             f"Submitted output path {sandbox_path!r} is outside the reserved output root "
@@ -151,7 +154,13 @@ def _output_destination(artifact: Artifact, sandbox_path: str) -> Path:
             f"Submitted output path must identify a file under the reserved output root "
             f"{str(sandbox_root)!r}"
         )
-    return destination.joinpath(*relative.parts)
+    target = destination.joinpath(*relative.parts)
+    if not target.resolve().is_relative_to(destination.resolve()):
+        raise ValueError(
+            f"Submitted output path {sandbox_path!r} escapes the reserved output root "
+            f"{str(destination)!r}"
+        )
+    return target
 
 
 class ValueInputAdapter(InputAdapter[Any]):
@@ -510,7 +519,13 @@ class FileOutputAdapter(OutputAdapter[File]):
             kind=artifact.kind,
             metadata={
                 **artifact.metadata,
-                "sandbox_path": binding.path,
+                "sandbox_path": sandbox_dir
+                if binding.metadata.get("in_place")
+                else binding.path,
+                "in_place": bool(binding.metadata.get("in_place")),
+                "destination_path": binding.path
+                if binding.metadata.get("in_place")
+                else host_dir,
             },
         )
         model_value = f"{binding.path.rstrip('/')}/"
@@ -547,6 +562,8 @@ class FileOutputAdapter(OutputAdapter[File]):
             submitted_path = submitted_path.strip()
             if PurePosixPath(submitted_path).is_absolute():
                 destination = _output_destination(artifact, submitted_path)
+                if artifact.metadata.get("in_place") and destination.is_file():
+                    return File(path=str(destination))
                 selected = Artifact(
                     id=artifact.id,
                     kind="compat.file",
@@ -573,6 +590,12 @@ class FileOutputAdapter(OutputAdapter[File]):
         session: ExecutionSession,
     ) -> list[File]:
         destination = Path(str(artifact.metadata["destination_path"]))
+        generated: dict[str, File] = {}
+        if artifact.metadata.get("in_place"):
+            for source in sorted(destination.rglob("*")):
+                _output_destination(artifact, str(source))
+                if source.is_file() and not source.is_symlink():
+                    generated[str(source)] = File(path=str(source))
         destination.parent.mkdir(parents=True, exist_ok=True)
         with tempfile.TemporaryDirectory(
             prefix=f".{destination.name}-collect-",
@@ -590,13 +613,17 @@ class FileOutputAdapter(OutputAdapter[File]):
                     },
                 )
             )
-            generated: list[File] = []
             for source in sorted(
                 path for path in staging.rglob("*") if path.is_file() and not path.is_symlink()
             ):
                 relative = source.relative_to(staging)
-                target = destination.joinpath(*relative.parts)
+                virtual_path = str(
+                    PurePosixPath(artifact.metadata["sandbox_path"]) / relative.as_posix()
+                )
+                target = _output_destination(artifact, virtual_path)
+                if str(target) in generated:
+                    continue
                 target.parent.mkdir(parents=True, exist_ok=True)
                 os.replace(source, target)
-                generated.append(File(path=str(target)))
-            return generated
+                generated[str(target)] = File(path=str(target))
+            return [generated[path] for path in sorted(generated)]

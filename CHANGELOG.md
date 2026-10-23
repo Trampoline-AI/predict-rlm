@@ -18,6 +18,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- DirectPython File outputs expose the reserved host directory under
+  `output_dir/<field>/` and accept both host and virtual submission paths.
+  Files already in place are returned without copying; paths escaping the
+  reserved field directory, including symlink escapes, are rejected.
 - File input mount mode and direct Workspace mounts now work on
   `DirectPythonBackend` via host-path passthrough, without copies or sandbox-path
   aliases. Read-only is advisory on DirectPython; the host must provide a

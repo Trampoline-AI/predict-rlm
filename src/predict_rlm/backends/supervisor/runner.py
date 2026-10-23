@@ -1151,6 +1151,9 @@ class DirectPythonBackend(PythonSupervisor):
     def mount_host_directory(self, mount: HostDirectoryMount) -> str:
         return mount.host_path
 
+    def mount_output_directory(self, host_path: str) -> str:
+        return str(Path(host_path).resolve())
+
     def __init__(
         self,
         *,
