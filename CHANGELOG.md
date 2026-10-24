@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.13.1] - 2026-10-23
+
+### Fixed
+
+- File output directory creation through the Python supervisor no longer requires
+  `mkdir` on PATH. Directory operations run with the configured Python executable
+  inside the adapter boundary, including hardened DirectPython containers.
+- Supervisor descendant cleanup and SBX startup, health checks, and timeout cleanup
+  no longer require `ps`, `env`, `true`, or `pkill`; they use native process APIs
+  and in-sandbox Python instead.
+
 ## [0.13.0] - 2026-10-23
 
 ### Added
@@ -184,7 +195,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the move to native asynchronous SBX execution and prevents synchronous
   shutdown from blocking its own event loop.
 
-[Unreleased]: https://github.com/Trampoline-AI/predict-rlm/compare/v0.12.0...HEAD
+[Unreleased]: https://github.com/Trampoline-AI/predict-rlm/compare/v0.13.1...HEAD
+[0.13.1]: https://github.com/Trampoline-AI/predict-rlm/compare/v0.13.0...v0.13.1
+[0.13.0]: https://github.com/Trampoline-AI/predict-rlm/compare/v0.12.0...v0.13.0
 [0.12.0]: https://github.com/Trampoline-AI/predict-rlm/compare/v0.11.0...v0.12.0
 [0.11.0]: https://github.com/Trampoline-AI/predict-rlm/compare/v0.10.0...v0.11.0
 [0.10.0]: https://github.com/Trampoline-AI/predict-rlm/compare/v0.9.0...v0.10.0
