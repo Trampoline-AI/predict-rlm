@@ -22,7 +22,6 @@ import re
 import select
 import shutil
 import signal
-import subprocess
 import sys
 import tempfile
 import threading
@@ -1146,37 +1145,41 @@ def _cancel_all_kernel_tasks(loop: Any) -> None:
     loop.run_until_complete(asyncio.gather(*to_cancel, return_exceptions=True))
 
 
-def _descendant_process_ids(parent_pid: int) -> list[int]:
+def _child_process_ids(parent_pid: int) -> list[int]:
+    if sys.platform == "darwin":
+        import ctypes
+
+        libproc = ctypes.CDLL("/usr/lib/libproc.dylib")
+        list_children = libproc.proc_listchildpids
+        list_children.argtypes = [ctypes.c_int, ctypes.c_void_p, ctypes.c_int]
+        list_children.restype = ctypes.c_int
+        size = list_children(parent_pid, None, 0)
+        if size <= 0:
+            return []
+        pids = (ctypes.c_int * (size // ctypes.sizeof(ctypes.c_int) + 32))()
+        count = list_children(parent_pid, pids, ctypes.sizeof(pids))
+        return [pid for pid in pids[:max(0, count)] if pid > 0]
+
+    children: set[int] = set()
     try:
-        result = subprocess.run(
-            ["ps", "-axo", "pid=,ppid="],
-            check=False,
-            capture_output=True,
-            text=True,
-            timeout=1,
-        )
-    except Exception:
+        tasks = list(REAL_PATH(f"/proc/{parent_pid}/task").iterdir())
+    except OSError:
         return []
-    if result.returncode != 0:
-        return []
-
-    children_by_parent: dict[int, list[int]] = {}
-    for line in result.stdout.splitlines():
-        parts = line.split()
-        if len(parts) != 2:
-            continue
+    for task in tasks:
         try:
-            pid, ppid = int(parts[0]), int(parts[1])
-        except ValueError:
+            children.update(int(pid) for pid in (task / "children").read_text().split())
+        except OSError:
             continue
-        children_by_parent.setdefault(ppid, []).append(pid)
+    return sorted(children)
 
+
+def _descendant_process_ids(parent_pid: int) -> list[int]:
     descendants: list[int] = []
-    pending = list(children_by_parent.get(parent_pid, []))
+    pending = _child_process_ids(parent_pid)
     while pending:
         pid = pending.pop()
         descendants.append(pid)
-        pending.extend(children_by_parent.get(pid, []))
+        pending.extend(_child_process_ids(pid))
     return descendants
 
 

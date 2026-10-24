@@ -81,6 +81,27 @@ SUPERVISOR_PAYLOAD_SOURCE_PATH = Path(__file__).parents[1] / "supervisor" / "_pa
 DEFAULT_PACKAGE_DOMAINS = ["pypi.org", "files.pythonhosted.org"]
 SBX_PYTHON_EXECUTABLE = "python3"
 SBX_TRANSPORT_PACKAGES = ["websockets"]
+_START_SUPERVISOR_SCRIPT = (
+    "import os, sys; "
+    "os.environ['PREDICT_RLM_SBX_ROOT'] = sys.argv[1]; "
+    "os.execv(sys.executable, [sys.executable, '-u', *sys.argv[2:]])"
+)
+_KILL_SUPERVISOR_SCRIPT = """
+import os
+import pathlib
+import signal
+import sys
+
+supervisor_path = os.fsencode(sys.argv[1])
+for proc in pathlib.Path('/proc').iterdir():
+    if not proc.name.isdigit() or int(proc.name) == os.getpid():
+        continue
+    try:
+        if supervisor_path in (proc / 'cmdline').read_bytes().split(b'\\0'):
+            os.kill(int(proc.name), signal.SIGTERM)
+    except (ProcessLookupError, FileNotFoundError, PermissionError):
+        continue
+"""
 _LOCALHOST_ENDPOINT_RE = re.compile(
     r"(?:(?P<scheme>https?)://)?(?P<host>localhost|127\.0\.0\.1|\[::1\])(?::(?P<port>\d+))"
 )
@@ -1281,10 +1302,10 @@ class SbxBackend(SyncWorkerTracker, SupervisorClient, LegacyExecutionBackend):
             "-w",
             str(self._staging_root),
             self._sandbox_name,
-            "env",
-            f"PREDICT_RLM_SBX_ROOT={runner_root}",
             SBX_PYTHON_EXECUTABLE,
-            "-u",
+            "-c",
+            _START_SUPERVISOR_SCRIPT,
+            str(runner_root),
             str(supervisor_path),
             "--websocket-host",
             "0.0.0.0",
@@ -1401,10 +1422,10 @@ class SbxBackend(SyncWorkerTracker, SupervisorClient, LegacyExecutionBackend):
             "-w",
             str(self._staging_root),
             self._sandbox_name,
-            "env",
-            f"PREDICT_RLM_SBX_ROOT={runner_root}",
             SBX_PYTHON_EXECUTABLE,
-            "-u",
+            "-c",
+            _START_SUPERVISOR_SCRIPT,
+            str(runner_root),
             str(supervisor_path),
             "--websocket-host",
             "0.0.0.0",
@@ -1522,10 +1543,10 @@ class SbxBackend(SyncWorkerTracker, SupervisorClient, LegacyExecutionBackend):
             "-w",
             str(self._staging_root),
             self._sandbox_name,
-            "env",
-            f"PREDICT_RLM_SBX_ROOT={runner_root}",
             SBX_PYTHON_EXECUTABLE,
-            "-u",
+            "-c",
+            _START_SUPERVISOR_SCRIPT,
+            str(runner_root),
             str(supervisor_path),
         ]
 
@@ -1707,7 +1728,7 @@ class SbxBackend(SyncWorkerTracker, SupervisorClient, LegacyExecutionBackend):
 
     async def _asbx_sandbox_healthy(self, name: str) -> bool:
         result = await self._arun_command(
-            ["sbx", "exec", name, "true"],
+            ["sbx", "exec", name, SBX_PYTHON_EXECUTABLE, "-c", "pass"],
             check=False,
             timeout=self.config.exec_timeout,
         )
@@ -1778,7 +1799,7 @@ class SbxBackend(SyncWorkerTracker, SupervisorClient, LegacyExecutionBackend):
     def _sbx_sandbox_healthy(self, name: str) -> bool:
         """Cheap liveness probe: a trivial in-container command must succeed."""
         result = subprocess.run(
-            ["sbx", "exec", name, "true"],
+            ["sbx", "exec", name, SBX_PYTHON_EXECUTABLE, "-c", "pass"],
             check=False,
             capture_output=True,
             text=True,
@@ -2315,8 +2336,9 @@ class SbxBackend(SyncWorkerTracker, SupervisorClient, LegacyExecutionBackend):
                     "-w",
                     str(self._staging_root),
                     self._sandbox_name,
-                    "pkill",
-                    "-f",
+                    SBX_PYTHON_EXECUTABLE,
+                    "-c",
+                    _KILL_SUPERVISOR_SCRIPT,
                     str(self._prepared_supervisor_path),
                 ],
                 check=False,
@@ -2353,8 +2375,9 @@ class SbxBackend(SyncWorkerTracker, SupervisorClient, LegacyExecutionBackend):
                     "-w",
                     str(self._staging_root),
                     self._sandbox_name,
-                    "pkill",
-                    "-f",
+                    SBX_PYTHON_EXECUTABLE,
+                    "-c",
+                    _KILL_SUPERVISOR_SCRIPT,
                     str(self._prepared_supervisor_path),
                 ],
                 check=False,

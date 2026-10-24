@@ -330,6 +330,7 @@ class _DirectProcessRunnerAdapter:
 
 
 class PythonSupervisor(SupervisorClient, LegacyExecutionBackend):
+    _MKDIR_SCRIPT = "import os, sys; os.makedirs(sys.argv[1], exist_ok=True)"
     _LIST_DIR_SCRIPT = (
         "import json, pathlib, sys; "
         "root = pathlib.Path(sys.argv[1]); "
@@ -411,7 +412,10 @@ class PythonSupervisor(SupervisorClient, LegacyExecutionBackend):
         self.adapter.copy_to(host_path, virtual_path)
 
     def mkdir_p(self, virtual_path: str) -> None:
-        result = self.adapter.exec(["mkdir", "-p", virtual_path], timeout=self.exec_timeout)
+        result = self.adapter.exec(
+            [self.python_executable, "-c", self._MKDIR_SCRIPT, virtual_path],
+            timeout=self.exec_timeout,
+        )
         self._raise_for_exec_failure(result, f"creating {virtual_path}")
 
     def list_dir(self, virtual_path: str) -> list[str]:

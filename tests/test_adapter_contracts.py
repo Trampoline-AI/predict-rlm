@@ -536,6 +536,56 @@ async def test_direct_python_file_outputs_use_reserved_host_directory(
 
 
 @pytest.mark.asyncio
+async def test_direct_python_file_output_without_path(tmp_path, monkeypatch):
+    import dspy
+
+    from predict_rlm import DirectPythonBackend, PredictRLM
+    from predict_rlm.runtime import SandboxRootReservation
+
+    monkeypatch.setenv("PATH", "")
+    root = tmp_path / "outputs with spaces; literal" / "attempt"
+    interpreter = DirectPythonBackend(
+        runner_path=str(tmp_path / "runner.py"), workdir=str(tmp_path), exec_timeout=10
+    )
+    program = PredictRLM(
+        dspy.Signature({"result": (File, dspy.OutputField())}),
+        interpreter=interpreter,
+        output_dir=root,
+    )
+    adapter = next(a for a in program.runtime_spec.output_adapters if a.name == "file")
+    field = FieldDescriptor("result", File)
+    ctx = SimpleNamespace(state={}, bind=lambda binding: None)
+    requirements = await adapter.prepare_session(field, None, ctx)
+    expected = root / "result" / "result.bin"
+    sandbox_dir = "/sandbox/output/result"
+    try:
+        async with program.runtime_spec.execution.start(
+            ExecutionSpec(
+                extra_write_paths=requirements.extra_write_paths,
+                sandbox_roots=(SandboxRootReservation(sandbox_dir),),
+            ),
+            ctx,
+        ) as session:
+            await session.create_directory(sandbox_dir)
+            assert (interpreter.adapter.sandbox_root / "output" / "result").is_dir()
+            reservation = await adapter.reserve(field, None, ctx, session)
+            assert expected.parent.is_dir()
+            await session.run_code(
+                "import os\n"
+                "assert os.environ['PATH'] == ''\n"
+                "from pathlib import Path\n"
+                f"Path({str(expected)!r}).write_bytes(b'result\\x00')"
+            )
+            result = await adapter.materialize(
+                reservation, File(path=str(expected)), ctx, session
+            )
+            assert result == File(path=str(expected))
+            assert expected.read_bytes() == b"result\x00"
+    finally:
+        interpreter.shutdown()
+
+
+@pytest.mark.asyncio
 async def test_files_contribution_mount_mode(tmp_path):
     contribution = files(input_mode="mount", output_dir=str(tmp_path))
     adapter = next(a for a in contribution.adapters if isinstance(a, FileInputAdapter))
