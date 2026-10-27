@@ -6,7 +6,7 @@ description: >-
   implement an RLM package with structured boundaries, capabilities, skills, host-side tools,
   custom adapters, or runtime-kernel extensions. For optimization of an existing
   RLM, use rlm-gepa instead.
-compatibility: Requires Python 3.11+, Deno 2, DSPy, and predict-rlm 0.8.0-alpha0 or newer.
+compatibility: Requires Python 3.11+, Deno 2, DSPy, and predict-rlm 0.14.0 or newer.
 metadata:
   author: Emile Riberdy
   version: "3.0"

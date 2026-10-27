@@ -6,7 +6,7 @@ description: >-
   build a train/validation optimization harness, configure AgentSpec or
   OptimizeConfig, run optimize --check, or inspect RLM-GEPA run artifacts. For
   creating the base RLM itself, use rlm first.
-compatibility: Requires Python 3.11+, Deno 2, predict-rlm[gepa] 0.8.0-alpha0 or newer, and a working PredictRLM.
+compatibility: Requires Python 3.11+, Deno 2, predict-rlm[gepa] 0.14.0 or newer, and a working PredictRLM.
 metadata:
   author: Emile Riberdy
   version: "1.0"
