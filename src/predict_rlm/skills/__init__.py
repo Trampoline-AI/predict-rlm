@@ -133,7 +133,7 @@ def format_skill_catalog(skills: list[Skill]) -> str:
     entries = "\n".join(f"- `{skill.name}`: {skill.description}" for skill in skills)
     return (
         "Skills are loaded on demand. When the task matches a skill's description, call "
-        "`await load_skill(name)` to read its instructions and list its files. Skill files "
+        "`print(await load_skill(name))` to see its instructions and file list. Skill files "
         f"are mounted at {SANDBOX_SKILLS_ROOT}/<name>/. Python and data files there "
         "can be used; shell scripts cannot run in this sandbox.\n\n"
         f"{entries}"

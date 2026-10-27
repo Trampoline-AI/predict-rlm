@@ -81,8 +81,9 @@ Skill(
 1. The prompt gets a **Skills** section listing each skill's name and
    description.
 2. When the task matches a description, the RLM calls
-   `await load_skill("invoice-totals")`. The tool returns the `SKILL.md` body
-   and the list of the skill's files.
+   `print(await load_skill("invoice-totals"))`. The tool returns the `SKILL.md`
+   body and the list of the skill's files; like any value in the sandbox, the
+   RLM only sees it once printed.
 3. Skill files are copied into the sandbox at `/sandbox/skills/<name>/`, so the
    host folder is never modified. The RLM reads them with `open()` and can
    import Python helpers by adding the folder to `sys.path`.

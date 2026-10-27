@@ -910,7 +910,7 @@ than guessing lifecycle parameters.
 
 - `Skill.from_dir(path)` loads an Agent Skills folder (`SKILL.md` with `name`
   and `description` frontmatter). Only the name and description reach the
-  prompt; the outer LM calls `await load_skill(name)` for the instructions, and
+  prompt; the outer LM prints `await load_skill(name)` to read the instructions, and
   the folder is mounted at `/sandbox/skills/<name>/`.
 
 - Host tools run outside WASM. Make their docstrings, arguments, and return
