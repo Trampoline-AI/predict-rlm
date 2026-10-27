@@ -4,7 +4,7 @@ import os
 from pathlib import Path
 from typing import Annotated
 
-from predict_rlm import Skill, SyncedFile
+from predict_rlm import Capability, SyncedFile
 
 from ..tools.recalculate import recalculate as _recalc_impl
 from ..tools.render import render_to_data_uri as _render_impl
@@ -83,7 +83,7 @@ def render(
 
 # Adapted from OpenAI's Apache-2.0 curated spreadsheet skill.
 # See ../THIRD_PARTY_NOTICES.md for provenance and license terms.
-libreoffice_spreadsheet_skill = Skill(
+libreoffice_spreadsheet_skill = Capability(
     name="spreadsheet",
     instructions="""# Spreadsheet Skill
 

@@ -26,7 +26,7 @@ import dspy
 import nest_asyncio
 from tqdm import tqdm
 
-from predict_rlm import File, PredictRLM, SbxConfig, SbxPool, Skill
+from predict_rlm import Capability, File, PredictRLM, SbxConfig, SbxPool
 from predict_rlm.evidence import RunEvidence, extract_evidence_from_exc
 from predict_rlm.trace import RunTrace, extract_trace_from_exc
 from rlm_gepa.runtime.lm_config import get_lm_config, get_sub_lm_config
@@ -522,12 +522,12 @@ def parse_answer_position(
     return sheet_name, answer_position
 
 
-def make_dynamic_skill(instructions: str) -> Skill:
+def make_dynamic_skill(instructions: str) -> Capability:
     """Return a copy of the LO spreadsheet skill with custom instructions.
 
     Preserves ``name``, ``packages``, ``modules``, and ``tools`` (including
     the ``recalculate`` host-side tool registered by ``skills.py``). Uses
-    pydantic ``model_copy`` so the new Skill is structurally identical to
+    pydantic ``model_copy`` so the new Capability is structurally identical to
     the seed except for the ``instructions`` field.
     """
     return libreoffice_spreadsheet_skill.model_copy(
@@ -599,7 +599,7 @@ async def _run_case(
     input_path: str,
     answer_path: str | None,
     sig_cls: type[dspy.Signature],
-    skill: Skill,
+    skill: Capability,
     lm: dspy.LM,
     sub_lm: dspy.LM,
     sem: asyncio.Semaphore,
@@ -644,7 +644,7 @@ async def _run_case(
                 sig_cls,
                 lm=lm,
                 sub_lm=sub_lm,
-                skills=[skill],
+                capabilities=[skill],
                 max_iterations=config.max_iterations,
                 verbose=config.verbose_rlm or config.log_dir is not None,
                 debug=config.debug_rlm,
@@ -770,7 +770,7 @@ def _predict_rlm_sandbox_kwargs(
 async def _run_tasks_async(
     tasks: list[SpreadsheetTask],
     sig_cls: type[dspy.Signature],
-    skill: Skill,
+    skill: Capability,
     lm: dspy.LM,
     sub_lm: dspy.LM,
     config: EvalConfig,

@@ -30,7 +30,7 @@ class SpreadsheetRLM(dspy.Module):
             ManipulateSpreadsheet,
             lm=self.lm,
             sub_lm=self.sub_lm,
-            skills=[libreoffice_spreadsheet_skill],
+            capabilities=[libreoffice_spreadsheet_skill],
             max_iterations=self.max_iterations,
             verbose=self.verbose,
             debug=self.debug,
