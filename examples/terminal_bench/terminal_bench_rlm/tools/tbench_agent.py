@@ -432,21 +432,21 @@ def _predict_rlm_class() -> Any:
     return PredictRLM
 
 
-def _skill_class() -> Any:
-    return getattr(importlib.import_module("predict_rlm"), "Skill")
+def _capability_class() -> Any:
+    return getattr(importlib.import_module("predict_rlm"), "Capability")
 
 
 def _with_terminal_bench_skill(
     rlm_kwargs: dict[str, Any],
     skill_instructions: str | None,
 ) -> None:
-    skills = [
-        skill
-        for skill in list(rlm_kwargs.get("skills") or [])
-        if getattr(skill, "name", None) != TERMINAL_BENCH_SKILL_NAME
+    capabilities = [
+        capability
+        for capability in list(rlm_kwargs.get("capabilities") or [])
+        if getattr(capability, "name", None) != TERMINAL_BENCH_SKILL_NAME
     ]
-    skills.append(build_terminal_bench_skill(_skill_class(), skill_instructions))
-    rlm_kwargs["skills"] = skills
+    capabilities.append(build_terminal_bench_skill(_capability_class(), skill_instructions))
+    rlm_kwargs["capabilities"] = capabilities
 
 
 def _interpreter_class() -> Any:

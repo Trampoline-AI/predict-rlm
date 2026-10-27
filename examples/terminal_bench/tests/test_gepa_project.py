@@ -2067,10 +2067,10 @@ def test_seed_candidate_skill_is_passed_to_terminal_bench_agent(monkeypatch) -> 
     )
     agent.perform_task("solve it", SimpleNamespace(container=object()))
 
-    skills = captured["kwargs"]["skills"]
-    assert len(skills) == 1
-    assert skills[0].name == "terminal-bench"
-    assert "verify files before finishing" in skills[0].instructions
+    capabilities = captured["kwargs"]["capabilities"]
+    assert len(capabilities) == 1
+    assert capabilities[0].name == "terminal-bench"
+    assert "verify files before finishing" in capabilities[0].instructions
 
 
 def test_evaluate_example_returns_gepa_result_from_fake_harness_runner(tmp_path: Path) -> None:

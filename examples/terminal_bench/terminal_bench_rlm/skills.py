@@ -179,8 +179,10 @@ pending, SUBMIT; SUBMIT makes the result final.
 ).strip()
 
 
-def build_terminal_bench_skill(skill_cls: type[Any], instructions: str | None = None) -> Any:
-    return skill_cls(
+def build_terminal_bench_skill(
+    capability_cls: type[Any], instructions: str | None = None
+) -> Any:
+    return capability_cls(
         name=TERMINAL_BENCH_SKILL_NAME,
         instructions=instructions or DEFAULT_TERMINAL_BENCH_SKILL_INSTRUCTIONS,
         tools={"web_search": web_search},
