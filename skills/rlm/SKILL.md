@@ -9,7 +9,7 @@ description: >-
 compatibility: Requires Python 3.11+, Deno 2, DSPy, and predict-rlm 0.14.0 or newer.
 metadata:
   author: Emile Riberdy
-  version: "3.0"
+  version: "4.0"
 ---
 
 # Create a PredictRLM

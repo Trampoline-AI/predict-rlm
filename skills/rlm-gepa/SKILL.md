@@ -9,7 +9,7 @@ description: >-
 compatibility: Requires Python 3.11+, Deno 2, predict-rlm[gepa] 0.14.0 or newer, and a working PredictRLM.
 metadata:
   author: Emile Riberdy
-  version: "1.0"
+  version: "2.0"
 ---
 
 # Optimize an RLM with RLM-GEPA
