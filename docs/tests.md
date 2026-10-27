@@ -28,7 +28,7 @@ collect the example-local test directories.
 
 | Collection root | Test modules | Test functions | Collected cases | Purpose |
 | --- | ---: | ---: | ---: | --- |
-| `tests/` | 45 | 315 | 388 | Default package regression suite: PredictRLM, execution backends, Codex LM, and RLM-GEPA. |
+| `tests/` | 47 | 368 | 479 | Default package regression suite: PredictRLM, execution backends, Codex LM, and RLM-GEPA. |
 | `examples/terminal_bench/tests/` | 8 | 136 | 136 | Terminal-Bench agents, controller adapters, local runner, scoring, and harness integration seams. |
 | `examples/spreadbench/tests/` | 6 | 42 | 43 | Spreadsheet recalculation/rendering and example evaluation configuration. |
 | `examples/appworld/tests/` | 1 | 47 | 47 | AppWorld task/session integration, evaluation, scoring, and fixture-backed project behavior. |
@@ -202,7 +202,7 @@ it does not mean they contact a live model provider.
 | [test_in_context.py](../tests/test_in_context.py) | 12 | Core | `CtxStr` adapter precedence and ambiguity; delimiter collisions; prepared versus final bound values; concurrent and sequential run-local predictor/signature isolation; invalid prompt-hook returns; rejection of non-string, optional, and output `CtxStr` declarations. These are host-side prompt construction contracts, not LM comprehension tests. |
 | [test_callbacks.py](../tests/test_callbacks.py) | 7 | Core + JSPI | Paired iteration events and shared call IDs; end events on execution failure; awaiting asynchronous handlers; handling async callbacks on the sync path; handler failure isolation; delivery of actual sandbox output to callbacks. |
 | [test_capabilities.py](../tests/test_capabilities.py) | 4 | Core + JSPI | Multiple capabilities execute together in an RLM run; duplicate tool/module ownership is rejected; a capability cannot silently replace a user tool. Package installation is covered separately below. |
-| [test_agent_skills.py](../tests/test_agent_skills.py) | 24 | Core + JSPI | `SKILL.md` frontmatter parsing and validation; capability fields on `Skill` are rejected; only name and description reach the prompt; `load_skill()` returns instructions and file list; skill name and tool conflicts; skill folders are mounted at `/sandbox/skills/<name>/` on sync and async runs. |
+| [test_agent_skills.py](../tests/test_agent_skills.py) | 26 | Core + JSPI | `SKILL.md` frontmatter parsing and validation; capability fields on `Skill` are rejected; only name and description reach the prompt; `load_skill()` returns instructions and file list; skill name and tool conflicts; skill folders are mounted at `/sandbox/skills/<name>/` on sync, async, and direct Python backend runs. |
 
 ### Runtime kernel, adapters, files, and workspaces
 

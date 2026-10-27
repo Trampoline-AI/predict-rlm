@@ -145,7 +145,8 @@ small.
 
 Each example follows: `schema.py` (Pydantic models) -> `signature.py` (DSPy
 Signature with strategy docstring) -> `tools.py` (host-side callables) ->
-`capabilities.py` (optional sandbox packages/instructions) -> `service.py` (DSPy
+`capabilities.py` (optional `Capability` bundles; older examples name it
+`skills.py`) -> `service.py` (DSPy
 Module wiring PredictRLM) -> `run.py` (CLI entry point).
 
 ## Code Style

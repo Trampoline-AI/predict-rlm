@@ -86,7 +86,7 @@ failure surfaces. Do not key instructions on task IDs, file names, row counts,
 or answer artifacts.
 
 ```python
-from predict_rlm import PredictRLM, Skill
+from predict_rlm import Capability, PredictRLM
 from rlm_gepa import agent_spec_from_rlm
 
 
@@ -100,7 +100,7 @@ def build_rlm(skill_instructions: str, *, lm=None, sub_lm=None, max_iterations: 
         sub_lm=sub_lm,
         max_iterations=max_iterations,
         verbose=False,
-        skills=[Skill(name="document-analysis", instructions=skill_instructions)],
+        capabilities=[Capability(name="document-analysis", instructions=skill_instructions)],
     )
 
 
