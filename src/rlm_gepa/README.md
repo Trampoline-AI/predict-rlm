@@ -91,7 +91,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
-from predict_rlm import PredictRLM, Skill
+from predict_rlm import Capability, PredictRLM
 from predict_rlm.trace import RunTrace
 from rlm_gepa import EvaluationContext, RLMGepaExampleResult, RLMGepaProject, agent_spec_from_rlm
 
@@ -131,7 +131,7 @@ def build_rlm(
         verbose=verbose,
         debug=debug,
         run_export_root=run_export_root,
-        skills=[Skill(name="document-analysis", instructions=skill_instructions)],
+        capabilities=[Capability(name="document-analysis", instructions=skill_instructions)],
     )
 
 
