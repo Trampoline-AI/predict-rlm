@@ -14,7 +14,7 @@ metadata:
 
 # Optimize an RLM with RLM-GEPA
 
-RLM-GEPA improves reusable text components, usually a `Skill.instructions`
+RLM-GEPA improves reusable text components, usually a `Capability.instructions`
 string, using scored executions of a real PredictRLM. It is not a replacement
 for initial RLM design. Start only after the base RLM has a concrete signature,
 tools, a measurable outcome, and a working smoke path.
