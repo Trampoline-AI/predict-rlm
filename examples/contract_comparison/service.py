@@ -18,7 +18,7 @@ from pathlib import Path
 import dspy
 
 from predict_rlm import File, PredictRLM
-from predict_rlm.skills import pdf as pdf_skill
+from predict_rlm.capabilities import pdf as pdf_capability
 
 from .signature import CompareContracts
 
@@ -43,7 +43,7 @@ class ContractComparator(dspy.Module):
         predictor = PredictRLM(
             CompareContracts,
             sub_lm=self.sub_lm,
-            skills=[pdf_skill],
+            capabilities=[pdf_capability],
             max_iterations=self.max_iterations,
             verbose=self.verbose,
             debug=self.debug,
