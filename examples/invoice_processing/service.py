@@ -19,8 +19,8 @@ from pathlib import Path
 import dspy
 
 from predict_rlm import File, PredictRLM
-from predict_rlm.skills import pdf as pdf_skill
-from predict_rlm.skills import spreadsheet as spreadsheet_skill
+from predict_rlm.capabilities import pdf as pdf_capability
+from predict_rlm.capabilities import spreadsheet as spreadsheet_capability
 
 from .signature import ProcessInvoices
 
@@ -50,7 +50,7 @@ class InvoiceProcessor(dspy.Module):
         predictor = PredictRLM(
             ProcessInvoices,
             sub_lm=self.sub_lm,
-            skills=[pdf_skill, spreadsheet_skill],
+            capabilities=[pdf_capability, spreadsheet_capability],
             max_iterations=self.max_iterations,
             verbose=self.verbose,
             debug=self.debug,

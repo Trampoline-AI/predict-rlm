@@ -67,5 +67,5 @@ unchanged and do not describe the current Codex defaults.
 | ------------------------------ | ----------------------------------------------------- |
 | [`schema.py`](schema.py)       | Pydantic models for invoice data (line items, totals) |
 | [`signature.py`](signature.py) | DSPy Signature with extraction instructions           |
-| [`service.py`](service.py)     | DSPy Module wiring PredictRLM with skills             |
+| [`service.py`](service.py)     | DSPy Module wiring PredictRLM with capabilities       |
 | [`run.py`](run.py)             | CLI entry point                                       |
