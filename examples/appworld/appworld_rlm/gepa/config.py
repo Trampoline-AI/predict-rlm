@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from predict_rlm import Skill
+from predict_rlm import Capability
 from rlm_gepa import AgentSpec, OptimizeConfig, agent_spec_from_rlm
 
 from ..agent.service import AppWorldRLM
@@ -47,7 +47,7 @@ def default_config() -> AppWorldGepaConfig:
 
 
 def build_appworld_spec() -> AgentSpec:
-    spec_skill = Skill(name="appworld", instructions=APPWORLD_SKILL_BASE_INSTRUCTIONS)
+    spec_skill = Capability(name="appworld", instructions=APPWORLD_SKILL_BASE_INSTRUCTIONS)
     rlm = AppWorldRLM(max_iterations=1, skill=spec_skill).build_predictor()
     return agent_spec_from_rlm(
         rlm,

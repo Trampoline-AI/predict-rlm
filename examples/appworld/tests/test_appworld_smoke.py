@@ -39,7 +39,7 @@ from appworld_rlm.tools.runner import (
     _tool_text,
 )
 
-from predict_rlm import Skill
+from predict_rlm import Capability
 from predict_rlm.evidence import RunEvidence
 from predict_rlm.trace import IterationStep, RunTrace, ToolCall
 from rlm_gepa.reporting.stats import render_stats
@@ -70,8 +70,8 @@ def _runner_result_text(
     )
 
 
-def _base_test_skill() -> Skill:
-    return Skill(name="appworld", instructions=APPWORLD_SKILL_BASE_INSTRUCTIONS)
+def _base_test_skill() -> Capability:
+    return Capability(name="appworld", instructions=APPWORLD_SKILL_BASE_INSTRUCTIONS)
 
 
 
@@ -944,8 +944,8 @@ def test_service_binds_current_task_appworld_tools(monkeypatch):
             return task_id
 
     class FakePredictRLM:
-        def __init__(self, _signature, *, skills, **_kwargs):
-            captured_tools.update(skills[0].tools)
+        def __init__(self, _signature, *, capabilities, **_kwargs):
+            captured_tools.update(capabilities[0].tools)
 
         async def acall(self, **kwargs):
             captured_prediction_kwargs.update(kwargs)
