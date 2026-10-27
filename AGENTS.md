@@ -125,11 +125,16 @@ small.
   subprocess running `backends/jspi/payload.js`. Handles JSPI flag
   detection, concurrent tool execution via `asyncio.gather()`, package
   installation, and network permissions.
-- **`rlm_skills.py`** -- `Skill` dataclass and `merge_skills()`. Skills bundle
-  instructions + PyPI packages + tools. Merging concatenates instructions,
-  deduplicates packages, and raises on tool name conflicts.
+- **`capabilities/`** -- `Capability` model and `merge_capabilities()`, plus the
+  built-in `pdf`, `spreadsheet`, and `docx` capabilities. Capabilities bundle
+  instructions + PyPI packages + modules + tools. Merging concatenates
+  instructions, deduplicates packages, and raises on tool name conflicts.
+- **`skills/`** -- `Skill`, the Agent Skills (`SKILL.md`) type. Only name and
+  description go in the prompt; the built-in `load_skill()` tool returns the
+  instructions, and skill folders are mounted at `/sandbox/skills/<name>/`.
 - **`_shared.py`** -- `build_rlm_signatures()` builds the action/extract
-  signatures with full tool docs and skill instructions.
+  signatures with full tool docs, capability instructions, and the skill
+  catalog.
   `format_tool_docs_full()` formats tool docstrings (unlike DSPy's default
   truncated format).
 - **`backends/jspi/payload.js`** -- Deno script: Pyodide runtime,
@@ -140,7 +145,7 @@ small.
 
 Each example follows: `schema.py` (Pydantic models) -> `signature.py` (DSPy
 Signature with strategy docstring) -> `tools.py` (host-side callables) ->
-`skills.py` (optional sandbox packages/instructions) -> `service.py` (DSPy
+`capabilities.py` (optional sandbox packages/instructions) -> `service.py` (DSPy
 Module wiring PredictRLM) -> `run.py` (CLI entry point).
 
 ## Code Style

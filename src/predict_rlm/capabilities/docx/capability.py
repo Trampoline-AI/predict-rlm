@@ -1,12 +1,12 @@
-"""Docx skill — python-docx for reading, writing, and modifying Word documents in the sandbox."""
+"""Docx capability — python-docx for reading, writing, and modifying Word documents in the sandbox."""
 
 from pathlib import Path
 
-from predict_rlm import Skill
+from ..core import Capability
 
 _MODULES_DIR = Path(__file__).parent / "modules"
 
-docx_skill = Skill(
+docx_capability = Capability(
     name="docx",
     instructions="""Use python-docx to work with Word documents (.docx) in the sandbox.
 

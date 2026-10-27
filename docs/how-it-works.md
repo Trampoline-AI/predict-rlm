@@ -66,7 +66,7 @@ normal `str`, and the value remains available as a Python variable inside the
 execution session.
 
 ```python
-from predict_rlm import CtxStr, File, PredictRLM, Skill
+from predict_rlm import Capability, CtxStr, File, PredictRLM
 
 class AnalyzeDocuments(dspy.Signature):
     """Analyze documents and produce a structured report.
@@ -79,7 +79,7 @@ class AnalyzeDocuments(dspy.Signature):
     criteria: CtxStr = dspy.InputField(desc="Report criteria to follow")
     analysis: DocumentAnalysis = dspy.OutputField()
 
-pdf_skill = Skill(
+pdf_capability = Capability(
     name="pdf",
     instructions="Use pymupdf to open and render PDF pages...",
     packages=["pymupdf"],
@@ -89,7 +89,7 @@ rlm = PredictRLM(
     AnalyzeDocuments,
     lm="openai/gpt-5.4",
     sub_lm="openai/gpt-5.1",
-    skills=[pdf_skill],
+    capabilities=[pdf_capability],
 )
 
 documents = [File(path="report.pdf"), File(path="appendix.pdf")]

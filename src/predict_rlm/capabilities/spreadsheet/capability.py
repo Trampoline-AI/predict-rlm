@@ -1,12 +1,12 @@
-"""Spreadsheet skill — build, transform, and style .xlsx workbooks in the sandbox."""
+"""Spreadsheet capability — build, transform, and style .xlsx workbooks in the sandbox."""
 
 from pathlib import Path
 
-from predict_rlm import Skill
+from ..core import Capability
 
 _MODULES_DIR = Path(__file__).parent / "modules"
 
-spreadsheet_skill = Skill(
+spreadsheet_capability = Capability(
     name="spreadsheet",
     instructions="""# Spreadsheet Skill
 

@@ -2,7 +2,8 @@
 
 Core classes:
     PredictRLM — RLM with a ``predict()`` tool for running DSPy signatures
-    Skill — Reusable bundle of instructions, packages, and tools
+    Capability — Reusable bundle of instructions, packages, modules, and tools
+    Skill — Agent Skill (SKILL.md folder) loaded on demand via ``load_skill()``
 
 File I/O:
     File — Unified file type for inputs (mount into sandbox) and outputs
@@ -26,6 +27,7 @@ from .backends import (
     DirectPythonBackend,
     PythonSupervisor,
 )
+from .capabilities import Capability
 from .evidence import (
     EvidenceIncompleteError,
     EvidenceRecorder,
@@ -43,7 +45,6 @@ from .predict_rlm import (
     ValidatingChatAdapter,
     ValidatingJSONAdapter,
 )
-from .rlm_skills import Skill
 from .runtime import (
     Artifact,
     ArtifactBinding,
@@ -78,6 +79,7 @@ from .runtime import (
     UnsupportedOperationError,
 )
 from .runtime_hooks import RuntimeHook, RuntimeHookEvent
+from .skills import Skill
 from .trace import IterationStep, RunTrace
 from .workspace import Workspace, WorkspaceMode
 
@@ -116,6 +118,7 @@ __all__ = [
     "Artifact",
     "ArtifactBinding",
     "ArtifactFileInfo",
+    "Capability",
     "CallableTool",
     "CtxStr",
     "CtxStrInputAdapter",

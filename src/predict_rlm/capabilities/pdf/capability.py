@@ -1,8 +1,8 @@
-"""PDF skill — pymupdf for reading, rendering, and writing PDFs in the sandbox."""
+"""PDF capability — pymupdf for reading, rendering, and writing PDFs in the sandbox."""
 
-from predict_rlm import Skill
+from ..core import Capability
 
-pdf_skill = Skill(
+pdf_capability = Capability(
     name="pdf",
     instructions="""Use pymupdf to work with PDF files mounted in the sandbox.
 

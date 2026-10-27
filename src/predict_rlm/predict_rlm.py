@@ -60,6 +60,7 @@ from .backends.adapters import (
 )
 from .backends.base import LegacyExecutionBackend, SandboxFatalError
 from .backends.jspi import JspiBackend
+from .capabilities.core import Capability, merge_capabilities
 from .compatibility import (
     SyncedFileToolOperation,
     ValueInputAdapter,
@@ -72,7 +73,6 @@ from .evidence import EvidenceRecorder, RunEventKind, RunEvidence, RunEvidenceEv
 from .execution_timeout import validate_execution_timeout
 from .files import File, build_file_plan, scan_file_fields
 from .in_context import CtxStrInputAdapter
-from .rlm_skills import Skill, merge_skills
 from .runtime import (
     Artifact,
     CallableTool,
@@ -103,6 +103,7 @@ from .runtime import (
     validate_sandbox_root_reservations,
 )
 from .runtime_hooks import RuntimeHook, RuntimeHookEvent
+from .skills import Skill, create_load_skill_tool, format_skill_catalog
 from .telemetry import TelemetryContext, make_span_id
 from .trace import (
     IterationStep,
@@ -952,6 +953,20 @@ When you see these, fix the call and try SUBMIT again — the loop continues unt
 """
 
 
+def _validate_skills(skills: list[Skill]) -> list[Skill]:
+    seen: set[str] = set()
+    for skill in skills:
+        if isinstance(skill, Capability):
+            raise TypeError(
+                f"Capability {skill.name!r} was passed in skills=; pass capabilities "
+                "with capabilities= instead"
+            )
+        if skill.name in seen:
+            raise ValueError(f"Duplicate skill name: {skill.name!r}")
+        seen.add(skill.name)
+    return list(skills)
+
+
 class PredictRLM(dspy.RLM):
     """RLM with DSPy predict tool for structured extraction and reasoning.
 
@@ -959,7 +974,8 @@ class PredictRLM(dspy.RLM):
     - Built-in predict tool for running DSPy signatures (supports dspy.Image)
     - JSPI-enabled interpreter for proper tool calling in Pyodide/WASM
     - Customized instructions optimized for structured extraction
-    - Skills support for domain-specific instructions, packages, and tools
+    - Capabilities that add instructions, packages, modules, and tools
+    - Agent Skills (SKILL.md) loaded on demand through ``load_skill()``
     - Configurable network access for the sandbox
 
     Use this when you need structured outputs with DSPy signatures, type hints,
@@ -976,11 +992,11 @@ class PredictRLM(dspy.RLM):
         result = rlm(images=["base64_img1", "base64_img2"], query="Compare totals")
         print(result.answer)
 
-    Example with skills::
+    Example with capabilities and skills::
 
-        from predict_rlm import Skill
+        from predict_rlm import Capability, Skill
 
-        pdf_skill = Skill(
+        pdf_capability = Capability(
             name="pdf-extraction",
             instructions="Use pdfplumber for table extraction.",
             packages=["pdfplumber"],
@@ -988,7 +1004,8 @@ class PredictRLM(dspy.RLM):
         rlm = PredictRLM(
             "documents -> tables: list[dict]",
             lm="openai/gpt-5.4",
-            skills=[pdf_skill],
+            capabilities=[pdf_capability],
+            skills=[Skill.from_dir("skills/table-cleanup")],
             sub_lm="openai/gpt-5.1",
         )
     """
@@ -1023,6 +1040,7 @@ class PredictRLM(dspy.RLM):
         sbx_config: SbxConfig | None = None,
         sbx_pool: SbxPool | None = None,
         allowed_domains: list[str] | None = None,
+        capabilities: list[Capability] | None = None,
         skills: list[Skill] | None = None,
         debug: bool = False,
         output_dir: str | Path | None = None,
@@ -1071,10 +1089,15 @@ class PredictRLM(dspy.RLM):
             allowed_domains: Domains/IPs the sandbox can access via network.
                             By default, no network access is allowed.
                             Example: ["api.example.com", "192.168.1.100:8080"]
-            skills: List of Skill instances providing domain-specific instructions,
-                   PyPI packages, and tools. Skills are merged automatically —
-                   instructions are appended to the prompt, packages are installed
-                   in the sandbox, and tools are exposed alongside predict().
+            capabilities: List of Capability instances providing domain-specific
+                   instructions, PyPI packages, modules, and tools. Capabilities are
+                   merged automatically — instructions are appended to the prompt,
+                   packages are installed in the sandbox, and tools are exposed
+                   alongside predict().
+            skills: List of Agent Skills (see ``Skill.from_dir``). Only each
+                   skill's name and description go in the prompt; the RLM calls
+                   ``load_skill(name)`` for the instructions, and skill files are
+                   mounted at ``/sandbox/skills/<name>/``.
             debug: If True, enable interpreter debug output and lifecycle
                   diagnostics. Debug does not imply verbose RLM trace output.
             output_dir: Constructor convenience that collects generated File and
@@ -1206,19 +1229,24 @@ class PredictRLM(dspy.RLM):
             Path(run_export_root).resolve() if run_export_root is not None else None
         )
 
-        # Merge skills into instructions, packages, modules, and tools
-        self._skill_instructions = ""
-        self._skill_packages: list[str] = []
-        self._skill_modules: dict[str, str] = {}
-        if skills:
-            skill_instructions, skill_packages, skill_modules, skill_tools = merge_skills(
-                skills
-            )
-            self._skill_instructions = skill_instructions
-            self._skill_packages = skill_packages
-            self._skill_modules = skill_modules
+        # Merge capabilities into instructions, packages, modules, and tools
+        self._capability_instructions = ""
+        self._capability_packages: list[str] = []
+        self._capability_modules: dict[str, str] = {}
+        if capabilities:
+            (
+                capability_instructions,
+                capability_packages,
+                capability_modules,
+                capability_tools,
+            ) = merge_capabilities(capabilities)
+            self._capability_instructions = capability_instructions
+            self._capability_packages = capability_packages
+            self._capability_modules = capability_modules
         else:
-            skill_tools = {}
+            capability_tools = {}
+
+        self._skills = _validate_skills(skills or [])
 
         # Normalize tools to dict[str, Callable] — accept both dict and list forms
         if isinstance(tools, list):
@@ -1226,14 +1254,22 @@ class PredictRLM(dspy.RLM):
         else:
             merged_tools = dict(tools or {})
 
-        # Merge skill tools (skill_tools conflicts already checked by merge_skills)
-        for name, fn in skill_tools.items():
+        # Merge capability tools (conflicts between capabilities already checked)
+        for name, fn in capability_tools.items():
             if name in merged_tools:
                 raise ValueError(
-                    f"Tool name conflict: '{name}' is provided by both a skill and "
+                    f"Tool name conflict: '{name}' is provided by both a capability and "
                     f"the tools parameter"
                 )
             merged_tools[name] = fn
+
+        if self._skills:
+            if "load_skill" in merged_tools:
+                raise ValueError(
+                    "Tool name conflict: 'load_skill' is reserved for loading skills "
+                    "when skills are configured"
+                )
+            merged_tools["load_skill"] = create_load_skill_tool(self._skills)
 
         if "predict" not in merged_tools:
             merged_tools["predict"] = self._create_predict_tool()
@@ -1358,14 +1394,14 @@ class PredictRLM(dspy.RLM):
         )
         runtime_spec = resolve_runtime_spec(
             direct=RuntimeContribution(
-                instructions=(self._skill_instructions,) if self._skill_instructions else (),
+                instructions=(self._capability_instructions,) if self._capability_instructions else (),
                 adapters=(
                     *compatibility_inputs,
                     *compatibility_outputs,
                     *tuple(adapters),
                 ),
                 tools=runtime_tools,
-                packages=tuple(self._skill_packages),
+                packages=tuple(self._capability_packages),
                 execution=resolved_execution,
                 events=tuple(events),
                 validators=file_compatibility_contribution.validators,
@@ -1430,7 +1466,7 @@ class PredictRLM(dspy.RLM):
 
     def _runtime_packages(self) -> tuple[str, ...]:
         spec = getattr(self, "_runtime_spec", None)
-        return spec.packages if spec is not None else tuple(self._skill_packages)
+        return spec.packages if spec is not None else tuple(self._capability_packages)
 
     def _runtime_tool_functions(self) -> dict[str, Callable[..., Any]]:
         spec = getattr(self, "_runtime_spec", None)
@@ -1444,7 +1480,7 @@ class PredictRLM(dspy.RLM):
     def _runtime_instructions(self) -> str:
         spec = getattr(self, "_runtime_spec", None)
         if spec is None:
-            return self._skill_instructions
+            return self._capability_instructions
         return "\n\n".join(spec.instructions)
 
     def _validate_inputs(self, input_args: dict[str, Any]) -> None:
@@ -1932,9 +1968,7 @@ class PredictRLM(dspy.RLM):
                 [file_plan["write_dir"]] if file_plan and file_plan["write_dir"] else None
             )
 
-            # Add module host paths to read permissions
-            for mod_path in self._skill_modules.values():
-                extra_read.append(mod_path)
+            extra_read.extend(self._sandbox_read_paths())
 
             interpreter_kwargs = {
                 "tools": execution_tools,
@@ -2038,7 +2072,7 @@ class PredictRLM(dspy.RLM):
                 (
                     SessionRequirements(
                         allowed_domains=tuple(self._allowed_domains or ()),
-                        extra_read_paths=tuple(self._skill_modules.values()),
+                        extra_read_paths=self._sandbox_read_paths(),
                     ),
                     *(
                         binding.prepared.requirements
@@ -3437,11 +3471,21 @@ class PredictRLM(dspy.RLM):
         session = ctx.session
         if session is None:
             return
-        if not self._skill_modules:
-            return
-        for module_name, source_path in self._skill_modules.items():
+        for skill in self._mounted_skills():
             artifact = Artifact(
-                id=f"skill-module-{module_name}-{ctx.run_id}",
+                id=f"skill-{skill.name}-{ctx.run_id}",
+                kind="skill.directory",
+                metadata={
+                    "source_path": str(skill.path),
+                    "sandbox_path": skill.sandbox_path,
+                },
+            )
+            ctx.bind(await session.mount(artifact))
+        if not self._capability_modules:
+            return
+        for module_name, source_path in self._capability_modules.items():
+            artifact = Artifact(
+                id=f"capability-module-{module_name}-{ctx.run_id}",
                 kind="compat.module",
                 metadata={
                     "source_path": source_path,
@@ -3452,6 +3496,15 @@ class PredictRLM(dspy.RLM):
             ctx.bind(binding)
         await session.run_code(
             "import sys; sys.path.insert(0, '/sandbox/lib')",
+        )
+
+    def _mounted_skills(self) -> list[Skill]:
+        return [skill for skill in self._skills if skill.path is not None]
+
+    def _sandbox_read_paths(self) -> tuple[str, ...]:
+        return (
+            *self._capability_modules.values(),
+            *(str(skill.path) for skill in self._mounted_skills()),
         )
 
     async def _reserve_runtime_outputs(self, ctx: RunContext) -> None:
@@ -4201,7 +4254,7 @@ class PredictRLM(dspy.RLM):
             backend=self._interpreter_backend_label(repl),
             mounts=len(file_plan["mounts"]),
             output_dirs=len(file_plan["output_dirs"]),
-            skill_modules=len(self._skill_modules),
+            skill_modules=len(self._capability_modules),
         )
         if hasattr(repl, "_ensure_deno_process"):
             repl._ensure_deno_process()
@@ -4222,10 +4275,10 @@ class PredictRLM(dspy.RLM):
                 virtual_path=virtual_dir,
             )
 
-        # Mount skill modules into /sandbox/lib/ so the RLM can import them
-        if self._skill_modules:
+        # Mount capability modules into /sandbox/lib/ so the RLM can import them
+        if self._capability_modules:
             repl.mkdir_p("/sandbox/lib")
-            for mod_name, host_path in self._skill_modules.items():
+            for mod_name, host_path in self._capability_modules.items():
                 repl.mount_file_at(host_path, f"/sandbox/lib/{mod_name}.py")
                 self._log_lifecycle(
                     "sandbox.files.skill_module_mount",
@@ -4805,7 +4858,8 @@ class PredictRLM(dspy.RLM):
             PREDICT_RLM_INSTRUCTIONS,
             raw_tools,
             self._format_tool_docs,
-            skill_instructions=self._runtime_instructions(),
+            capability_instructions=self._runtime_instructions(),
+            skill_catalog=format_skill_catalog(self._skills),
             file_instructions=file_instructions,
             model_execution_timeout=self._model_execution_timeout,
             max_output_chars=self.max_output_chars,
@@ -4820,7 +4874,8 @@ class PredictRLM(dspy.RLM):
             PREDICT_RLM_INSTRUCTIONS,
             raw_tools,
             self._format_tool_docs,
-            skill_instructions=self._runtime_instructions(),
+            capability_instructions=self._runtime_instructions(),
+            skill_catalog=format_skill_catalog(self._skills),
             model_execution_timeout=self._model_execution_timeout,
             max_output_chars=self.max_output_chars,
         )
