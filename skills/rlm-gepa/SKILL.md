@@ -37,7 +37,7 @@ Keep those concerns separate.
 Use RLM-GEPA when the user wants a reusable behavior to improve and can provide:
 
 - a working PredictRLM with its real DSPy signature and tool surface;
-- a text component worth optimizing, such as domain skill instructions;
+- a text component worth optimizing, such as domain capability instructions;
 - representative examples and a deterministic or carefully designed score;
 - concrete feedback for imperfect outputs.
 
@@ -214,7 +214,7 @@ Keep optimization code local to the generated project:
 
 ```text
 my_rlm/
-├── agent/             # Existing PredictRLM signature, service, skills, tools
+├── agent/             # Existing PredictRLM signature, service, capabilities, tools
 ├── bench/             # Examples, split policy, deterministic scorer
 └── gepa/
     ├── __init__.py

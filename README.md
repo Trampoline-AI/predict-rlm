@@ -114,8 +114,9 @@ codex-lm usage
   calls using native provider multimodal APIs.
 - **Async tool calling** — native RLM async support in the WASM sandbox,
   enabling concurrent sub-LM invocations and tool calls.
-- **Skills & tools** — bundle domain instructions, PyPI packages, sandbox
-  modules, and host-side tools for reusable task capabilities.
+- **Capabilities, skills & tools** — bundle domain instructions, PyPI packages,
+  sandbox modules, and host-side tools as reusable capabilities, and load Agent
+  Skills (`SKILL.md`) on demand.
 - **Simple file I/O** — pass local files and mutable workspaces as typed inputs,
   and return generated artifacts through `File` outputs.
 - **Structured sub-LM calls** — native Pydantic and DSPy signature support for
@@ -508,6 +509,6 @@ invariant; extend the shared contract instead of copying it into backend suites.
 - [Capabilities](docs/capabilities.md) — define, compose, and mount packages,
   modules, and tools
 - [Skills](docs/skills.md) — load Agent Skills (`SKILL.md`) on demand
-- [RLM-GEPA](src/rlm_gepa/README.md) — optimize RLM skills from traces and
+- [RLM-GEPA](src/rlm_gepa/README.md) — optimize RLM capability instructions from traces and
   configure `AgentSpec`
 - [Examples](examples/) — end-to-end demos with setup instructions

@@ -3,7 +3,7 @@ name: rlm
 description: >-
   Plan and build a new callable Recursive Language Model with predict-rlm. Use
   when a user wants to design an RLM, assess whether an RLM fits a workflow, or
-  implement an RLM package with structured boundaries, skills, host-side tools,
+  implement an RLM package with structured boundaries, capabilities, skills, host-side tools,
   custom adapters, or runtime-kernel extensions. For optimization of an existing
   RLM, use rlm-gepa instead.
 compatibility: Requires Python 3.11+, Deno 2, DSPy, and predict-rlm 0.8.0-alpha0 or newer.
@@ -140,14 +140,15 @@ Use `File` or `list[File]` for large file inputs and generated artifacts. Use
 must be added to the outer LM prompt as well as exposed as a Python variable.
 Use a `Capability` when the sandbox needs reusable instructions, packages,
 modules, or bundled tools. Use a `Skill` (`Skill.from_dir(path)`) for an Agent
-Skills folder whose instructions should only be loaded when relevant. Use `tools=` directly for specific host-side actions such as
-authenticated APIs, databases, native libraries, or host filesystem access.
+Skills folder whose instructions should only be loaded when relevant. Use
+`tools=` directly for specific host-side actions such as authenticated APIs,
+databases, native libraries, or host filesystem access.
 
 ## Runtime kernel and extension model
 
 Most RLMs should use only signatures, `File`, `CtxStr`, `Workspace`,
-capabilities, skills, and host tools. Extend the kernel only when the workflow needs a new typed boundary,
-resource lifecycle, execution substrate, or correctness-critical event stream.
+capabilities, skills, and host tools. Extend the kernel only when the workflow
+needs a new typed boundary, resource lifecycle, execution substrate, or correctness-critical event stream.
 Do not reach for a custom adapter merely because a signature uses a Pydantic
 model.
 
@@ -639,7 +640,7 @@ If the workflow needs a custom runtime boundary, specify it in the plan rather
 than discovering it during implementation:
 
 - the caller-facing signature type and model-visible value;
-- why built-in files, workspaces, skills, or host tools are insufficient;
+- why built-in files, workspaces, capabilities, skills, or host tools are insufficient;
 - the smallest extension point from the kernel decision order above;
 - all sandbox paths, copy versus mount behavior, and backend requirements;
 - adapter-owned resources, invocation-local state, persistence points, and
@@ -655,7 +656,7 @@ Write the strategy that belongs in the DSPy signature docstring. It is the
 RLM's playbook:
 
 1. survey and understand the available inputs;
-2. gather evidence with file skills, `predict()`, and host tools;
+2. gather evidence with file capabilities, `predict()`, and host tools;
 3. process, cross-check, and synthesize the evidence;
 4. emit the declared data and write any output files in their output locations.
 
@@ -690,7 +691,7 @@ Deliver a plan containing:
 2. Delivery scope and file manifest.
 3. Complete input and output schemas.
 4. Complete signature strategy.
-5. Skill and host-tool contracts.
+5. Capability and host-tool contracts.
 6. Service architecture, including a typed DAG when chained.
 7. Feasibility constraints, alternatives, and initial budgets.
 8. Smoke-test cases and exact verification commands.
@@ -713,7 +714,7 @@ my_rlm/
 │       ├── schema.py       # Pydantic inputs and outputs
 │       ├── signature.py    # DSPy signature and strategy
 │       ├── service.py      # PredictRLM wiring
-│       ├── skills.py       # Only when custom skills are needed
+│       ├── capabilities.py # Only when custom capabilities are needed
 │       └── tools.py        # Only when host-side tools are needed
 ```
 
@@ -728,7 +729,7 @@ uv add predict-rlm
 ```
 
 Add the `examples` extra only when using built-in document or spreadsheet
-skills, and add any domain dependency only where it runs. Do not include GEPA
+capabilities, and add any domain dependency only where it runs. Do not include GEPA
 or visualization extras in an agent-only project.
 
 ## Schema
@@ -917,7 +918,7 @@ than guessing lifecycle parameters.
 
 ## Sandbox constraints
 
-- Use pure-Python or Pyodide-compatible packages in sandbox skills.
+- Use pure-Python or Pyodide-compatible packages in sandbox capabilities.
 - Do not expect subprocesses, native binaries, or ordinary C extensions.
 - Default network access is denied; set a minimal `allowed_domains` list when
   the sandbox must reach a network service.
