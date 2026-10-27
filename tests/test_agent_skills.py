@@ -46,6 +46,15 @@ class TestSkillFromDir:
         assert skill.path == invoice_skill_dir.resolve()
         assert skill.resource_files == ["helper.py", "reference/currencies.json"]
 
+    def test_utf8_bom_before_frontmatter_is_accepted(self, tmp_path: Path):
+        folder = tmp_path / "bom-skill"
+        folder.mkdir()
+        (folder / "SKILL.md").write_bytes(
+            "﻿---\nname: bom-skill\ndescription: d\n---\nBody.\n".encode()
+        )
+
+        assert Skill.from_dir(folder).name == "bom-skill"
+
     def test_missing_skill_md_is_rejected(self, tmp_path: Path):
         (tmp_path / "empty").mkdir()
         with pytest.raises(FileNotFoundError, match="SKILL.md"):

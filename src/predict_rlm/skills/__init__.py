@@ -83,7 +83,7 @@ class Skill(BaseModel):
         if not skill_file.is_file():
             raise FileNotFoundError(f"No {SKILL_FILE} in skill folder: {folder}")
 
-        frontmatter, body = _split_frontmatter(skill_file.read_text(encoding="utf-8"))
+        frontmatter, body = _split_frontmatter(skill_file.read_text(encoding="utf-8-sig"))
         if frontmatter.get("name") != folder.name:
             raise ValueError(
                 f"Skill name {frontmatter.get('name')!r} in {skill_file} must match its "
