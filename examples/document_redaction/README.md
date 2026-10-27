@@ -98,10 +98,10 @@ unchanged and do not describe the current Codex defaults.
 
 ## Structure
 
-| File                           | Purpose                                                 |
-| ------------------------------ | ------------------------------------------------------- |
-| [`schema.py`](schema.py)       | Pydantic models for redaction results                   |
-| [`signature.py`](signature.py) | DSPy Signature with redaction instructions              |
-| [`skills.py`](skills.py)       | Custom redaction skill (pymupdf redaction API patterns) |
-| [`service.py`](service.py)     | DSPy Module wiring PredictRLM with skills               |
-| [`run.py`](run.py)             | CLI entry point                                         |
+| File                                 | Purpose                                                      |
+| ------------------------------------ | ------------------------------------------------------------ |
+| [`schema.py`](schema.py)             | Pydantic models for redaction results                        |
+| [`signature.py`](signature.py)       | DSPy Signature with redaction instructions                   |
+| [`capabilities.py`](capabilities.py) | Custom redaction capability (pymupdf redaction API patterns) |
+| [`service.py`](service.py)           | DSPy Module wiring PredictRLM with capabilities              |
+| [`run.py`](run.py)                   | CLI entry point                                              |
