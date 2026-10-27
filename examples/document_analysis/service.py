@@ -21,8 +21,8 @@ from pathlib import Path
 import dspy
 
 from predict_rlm import File, PredictRLM
-from predict_rlm.skills import docx as docx_skill
-from predict_rlm.skills import pdf as pdf_skill
+from predict_rlm.capabilities import docx as docx_capability
+from predict_rlm.capabilities import pdf as pdf_capability
 
 from .signature import AnalyzeDocuments
 
@@ -49,7 +49,7 @@ class DocumentAnalyzer(dspy.Module):
         predictor = PredictRLM(
             signature,
             sub_lm=self.sub_lm,
-            skills=[pdf_skill, docx_skill],
+            capabilities=[pdf_capability, docx_capability],
             max_iterations=self.max_iterations,
             verbose=self.verbose,
             debug=self.debug,

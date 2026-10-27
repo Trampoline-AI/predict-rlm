@@ -95,5 +95,5 @@ unchanged and do not describe the current Codex defaults.
 | ------------------------------ | -------------------------------------------------------- |
 | [`schema.py`](schema.py)       | Pydantic models for the output (dates, entities, report) |
 | [`signature.py`](signature.py) | DSPy Signature with task instructions                    |
-| [`service.py`](service.py)     | DSPy Module wiring PredictRLM with skills                |
+| [`service.py`](service.py)     | DSPy Module wiring PredictRLM with capabilities          |
 | [`run.py`](run.py)             | CLI entry point                                          |
