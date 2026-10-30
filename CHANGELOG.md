@@ -21,6 +21,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   telemetry context reach the tool. Pending async tools are cancelled when an
   iteration times out or the execute is cancelled, as on JSPI and SBX.
 
+### Changed
+
+- Direct host tools no longer run under a per-call deadline thread. With no
+  execution timeout, a tool still running at the request deadline ends the
+  session with `SandboxFatalError`, as on SBX. In 0.13.1 the per-call error
+  reached the sandbox only 50 ms before that deadline, too late to answer, so
+  such runs already ended the same way. Pass an execution timeout to keep
+  REPL state when a tool hangs.
+
 ## [0.13.1] - 2026-10-23
 
 ### Fixed
