@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
+import contextvars
 import hashlib
 import importlib.util
 import inspect
@@ -9,7 +11,6 @@ import math
 import os
 import queue
 import re
-import select
 import shutil
 import subprocess
 import sys
@@ -42,7 +43,9 @@ from predict_rlm.runtime import HostDirectoryMount
 PYTHON_RUNNER_RECOVERABLE_TIMEOUT_GRACE_SECONDS = (
     DEFAULT_RECOVERABLE_EXECUTION_TIMEOUT_GRACE_SECONDS
 )
-HOST_TOOL_TIMEOUT_RESPONSE_MARGIN_SECONDS = 0.05
+# While host tool calls are in flight the request loop polls stdout at this
+# interval so finished calls are answered without waiting for the next line.
+TOOL_CALL_POLL_SECONDS = 0.05
 _CODE_PREVIEW_CHARS = 500
 _SECRETISH_CODE_RE = re.compile(
     r"(?i)\b(api[_-]?key|authorization|bearer|credential|password|secret|token)\b"
@@ -149,8 +152,12 @@ class SupervisorTransport(Protocol):
     ) -> RunnerProcess: ...
 
 
-class _HostToolTimeoutError(TimeoutError):
-    pass
+# The event loop that called ``aexecute()``. Async host tools run on it, so they
+# share the caller's loop-bound state (locks, sessions) instead of each getting a
+# private ``asyncio.run`` loop in a worker thread.
+_CALLER_LOOP: contextvars.ContextVar[asyncio.AbstractEventLoop | None] = (
+    contextvars.ContextVar("predict_rlm_supervisor_caller_loop", default=None)
+)
 
 
 class _TimeoutLineReader:
@@ -170,35 +177,22 @@ class _TimeoutLineReader:
             self._thread.join(timeout=1)
 
     def readline(self, timeout: float) -> str | None:
+        """Return the next line, or ``None`` if none arrives within ``timeout``.
+
+        A reader thread owns the buffered pipe. Polling the raw fd with
+        ``select()`` misses lines that an earlier ``readline()`` already pulled
+        into the pipe's buffer, which stalls the request when several tool calls
+        arrive in one read.
+        """
         timeout = max(0.0, timeout)
         read_with_timeout = getattr(self.pipe, "readline_timeout", None)
         if read_with_timeout is not None:
             return read_with_timeout(timeout)
-        fd = self._fileno()
-        if fd is not None:
-            try:
-                ready, _, _ = select.select([fd], [], [], timeout)
-            except (OSError, ValueError):
-                fd = None
-            else:
-                if ready:
-                    return self.pipe.readline()
-                return None
         self._ensure_thread()
         try:
             return self._queue.get(timeout=timeout)
         except queue.Empty:
             return None
-
-    def _fileno(self) -> int | None:
-        fileno = getattr(self.pipe, "fileno", None)
-        if fileno is None:
-            return None
-        try:
-            fd = fileno()
-        except (OSError, ValueError, AttributeError):
-            return None
-        return fd if isinstance(fd, int) and fd >= 0 else None
 
     def _ensure_thread(self) -> None:
         if self._thread is not None:
@@ -381,6 +375,8 @@ class PythonSupervisor(SupervisorClient, LegacyExecutionBackend):
         self._execution_gate = BackendExecutionGate(supervisor_name)
         self._debug_request_context: dict[int, dict[str, Any]] = {}
         self._defer_next_submit_finalization = False
+        self._caller_loop_tool_calls: set[concurrent.futures.Future[Any]] = set()
+        self._caller_loop_tool_calls_lock = threading.Lock()
 
     def defer_next_submit_finalization(self) -> None:
         self._defer_next_submit_finalization = True
@@ -402,11 +398,14 @@ class PythonSupervisor(SupervisorClient, LegacyExecutionBackend):
         *,
         timeout: float | None = None,
     ) -> Any:
+        token = _CALLER_LOOP.set(asyncio.get_running_loop())
         try:
             return await asyncio.to_thread(self.execute, code, variables, timeout=timeout)
         except asyncio.CancelledError:
             self._abort_supervisor_after_cancellation()
             raise
+        finally:
+            _CALLER_LOOP.reset(token)
 
     def mount_file_at(self, host_path: str, virtual_path: str) -> None:
         self.adapter.copy_to(host_path, virtual_path)
@@ -455,6 +454,7 @@ class PythonSupervisor(SupervisorClient, LegacyExecutionBackend):
                 process.wait(timeout=5)
             except Exception:
                 process.kill()
+        self._retire_pending_tool_calls()
         if self._stdout_reader is not None:
             self._stdout_reader.close()
         self._process = None
@@ -475,6 +475,7 @@ class PythonSupervisor(SupervisorClient, LegacyExecutionBackend):
                 process.wait(timeout=1)
             except Exception:
                 pass
+        self._retire_pending_tool_calls()
         if self._stdout_reader is not None:
             self._stdout_reader.close()
         self._process = None
@@ -731,7 +732,11 @@ class PythonSupervisor(SupervisorClient, LegacyExecutionBackend):
             request_timeout=request_timeout,
             response=response,
         )
-        if not predict_rlm_debug_enabled() or method != "execute":
+        if method != "execute":
+            return
+        if self._execute_response_kind(response) == "structured_timeout":
+            self._retire_pending_tool_calls()
+        if not predict_rlm_debug_enabled():
             return
         result = response.get("result") if isinstance(response, dict) else None
         output = result.get("output") if isinstance(result, dict) else None
@@ -939,18 +944,9 @@ class PythonSupervisor(SupervisorClient, LegacyExecutionBackend):
     ) -> str | None:
         if self._stdout_reader is None or self._stdout_reader.process is not process:
             self._stdout_reader = _TimeoutLineReader(process)
-        return self._stdout_reader.readline(timeout)
-
-    def _handle_supervisor_control_message(
-        self,
-        message: dict[str, Any],
-        *,
-        deadline: float,
-    ) -> bool:
-        if message.get("method") != "tool_call":
-            return False
-        self._write_tool_response(self._build_tool_response(message, deadline=deadline))
-        return True
+        if not self._pending_tool_calls:
+            return self._stdout_reader.readline(timeout)
+        return self._stdout_reader.readline(min(timeout, TOOL_CALL_POLL_SECONDS)) or ""
 
     def _kill_process_after_timeout(self, process: RunnerProcess) -> None:
         self._debug_event(
@@ -970,6 +966,7 @@ class PythonSupervisor(SupervisorClient, LegacyExecutionBackend):
                 "discard",
                 **_process_debug_metadata(process),
             )
+        self._retire_pending_tool_calls()
         if self._stdout_reader is not None:
             self._stdout_reader.close()
         self._process = None
@@ -997,14 +994,9 @@ class PythonSupervisor(SupervisorClient, LegacyExecutionBackend):
             diagnostic = f"{diagnostic}\n[supervisor stderr before restart]\n{stderr.rstrip()}"
         return diagnostic
 
-    def _build_tool_response(
-        self,
-        message: dict[str, Any],
-        *,
-        deadline: float | None = None,
-    ) -> dict[str, Any]:
-        request_id = message.get("id")
-        params = message.get("params") or {}
+    def _build_tool_response(self, request: dict[str, Any]) -> dict[str, Any]:
+        request_id = request.get("id")
+        params = request.get("params") or {}
         name = params.get("name")
         try:
             if name not in self.tools:
@@ -1013,12 +1005,7 @@ class PythonSupervisor(SupervisorClient, LegacyExecutionBackend):
             args = list(params.get("args") or [])
             kwargs = dict(params.get("kwargs") or {})
             with self._execution_gate.tool_callback():
-                result = self._run_host_tool_with_deadline(
-                    tool,
-                    args,
-                    kwargs,
-                    deadline=deadline,
-                )
+                result = self._call_host_tool(tool, args, kwargs)
             is_json = result is None or isinstance(result, (dict, list, int, float, bool))
             return {
                 "jsonrpc": "2.0",
@@ -1040,61 +1027,34 @@ class PythonSupervisor(SupervisorClient, LegacyExecutionBackend):
                 },
             }
 
-    def _run_host_tool_with_deadline(
+    def _call_host_tool(
         self,
         tool: Callable[..., Any],
         args: list[Any],
         kwargs: dict[str, Any],
-        *,
-        deadline: float | None,
     ) -> Any:
-        if deadline is None:
-            result = tool(*args, **kwargs)
-            if inspect.isawaitable(result):
-                result = asyncio.run(result)
+        result = tool(*args, **kwargs)
+        if not inspect.isawaitable(result):
             return result
-
-        remaining = deadline - time.monotonic()
-        callback_budget = remaining - HOST_TOOL_TIMEOUT_RESPONSE_MARGIN_SECONDS
-        if callback_budget <= 0:
-            raise _HostToolTimeoutError(
-                "Host tool call timed out before dispatch because the "
-                f"{self._supervisor_name} request deadline was exhausted"
-            )
-
-        result_queue: queue.Queue[tuple[str, Any]] = queue.Queue(maxsize=1)
-
-        def run() -> None:
-            try:
-                result = tool(*args, **kwargs)
-                if inspect.isawaitable(result):
-                    result = asyncio.run(result)
-            except BaseException as exc:
-                result_queue.put(("error", exc))
-            else:
-                result_queue.put(("result", result))
-
-        thread = threading.Thread(
-            target=run,
-            name="python-runner-host-tool",
-            daemon=True,
-        )
-        thread.start()
+        caller_loop = _CALLER_LOOP.get()
+        if caller_loop is None:
+            return asyncio.run(result)
+        future = asyncio.run_coroutine_threadsafe(result, caller_loop)
+        with self._caller_loop_tool_calls_lock:
+            self._caller_loop_tool_calls.add(future)
         try:
-            kind, value = result_queue.get(timeout=max(0.0, callback_budget))
-        except queue.Empty as exc:
-            raise _HostToolTimeoutError(
-                "Host tool call timed out after exhausting the remaining "
-                f"{self._supervisor_name} request budget "
-                f"({callback_budget:g}s plus a "
-                f"{HOST_TOOL_TIMEOUT_RESPONSE_MARGIN_SECONDS:g}s response margin). "
-                "The tool runs in a single-use daemon thread, so Python cannot "
-                "forcibly stop underlying provider or library work that ignores "
-                "cancellation."
-            ) from exc
-        if kind == "error":
-            raise value
-        return value
+            return future.result()
+        finally:
+            with self._caller_loop_tool_calls_lock:
+                self._caller_loop_tool_calls.discard(future)
+
+    def _retire_pending_tool_calls(self) -> None:
+        """Drop the answers of in-flight calls and cancel those on the caller's loop."""
+        self._quarantine_sync_tool_calls()
+        with self._caller_loop_tool_calls_lock:
+            caller_loop_calls = tuple(self._caller_loop_tool_calls)
+        for future in caller_loop_calls:
+            future.cancel()
 
     def _write_tool_response(self, response: dict[str, Any]) -> None:
         process = self._require_process()
