@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import dataclasses
+from decimal import Decimal
 from enum import Enum
 from typing import Any
 
@@ -14,6 +15,11 @@ def to_plain_data(value: Any) -> Any:
     transport. Unknown objects are deliberately preserved so backend-specific
     literal/transport code can fail with a precise unsupported-type error.
     """
+    if isinstance(value, Decimal):
+        # JSON has no decimal type.  Preserve exact precision for evidence and
+        # transport by using the same string representation as Pydantic JSON.
+        return str(value)
+
     if _is_pydantic_v2_model(value):
         return to_plain_data(_model_dump(value))
 
@@ -52,6 +58,9 @@ def _is_pydantic_v1_model(value: Any) -> bool:
 
 def _model_dump(value: Any) -> Any:
     try:
-        return value.model_dump(mode="python")
+        # Evidence is recorded as JSON.  Pydantic's JSON mode converts rich
+        # standard values such as Decimal and date without losing their stable
+        # wire representation.
+        return value.model_dump(mode="json")
     except TypeError:
         return value.model_dump()
