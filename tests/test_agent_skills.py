@@ -72,6 +72,25 @@ class TestSkillFromDir:
         with pytest.raises(ValueError, match="must match its folder name"):
             Skill.from_dir(folder)
 
+    def test_name_matches_symlink_name_not_its_target(self, tmp_path: Path):
+        target = _write_skill(
+            tmp_path / "store", "invoice-totals-v2", "name: invoice-totals\ndescription: d"
+        )
+        link = tmp_path / "invoice-totals"
+        link.symlink_to(target, target_is_directory=True)
+
+        skill = Skill.from_dir(link)
+
+        assert skill.name == "invoice-totals"
+        assert skill.path == target.resolve()
+
+    def test_current_directory_uses_its_own_name(
+        self, invoice_skill_dir: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        monkeypatch.chdir(invoice_skill_dir)
+
+        assert Skill.from_dir(".").name == "invoice-totals"
+
     def test_missing_description_is_rejected(self, tmp_path: Path):
         folder = _write_skill(tmp_path, "no-desc", "name: no-desc")
         with pytest.raises(ValidationError, match="description"):

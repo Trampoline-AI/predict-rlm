@@ -32,6 +32,7 @@ Example::
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from typing import Any
 
@@ -78,16 +79,17 @@ class Skill(BaseModel):
     @classmethod
     def from_dir(cls, path: str | Path) -> Skill:
         """Load a skill from a folder containing a ``SKILL.md``."""
+        folder_name = Path(os.path.abspath(path)).name
         folder = Path(path).resolve()
         skill_file = folder / SKILL_FILE
         if not skill_file.is_file():
             raise FileNotFoundError(f"No {SKILL_FILE} in skill folder: {folder}")
 
         frontmatter, body = _split_frontmatter(skill_file.read_text(encoding="utf-8-sig"))
-        if frontmatter.get("name") != folder.name:
+        if frontmatter.get("name") != folder_name:
             raise ValueError(
                 f"Skill name {frontmatter.get('name')!r} in {skill_file} must match its "
-                f"folder name {folder.name!r}"
+                f"folder name {folder_name!r}"
             )
         return cls(
             name=frontmatter["name"],
