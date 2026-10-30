@@ -229,7 +229,7 @@ rlm = PredictRLM(MySignature, modules=[remote_workspace_module])
 ```
 
 `PredictRLM(modules=...)` contributes host-side runtime behavior. It is distinct
-from `Skill.modules`, which copies Python modules into the sandbox for generated
+from `Capability.modules`, which copies Python modules into the sandbox for generated
 code to import.
 
 ## Design checklist

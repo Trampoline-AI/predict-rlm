@@ -9,9 +9,9 @@ from unittest.mock import MagicMock
 import pytest
 
 from predict_rlm import PredictRLM
-from predict_rlm.rlm_skills import Skill
+from predict_rlm.capabilities import Capability
 
-SLUGIFY_SKILL = Skill(
+SLUGIFY_CAPABILITY = Capability(
     name="slugify",
     instructions="Use python-slugify when converting text into URL slugs.",
     packages=["python-slugify"],
@@ -53,10 +53,10 @@ def _real_sbx_available() -> bool:
     )
 
 
-def _run_skill_package_rlm(**kwargs) -> None:
+def _run_capability_package_rlm(**kwargs) -> None:
     actions = SequentialActions(
         SimpleNamespace(
-            plan="import and use the package declared by the skill",
+            plan="import and use the package declared by the capability",
             code=SLUGIFY_CODE,
         )
     )
@@ -64,7 +64,7 @@ def _run_skill_package_rlm(**kwargs) -> None:
         "prompt -> answer",
         sub_lm=MagicMock(),
         max_iterations=1,
-        skills=[SLUGIFY_SKILL],
+        capabilities=[SLUGIFY_CAPABILITY],
         **kwargs,
     )
     rlm.generate_action = actions
@@ -77,10 +77,10 @@ def _run_skill_package_rlm(**kwargs) -> None:
 
 @pytest.mark.integration
 @pytest.mark.skipif(
-    shutil.which("deno") is None, reason="JSPI skill-package test requires Deno"
+    shutil.which("deno") is None, reason="JSPI capability-package test requires Deno"
 )
-def test_predict_rlm_installs_skill_packages_in_jspi_sandbox() -> None:
-    _run_skill_package_rlm()
+def test_predict_rlm_installs_capability_packages_in_jspi_sandbox() -> None:
+    _run_capability_package_rlm()
 
 
 @pytest.mark.sbx
@@ -89,15 +89,15 @@ def test_predict_rlm_installs_skill_packages_in_jspi_sandbox() -> None:
     not _real_sbx_available(),
     reason="real SBX tests require PREDICT_RLM_RUN_SBX_TESTS=1, sbx CLI, and sbx login",
 )
-def test_predict_rlm_installs_skill_packages_in_sbx_pool_sandbox() -> None:
+def test_predict_rlm_installs_capability_packages_in_sbx_pool_sandbox() -> None:
     from predict_rlm import SbxConfig, SbxPool
 
     pool = SbxPool(
         size=1,
-        config=SbxConfig(name=f"predict-rlm-skill-package-pool-{os.getpid()}"),
+        config=SbxConfig(name=f"predict-rlm-capability-package-pool-{os.getpid()}"),
         preinstall_packages=False,
     )
     try:
-        _run_skill_package_rlm(sandbox_backend="sbx", sbx_pool=pool)
+        _run_capability_package_rlm(sandbox_backend="sbx", sbx_pool=pool)
     finally:
         pool.shutdown()

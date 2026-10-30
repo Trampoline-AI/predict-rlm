@@ -114,8 +114,9 @@ codex-lm usage
   calls using native provider multimodal APIs.
 - **Async tool calling** — native RLM async support in the WASM sandbox,
   enabling concurrent sub-LM invocations and tool calls.
-- **Skills & tools** — bundle domain instructions, PyPI packages, sandbox
-  modules, and host-side tools for reusable task capabilities.
+- **Capabilities, skills & tools** — bundle domain instructions, PyPI packages,
+  sandbox modules, and host-side tools as reusable capabilities, and load Agent
+  Skills (`SKILL.md`) on demand.
 - **Simple file I/O** — pass local files and mutable workspaces as typed inputs,
   and return generated artifacts through `File` outputs.
 - **Structured sub-LM calls** — native Pydantic and DSPy signature support for
@@ -347,10 +348,10 @@ The native execution stack uses a persistent supervisor plus a persistent Python
 See [predict-rlm Architecture](ARCHITECTURE.md) for the component model,
 timeout behavior, and shared backend contracts.
 
-### Using the spreadsheet skill
+### Using the spreadsheet capability
 
-The optimized spreadsheet skill is built in. Import it and pass it through
-`skills=[spreadsheet]` so the RLM gets the spreadsheet-specific instructions,
+The optimized spreadsheet capability is built in. Import it and pass it through
+`capabilities=[spreadsheet]` so the RLM gets the spreadsheet-specific instructions,
 `openpyxl`, `pandas`, `formulas`, and the `formula_eval` verification module
 inside its sandbox.
 
@@ -358,7 +359,7 @@ inside its sandbox.
 import dspy
 
 from predict_rlm import CtxStr, File, PredictRLM
-from predict_rlm.skills import spreadsheet
+from predict_rlm.capabilities import spreadsheet
 
 
 class UpdateWorkbook(dspy.Signature):
@@ -377,7 +378,7 @@ rlm = PredictRLM(
     UpdateWorkbook,
     lm="openai/gpt-5.4",
     sub_lm="openai/gpt-5.1",
-    skills=[spreadsheet],
+    capabilities=[spreadsheet],
 )
 
 result = rlm(
@@ -388,12 +389,12 @@ result = rlm(
 print(result.updated_workbook.path)
 ```
 
-For workflows that combine source documents and spreadsheets, compose skills:
+For workflows that combine source documents and spreadsheets, compose capabilities:
 
 ```python
-from predict_rlm.skills import pdf, spreadsheet
+from predict_rlm.capabilities import pdf, spreadsheet
 
-rlm = PredictRLM(ProcessInvoices, skills=[pdf, spreadsheet])
+rlm = PredictRLM(ProcessInvoices, capabilities=[pdf, spreadsheet])
 ```
 
 ## Lifecycle callbacks
@@ -504,8 +505,10 @@ invariant; extend the shared contract instead of copying it into backend suites.
 - [How it works](docs/how-it-works.md) — understand the sandbox, REPL loop,
   signatures, and file I/O
 - [API reference](docs/api.md) — constructor params for `PredictRLM`, `File`,
-  `CtxStr`, and `Skill`
-- [Skills](docs/skills.md) — define, compose, and mount custom skills
-- [RLM-GEPA](src/rlm_gepa/README.md) — optimize RLM skills from traces and
+  `CtxStr`, `Capability`, and `Skill`
+- [Capabilities](docs/capabilities.md) — define, compose, and mount packages,
+  modules, and tools
+- [Skills](docs/skills.md) — load Agent Skills (`SKILL.md`) on demand
+- [RLM-GEPA](src/rlm_gepa/README.md) — optimize RLM capability instructions from traces and
   configure `AgentSpec`
 - [Examples](examples/) — end-to-end demos with setup instructions

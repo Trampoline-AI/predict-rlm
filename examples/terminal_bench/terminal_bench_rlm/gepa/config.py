@@ -92,7 +92,7 @@ def _terminal_bench_tool_signatures() -> str:
     return (
         f"DaytonaRemotePredictRLMAgent.__init__{init_sig}\n"
         "Constructs a Daytona remote PredictRLM-backed Harbor agent. The optimized "
-        "`skill_instructions` component is passed as a PredictRLM Skill.\n\n"
+        "`skill_instructions` component is passed as a PredictRLM Capability.\n\n"
         f"DaytonaRemotePredictRLMAgent.run{task_sig}\n"
         "Runs the RLM controller inside Daytona for Terminal-Bench 2.x tasks."
     )

@@ -6,15 +6,15 @@ description: >-
   build a train/validation optimization harness, configure AgentSpec or
   OptimizeConfig, run optimize --check, or inspect RLM-GEPA run artifacts. For
   creating the base RLM itself, use rlm first.
-compatibility: Requires Python 3.11+, Deno 2, predict-rlm[gepa] 0.8.0-alpha0 or newer, and a working PredictRLM.
+compatibility: Requires Python 3.11+, Deno 2, predict-rlm[gepa] 0.14.0 or newer, and a working PredictRLM.
 metadata:
   author: Emile Riberdy
-  version: "1.0"
+  version: "2.0"
 ---
 
 # Optimize an RLM with RLM-GEPA
 
-RLM-GEPA improves reusable text components, usually a `Skill.instructions`
+RLM-GEPA improves reusable text components, usually a `Capability.instructions`
 string, using scored executions of a real PredictRLM. It is not a replacement
 for initial RLM design. Start only after the base RLM has a concrete signature,
 tools, a measurable outcome, and a working smoke path.
@@ -37,7 +37,7 @@ Keep those concerns separate.
 Use RLM-GEPA when the user wants a reusable behavior to improve and can provide:
 
 - a working PredictRLM with its real DSPy signature and tool surface;
-- a text component worth optimizing, such as domain skill instructions;
+- a text component worth optimizing, such as domain capability instructions;
 - representative examples and a deterministic or carefully designed score;
 - concrete feedback for imperfect outputs.
 
@@ -86,7 +86,7 @@ failure surfaces. Do not key instructions on task IDs, file names, row counts,
 or answer artifacts.
 
 ```python
-from predict_rlm import PredictRLM, Skill
+from predict_rlm import Capability, PredictRLM
 from rlm_gepa import agent_spec_from_rlm
 
 
@@ -100,7 +100,7 @@ def build_rlm(skill_instructions: str, *, lm=None, sub_lm=None, max_iterations: 
         sub_lm=sub_lm,
         max_iterations=max_iterations,
         verbose=False,
-        skills=[Skill(name="document-analysis", instructions=skill_instructions)],
+        capabilities=[Capability(name="document-analysis", instructions=skill_instructions)],
     )
 
 
@@ -214,7 +214,7 @@ Keep optimization code local to the generated project:
 
 ```text
 my_rlm/
-├── agent/             # Existing PredictRLM signature, service, skills, tools
+├── agent/             # Existing PredictRLM signature, service, capabilities, tools
 ├── bench/             # Examples, split policy, deterministic scorer
 └── gepa/
     ├── __init__.py

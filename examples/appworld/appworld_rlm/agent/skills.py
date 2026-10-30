@@ -5,7 +5,7 @@ from importlib import resources
 from pathlib import Path
 from typing import Any
 
-from predict_rlm import Skill
+from predict_rlm import Capability
 
 _ICL_DEMO_TASK_IDS_ASSET = "assets/appworld_icl_demo_task_ids.json"
 
@@ -323,8 +323,8 @@ def get_appworld_skill_instructions(data_root: Path | str | None = None) -> str:
     return APPWORLD_SKILL_BASE_INSTRUCTIONS + "\n" + render_official_icl_demos(data_root=data_root)
 
 
-def get_appworld_skill(data_root: Path | str | None = None) -> Skill:
-    return Skill(
+def get_appworld_skill(data_root: Path | str | None = None) -> Capability:
+    return Capability(
         name="appworld",
         instructions=get_appworld_skill_instructions(data_root=data_root),
     )

@@ -28,7 +28,7 @@ collect the example-local test directories.
 
 | Collection root | Test modules | Test functions | Collected cases | Purpose |
 | --- | ---: | ---: | ---: | --- |
-| `tests/` | 45 | 315 | 388 | Default package regression suite: PredictRLM, execution backends, Codex LM, and RLM-GEPA. |
+| `tests/` | 47 | 377 | 507 | Default package regression suite: PredictRLM, execution backends, Codex LM, and RLM-GEPA. |
 | `examples/terminal_bench/tests/` | 8 | 136 | 136 | Terminal-Bench agents, controller adapters, local runner, scoring, and harness integration seams. |
 | `examples/spreadbench/tests/` | 6 | 42 | 43 | Spreadsheet recalculation/rendering and example evaluation configuration. |
 | `examples/appworld/tests/` | 1 | 47 | 47 | AppWorld task/session integration, evaluation, scoring, and fixture-backed project behavior. |
@@ -107,12 +107,12 @@ number actually executed.
 
 | Selection | Collected locally | Selected by current CI |
 | --- | ---: | ---: |
-| Core | 167 | 166 |
-| SBX, non-integration | 63 | 60 |
-| GEPA, non-integration | 43 | 43 |
+| Core | 251 | 250 |
+| SBX, non-integration | 70 | 67 |
+| GEPA, non-integration | 52 | 52 |
 | Codex LM, non-integration | 46 | 46 |
-| JSPI integration | 47 | 46 |
-| Real SBX integration | 22 | No standing job |
+| JSPI integration | 60 | 59 |
+| Real SBX integration | 28 | No standing job |
 
 **Bootstrap exception:** the five Docker bootstrap cases are currently unmarked.
 They appear in core/non-integration collections but skip unless
@@ -201,7 +201,8 @@ it does not mean they contact a live model provider.
 | [test_empty_code_retry.py](../tests/test_empty_code_retry.py) | 3 | Core | Invalid actions recover through the chat-to-JSON adapter fallback, persistently invalid responses exhaust recovery, and empty custom-predictor code is rejected before execution. |
 | [test_in_context.py](../tests/test_in_context.py) | 12 | Core | `CtxStr` adapter precedence and ambiguity; delimiter collisions; prepared versus final bound values; concurrent and sequential run-local predictor/signature isolation; invalid prompt-hook returns; rejection of non-string, optional, and output `CtxStr` declarations. These are host-side prompt construction contracts, not LM comprehension tests. |
 | [test_callbacks.py](../tests/test_callbacks.py) | 7 | Core + JSPI | Paired iteration events and shared call IDs; end events on execution failure; awaiting asynchronous handlers; handling async callbacks on the sync path; handler failure isolation; delivery of actual sandbox output to callbacks. |
-| [test_rlm_skills.py](../tests/test_rlm_skills.py) | 4 | Core + JSPI | Multiple skills execute together in an RLM run; duplicate tool/module ownership is rejected; a skill cannot silently replace a user tool. Package installation is covered separately below. |
+| [test_capabilities.py](../tests/test_capabilities.py) | 4 | Core + JSPI | Multiple capabilities execute together in an RLM run; duplicate tool/module ownership is rejected; a capability cannot silently replace a user tool. Package installation is covered separately below. |
+| [test_agent_skills.py](../tests/test_agent_skills.py) | 29 | Core + JSPI | `SKILL.md` frontmatter parsing and validation, including the folder-name check through symlinks; capability fields on `Skill` are rejected; only name and description reach the prompt; `load_skill()` returns instructions and file list; skill name and tool conflicts; skill folders are mounted at `/sandbox/skills/<name>/` on sync, async, and direct Python backend runs. |
 
 ### Runtime kernel, adapters, files, and workspaces
 
@@ -237,7 +238,7 @@ execute/state/tool/file scenarios.
 | [test_iteration_execution_timeout.py](../tests/test_iteration_execution_timeout.py) | 7 | Core + JSPI | Bounded failure of silent JSPI timeout recovery; a real PredictRLM deadline preserves state/history/output and permits later `predict()` use; suspended execution and CPU-bound child coroutines from `exec`, imported modules, and async generators recover without losing state or the previous SIGINT handler; non-finite LM-selected deadlines fail before executing code. |
 | [test_tool_call_timeout.py](../tests/test_tool_call_timeout.py) | 3 | Core | Hung asynchronous tools return bounded errors; a timed-out synchronous worker does not poison later executor work; evidence-wrapped sync tool deadlines return without waiting for the still-live worker. Uses real tasks/threads with controlled backend seams. |
 | [test_runtime_hooks.py](../tests/test_runtime_hooks.py) | 3 | Core | Real local supervisor hook registration, before/after events for file/subprocess operations, clearing hooks, suppression of internal capture operations, and error events for failed user operations. |
-| [test_skill_package_integration.py](../tests/test_skill_package_integration.py) | 2 | JSPI + real SBX | A skill installs `python-slugify`, imports it in generated code, and returns a result through PredictRLM. Covers JSPI and an opt-in real SBX pool; not a fake package-list assertion. |
+| [test_capability_package_integration.py](../tests/test_capability_package_integration.py) | 2 | JSPI + real SBX | A capability installs `python-slugify`, imports it in generated code, and returns a result through PredictRLM. Covers JSPI and an opt-in real SBX pool; not a fake package-list assertion. |
 | [test_bootstrap_controller.py](../tests/test_bootstrap_controller.py) | 5 | Core selection; Docker opt-in | Build fixture images to exercise Python/venv/controller bootstrap on Alpine, Python 3.13 slim, and Ubuntu without Python; reject unsupported BusyBox package management and a non-root environment needing privileged repair. Docker builds install dependencies and can require network access. |
 
 ### Traces, telemetry, and cancellation evidence

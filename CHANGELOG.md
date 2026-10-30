@@ -7,6 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **BREAKING:** `Skill` (bundles of instructions, packages, modules, and tools)
+  is renamed to `Capability`, and `PredictRLM(skills=...)` for those bundles is
+  now `PredictRLM(capabilities=...)`. The built-in `pdf`, `spreadsheet`, and
+  `docx` bundles moved from `predict_rlm.skills` to `predict_rlm.capabilities`.
+  Prompt sections are headed `## Capabilities` / `## Capability: <name>`.
+  `predict_rlm.rlm_skills` is removed; import `Capability` and
+  `merge_capabilities` from `predict_rlm.capabilities`. There is no shim:
+  constructing the new `Skill` with `packages`, `modules`, or `tools` raises
+  `TypeError` pointing to `Capability`.
+
+  | Before                                    | After                                           |
+  | ----------------------------------------- | ----------------------------------------------- |
+  | `from predict_rlm import Skill`           | `from predict_rlm import Capability`            |
+  | `Skill(name=..., instructions=..., ...)`  | `Capability(name=..., instructions=..., ...)`   |
+  | `PredictRLM(..., skills=[...])`           | `PredictRLM(..., capabilities=[...])`           |
+  | `from predict_rlm.skills import pdf`      | `from predict_rlm.capabilities import pdf`      |
+  | `from predict_rlm.rlm_skills import ...`  | `from predict_rlm.capabilities import ...`      |
+
+### Added
+
+- `Skill` now follows the [Agent Skills](https://agentskills.io) format. Load a
+  `SKILL.md` folder with `Skill.from_dir(path)` and pass it with
+  `PredictRLM(skills=[...])`. Only each skill's name and description go in the
+  prompt; the RLM calls the built-in `load_skill(name)` tool for the
+  instructions and file list, and skill folders are mounted at
+  `/sandbox/skills/<name>/`.
+- `pyyaml` is now a direct dependency (used to parse `SKILL.md` frontmatter).
+
 ## [0.13.2] - 2026-10-30
 
 ### Fixed

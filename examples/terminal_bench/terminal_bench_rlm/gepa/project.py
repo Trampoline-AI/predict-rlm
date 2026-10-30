@@ -678,7 +678,7 @@ class TerminalBenchGepaProject(RLMGepaProject):
         if component_name == COMPONENT_SKILL:
             return (
                 "terminal/container problem-solving instructions injected into "
-                "the PredictRLM agent as a Skill"
+                "the PredictRLM agent as a Capability"
             )
         return ""
 

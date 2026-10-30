@@ -23,7 +23,8 @@ rlm = PredictRLM(
     execution=None,           # Custom root execution backend
     modules=(),               # Runtime contributions or factories
     events=(),                # Ordered lifecycle event sinks
-    skills=None,              # List of Skill instances
+    capabilities=None,        # List of Capability instances
+    skills=None,              # List of Agent Skills (SKILL.md)
     allowed_domains=None,     # Domains the sandbox can access
     debug=False,              # Print timestamped lifecycle diagnostics
     output_dir=None,          # Collection root for generated File outputs
@@ -49,7 +50,8 @@ rlm = PredictRLM(
 | `execution`        | `ExecutionBackend \| None`                       | `None`   | Preferred option for session-native execution integrations. CodeInterpreter-shaped compatibility integrations belong under `interpreter=`.                                                                       |
 | `modules`          | `Sequence[RuntimeContribution \| RuntimeModule]` | `()`     | Runtime contributions or zero-argument factories. Factories expand once at construction.                                                                                                                          |
 | `events`           | `Sequence[EventSink]`                            | `()`     | Ordered lifecycle event sinks. Strict sinks are correctness-critical; non-strict sinks are best effort.                                                                                                           |
-| `skills`           | `list[Skill] \| None`                            | `None`   | [Skills](skills.md) providing domain-specific instructions, packages, and tools. Merged automatically.                                                                                                            |
+| `capabilities`     | `list[Capability] \| None`                       | `None`   | [Capabilities](capabilities.md) providing domain-specific instructions, packages, modules, and tools. Merged automatically.                                                                                       |
+| `skills`           | `list[Skill] \| None`                            | `None`   | [Agent Skills](skills.md). Only name and description go in the prompt; the RLM loads the rest with `load_skill()`.                                                                                                |
 | `allowed_domains`  | `list[str] \| None`                              | `None`   | Domains/IPs the sandbox can access via network. By default, no network access. Example: `["api.example.com", "192.168.1.100:8080"]`                                                                               |
 | `debug`            | `bool`                                           | `False`  | Print timestamped RLM and sandbox lifecycle diagnostics to stderr. Error-like debug records are colored red when the terminal supports ANSI colors.                                                               |
 | `output_dir`       | `str \| Path \| None`                            | `None`   | Constructor convenience that collects generated `File` and `list[File]` outputs under `<output_dir>/<field>/`. It does not redirect scalar/JSON outputs, logs, or traces. `FileOutputAdapter` is the lower-level configurable equivalent. |
@@ -636,16 +638,16 @@ how `CtxStr` composes with ordinary sandbox variables.
 
 ---
 
-## `Skill`
+## `Capability`
 
 Reusable bundle of instructions, packages, modules, and tools. See the
-[skills guide](skills.md) for detailed usage.
+[capabilities guide](capabilities.md) for detailed usage.
 
 ```python
-from predict_rlm import Skill
+from predict_rlm import Capability
 
-Skill(
-    name="my-skill",                        # short identifier (required)
+Capability(
+    name="my-capability",                   # short identifier (required)
     instructions="How to approach...",       # injected into the RLM prompt
     packages=["pandas", "pdfplumber"],       # installed in the sandbox
     modules={"helper": "/path/to/mod.py"},   # mounted as importable modules
@@ -657,8 +659,39 @@ Skill(
 
 | Field          | Type                  | Default | Description                                                                                                |
 | -------------- | --------------------- | ------- | ---------------------------------------------------------------------------------------------------------- |
-| `name`         | `str`                 | —       | Short identifier for the skill (e.g. `"pdf-extraction"`). Required.                                        |
+| `name`         | `str`                 | —       | Short identifier for the capability (e.g. `"pdf-extraction"`). Required.                                   |
 | `instructions` | `str`                 | `""`    | Prose instructions injected into the RLM prompt. Describes patterns, best practices, and domain knowledge. |
 | `packages`     | `list[str]`           | `[]`    | PyPI packages installed in the sandbox via `micropip` before the first code execution.                     |
 | `modules`      | `dict[str, str]`      | `{}`    | Python modules to mount in the sandbox. Maps import name to host filesystem path of the `.py` file.        |
 | `tools`        | `dict[str, Callable]` | `{}`    | Tool functions exposed to the RLM alongside `predict()`. Can be sync or async.                             |
+
+---
+
+## `Skill`
+
+An [Agent Skill](https://agentskills.io): a name and description shown in the
+prompt, with instructions and files loaded on demand. See the
+[skills guide](skills.md) for detailed usage.
+
+```python
+from predict_rlm import Skill
+
+Skill.from_dir("skills/invoice-totals")    # folder containing SKILL.md
+
+Skill(                                      # inline skill without files
+    name="tone-check",
+    description="Check reply tone. Use before submitting customer-facing text.",
+    instructions="Rewrite any sentence longer than 30 words...",
+)
+```
+
+### Fields
+
+| Field          | Type           | Default | Description                                                                                  |
+| -------------- | -------------- | ------- | -------------------------------------------------------------------------------------------- |
+| `name`         | `str`          | —       | Lowercase hyphenated identifier, up to 64 characters. Must match the folder name. Required.  |
+| `description`  | `str`          | —       | What the skill does and when to use it, 1–1024 characters. Always in the prompt. Required.   |
+| `instructions` | `str`          | —       | `SKILL.md` body, returned by `load_skill()`. Required.                                       |
+| `path`         | `Path \| None` | `None`  | Skill folder copied into the sandbox at `/sandbox/skills/<name>/`. Set by `Skill.from_dir`.  |
+
+Passing `packages`, `modules`, or `tools` raises `TypeError`; use `Capability` for those.

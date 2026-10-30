@@ -1,9 +1,9 @@
-"""Skills for the document redaction example."""
+"""Capabilities for the document redaction example."""
 
-from predict_rlm import Skill
-from predict_rlm.skills import pdf as pdf_skill
+from predict_rlm import Capability
+from predict_rlm.capabilities import pdf as pdf_capability
 
-redaction_skill = Skill(
+redaction_capability = Capability(
     name="redaction",
     instructions="""How to redact content from PDFs using pymupdf.
 
@@ -54,4 +54,4 @@ After applying redactions, re-render the page and verify visually:
 - Always close the document: doc.close()""",
 )
 
-__all__ = ["pdf_skill", "redaction_skill"]
+__all__ = ["pdf_capability", "redaction_capability"]

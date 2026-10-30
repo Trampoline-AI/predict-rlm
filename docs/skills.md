@@ -1,216 +1,102 @@
 # Skills
 
-Skills are the primary way to extend what an RLM can do inside its sandbox. The
-sandbox starts with just Python's standard library and `predict()` — skills add
-**PyPI packages**, **instructions**, **modules**, and **tools** on top.
+predict-rlm supports [Agent Skills](https://agentskills.io): folders with a
+`SKILL.md` that describe how to do a task, optionally with reference files,
+Python helpers, or data. The format is shared with Claude Code, the Claude Agent
+SDK, OpenAI Codex, and other agent frameworks, so the same skill folder works
+across runtimes.
 
-Skills are for **general capabilities** — teaching the RLM how to use a library
-or approach a domain. For single specialized functions (fetch a URL, query a
-database, call an API), use the `tools=` parameter directly instead.
+Skills differ from [capabilities](capabilities.md) in when their content reaches
+the model:
 
-## Defining a skill
+|                         | Capability                              | Skill                                    |
+| ----------------------- | --------------------------------------- | ---------------------------------------- |
+| In the prompt           | Full instructions                       | Name and description only                |
+| Loaded on demand        | —                                       | Instructions and files via `load_skill()` |
+| PyPI packages           | Installed in the sandbox                | —                                        |
+| Host tools              | Exposed alongside `predict()`           | —                                        |
+| Files                   | `.py` modules on `/sandbox/lib`         | Whole folder at `/sandbox/skills/<name>/` |
+
+Use a capability when the RLM always needs the guidance or a package. Use skills
+when you have many specialized playbooks and the RLM should pick the relevant
+ones itself.
+
+## Skill folder layout
+
+```
+invoice-totals/
+├── SKILL.md
+├── helper.py
+└── reference/
+    └── currencies.json
+```
+
+`SKILL.md` starts with YAML frontmatter, followed by the instructions in Markdown:
+
+```markdown
+---
+name: invoice-totals
+description: Reconcile invoice line items with the stated total. Use when an invoice total needs checking.
+---
+
+# Invoice totals
+
+1. Extract the line items with `predict()`.
+2. Load `reference/currencies.json` for the decimal places of each currency.
+3. Sum with `helper.total(items)` and compare with the stated total.
+```
+
+- `name` — required. Lowercase letters, digits, and single hyphens, up to 64
+  characters. It must match the folder name.
+- `description` — required, 1–1024 characters. It is the only text the RLM sees
+  before loading the skill, so say what the skill does **and when to use it**.
+- Other spec fields (`license`, `compatibility`, `metadata`, `allowed-tools`)
+  are accepted and ignored.
+
+## Using skills
 
 ```python
-from predict_rlm import Skill
-
-pdf_skill = Skill(
-    name="pdf",
-    instructions="Use pymupdf to open PDFs. Render pages as images (dpi=200) for analysis with predict().",
-    packages=["pymupdf"],
-)
+from predict_rlm import PredictRLM, Skill
 
 rlm = PredictRLM(
-    "documents -> tables: list[dict]",
+    "invoice: File -> total_matches: bool",
     lm="openai/gpt-5.4",
     sub_lm="openai/gpt-5.1",
-    skills=[pdf_skill],
+    skills=[Skill.from_dir("skills/invoice-totals")],
 )
 ```
 
-See the [API reference](api.md#skill) for the full list of `Skill` fields.
-
-## Composing skills
-
-Pass multiple skills and their instructions, packages, modules, and tools are
-merged automatically:
+You can also define a skill inline when it has no files:
 
 ```python
-data_skill = Skill(
-    name="data-analysis",
-    instructions="Use pandas for tabular data. Print df.head() to inspect before processing.",
-    packages=["pandas", "openpyxl"],
-)
-
-viz_skill = Skill(
-    name="visualization",
-    instructions="Use matplotlib for charts. Save figures to bytes, don't call plt.show().",
-    packages=["matplotlib"],
-)
-
-rlm = PredictRLM(
-    "spreadsheet, query -> analysis: str, chart: bytes",
-    lm="openai/gpt-5.4",
-    skills=[data_skill, viz_skill],
+Skill(
+    name="tone-check",
+    description="Check that a reply is polite and concise. Use before submitting customer-facing text.",
+    instructions="Rewrite any sentence longer than 30 words...",
 )
 ```
 
-When skills are merged:
+## How progressive disclosure works
 
-- **Instructions** are joined with section headers: `## Skill: {name}`
-- **Packages** are deduplicated (preserving order)
-- **Modules** are merged — duplicate import names raise `ValueError`
-- **Tools** are merged — duplicate tool names raise `ValueError`
+1. The prompt gets a **Skills** section listing each skill's name and
+   description.
+2. When the task matches a description, the RLM calls
+   `print(await load_skill("invoice-totals"))`. The tool returns the `SKILL.md`
+   body and the list of the skill's files; like any value in the sandbox, the
+   RLM only sees it once printed.
+3. Skill files are copied into the sandbox at `/sandbox/skills/<name>/`, so the
+   host folder is never modified. The RLM reads them with `open()` and can
+   import Python helpers by adding the folder to `sys.path`.
 
-## Sandbox modules
+`load_skill` is only registered when at least one skill is configured. Its
+calls appear in the run trace like any other tool call, so you can see which
+skills a run used.
 
-Skills can mount Python modules directly into the sandbox via the `modules`
-field. This lets you ship custom Python code that the RLM can `import` — without
-publishing it to PyPI.
+## Sandbox limits
 
-```python
-from pathlib import Path
+The sandbox runs [Pyodide](https://pyodide.org/), so:
 
-spreadsheet_skill = Skill(
-    name="spreadsheet",
-    instructions="Use openpyxl to build workbooks. Use formula_eval to verify formulas.",
-    packages=["openpyxl", "pandas", "formulas"],
-    modules={"formula_eval": str(Path(__file__).parent / "modules" / "formula_eval.py")},
-)
-```
-
-The key maps the **import name** to the **host filesystem path** of the `.py`
-file. Inside the sandbox, the module becomes importable:
-
-```python
-# Inside the sandbox, the RLM can write:
-from formula_eval import evaluate
-report = evaluate("output.xlsx")
-```
-
-## Skill tools
-
-Skills can expose tool functions to the RLM alongside the built-in `predict()`
-tool. Skill tools run on the host (not in the WASM sandbox), so they can access
-databases, APIs, the filesystem, or anything requiring native Python.
-
-```python
-async def fetch_document(doc_id: str) -> str:
-    """Fetch a document by ID and return its URL."""
-    return await my_storage.get_signed_url(doc_id)
-
-doc_skill = Skill(
-    name="document-access",
-    instructions="Use fetch_document(doc_id) to get document URLs.",
-    tools={"fetch_document": fetch_document},
-)
-```
-
-Tools can be sync or async (async preferred for I/O). Their full docstrings are
-extracted and formatted into the RLM's prompt, so descriptive docstrings help
-the RLM know when and how to call them.
-
-## Package compatibility
-
-The sandbox runs [Pyodide](https://pyodide.org/) (CPython compiled to
-WebAssembly), which supports **pure-Python packages** out of the box via
-micropip. Packages with C extensions only work if they ship a pre-built Pyodide
-wheel —
-[many popular ones do](https://pyodide.org/en/stable/usage/packages-in-pyodide.html)
-(numpy, pandas, scipy, Pillow, pymupdf, etc.), but packages that rely on system
-libraries without a Pyodide build (e.g. psycopg2, torch) cannot be installed in
-the sandbox.
-
-For these, expose the functionality as a **host-side tool** instead — the tool
-runs in your normal Python environment and the RLM calls it from the sandbox via
-the tool bridge.
-
-## Built-in skills
-
-predict-rlm ships a library of pre-built skills you can use directly:
-
-```python
-from predict_rlm.skills import pdf, spreadsheet, docx
-
-rlm = PredictRLM(MySignature, skills=[pdf, spreadsheet, docx])
-```
-
-| Skill           | Import                                       | Packages                         | Modules        | What it teaches the RLM                                                    |                                                          |
-| --------------- | -------------------------------------------- | -------------------------------- | -------------- | -------------------------------------------------------------------------- | -------------------------------------------------------- |
-| **pdf**         | `from predict_rlm.skills import pdf`         | `pymupdf`                        | —              | Read, render, modify, and redact PDFs                                      | [source](../src/predict_rlm/skills/pdf/skill.py)         |
-| **spreadsheet** | `from predict_rlm.skills import spreadsheet` | `openpyxl`, `pandas`, `formulas` | `formula_eval` | Build and modify Excel workbooks with formulas and formatting              | [source](../src/predict_rlm/skills/spreadsheet/skill.py) |
-| **docx**        | `from predict_rlm.skills import docx`        | `python-docx`                    | `md2docx`      | Read, write, and modify Word documents with tables, formatting, and styles | [source](../src/predict_rlm/skills/docx/skill.py)        |
-
-### pdf ([source](../src/predict_rlm/skills/pdf/skill.py))
-
-Uses [pymupdf](https://pymupdf.readthedocs.io/) for opening, inspecting,
-rendering, and modifying PDFs.
-
-Key patterns the skill teaches the RLM:
-
-- **Visual rendering** — always render pages as images (`dpi=200`) for analysis
-  with `predict()`, rather than relying on raw text extraction
-- **Text extraction** — use `get_text()` only for keyword searches and string
-  matching, not for understanding page content
-- **Parallel processing** — fan out `predict()` calls across multiple pages with
-  `asyncio.gather()`
-- **Document modification** — search-and-redact workflows using `search_for()`
-  and `add_redact_annot()`
-- **Metadata and structure** — access TOC, annotations, links, and page-level
-  metadata
-
-### spreadsheet ([source](../src/predict_rlm/skills/spreadsheet/skill.py))
-
-Uses [openpyxl](https://openpyxl.readthedocs.io/) for building and modifying
-Excel workbooks, [pandas](https://pandas.pydata.org/) for data manipulation, and
-[formulas](https://pypi.org/project/formulas/) for formula evaluation.
-
-Includes the
-[`formula_eval`](../src/predict_rlm/skills/spreadsheet/modules/formula_eval.py)
-sandbox module with two functions:
-
-- **`evaluate(path)`** — evaluates all formulas in a workbook and returns a
-  report:
-  `{"ok": bool, "formulas": int, "errors": int, "breakdown": dict, "computed": dict}`
-- **`ensure_recalc_on_open(path)`** — sets the `fullCalcOnLoad` flag so Excel
-  recalculates formulas when opened
-
-Key patterns the skill teaches the RLM:
-
-- **Formulas belong in Excel** — write Excel formulas (SUM, VLOOKUP, IF), don't
-  compute values in Python and paste static numbers
-- **Two libraries** — pandas for data operations, openpyxl for presentation and
-  formatting
-- **Structured assumptions** — each driver in a dedicated cell, referenced by
-  formulas
-- **Formula error guarding** — handle `#REF!`, `#DIV/0!`, `#VALUE!`, `#N/A`,
-  `#NAME?`
-- **Verification** — use `formula_eval.evaluate()` to verify formulas before
-  submitting
-
-### docx ([source](../src/predict_rlm/skills/docx/skill.py))
-
-Uses [python-docx](https://python-docx.readthedocs.io/) for reading, writing,
-and modifying Word documents.
-
-Includes the [`md2docx`](../src/predict_rlm/skills/docx/modules/md2docx.py)
-sandbox module with three functions:
-
-- **`add_markdown(doc, text)`** — convert markdown-formatted text into properly
-  styled Word elements (headings, bold, italic, code, lists, tables,
-  blockquotes)
-- **`add_styled_markdown(doc, text, confidence)`** — markdown with
-  confidence-based coloring (high=black, medium=orange, placeholder=red)
-- **`setup_document()`** — return a pre-configured document (1-inch margins,
-  Arial 11pt)
-
-Key patterns the skill teaches the RLM:
-
-- **Document structure** — headings (levels 0–9), bullet and numbered lists,
-  page breaks, sections
-- **Page layout** — paper size, margins, orientation, landscape pages
-  mid-document
-- **Tables** — column widths, cell merging, alternating row shading
-- **Headers/footers** — static text and dynamic page numbers via field codes
-- **Content extraction** — body text, table text, and combined document-order
-  extraction
-- **Hyperlinks** — via relationship and XML layers
+- Python and data files in a skill work.
+- Shell scripts and native binaries in a skill **cannot run**.
+- A skill cannot install packages. If its helpers need a PyPI package, add a
+  [capability](capabilities.md) that installs it.

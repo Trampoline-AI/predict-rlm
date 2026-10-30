@@ -40,7 +40,8 @@ src/predict_rlm/
 ├── runtime.py                 runtime contributions, adapters, root execution
 │                              backend and session contracts
 ├── _shared.py                 build_rlm_signatures()
-├── rlm_skills.py              Skill, merge_skills()
+├── capabilities/              Capability, merge_capabilities(), pdf/spreadsheet/docx
+├── skills/                    Skill (Agent Skills), load_skill tool, skill catalog
 ├── files.py                   File, SyncedFile
 ├── trace.py                   IterationStep, RunTrace
 ├── backends/
@@ -69,9 +70,13 @@ src/predict_rlm/
   action loop, exposes `predict()` to generated code, creates or leases the
   configured execution backend, and records trace output.
 - `build_rlm_signatures()` (`_shared.py`) builds the action/extract signatures
-  shown to the outer LM, including tool docs and skill instructions.
-- `Skill` and `merge_skills()` (`rlm_skills.py`) bundle reusable instructions,
-  PyPI packages, Python modules, and tools for the sandbox.
+  shown to the outer LM, including tool docs, capability instructions, and the
+  skill catalog.
+- `Capability` and `merge_capabilities()` (`capabilities/`) bundle reusable
+  instructions, PyPI packages, Python modules, and tools for the sandbox.
+- `Skill` (`skills/`) is an Agent Skill (`SKILL.md`): only its name and
+  description reach the prompt, `load_skill()` returns the instructions, and its
+  folder is mounted at `/sandbox/skills/<name>/`.
 
 ### Backend contract and selection
 

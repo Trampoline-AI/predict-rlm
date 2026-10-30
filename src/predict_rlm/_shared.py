@@ -96,12 +96,22 @@ Use lightweight caps: short probes are usually ~1-5 seconds, normal bounded work
 """
 
 
+def _optional_sections(capability_instructions: str, skill_catalog: str) -> str:
+    sections = ""
+    if capability_instructions:
+        sections += f"\n\n## Capabilities\n\n{capability_instructions}"
+    if skill_catalog:
+        sections += f"\n\n## Skills\n\n{skill_catalog}"
+    return sections
+
+
 def build_rlm_signatures(
     signature: Signature,
     instructions_template: str,
     user_tools: dict[str, Callable],
     format_tool_docs: Callable[[dict[str, Callable]], str],
-    skill_instructions: str = "",
+    capability_instructions: str = "",
+    skill_catalog: str = "",
     file_instructions: str = "",
     model_execution_timeout: bool = True,
     max_output_chars: int = 50_000,
@@ -125,7 +135,6 @@ def build_rlm_signatures(
     # Format tool documentation for user-provided tools
     tool_docs = format_tool_docs(user_tools)
 
-    # Build the full instructions with optional skill instructions
     full_instructions = (
         task_instructions
         + instructions_template.format(
@@ -141,8 +150,7 @@ def build_rlm_signatures(
     )
     if file_instructions:
         full_instructions += f"\n\n{file_instructions}"
-    if skill_instructions:
-        full_instructions += f"\n\n## Skills\n\n{skill_instructions}"
+    full_instructions += _optional_sections(capability_instructions, skill_catalog)
 
     action_sig = dspy.Signature({}, full_instructions)
     action_sig = action_sig.append(
@@ -210,8 +218,7 @@ def build_rlm_signatures(
     full_extract_instructions = extended_task_instructions + extract_instructions + tool_docs
     if file_instructions:
         full_extract_instructions += f"\n\n{file_instructions}"
-    if skill_instructions:
-        full_extract_instructions += f"\n\n## Skills\n\n{skill_instructions}"
+    full_extract_instructions += _optional_sections(capability_instructions, skill_catalog)
 
     extract_sig = dspy.Signature(
         {**signature.output_fields},

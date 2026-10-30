@@ -5,7 +5,7 @@ import json
 from collections.abc import Mapping
 from typing import Any
 
-from predict_rlm import Skill
+from predict_rlm import Capability
 from predict_rlm.evidence import RunEvidence, extract_evidence_from_exc
 from predict_rlm.trace import RunTrace, extract_trace_from_exc
 from rlm_gepa import EvaluationContext, RLMGepaExampleResult, RLMGepaProject
@@ -79,7 +79,7 @@ class AppWorldGepaProject(RLMGepaProject):
         example: AppWorldExample,
         context: EvaluationContext,
     ) -> RLMGepaExampleResult:
-        skill = Skill(name="appworld", instructions=candidate[COMPONENT_SKILL])
+        skill = Capability(name="appworld", instructions=candidate[COMPONENT_SKILL])
         trace: RunTrace | None = None
         evidence: RunEvidence | None = None
         agent = AppWorldRLM(

@@ -23,8 +23,8 @@ import dspy
 
 from predict_rlm import File, PredictRLM
 
+from .capabilities import pdf_capability, redaction_capability
 from .signature import RedactDocuments
-from .skills import pdf_skill, redaction_skill
 
 
 class DocumentRedactor(dspy.Module):
@@ -57,7 +57,7 @@ class DocumentRedactor(dspy.Module):
         predictor = PredictRLM(
             signature,
             sub_lm=self.sub_lm,
-            skills=[pdf_skill, redaction_skill],
+            capabilities=[pdf_capability, redaction_capability],
             max_iterations=self.max_iterations,
             verbose=self.verbose,
             debug=self.debug,

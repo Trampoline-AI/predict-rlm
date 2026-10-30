@@ -3,13 +3,13 @@ name: rlm
 description: >-
   Plan and build a new callable Recursive Language Model with predict-rlm. Use
   when a user wants to design an RLM, assess whether an RLM fits a workflow, or
-  implement an RLM package with structured boundaries, skills, host-side tools,
+  implement an RLM package with structured boundaries, capabilities, skills, host-side tools,
   custom adapters, or runtime-kernel extensions. For optimization of an existing
   RLM, use rlm-gepa instead.
-compatibility: Requires Python 3.11+, Deno 2, DSPy, and predict-rlm 0.8.0-alpha0 or newer.
+compatibility: Requires Python 3.11+, Deno 2, DSPy, and predict-rlm 0.14.0 or newer.
 metadata:
   author: Emile Riberdy
-  version: "3.0"
+  version: "4.0"
 ---
 
 # Create a PredictRLM
@@ -46,7 +46,7 @@ function contract, and its docstring is the operating procedure. On each call:
 3. Sandbox code can use `await predict(...)` for focused **sub-LM** perception
    or extraction. Each `predict()` call has its own context window and can use a
    typed DSPy signature, Pydantic schemas, and `dspy.Image`.
-4. Sandbox code can also use packages and modules supplied by `Skill` objects,
+4. Sandbox code can also use packages and modules supplied by `Capability` objects,
    call host-side tools for capabilities outside WASM, and access explicitly
    allowed network domains.
 5. When the work is complete, the outer LM calls `SUBMIT(...)`. PredictRLM
@@ -63,7 +63,7 @@ application call
     -> DSPy signature: inputs + strategy + outputs
     -> outer LM <-> stateful sandbox REPL
                      |-> predict() -> sub-LM
-                     |-> skill packages and modules
+                     |-> capability packages and modules
                      `-> host-side tools
     -> validated dspy.Prediction + trace
 ```
@@ -83,7 +83,7 @@ import dspy
 from pydantic import BaseModel, Field
 
 from predict_rlm import CtxStr, File, PredictRLM
-from predict_rlm.skills import pdf
+from predict_rlm.capabilities import pdf
 
 
 class Analysis(BaseModel):
@@ -107,7 +107,7 @@ rlm = PredictRLM(
     AnalyzeDocuments,
     lm="openai/gpt-5.4",
     sub_lm="openai/gpt-5.1",
-    skills=[pdf],
+    capabilities=[pdf],
     max_iterations=30,
 )
 
@@ -127,7 +127,8 @@ The main constructor surface is:
 - `signature` — a DSPy signature class or compact string signature;
 - `lm` — the outer LM that writes code;
 - `sub_lm` — the LM behind the built-in `predict()` tool;
-- `skills` — reusable instructions, PyPI packages, sandbox modules, and tools;
+- `capabilities` — reusable instructions, PyPI packages, sandbox modules, and tools;
+- `skills` — Agent Skills (`SKILL.md` folders) the outer LM loads on demand;
 - `tools` — sync or async host callables exposed inside the sandbox;
 - `allowed_domains` — the sandbox network allowlist, empty by default;
 - `max_iterations`, `max_llm_calls`, and `max_output_chars` — execution budgets;
@@ -137,15 +138,17 @@ The main constructor surface is:
 Use `File` or `list[File]` for large file inputs and generated artifacts. Use
 `CtxStr` for a direct string input, such as a rubric, whose full runtime value
 must be added to the outer LM prompt as well as exposed as a Python variable.
-Use a `Skill` when the sandbox needs reusable instructions, packages, modules,
-or bundled tools. Use `tools=` directly for specific host-side actions such as
-authenticated APIs, databases, native libraries, or host filesystem access.
+Use a `Capability` when the sandbox needs reusable instructions, packages,
+modules, or bundled tools. Use a `Skill` (`Skill.from_dir(path)`) for an Agent
+Skills folder whose instructions should only be loaded when relevant. Use
+`tools=` directly for specific host-side actions such as authenticated APIs,
+databases, native libraries, or host filesystem access.
 
 ## Runtime kernel and extension model
 
-Most RLMs should use only signatures, `File`, `CtxStr`, `Workspace`, skills, and
-host tools. Extend the kernel only when the workflow needs a new typed boundary,
-resource lifecycle, execution substrate, or correctness-critical event stream.
+Most RLMs should use only signatures, `File`, `CtxStr`, `Workspace`,
+capabilities, skills, and host tools. Extend the kernel only when the workflow
+needs a new typed boundary, resource lifecycle, execution substrate, or correctness-critical event stream.
 Do not reach for a custom adapter merely because a signature uses a Pydantic
 model.
 
@@ -197,7 +200,7 @@ Use the first boundary that can express the requirement:
 
 1. **Signature docstring or `CtxStr`** — task strategy or invocation-specific
    criteria the outer LM must read.
-2. **`Skill`** — reusable outer-LM instructions plus sandbox packages,
+2. **`Capability`** — reusable outer-LM instructions plus sandbox packages,
    importable Python modules, or bundled host tools.
 3. **`tools=`** — a narrow sync or async host callable. Use this for native
    libraries, credentials, APIs, databases, and host filesystem access. Return
@@ -340,7 +343,7 @@ rlm = PredictRLM(MySignature, modules=[document_runtime])
 ```
 
 `PredictRLM(modules=...)` composes host-side runtime behavior.
-`Skill.modules` is different: it copies Python files into the sandbox so
+`Capability.modules` is different: it copies Python files into the sandbox so
 generated code can import them. Contribution packages are deduplicated;
 duplicate adapter, tool, or tool-operation names are errors; and the resolved
 configuration must select exactly one execution backend.
@@ -467,7 +470,7 @@ Research autonomously, then report a clear feasibility assessment.
 4. Identify host-side needs. Put native libraries, authenticated APIs, database
    access, heavy host filesystem work, and unsupported packages behind typed
    host-side tools.
-5. Check whether `pdf`, `spreadsheet`, or `docx` built-in skills already cover
+5. Check whether `pdf`, `spreadsheet`, or `docx` built-in capabilities already cover
    the task.
 6. Check whether the boundary already fits `File`, `Workspace`, `CtxStr`, an
    existing adapter, or a `PreparedInput` path declaration before designing a
@@ -480,18 +483,18 @@ at implementation time: use a host-side tool or change the approach.
 
 Choose the smallest capability surface that makes the workflow work.
 
-### Built-in skills
+### Built-in capabilities
 
-State which built-in skills are needed and why:
+State which built-in capabilities are needed and why:
 
 - `pdf` for PDF rendering, text extraction, modification, and redaction;
 - `spreadsheet` for Excel workbooks, formulas, and formatting;
 - `docx` for reading and writing Word documents.
 
-### Custom skills
+### Custom capabilities
 
-Create a `Skill` only for a capability that can be reused across different
-RLMs. A skill teaches the model how to use one thing well—for example, how to
+Create a `Capability` only for a capability that can be reused across different
+RLMs. A capability teaches the model how to use one thing well—for example, how to
 inspect and modify PDFs, work with spreadsheets, or query a docket system. Its
 instructions should remain useful when attached unchanged to another RLM that
 needs the same capability.
@@ -504,18 +507,18 @@ requirements, verification steps, and completion criteria.
 Use this test:
 
 - If the guidance explains **how to use a reusable capability**, put it in a
-  `Skill`.
+  `Capability`.
 - If the guidance explains **what this RLM must do**, put it in the signature
   docstring.
 - If the text names this RLM's fields, output schema, one-off policy, or
   workflow stages, it is almost certainly signature-specific.
 
-Do not create a skill merely to move instructions out of a long signature, and
+Do not create a capability merely to move instructions out of a long signature, and
 do not duplicate the same guidance in both places. A one-off host callable
-belongs directly in `tools=`; bundle it into a skill only when the callable and
+belongs directly in `tools=`; bundle it into a capability only when the callable and
 its operating guidance form a capability other RLMs can reuse.
 
-For each genuinely reusable skill, specify:
+For each genuinely reusable capability, specify:
 
 - `name` — concise capability identifier;
 - `instructions` — general operating guidance independent of the current RLM;
@@ -524,7 +527,7 @@ For each genuinely reusable skill, specify:
 - `tools` — host callables that belong with the reusable capability.
 
 `instructions` should be an operating manual, not a short package description
-or list of functions. A useful skill normally includes:
+or list of functions. A useful capability normally includes:
 
 1. when to use the capability and how to choose among its approaches;
 2. an ordered workflow for inspecting, modifying, or producing artifacts;
@@ -532,19 +535,19 @@ or list of functions. A useful skill normally includes:
 4. correctness invariants and checks to perform before `SUBMIT`;
 5. known failure modes, sandbox limitations, and recovery guidance.
 
-Built-in skills are intentionally substantive: the PDF skill explains visual
-rendering versus text extraction and parallel `predict()` calls; the DOCX skill
-covers document structure, editing patterns, formatting traps, and limitations;
-the spreadsheet skill covers formula policy, recalculation, rendering, style
+Built-in capabilities are intentionally substantive: the PDF capability explains
+visual rendering versus text extraction and parallel `predict()` calls; the DOCX
+capability covers document structure, editing patterns, formatting traps, and
+limitations; the spreadsheet capability covers formula policy, recalculation, rendering, style
 preservation, and output verification.
 
 This reusable HTML capability shows the expected shape at a smaller scale:
 
 ```python
-from predict_rlm import Skill
+from predict_rlm import Capability
 
 
-html_skill = Skill(
+html_capability = Capability(
     name="html",
     instructions="""Use BeautifulSoup to inspect and extract static HTML documents.
 
@@ -637,7 +640,7 @@ If the workflow needs a custom runtime boundary, specify it in the plan rather
 than discovering it during implementation:
 
 - the caller-facing signature type and model-visible value;
-- why built-in files, workspaces, skills, or host tools are insufficient;
+- why built-in files, workspaces, capabilities, skills, or host tools are insufficient;
 - the smallest extension point from the kernel decision order above;
 - all sandbox paths, copy versus mount behavior, and backend requirements;
 - adapter-owned resources, invocation-local state, persistence points, and
@@ -653,7 +656,7 @@ Write the strategy that belongs in the DSPy signature docstring. It is the
 RLM's playbook:
 
 1. survey and understand the available inputs;
-2. gather evidence with file skills, `predict()`, and host tools;
+2. gather evidence with file capabilities, `predict()`, and host tools;
 3. process, cross-check, and synthesize the evidence;
 4. emit the declared data and write any output files in their output locations.
 
@@ -688,7 +691,7 @@ Deliver a plan containing:
 2. Delivery scope and file manifest.
 3. Complete input and output schemas.
 4. Complete signature strategy.
-5. Skill and host-tool contracts.
+5. Capability and host-tool contracts.
 6. Service architecture, including a typed DAG when chained.
 7. Feasibility constraints, alternatives, and initial budgets.
 8. Smoke-test cases and exact verification commands.
@@ -711,7 +714,7 @@ my_rlm/
 │       ├── schema.py       # Pydantic inputs and outputs
 │       ├── signature.py    # DSPy signature and strategy
 │       ├── service.py      # PredictRLM wiring
-│       ├── skills.py       # Only when custom skills are needed
+│       ├── capabilities.py # Only when custom capabilities are needed
 │       └── tools.py        # Only when host-side tools are needed
 ```
 
@@ -726,7 +729,7 @@ uv add predict-rlm
 ```
 
 Add the `examples` extra only when using built-in document or spreadsheet
-skills, and add any domain dependency only where it runs. Do not include GEPA
+capabilities, and add any domain dependency only where it runs. Do not include GEPA
 or visualization extras in an agent-only project.
 
 ## Schema
@@ -820,7 +823,7 @@ inspect the value from the sandbox instead.
 import dspy
 
 from predict_rlm import File, PredictRLM
-from predict_rlm.skills import pdf
+from predict_rlm.capabilities import pdf
 
 from .signature import AnalyzeDocuments
 
@@ -842,7 +845,7 @@ class DocumentAnalyzer(dspy.Module):
             max_iterations=max_iterations,
             verbose=verbose,
             debug=debug,
-            skills=[pdf],
+            capabilities=[pdf],
         )
 
     async def aforward(self, documents: list[File], criteria: str):
@@ -850,8 +853,8 @@ class DocumentAnalyzer(dspy.Module):
 ```
 
 Use `tools=[callable]` when the callable name is suitable, or
-`tools={"name": callable}` to expose a deliberate tool name. Use `skills=[...]`
-for reusable sandbox capabilities. Pass `output_dir` to `PredictRLM` when
+`tools={"name": callable}` to expose a deliberate tool name. Use
+`capabilities=[...]` for reusable sandbox capabilities. Pass `output_dir` to `PredictRLM` when
 `File` or `list[File]` outputs must be collected below a caller-selected root.
 
 # Runtime reference
@@ -868,6 +871,7 @@ PredictRLM(
     max_output_chars=50_000,
     verbose=True,
     tools=None,
+    capabilities=None,
     skills=None,
     adapters=(),
     execution=None,
@@ -890,26 +894,31 @@ session-native backend and reserve `interpreter=` for CodeInterpreter-shaped
 compatibility integrations. Consult `docs/api.md` for exact signatures rather
 than guessing lifecycle parameters.
 
-## Files, skills, and tools
+## Files, capabilities, skills, and tools
 
 - `File(path="report.pdf")` represents an input file; `File.from_dir(path)`
   creates a sorted recursive list of file references.
 - Input files are copied to `/sandbox/input/<field>/`. File outputs are written
   under `/sandbox/output/<field>/` and synchronized back after execution.
-- `Skill(name, instructions, packages, modules, tools)` bundles reusable
-  capability. Skill tool-name collisions are errors.
-- `pdf`, `spreadsheet`, and `docx` are the built-in skills:
+- `Capability(name, instructions, packages, modules, tools)` bundles reusable
+  capability. Capability tool-name collisions are errors.
+- `pdf`, `spreadsheet`, and `docx` are the built-in capabilities:
 
   ```python
-  from predict_rlm.skills import docx, pdf, spreadsheet
+  from predict_rlm.capabilities import docx, pdf, spreadsheet
   ```
+
+- `Skill.from_dir(path)` loads an Agent Skills folder (`SKILL.md` with `name`
+  and `description` frontmatter). Only the name and description reach the
+  prompt; the outer LM prints `await load_skill(name)` to read the instructions, and
+  the folder is mounted at `/sandbox/skills/<name>/`.
 
 - Host tools run outside WASM. Make their docstrings, arguments, and return
   data clear enough for generated code to call safely.
 
 ## Sandbox constraints
 
-- Use pure-Python or Pyodide-compatible packages in sandbox skills.
+- Use pure-Python or Pyodide-compatible packages in sandbox capabilities.
 - Do not expect subprocesses, native binaries, or ordinary C extensions.
 - Default network access is denied; set a minimal `allowed_domains` list when
   the sandbox must reach a network service.

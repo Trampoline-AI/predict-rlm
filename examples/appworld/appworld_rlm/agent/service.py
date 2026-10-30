@@ -7,7 +7,7 @@ from typing import Any
 
 import dspy
 
-from predict_rlm import PredictRLM, Skill
+from predict_rlm import Capability, PredictRLM
 
 from ..tools.runner import AppWorldSessionClient
 from .signature import build_solve_appworld_task_signature
@@ -24,7 +24,7 @@ class AppWorldRLM(dspy.Module):
         max_iterations: int = 50,
         verbose: bool = True,
         debug: bool = False,
-        skill: Skill | None = None,
+        skill: Capability | None = None,
         data_root: str | Path | None = None,
         appworld_client: AppWorldSessionClient | None = None,
     ):
@@ -38,7 +38,7 @@ class AppWorldRLM(dspy.Module):
 
     def build_predictor(
         self,
-        skill: Skill | None = None,
+        skill: Capability | None = None,
         task_id: str = "__current_task__",
         supervisor_name: str = "",
         supervisor_email: str = "",
@@ -54,7 +54,7 @@ class AppWorldRLM(dspy.Module):
             ),
             lm=self.lm,
             sub_lm=self.sub_lm,
-            skills=[skill],
+            capabilities=[skill],
             max_iterations=self.max_iterations,
             verbose=self.verbose,
             debug=self.debug,

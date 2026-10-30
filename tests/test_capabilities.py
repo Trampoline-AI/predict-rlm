@@ -1,15 +1,15 @@
-"""Skill composition executes tools and refuses ambiguous resource ownership."""
+"""Capability composition executes tools and refuses ambiguous resource ownership."""
 
 import dspy
 import pytest
 from dspy.utils.dummies import DummyLM
 
 from predict_rlm import PredictRLM
-from predict_rlm.rlm_skills import Skill, merge_skills
+from predict_rlm.capabilities import Capability, merge_capabilities
 
 
 @pytest.mark.integration
-def test_composed_skills_execute_together_in_the_rlm_loop():
+def test_composed_capabilities_execute_together_in_the_rlm_loop():
     from predict_rlm.backends import JspiBackend
 
     def double(value: int) -> int:
@@ -23,9 +23,9 @@ def test_composed_skills_execute_together_in_the_rlm_loop():
         rlm = PredictRLM(
             "query -> answer",
             interpreter=interpreter,
-            skills=[
-                Skill(name="arithmetic", tools={"double": double}),
-                Skill(name="report", tools={"label": label}),
+            capabilities=[
+                Capability(name="arithmetic", tools={"double": double}),
+                Capability(name="report", tools={"label": label}),
             ],
             max_iterations=1,
         )
@@ -33,7 +33,7 @@ def test_composed_skills_execute_together_in_the_rlm_loop():
             lm=DummyLM(
                 [
                     {
-                        "plan": "compose both skills",
+                        "plan": "compose both capabilities",
                         "code": "value = await double(21)\nSUBMIT(answer=await label(value))",
                     }
                 ],
@@ -46,36 +46,36 @@ def test_composed_skills_execute_together_in_the_rlm_loop():
         interpreter.shutdown()
 
 
-def test_duplicate_skill_tool_names_are_rejected():
+def test_duplicate_capability_tool_names_are_rejected():
     def tool():
         return "value"
 
     with pytest.raises(ValueError, match="Tool name conflict.*shared"):
-        merge_skills(
+        merge_capabilities(
             [
-                Skill(name="first", tools={"shared": tool}),
-                Skill(name="second", tools={"shared": tool}),
+                Capability(name="first", tools={"shared": tool}),
+                Capability(name="second", tools={"shared": tool}),
             ]
         )
 
 
-def test_duplicate_skill_module_names_are_rejected():
+def test_duplicate_capability_module_names_are_rejected():
     with pytest.raises(ValueError, match="Module name conflict.*shared_mod"):
-        merge_skills(
+        merge_capabilities(
             [
-                Skill(name="first", modules={"shared_mod": "/path/a.py"}),
-                Skill(name="second", modules={"shared_mod": "/path/b.py"}),
+                Capability(name="first", modules={"shared_mod": "/path/a.py"}),
+                Capability(name="second", modules={"shared_mod": "/path/b.py"}),
             ]
         )
 
 
-def test_skill_tool_cannot_silently_replace_user_tool():
+def test_capability_tool_cannot_silently_replace_user_tool():
     def tool():
         return "value"
 
     with pytest.raises(ValueError, match="Tool name conflict.*shared"):
         PredictRLM(
             "query -> answer",
-            skills=[Skill(name="skill", tools={"shared": tool})],
+            capabilities=[Capability(name="capability", tools={"shared": tool})],
             tools={"shared": tool},
         )

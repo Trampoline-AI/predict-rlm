@@ -137,7 +137,7 @@ class SpreadsheetGepaProject(RLMGepaProject):
                 ManipulateSpreadsheet,
                 lm=context.lm,
                 sub_lm=context.sub_lm,
-                skills=[skill],
+                capabilities=[skill],
                 max_iterations=context.max_iterations,
                 verbose=context.verbose_rlm,
                 debug=context.debug_rlm,
