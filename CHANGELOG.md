@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- `DirectPythonBackend` (and other Python-supervisor backends) now run concurrent
+  host tool calls in parallel, so `asyncio.gather(predict(...), ...)` takes about
+  one call's time instead of the sum. The supervisor shares the SBX backend's
+  dispatch: each call runs in its own worker and is answered when it finishes.
+- A burst of three or more small concurrent tool calls no longer stalls a Direct
+  execute until its request deadline.
+- Direct host tools run in the caller's context, and async tools on the event loop
+  that called `aexecute()`. `predict()` therefore uses the RLM's adapter (one LM
+  call instead of a ChatAdapter attempt plus a JSON retry), and evidence and
+  telemetry context reach the tool. Pending async tools are cancelled when an
+  iteration times out or the execute is cancelled, as on JSPI and SBX.
+
 ## [0.13.1] - 2026-10-23
 
 ### Fixed

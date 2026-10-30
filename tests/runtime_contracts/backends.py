@@ -151,7 +151,7 @@ def runtime_specs() -> list[RuntimeSpec]:
         RuntimeSpec(
             "python-runner/direct-process",
             _make_direct,
-            frozenset({"partial_error_output", "concurrent_tools"}),
+            frozenset({"partial_error_output"}),
         ),
         RuntimeSpec("sbx/local-websocket", _make_sbx, frozenset({"deferred_submit"})),
         RuntimeSpec("sbx", _make_sbx, frozenset({"deferred_submit"})),

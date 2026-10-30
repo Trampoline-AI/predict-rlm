@@ -169,7 +169,10 @@ The fixture shuts down each handle after its case.
 | Mount, create directories, list, write, and collect files | Covered | Covered | Covered | Opt-in |
 | Preserve timeout output and recover for another execution | Covered | Covered | Covered | Opt-in |
 | Round-trip list/dict/null/text host-tool results | Covered | Covered | Covered | Opt-in |
-| Execute synchronous and asynchronous host tools concurrently | Covered | Unsupported/skipped: callbacks are serial | Covered | Opt-in |
+| Execute synchronous and asynchronous host tools concurrently | Covered | Covered | Covered | Opt-in |
+| Complete a burst of small concurrent host-tool calls | Covered | Covered | Covered | Opt-in |
+| Run host tools in the caller's context and async tools on its event loop | Covered | Covered | Covered | Opt-in |
+| Cancel pending async host tools at an iteration timeout or execute cancellation | Covered | Covered | Covered | Opt-in |
 | Recover from host-tool exceptions and tool deadlines | Covered | Covered | Covered | Opt-in |
 | Round-trip a roughly 950 KB host-tool request | Local-only | Local-only | Local-only | Local-only and opt-in |
 
@@ -182,7 +185,7 @@ higher-level PredictRLM submit-confirmation loop.
 | Module | Cases | Core feature and covered behavior |
 | --- | ---: | --- |
 | [test_execution_contract.py](../tests/runtime_contracts/test_execution_contract.py) | 44 | Execution/state/reset; concurrent request serialization; code fences; user and syntax error recovery; partial error output where supported; `SUBMIT` and deferred finalization; file roundtrips; recoverable execution deadlines with stdout/stderr. |
-| [test_tool_contract.py](../tests/runtime_contracts/test_tool_contract.py) | 24 | Host-tool value shapes; genuine overlap of sync/async callbacks where supported; large-payload transport; recovery after tool errors; bounded timeout/recovery while multiple tools are pending. The deadline reproduction runs in a child process so a stalled backend cannot hang the test indefinitely. |
+| [test_tool_contract.py](../tests/runtime_contracts/test_tool_contract.py) | 48 | Host-tool value shapes; genuine overlap of sync/async callbacks; a burst of small concurrent calls sharing pipe reads; caller contextvars in sync/async tools and async tools on the caller's event loop; cancellation of pending async tools at an iteration timeout or when the execute is cancelled; large-payload transport; recovery after tool errors; bounded timeout/recovery while multiple tools are pending. The deadline reproduction runs in a child process so a stalled backend cannot hang the test indefinitely. |
 
 ## Package suite inventory
 
@@ -224,7 +227,7 @@ execute/state/tool/file scenarios.
 | Module | Cases | Routing | Core feature and covered behavior |
 | --- | ---: | --- | --- |
 | [test_interpreter.py](../tests/test_interpreter.py) | 15 | JSPI | Submit defaults/errors; multi-block fence extraction and inline backticks; nested Pydantic/tool serialization, null values, and string fallback for otherwise unserializable values; nested signature schemas; serialization-error recovery; ignoring late tool responses; reconstructed model extra fields and `items` access; fatal process deadline; workspace flush before cancellation shutdown. Uses real Deno/Pyodide. |
-| [test_direct_python_backend.py](../tests/test_direct_python_backend.py) | 3 | Core | Real local runner path virtualization: sandbox paths do not poison subsequent executions; directory contents are copied into the sandbox namespace; a regular `Path` global survives timeout recovery with usable path operations. |
+| [test_direct_python_backend.py](../tests/test_direct_python_backend.py) | 4 | Core | Real local runner path virtualization: sandbox paths do not poison subsequent executions; directory contents are copied into the sandbox namespace; a regular `Path` global survives timeout recovery with usable path operations. A PredictRLM `predict()` through Direct uses the RLM's adapter, so it makes one LM call. |
 | [test_sbx_interpreter.py](../tests/test_sbx_interpreter.py) | 40 | SBX + real SBX | Native supervisor snapshot/recovery behavior, subprocess stdin isolation, child stdout/stderr attribution, runner exit survival, timeout enforcement despite user exception handlers, tool-reader handoff, late-call quarantine, staging-root ownership, reset, SyncedFile writeback, WebSocket authentication, independent reusable supervisors, Pydantic reconstruction/validation, async interruption, post-hook failure precedence, fixed invocation policy, and cancellation-safe worker cleanup. Most cases use local payload processes; the persistent/re-attach/destroy lifecycle is an opt-in real SBX case. |
 | [test_sbx_pool.py](../tests/test_sbx_pool.py) | 20 | Core + SBX | Exclusive leasing/reset; startup and shutdown races; failed reset/replacement/prewarm must not lose capacity or requeue retired interpreters; cancellation-safe retirement and loop migration; waiter cancellation; release after configuration failure; fixed session-policy validation; restart after shutdown. Mixes fake-interpreter synchronization contracts and local supervisor-backed pool cases, not real SBX provisioning. |
 | [test_jspi_async_operations.py](../tests/test_jspi_async_operations.py) | 7 | Core | Synthetic async JSPI seams: interrupt until execution quiesces, host-task ownership through recoverable timeout/cancellation, quarantine before the next iteration, and post-hook behavior after fatal/cancelled/failed execution. The filename does not make these Deno integration tests. |
@@ -475,9 +478,9 @@ When reading a result:
 - These tests do not measure real model quality, benchmark accuracy, or live
   provider authentication/API compatibility. Scripted LMs and local protocol
   servers make the relevant software contracts deterministic.
-- The backend matrix does not assert uniform capabilities. Direct serial
-  callbacks, partial-error-output differences, and deferred-submit support are
-  explicit limitations of the tested interfaces.
+- The backend matrix does not assert uniform capabilities. Partial-error-output
+  differences and deferred-submit support are explicit limitations of the tested
+  interfaces.
 - Nested model reconstruction is exercised for sandbox-global model definitions;
   this is not a guarantee of reconstruction for arbitrary function-local classes.
 - The successful portable SyncedFile roundtrip uses an **owned** PredictRLM JSPI

@@ -467,8 +467,7 @@ docstrings, source text, or mocked argument forwarding.
 
 - `tests/runtime_contracts/`: shared execution, state, submission, files, tools,
   and recovery contracts across Direct, JSPI, and SBX. Backend-specific gaps are
-  explicit in `backends.py`; native Direct callbacks are serial, and deferred
-  submission is a Direct-only interpreter API.
+  explicit in `backends.py`; deferred submission is a Direct-only interpreter API.
 - RLM, adapter, file, and workspace tests: generated-code execution, typed
   predictions, input/output handling, cancellation ownership, and data-loss boundaries.
 - Trace and telemetry tests: evidence projection, accounting, redaction, and

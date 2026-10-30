@@ -4,9 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import atexit
-import concurrent.futures
 import contextlib
-import contextvars
 import hashlib
 import inspect
 import json
@@ -58,7 +56,6 @@ from predict_rlm.files import get_synced_file_params
 from predict_rlm.runtime import (
     ArtifactFileInfo,
     HostDirectoryMount,
-    SyncWorkerTracker,
     host_sync_worker_policy,
     invoke_host_callable,
 )
@@ -134,7 +131,7 @@ class _DetachedWebSocketSupervisorProcess:
         return None
 
 
-class SbxBackend(SyncWorkerTracker, SupervisorClient, LegacyExecutionBackend):
+class SbxBackend(SupervisorClient, LegacyExecutionBackend):
     """Execution backend backed by Docker Sandboxes.
 
     The backend starts a Python JSON-RPC supervisor inside a Docker Sandbox and
@@ -212,10 +209,6 @@ class SbxBackend(SyncWorkerTracker, SupervisorClient, LegacyExecutionBackend):
         self._quarantined_async_tool_calls: set[asyncio.Task[Any]] = set()
         self._host_work_retirement: asyncio.Task[None] | None = None
         self._active_async_request: dict[str, Any] | None = None
-        self._pending_tool_calls: dict[concurrent.futures.Future[dict[str, Any]], int] = {}
-        self._quarantined_tool_calls: set[
-            concurrent.futures.Future[dict[str, Any]]
-        ] = set()
         self._active_execute_timeout_deadline: float | None = None
         self.cancellation_interrupt_timeout: float = 10.0
         self._execution_gate = BackendExecutionGate("SBX backend")
@@ -2422,9 +2415,7 @@ class SbxBackend(SyncWorkerTracker, SupervisorClient, LegacyExecutionBackend):
             tool=params.get("name"),
             request_id=request_id,
         )
-        ctx = contextvars.copy_context()
-        worker = self._start_sync_worker(ctx.run, self._build_tool_response, request)
-        self._pending_tool_calls[worker.future] = request_id
+        super()._submit_tool_call(request)
 
     def _asubmit_tool_call(self, request: dict[str, Any]) -> None:
         request_id = request.get("id")
@@ -2443,20 +2434,11 @@ class SbxBackend(SyncWorkerTracker, SupervisorClient, LegacyExecutionBackend):
         task = asyncio.create_task(self._abuild_tool_response(request))
         self._async_pending_tool_calls[task] = request_id
 
-    def _drain_completed_tool_calls(self) -> None:
-        completed = [future for future in self._pending_tool_calls if future.done()]
-        for future in completed:
-            self._pending_tool_calls.pop(future)
-            self._write_tool_response(future.result())
-
     async def _adrain_completed_tool_calls(self) -> None:
         completed = [task for task in self._async_pending_tool_calls if task.done()]
         for task in completed:
             self._async_pending_tool_calls.pop(task)
             await self._awrite_tool_response(task.result())
-
-    def _drain_completed_supervisor_work(self) -> None:
-        self._drain_completed_tool_calls()
 
     def _handle_supervisor_control_message(
         self,
@@ -2464,8 +2446,7 @@ class SbxBackend(SyncWorkerTracker, SupervisorClient, LegacyExecutionBackend):
         *,
         deadline: float,
     ) -> bool:
-        if message.get("method") == "tool_call":
-            self._submit_tool_call(message)
+        if super()._handle_supervisor_control_message(message, deadline=deadline):
             return True
         if message.get("method") == "runtime_hook_event":
             self._handle_runtime_hook_event(message)
@@ -3162,19 +3143,6 @@ class SbxBackend(SyncWorkerTracker, SupervisorClient, LegacyExecutionBackend):
                 *getattr(self, "_quarantined_async_tool_calls", ()),
             }
         ) or self.has_live_sync_workers()
-
-    def _quarantine_sync_tool_calls(self) -> None:
-        pending = getattr(self, "_pending_tool_calls", None)
-        if not pending:
-            return
-        quarantine = getattr(self, "_quarantined_tool_calls", None)
-        if quarantine is None:
-            quarantine = set()
-            self._quarantined_tool_calls = quarantine
-        quarantine.difference_update(future for future in quarantine if future.done())
-        for future in tuple(pending):
-            quarantine.add(future)
-        pending.clear()
 
     def retire_when_host_work_finishes(self) -> bool:
         self._quarantine_sync_tool_calls()

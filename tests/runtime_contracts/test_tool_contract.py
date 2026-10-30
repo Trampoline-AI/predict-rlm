@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import contextvars
 import multiprocessing
 import os
 import queue as queue_module
@@ -45,6 +47,61 @@ def test_host_tools_run_concurrently(runtime: RuntimeHandle, asynchronous: bool)
         "import asyncio\nprint(await asyncio.gather(double(3), double(7)))"
     )
     assert runtime.output(result) == "[6, 14]\n"
+
+
+def test_burst_of_small_concurrent_host_tool_calls_completes(runtime: RuntimeHandle) -> None:
+    # Small requests arrive together, so several can share one pipe read.
+    def echo(value):
+        time.sleep(0.2)
+        return value
+
+    runtime.configure(tools={"echo": echo})
+    result = runtime.execute(
+        "import asyncio\nprint(await asyncio.gather(*[echo(i) for i in range(6)]))"
+    )
+    assert runtime.output(result) == "[0, 1, 2, 3, 4, 5]\n"
+
+
+_CALLER_VALUE: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "caller_value", default="unset"
+)
+
+
+@pytest.mark.parametrize("asynchronous", [False, True], ids=["sync-tool", "async-tool"])
+def test_host_tools_see_the_callers_context(runtime: RuntimeHandle, asynchronous: bool) -> None:
+    def sync_probe():
+        return _CALLER_VALUE.get()
+
+    async def async_probe():
+        return _CALLER_VALUE.get()
+
+    runtime.configure(tools={"probe": async_probe if asynchronous else sync_probe})
+
+    async def execute_with_caller_context():
+        _CALLER_VALUE.set("caller")
+        return await runtime.aexecute("print(await probe())")
+
+    result = asyncio.run(execute_with_caller_context())
+    assert runtime.output(result) == "caller\n"
+
+
+def test_async_host_tools_run_on_the_callers_event_loop(runtime: RuntimeHandle) -> None:
+    tool_loops = []
+
+    async def record_loop():
+        tool_loops.append(asyncio.get_running_loop())
+        return "ok"
+
+    runtime.configure(tools={"record_loop": record_loop})
+
+    async def execute_and_return_loop():
+        await runtime.aexecute(
+            "import asyncio\nprint(await asyncio.gather(record_loop(), record_loop()))"
+        )
+        return asyncio.get_running_loop()
+
+    caller_loop = asyncio.run(execute_and_return_loop())
+    assert tool_loops == [caller_loop, caller_loop]
 
 
 # Large pipe messages have intermittently stalled on loaded CI; retain the
@@ -153,3 +210,64 @@ def test_timeout_during_concurrent_host_tools_is_recoverable(
                 text=True,
                 timeout=30,
             )
+
+
+def test_iteration_timeout_cancels_pending_async_host_tools(runtime: RuntimeHandle) -> None:
+    cancelled = []
+
+    async def wait_forever():
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            cancelled.append(True)
+            raise
+
+    runtime.configure(tools={"wait_forever": wait_forever})
+
+    async def time_out_then_settle():
+        result = await runtime.aexecute(
+            "import asyncio\nawait asyncio.gather(wait_forever(), wait_forever())",
+            timeout=0.2,
+        )
+        for _ in range(100):
+            if len(cancelled) == 2:
+                break
+            await asyncio.sleep(0.01)
+        # Snapshot before asyncio.run() cancels any task still left on the loop.
+        return result, list(cancelled)
+
+    result, cancelled_before_loop_exit = asyncio.run(time_out_then_settle())
+    assert result.timeout_seconds == 0.2
+    assert cancelled_before_loop_exit == [True, True]
+
+
+def test_cancelling_execute_cancels_pending_async_host_tools(runtime: RuntimeHandle) -> None:
+    started = []
+    cancelled = []
+
+    async def wait_forever():
+        started.append(True)
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            cancelled.append(True)
+            raise
+
+    runtime.configure(tools={"wait_forever": wait_forever})
+
+    async def cancel_while_tool_waits():
+        execution = asyncio.create_task(runtime.aexecute("await wait_forever()"))
+        for _ in range(500):
+            if started or execution.done():
+                break
+            await asyncio.sleep(0.01)
+        execution.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await execution
+        for _ in range(100):
+            if cancelled:
+                break
+            await asyncio.sleep(0.01)
+        return list(started), list(cancelled)
+
+    assert asyncio.run(cancel_while_tool_waits()) == ([True], [True])

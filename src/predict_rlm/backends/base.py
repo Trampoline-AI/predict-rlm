@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import contextvars
 import json
 import threading
@@ -15,6 +16,7 @@ from typing import Any, Protocol
 from dspy.primitives.code_interpreter import CodeInterpreterError, FinalOutput
 
 from predict_rlm.execution_timeout import format_recoverable_timeout_result
+from predict_rlm.runtime import SyncWorkerTracker
 
 STALE_RESPONSE_DISCARD_LIMIT = 50
 
@@ -194,12 +196,18 @@ class SupervisorProcess(Protocol):
     def poll(self) -> int | None: ...
 
 
-class SupervisorClient(ABC):
+class SupervisorClient(SyncWorkerTracker, ABC):
     """Shared JSON-RPC client for Python supervisors.
 
-    Backend subclasses own process creation, tool callbacks, file semantics,
+    Backend subclasses own process creation, tool execution, file semantics,
     timeout policy, and user-facing diagnostics. This class owns request IDs,
-    JSON-RPC framing, response resync, and structured-response lifecycle state.
+    JSON-RPC framing, response resync, structured-response lifecycle state, and
+    host tool-call dispatch.
+
+    Sandbox code can have many host tool calls in flight (``asyncio.gather``),
+    so each ``tool_call`` request runs in its own sync worker while the request
+    loop keeps reading. The loop writes each response once its worker finishes,
+    in completion order; the supervisor matches responses to calls by id.
     """
 
     def __init__(
@@ -215,6 +223,8 @@ class SupervisorClient(ABC):
         self._stale_response_discard_limit = stale_response_discard_limit
         self._request_id = 0
         self._supervisor_exit_recovery_context: dict[str, Any] | None = None
+        self._pending_tool_calls: dict[concurrent.futures.Future[dict[str, Any]], Any] = {}
+        self._quarantined_tool_calls: set[concurrent.futures.Future[dict[str, Any]]] = set()
 
     def _send_json_rpc_request(
         self,
@@ -472,7 +482,7 @@ class SupervisorClient(ABC):
         return json.dumps(message)
 
     def _drain_completed_supervisor_work(self) -> None:
-        return None
+        self._drain_completed_tool_calls()
 
     def _handle_supervisor_control_message(
         self,
@@ -480,7 +490,40 @@ class SupervisorClient(ABC):
         *,
         deadline: float,
     ) -> bool:
-        return False
+        if message.get("method") != "tool_call":
+            return False
+        self._submit_tool_call(message)
+        return True
+
+    def _submit_tool_call(self, request: dict[str, Any]) -> None:
+        worker = self._start_sync_worker(self._build_tool_response, request)
+        self._pending_tool_calls[worker.future] = request.get("id")
+
+    def _drain_completed_tool_calls(self) -> None:
+        completed = [future for future in self._pending_tool_calls if future.done()]
+        for future in completed:
+            self._pending_tool_calls.pop(future)
+            self._write_tool_response(future.result())
+
+    def _quarantine_sync_tool_calls(self) -> None:
+        """Stop answering in-flight tool calls whose supervisor request is over."""
+        pending = getattr(self, "_pending_tool_calls", None)
+        if not pending:
+            return
+        quarantine = getattr(self, "_quarantined_tool_calls", None)
+        if quarantine is None:
+            quarantine = set()
+            self._quarantined_tool_calls = quarantine
+        quarantine.difference_update(future for future in quarantine if future.done())
+        for future in tuple(pending):
+            quarantine.add(future)
+        pending.clear()
+
+    def _build_tool_response(self, request: dict[str, Any]) -> dict[str, Any]:
+        raise NotImplementedError
+
+    def _write_tool_response(self, response: dict[str, Any]) -> None:
+        raise NotImplementedError
 
     def _on_supervisor_request_start(
         self,
